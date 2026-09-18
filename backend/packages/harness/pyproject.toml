@@ -1,0 +1,15 @@
+[project]
+name = "agentkit"
+version = "0.1.0"
+authors = [
+    { name = "liyuanbo", email = "liyuanbo@gomain.com.cn" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.13.5",
+]
+
+
+#[build-system]
+#requires = ["uv_build>=0.12.5,<0.13.0"]#
+#build-backend = "uv_build"

@@ -1,0 +1,23 @@
+[project]
+name = "backend"
+version = "0.1.0"
+authors = [
+    { name = "liyuanbo", email = "liyuanbo@gomain.com.cn" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "agentkit",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.uv.sources]
+agentkit = { workspace = true }
+
+
+#[build-system]
+#requires = ["uv_build>=0.12.5,<0.13.0"]
+#build-backend = "uv_build"

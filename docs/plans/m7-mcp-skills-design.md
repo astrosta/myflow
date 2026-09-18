@@ -1,9 +1,9 @@
 # M7 能力扩展：MCP 与技能 详细设计
 
-> 配套文档：[分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md) ·
-> [M0 地基](2026-09-16-m0-foundation-design.md) · [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md) ·
-> [M2 工具与沙箱](2026-09-16-m2-tools-sandbox-design.md) · [M3 Gateway 与流式](2026-09-16-m3-gateway-streaming-design.md) ·
-> [M4 持久化](2026-09-16-m4-persistence-design.md) · [M6 中间件体系](2026-09-16-m6-middleware-design.md)
+> 配套文档：[分阶段开发方案](greenfield-agent-service-roadmap.md) ·
+> [M0 地基](m0-foundation-design.md) · [M1 最小 Agent](m1-minimal-agent-design.md) ·
+> [M2 工具与沙箱](m2-tools-sandbox-design.md) · [M3 Gateway 与流式](m3-gateway-streaming-design.md) ·
+> [M4 持久化](m4-persistence-design.md) · [M6 中间件体系](m6-middleware-design.md)
 >
 > 本文细化 M7（2 周，可与 M8 并行）。沿用包名：框架层 `agentkit.*`，应用层 `app.*`。
 

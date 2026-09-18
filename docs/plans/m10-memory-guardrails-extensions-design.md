@@ -1,10 +1,10 @@
 # M10 记忆、护栏、扩展、可观测性 详细设计
 
-> 配套文档：[分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md) ·
-> [M0 地基](2026-09-16-m0-foundation-design.md) · [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md) ·
-> [M2 工具与沙箱](2026-09-16-m2-tools-sandbox-design.md) · [M3 Gateway 与流式](2026-09-16-m3-gateway-streaming-design.md) ·
-> [M4 持久化](2026-09-16-m4-persistence-design.md) · [M6 中间件体系](2026-09-16-m6-middleware-design.md) ·
-> [M7 MCP 与技能](2026-09-16-m7-mcp-skills-design.md) · [M8 子代理委托](2026-09-16-m8-subagents-design.md)
+> 配套文档：[分阶段开发方案](greenfield-agent-service-roadmap.md) ·
+> [M0 地基](m0-foundation-design.md) · [M1 最小 Agent](m1-minimal-agent-design.md) ·
+> [M2 工具与沙箱](m2-tools-sandbox-design.md) · [M3 Gateway 与流式](m3-gateway-streaming-design.md) ·
+> [M4 持久化](m4-persistence-design.md) · [M6 中间件体系](m6-middleware-design.md) ·
+> [M7 MCP 与技能](m7-mcp-skills-design.md) · [M8 子代理委托](m8-subagents-design.md)
 >
 > 本文细化 M10（3–4 周，四条线内部可并行）。沿用包名：框架层 `agentkit.*`，应用层 `app.*`。
 

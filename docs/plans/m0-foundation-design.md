@@ -1,6 +1,6 @@
 # M0 地基详细设计
 
-> 配套文档：[从零构建一个对标 DeerFlow 的 Agent 服务 —— 分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md)
+> 配套文档：[从零构建一个对标 DeerFlow 的 Agent 服务 —— 分阶段开发方案](greenfield-agent-service-roadmap.md)
 >
 > 本文细化 M0（1 周）。示例包名：框架层 `agentkit.*`，应用层 `app.*`。
 > 所有"为什么"都对应 DeerFlow 现有实现里已经付过学费的地方，代码片段可直接改名使用。
@@ -14,27 +14,33 @@
 
 **不做什么（且要克制住）：**
 
-| 不做 | 因为 |
-|---|---|
+
+| 不做                | 因为                           |
+| ----------------- | ---------------------------- |
 | FastAPI / 任何 HTTP | M3 才定 run 语义，现在写的路由 100% 会重写 |
-| LangGraph 图 | M1 |
-| 数据库 / ORM | M4。现在连不上表结构长什么样都不知道 |
-| 前端 | M5 |
-| Docker | M0 结束后再补，现在 Dockerfile 会天天变 |
+| LangGraph 图       | M1                           |
+| 数据库 / ORM         | M4。现在连不上表结构长什么样都不知道          |
+| 前端                | M5                           |
+| Docker            | M0 结束后再补，现在 Dockerfile 会天天变  |
+
 
 M0 的唯一交付是**一个能被 import、能被测试、能加载配置、能造出模型对象的 Python 包**。
 
 ### 一周排期
 
-| 天 | 内容 |
-|---|---|
-| D1 | 目录骨架、双包 pyproject、uv workspace、ruff/pytest/pre-commit、边界测试 |
-| D2 | 路径系统（`runtime_paths` + `Paths`） |
-| D3 | 配置系统上半：`AppConfig` 骨架、YAML 加载、`$ENV` 解析、优先级解析 |
-| D4 | 配置系统下半：内容签名缓存、热重载边界注册表、测试注入 API、版本检查 |
-| D5 | 反射系统 + 模型工厂 + 日志 + Makefile + 补测试 |
+
+| 天   | 内容                                                         |
+| --- | ---------------------------------------------------------- |
+| D1  | 目录骨架、双包 pyproject、uv workspace、ruff/pytest/pre-commit、边界测试 |
+| D2  | 路径系统（`runtime_paths` + `Paths`）                            |
+| D3  | 配置系统上半：`AppConfig` 骨架、YAML 加载、`$ENV` 解析、优先级解析              |
+| D4  | 配置系统下半：内容签名缓存、热重载边界注册表、测试注入 API、版本检查                       |
+| D5  | 反射系统 + 模型工厂 + 日志 + Makefile + 补测试                          |
+
 
 ---
+
+
 
 ## 2. 目录结构
 
@@ -94,7 +100,11 @@ myflow/
 
 ---
 
+
+
 ## 3. 包与构建
+
+
 
 ### 3.1 双包 + uv workspace
 
@@ -132,6 +142,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 ```
 
+
+
 ### 3.2 依赖分层原则：provider 一律走 extras
 
 **核心依赖里不要出现任何具体的 LLM provider 包，也不要出现任何平台相关的包。**
@@ -159,6 +171,8 @@ def test_providers_are_optional() -> None:
 （模块名 `langchain_google_genai` ≠ 包名 `langchain-google-genai`）。
 
 ---
+
+
 
 ## 4. 分层边界测试（D1 就要有）
 
@@ -204,15 +218,21 @@ def test_harness_does_not_import_app():
 
 ---
 
+
+
 ## 5. 配置系统（M0 的主体，约 2.5 天）
+
+
 
 ### 5.1 三份文件，职责不同
 
-| 文件 | 谁写 | 运行时可改 | 生产挂载 |
-|---|---|---|---|
-| `config.yaml` | 运维 | 部分字段热生效 | `:ro` |
-| `extensions_config.json` | **Gateway API** | 全部 | 读写 |
-| `.env` | 运维 | 否 | — |
+
+| 文件                       | 谁写              | 运行时可改   | 生产挂载  |
+| ------------------------ | --------------- | ------- | ----- |
+| `config.yaml`            | 运维              | 部分字段热生效 | `:ro` |
+| `extensions_config.json` | **Gateway API** | 全部      | 读写    |
+| `.env`                   | 运维              | 否       | —     |
+
 
 M0 只需要把 `config.yaml` 做完整，`extensions_config.json` 留一个能读的空壳。但**两份文件的
 分离必须在 M0 就成立**，因为它们的挂载方式、锁策略、原子写要求完全不同（详见路线图 M7 陷阱）。
@@ -256,7 +276,7 @@ class AppConfig(BaseModel):
 `sandbox_config.py`……）。DeerFlow 的 `config/` 下现在有 47 个文件，`app_config.py` 本身
 只剩下字段声明和加载逻辑。如果一开始就把所有 section 写在一个文件里，到 M6 那个文件会有 3000 行。
 
-**`extra="allow"` 的取舍。** 允许未知字段的好处是接新 provider 时不用改 schema（provider 特有的
+`extra="allow"` **的取舍。** 允许未知字段的好处是接新 provider 时不用改 schema（provider 特有的
 `api_version`、`organization` 之类直接透传）。代价是**配置项打错字不会报错**——`maxx_tokens`
 会被原样传给构造函数，然后在请求时被 SDK 拒绝，错误信息完全看不出是配置笔误。
 补偿措施放在模型工厂里（§7.3）。
@@ -371,7 +391,7 @@ def test_startup_only_registry_matches_schema():
 
 ### 5.7 三个 YAML 加载的边角情况
 
-**注释掉整段会解析成 `None`。** 用户照文档执行 `cp config.example.yaml config.yaml`，而模板里
+**注释掉整段会解析成** `None`**。** 用户照文档执行 `cp config.example.yaml config.yaml`，而模板里
 `models:` 下面全是注释，PyYAML 会把值解析成 `None`，pydantic 报
 `Input should be a valid list`。第一次运行就崩，且错误信息完全看不出原因。
 
@@ -435,7 +455,11 @@ def _build_name_indexes(self) -> "AppConfig":
 
 ---
 
+
+
 ## 6. 路径系统（D2，约 0.5 天）
+
+
 
 ### 6.1 两层：runtime_paths 决定根，Paths 决定布局
 
@@ -515,6 +539,8 @@ def make_safe_user_id(raw: str) -> str:
     return f"{sanitized}-{digest}"   # 摘要后缀保证不碰撞
 ```
 
+
+
 ### 6.3 Windows 宿主路径要保留原生风格
 
 如果将来要在 Windows 上跑 Docker，bind mount 的源路径必须保持 `C:\repo\...` 形式。
@@ -535,7 +561,11 @@ def join_host_path(base: str, *parts: str) -> str:
 
 ---
 
+
+
 ## 7. 反射系统与模型工厂（D5）
+
+
 
 ### 7.1 反射层
 
@@ -589,15 +619,17 @@ MODULE_TO_PACKAGE_HINTS = {
 
 必须在 M0 就存在的字段（后面阶段会依赖）：
 
-| 字段 | 谁在用 |
-|---|---|
-| `name` / `display_name` / `description` | M3 的 `/api/models`、M5 的模型选择器 |
-| `use` | 反射类路径 |
-| `model` | provider 侧模型 ID |
-| `supports_thinking` + `when_thinking_enabled` / `when_thinking_disabled` | M5 的思考开关 |
-| `supports_vision` | M6 的 `ViewImageMiddleware` |
-| `context_window` | M5 的上下文占用百分比、M6 的按比例压缩触发 |
-| `max_tokens` | 每次调用的输出上限 |
+
+| 字段                                                                       | 谁在用                          |
+| ------------------------------------------------------------------------ | ---------------------------- |
+| `name` / `display_name` / `description`                                  | M3 的 `/api/models`、M5 的模型选择器 |
+| `use`                                                                    | 反射类路径                        |
+| `model`                                                                  | provider 侧模型 ID              |
+| `supports_thinking` + `when_thinking_enabled` / `when_thinking_disabled` | M5 的思考开关                     |
+| `supports_vision`                                                        | M6 的 `ViewImageMiddleware`   |
+| `context_window`                                                         | M5 的上下文占用百分比、M6 的按比例压缩触发     |
+| `max_tokens`                                                             | 每次调用的输出上限                    |
+
 
 `context_window` 和 `max_tokens` 是**两个不同的东西**（总窗口 vs 单次输出上限），
 命名上要在 description 里写清楚，否则 100% 会被配错。
@@ -620,7 +652,7 @@ MODULE_TO_PACKAGE_HINTS = {
 11. 构造后注入 profile（context_window → max_input_tokens）
 ```
 
-**第 2 步的 exclude 集合要完整。** `display_name`、`description`、`supports_*`、
+**第 2 步的 exclude 集合要完整。** `display_name`、`description`、`supports_`*、
 `when_thinking_*`、`context_window`、`pricing` 全是元数据，传给 provider 客户端会被塞进
 `model_kwargs` 然后在请求时炸掉。漏掉任何一个都是个难查的 bug。
 
@@ -635,9 +667,11 @@ inferred = getattr(model_instance, "profile", None)
 model_instance.profile = {**(inferred or {}), "max_input_tokens": model_config.context_window}
 ```
 
+
+
 ### 7.4 三个必踩的 provider 坑（提前埋防护）
 
-**坑一：`api_base` vs `base_url`。** `BaseChatOpenAI` 系列接受的是 `base_url`，但很多文档和
+**坑一：**`api_base` **vs** `base_url`**。** `BaseChatOpenAI` 系列接受的是 `base_url`，但很多文档和
 配置示例写的是 `api_base`。因为 `extra="allow"`，这个 key 会被透传给构造函数，构造函数不报错
 但会把它转移进 `model_kwargs`，然后展开进每次 `Completions.create()`，被 OpenAI SDK 以
 `unexpected keyword argument 'api_base'` 拒绝——**而且 endpoint 覆盖被静默丢弃了**。
@@ -671,6 +705,8 @@ if "stream_usage" not in settings and "stream_usage" in getattr(model_class, "mo
 
 ---
 
+
+
 ## 8. 日志
 
 M0 只做两件事：
@@ -694,6 +730,8 @@ httpx 的日志淹没有用信息。root handler 的阈值只降不升，这样�
 但要预留 `logging.enhance` 配置块，并从一开始就注册为 startup-only。
 
 ---
+
+
 
 ## 9. 工具链与 Makefile
 
@@ -726,22 +764,28 @@ API 配额跑完而红，然后大家就开始习惯性忽略 CI。
 
 ---
 
+
+
 ## 10. M0 的测试清单
 
-| 测试文件 | 覆盖 |
-|---|---|
-| `test_harness_boundary.py` | harness 不 import app |
-| `test_harness_packaging.py` | provider 包在 optional-dependencies 里 |
-| `test_app_config.py` | 四级路径优先级；显式路径缺失抛异常 vs 搜索模式返回 None；`$ENV` 解析成功/缺失抛异常；null section 降级为默认；版本过低 warning；名称索引首匹配语义；`set/reset/push/pop` 语义 |
-| `test_config_signature.py` | 同秒等长改内容能被检出；mtime 回退能被检出；文件不存在返回 None；stat 成功但读失败返回部分签名 |
-| `test_reload_boundary.py` | 注册表 ↔ schema description 双向一致 |
-| `test_paths.py` | 虚拟路径映射；非法 user_id / thread_id 被拒；`make_safe_user_id` 不碰撞；Windows 路径拼接保留风格；`MYFLOW_PROJECT_ROOT` 指向不存在路径时抛异常 |
-| `test_reflection.py` | 正常解析；路径格式错误；模块缺失给出安装提示；模块内部 ImportError 保留原信息；`expected_type` 校验；`base_class` 校验 |
-| `test_model_factory.py` | 元数据字段不进构造函数；`api_base` 被改名；未知 key 告警；`stream_usage` 默认；thinking 开关分支；`context_window` 在构造后 merge 进 profile 而非替换 |
+
+| 测试文件                        | 覆盖                                                                                                                   |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `test_harness_boundary.py`  | harness 不 import app                                                                                                 |
+| `test_harness_packaging.py` | provider 包在 optional-dependencies 里                                                                                  |
+| `test_app_config.py`        | 四级路径优先级；显式路径缺失抛异常 vs 搜索模式返回 None；`$ENV` 解析成功/缺失抛异常；null section 降级为默认；版本过低 warning；名称索引首匹配语义；`set/reset/push/pop` 语义 |
+| `test_config_signature.py`  | 同秒等长改内容能被检出；mtime 回退能被检出；文件不存在返回 None；stat 成功但读失败返回部分签名                                                              |
+| `test_reload_boundary.py`   | 注册表 ↔ schema description 双向一致                                                                                        |
+| `test_paths.py`             | 虚拟路径映射；非法 user_id / thread_id 被拒；`make_safe_user_id` 不碰撞；Windows 路径拼接保留风格；`MYFLOW_PROJECT_ROOT` 指向不存在路径时抛异常          |
+| `test_reflection.py`        | 正常解析；路径格式错误；模块缺失给出安装提示；模块内部 ImportError 保留原信息；`expected_type` 校验；`base_class` 校验                                     |
+| `test_model_factory.py`     | 元数据字段不进构造函数；`api_base` 被改名；未知 key 告警；`stream_usage` 默认；thinking 开关分支；`context_window` 在构造后 merge 进 profile 而非替换      |
+
 
 模型工厂的测试用一个 fake `BaseChatModel` 子类，不要真连 provider。
 
 ---
+
+
 
 ## 11. 验收清单
 
@@ -758,18 +802,24 @@ API 配额跑完而红，然后大家就开始习惯性忽略 CI。
 
 ---
 
+
+
 ## 12. 刻意不做的事，以及为什么
 
-| 不做 | 理由 |
-|---|---|
-| 配置文件的跨进程写锁 | M0 还没有会写配置的 API。M7 引入 Gateway 写入时再加，那时才知道要锁什么 |
-| 配置的 JSON Schema 导出 | 等 schema 稳定（约 M6）再做，否则天天重新生成 |
-| `extensions_config.json` 的完整实现 | M7。M0 只留一个能读的空壳和路径解析 |
-| trace id / 结构化日志 | M3。M0 没有请求边界 |
-| Docker / Helm | M0 结束后，配置形状稳定了再写 |
-| 配置热重载的单例重置联动 | 等 M4 有了数据库单例再做。现在没有单例需要重置 |
+
+| 不做                             | 理由                                            |
+| ------------------------------ | --------------------------------------------- |
+| 配置文件的跨进程写锁                     | M0 还没有会写配置的 API。M7 引入 Gateway 写入时再加，那时才知道要锁什么 |
+| 配置的 JSON Schema 导出             | 等 schema 稳定（约 M6）再做，否则天天重新生成                  |
+| `extensions_config.json` 的完整实现 | M7。M0 只留一个能读的空壳和路径解析                          |
+| trace id / 结构化日志               | M3。M0 没有请求边界                                  |
+| Docker / Helm                  | M0 结束后，配置形状稳定了再写                              |
+| 配置热重载的单例重置联动                   | 等 M4 有了数据库单例再做。现在没有单例需要重置                     |
+
 
 ---
+
+
 
 ## 13. 一句话总结
 
