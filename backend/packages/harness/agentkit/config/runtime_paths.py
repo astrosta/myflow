@@ -22,3 +22,12 @@ def resolve_path(value: str|os.PathLike[str], *, base: Path|None = None) -> Path
     if not path.is_absolute():
         path = (base or project_root()) / path
     return path.resolve()
+
+def existing_project_file(names: tuple[str, ...]) -> Path|None:
+    root = project_root()
+
+    for name in names:
+        file = root / name
+        if file.is_file():
+            return file
+    return None

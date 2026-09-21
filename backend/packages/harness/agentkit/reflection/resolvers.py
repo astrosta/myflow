@@ -27,3 +27,14 @@ def resolve_variable[T](variable_path: str, expected_type: type[T] | tuple[type[
     
     if expected_type is not None and not isinstance(variable, expected_type):
         raise ValueError(f"{variable_path} is not of type {expected_type}, got {type(variable).__name__}")
+    
+    return variable
+
+
+def resolve_class[T](class_path: str, base_classes: type[T] | None = None) -> T:
+  model_class = resolve_variable(class_path, expected_type=type)
+
+  if base_classes is not None and not issubclass(model_class, base_classes):
+    raise ValueError(f"{class_path} is not a subclass of {base_classes}")
+
+  return model_class

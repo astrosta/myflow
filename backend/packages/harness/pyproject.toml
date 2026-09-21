@@ -6,6 +6,9 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "langchain>=1.4.1",
+    "langchain-core>=1.6.3",
+    "langchain-openai>=1.6.2",
     "pydantic>=2.13.5",
 ]
 

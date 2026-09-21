@@ -1,0 +1,48 @@
+# ============================================================
+# MyFlow 配置模板 —— 复制为 config.yaml 后编辑（config.yaml 已 gitignored）
+#   cp config.example.yaml config.yaml
+# ============================================================
+
+# schema 版本。改 schema 时 bump；加载时比对，过低会提示升级。
+config_version: 1
+
+# 只影响 myflow / app 两个 logger，不动第三方库。
+# startup-only: 改了要重启（apply_logging_level 只在启动时跑一次）
+log_level: info
+
+# ------------------------------------------------------------
+# 模型。列表顺序有意义：不指定模型时用第一个。
+# 以 $ 开头的值从环境变量读取；读不到会直接报错，不会静默变成空串。
+# ------------------------------------------------------------
+models:
+  - name: deepseek-reasoner
+    use: langchain_deepseek:ChatDeepSeek
+    model: deepseek-reasoner
+    api_key: $DEEPSEEK_API_KEY
+    base_url: https://api.deepseek.com   # 是 base_url 不是 api_base（见 §7.4 坑一）
+    supports_thinking: true
+    when_thinking_enabled:
+      extra_body:
+        thinking: { type: enabled }
+
+  # - name: gpt-4o                       # 唯一标识，API 和前端用这个名字选模型
+  #   display_name: GPT-4o               # 给人看的，不会传给 provider
+  #   description: OpenAI 旗舰多模态模型
+  #   use: langchain_openai:ChatOpenAI   # 反射类路径。这是代码执行入口，故本文件不可 API 写
+  #   model: gpt-4o                      # provider 侧的模型 ID
+  #   api_key: $OPENAI_API_KEY
+  #   context_window: 128000             # 总窗口（prompt + completion），UI 算占用率用
+  #   max_tokens: 4096                   # 单次输出上限 —— 和上面那个不是一回事
+  #   supports_vision: true
+
+  
+
+# ------------------------------------------------------------
+# 以下 section M0 还不读，留着是为了让文件形状从一开始就稳定。
+# 整段注释掉会被 YAML 解析成 null，加载器当作"缺失"走默认值（见 §5.7）。
+# ------------------------------------------------------------
+# sandbox:         # M2
+# database:        # M4   startup-only
+# checkpointer:    # M4   startup-only
+# summarization:   # M6
+# plugins:         # M10  startup-only，且会导致代码被 import
