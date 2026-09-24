@@ -5,6 +5,9 @@ STARTUP_ONLY_FIELDS: dict[str,str] = {
     "log_level": (
         "apply_logging_level() 只在启动时运行；重载后的AppConfig不会重新触发它"
     ),
+    "checkpointer.type": (
+        "get_checkpointer() 首次调用时按 type 创建单例；重载后的 AppConfig 不会重建它"
+    ),
 }
 
 def format_field_description(field_path: str, *, field_doc: str|None=None) -> str:

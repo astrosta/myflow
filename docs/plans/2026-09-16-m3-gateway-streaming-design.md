@@ -1,8 +1,8 @@
 # M3 Gateway 与流式详细设计
 
-> 配套文档：[分阶段开发方案](greenfield-agent-service-roadmap.md) ·
-> [M0 地基](m0-foundation-design.md) · [M1 最小 Agent](m1-minimal-agent-design.md) ·
-> [M2 工具与沙箱](m2-tools-sandbox-design.md)
+> 配套文档：[分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md) ·
+> [M0 地基](2026-09-16-m0-foundation-design.md) · [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md) ·
+> [M2 工具与沙箱](2026-09-16-m2-tools-sandbox-design.md)
 >
 > 本文细化 M3（2–3 周）。沿用包名：框架层 `agentkit.*`，应用层 `app.*`。
 
@@ -26,6 +26,44 @@ M3 不一样。它定义的是**并发模型**——谁能跑、谁在跑、跑�
 | W1 | 对象模型 + `RunManager` 状态机 + `RunStore` 接口（内存实现） |
 | W2 | `StreamBridge`（内存实现，带 offset）+ worker + SSE 编帧 |
 | W3 | 取消 / 断开 / 幂等 / `/wait` / `/join` + 边界测试 |
+
+### M3 新增的文件
+
+**执行栈在 harness 层，HTTP 在 app 层**——这个划分是 M3 的一条硬边界：
+
+```
+agentkit/runtime/                     ← 框架层，不认识 FastAPI
+├── runs/
+│   ├── manager.py                 ★  # RunManager + RunRecord + 状态机
+│   ├── worker.py                  ★  # run_agent
+│   ├── schemas.py                    # RunStatus / ThreadOperationKind / CancelOutcome
+│   └── store/
+│       ├── base.py                ★  # RunStore ABC
+│       └── memory.py                 # M3 的实现；M4 加 sql.py
+├── stream_bridge/
+│   ├── base.py                    ★  # StreamBridge ABC + StreamEvent/StreamGap/哨兵
+│   ├── memory.py                     # M3 的实现；M9 加 redis.py
+│   └── provider.py                   # 按 config 选后端，懒加载
+├── stream_modes.py                   # 公开 mode 名 ↔ LangGraph 内部 mode 名的映射
+└── context.py                        # RunContext（打包基础设施依赖）
+
+app/gateway/                          ← 应用层，唯一认识 HTTP 的地方
+├── app.py                            # FastAPI 装配 + lifespan
+├── deps.py                           # 依赖注入：bridge / run_manager / config
+├── run_models.py                  ★  # RunCreateRequest（HTTP 和内部 launch 共用）
+├── services.py                    ★  # start_run / sse_consumer / format_sse
+└── routers/
+    ├── threads.py                    # /state、thread CRUD
+    └── thread_runs.py                # /runs、/stream、/wait、/join、/cancel
+```
+
+**`start_run` 放在 `services.py` 而不是 router 里。** router 只做参数绑定和响应编码；
+调度器和 IM 通道（M9）会直接调 `services.start_run`，它们没有 `Request` 对象。
+写进 router 里，M9 就只能选择"伪造一个 Request"或者"复制一份逻辑"——两条路都错。
+
+反过来，**`RunManager` 和 `StreamBridge` 绝不能 import FastAPI**。M1 的嵌入式客户端、
+M8 的子代理都要用 `RunManager` 的部分能力，让它依赖 Web 框架就把它们一起拖下水了。
+M0 §4 的分层边界测试正是为这条服务的。
 
 ---
 
@@ -230,6 +268,129 @@ hydrate 出来的记录标 `store_only=True`，没有本地 `task`。
 `get()` 是 async（要访问 store），所有调用都得 `await`。这个签名现在定下来，
 M4 接 SQL 时不用改所有调用点。
 
+#### `RunRecord` 的三组字段
+
+```python
+@dataclass
+class RunRecord:
+    # --- 第一组：可序列化，会进 RunStore ---
+    run_id: str
+    thread_id: str
+    assistant_id: str | None
+    status: RunStatus
+    on_disconnect: DisconnectMode
+    operation_kind: ThreadOperationKind = ThreadOperationKind.run
+    multitask_strategy: str = "reject"
+    metadata: dict = field(default_factory=dict)
+    kwargs: dict = field(default_factory=dict)      # {"input": ..., "config": ...}，密钥已脱敏
+    user_id: str | None = None
+    model_name: str | None = None
+    error: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+    idempotency_key: str | None = None
+
+    # --- 第二组：进程内控制，绝不序列化 ---
+    task: asyncio.Task | None = field(default=None, repr=False)
+    abort_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    abort_action: str = "interrupt"
+    start_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    finalizing: bool = False                        # 见 §5.2：不是状态机上的一档
+    store_only: bool = False                        # 从 store hydrate 出来的，没有本地 task
+    idempotency_reused: bool = False                # 见 §5.7：这个 caller 不许再挂 worker
+
+    # --- 第三组：统计 ---
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    llm_call_count: int = 0
+    lead_agent_tokens: int = 0                      # 归因维度，见下
+    subagent_tokens: int = 0
+    middleware_tokens: int = 0
+    token_usage_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    # --- M9 预留，M3 恒为默认值 ---
+    owner_worker_id: str | None = None
+    lease_expires_at: str | None = None
+    ownership_lost: bool = False
+    stop_reason: str | None = None
+```
+
+**`repr=False` 不是美观问题。** `task` 和 `abort_event` 会出现在任何异常回溯和日志里，
+`asyncio.Task` 的 repr 包含整个协程栈。一条 error 日志会变成几十行噪音。
+
+**`start_lock` 看起来多余，但要有。** 它序列化"一条已准入的 run 被交给了不止一个 worker 路径"
+这种情况的启动。M3 里 `start_run` 保证只挂一个 task，所以它永远不会被争用；但 M9 的接管路径
+和 M3 的幂等复用路径都可能触碰同一条记录。**一把从不被争用的锁的成本是零，而缺了它的
+症状是同一个 run 跑两遍。**
+
+**token 归因的三个维度现在就要定。** `lead_agent` / `subagent` / `middleware` 看起来 M3 用不上
+（M8 才有子代理、M6 才有中间件调模型），但这是个**加起来必须等于总数**的分解。等到 M8 再
+引入维度，历史数据就永远缺这一列，而报表要么少算要么对不上。同理
+`token_usage_by_model` 是按模型名分桶——M6 的总结中间件会用另一个模型，不分桶就无法计价。
+
+#### `RunStore` 接口：M3 要实现的十个方法
+
+```python
+class RunStore(abc.ABC):
+    # --- 准入：唯一一个必须原子的方法 ---
+    @abc.abstractmethod
+    async def create_thread_operation_atomic(
+        self, record: dict, *, kind: ThreadOperationKind
+    ) -> bool:
+        """在 (thread_id) WHERE status IN ('pending','running') 的部分唯一索引上抢位。
+        返回 False 表示该 thread 已有活跃操作。不要抛 IntegrityError 给上层。"""
+
+    # --- 状态迁移 ---
+    @abc.abstractmethod
+    async def start_run(self, run_id: str) -> bool:
+        """pending -> running 的 CAS。返回 False 表示已不是 pending（多半被取消了）。"""
+
+    @abc.abstractmethod
+    async def update_status(self, run_id: str, status: RunStatus, *, error: str | None = None) -> None:
+        """必须带 status IN ('pending','running') 守卫：终态行不接受后到的写入。"""
+
+    @abc.abstractmethod
+    async def update_run_completion(self, run_id: str, *, status: RunStatus, **totals) -> None:
+        """终态 + token 汇总一次写完。拒绝替换一个**不同的**终态。"""
+
+    # --- 读 ---
+    @abc.abstractmethod
+    async def get(self, run_id: str, *, user_id: str | None) -> dict | None: ...
+    @abc.abstractmethod
+    async def list_by_thread(self, thread_id: str, *, user_id: str | None, limit: int = 100) -> list[dict]: ...
+    @abc.abstractmethod
+    async def list_inflight(self) -> list[dict]:
+        """启动时回收孤儿用：所有 pending/running 的行。"""
+
+    # --- 删 ---
+    @abc.abstractmethod
+    async def delete_thread_operation(self, run_id: str, *, user_id: str | None) -> None:
+        """释放非 run 的短命预留行（compact 等）。"""
+
+    # --- 幂等 ---
+    @abc.abstractmethod
+    async def get_by_idempotency_key(self, scoped_key: str) -> dict | None: ...
+
+    # --- M9 预留：M3 不实现，但签名现在定 ---
+    # renew_lease / claim_for_takeover / request_cancel /
+    # finalize_if_not_cancelled / list_inflight_with_expired_lease
+```
+
+**三个签名细节值得现在就定死：**
+
+**一、准入方法返回 `bool`，不抛 `IntegrityError`。** 唯一索引冲突是**预期内的正常结果**
+（用户手快点了两次发送），不是异常。让它冒到路由层意味着每个调用点都要 catch 一个
+数据库特定的异常类型——而 SQLite 和 Postgres 抛的还不是同一个。
+
+**二、所有读方法都带 `user_id` 参数。** M3 只有单用户，传 `None` 即可。但这个参数位现在留着，
+M9 加多租户时改的是实现，不是几十个调用点。更关键的是**默认值不能是 `None`**——
+`user_id: str | None` 但不给默认值，强迫每个调用点显式表态"我这里确实要全局查"。
+给了默认值，M9 时会有一半调用点在无声地跨用户查询。
+
+**三、`update_status` 和 `update_run_completion` 分开。** 前者是中途的状态变更，后者是终态
+加汇总的一次性写入。合并成一个方法会让"终态守卫"这条规则难以表达——中途变更允许覆盖，
+终态不允许。
+
 ### 5.2 状态机只有六个状态
 
 ```
@@ -382,6 +543,91 @@ M4–M10 每个阶段都会往里加东西。
 
 所以测试策略上要专门写一组"注入各种失败，断言 END 一定到达"的用例。
 
+#### 骨架：`publish_end` 要在最内层的 finally
+
+```python
+async def run_agent(bridge, run_manager, record, ctx: RunContext) -> None:
+    run_id = record.run_id
+    try:
+        await run_manager.wait_for_prior_finalizing(record.thread_id)
+
+        if await run_manager.try_start(run_id) is RunStartOutcome.cancelled:
+            return                                    # 不组图。END 由 finally 负责
+
+        await ctx.thread_store.set_status(record.thread_id, "running")
+        rollback_point = await _capture_checkpoint_head(ctx, record.thread_id)
+
+        await bridge.publish(run_id, "metadata", {"run_id": run_id, "thread_id": record.thread_id})
+
+        assembly = assemble_agent(ctx.run_config, app_config=ctx.app_config)
+
+        async for mode, chunk in assembly.graph.astream(
+            ctx.graph_input, config=ctx.run_config, stream_mode=ctx.stream_modes
+        ):
+            if record.abort_event.is_set():           # ★ 每一轮都查
+                raise RunAborted(record.abort_action)
+            for event, data in translate_chunk(mode, chunk):
+                await bridge.publish(run_id, event, data)
+
+        terminal, error = RunStatus.success, None
+
+    except RunAborted as aborted:
+        terminal, error = RunStatus.interrupted, None
+        if aborted.action == "rollback":
+            await _restore_checkpoint(ctx, record.thread_id, rollback_point)
+    except asyncio.CancelledError:
+        terminal, error = RunStatus.interrupted, None
+        raise                                          # 不吞，但终态要写
+    except Exception as exc:
+        terminal, error = RunStatus.error, str(exc)
+        logger.exception("Run %s failed", run_id)
+
+    finally:
+        record.finalizing = True
+        try:
+            # 收尾可能很多：写终态、标题生成、token 汇总、事件账本落盘（M4）。
+            # 这里面任何一步都可能抛。
+            await _finalize(run_manager, record, ctx, terminal, error)
+        finally:
+            # ★ 无论收尾成功与否，流必须结束。
+            await bridge.publish_end(run_id)
+            record.finalizing = False
+```
+
+**`publish_end` 放在嵌套的内层 `finally`，不是和收尾逻辑并列。** 这是全节最重要的一行结构。
+收尾要做的事会随阶段增长——M4 加事件账本落盘、M6 加标题生成、M9 加租约释放——**其中任何
+一个新增的 IO 抛异常，都会在"并列写法"下把 `publish_end` 跳过去**。而这类回归极难发现：
+它只在那个新增步骤失败时触发，而那个步骤失败本身就是个罕见分支。
+
+嵌套写法把这条不变量变成了结构性的，不依赖后来的人记得把 `publish_end` 放在最后。
+
+**`CancelledError` 要写终态再 `raise`，不能吞。** 吞掉它会让上层的 `asyncio.gather`、
+lifespan 的排空逻辑以为这个 task 正常结束了。但也不能只 `raise` 不写终态——那样 store 里
+会留一行永远 running。
+
+**`try_start` 返回 cancelled 时直接 `return`，不是 `raise`。** 这条路径是"这个 run 在组图之前
+就被取消了"，是预期内的正常流程。`finally` 仍然会跑，`publish_end` 仍然会发——订阅者收到
+一个只有 metadata 和 end 的流，这是对的。
+
+#### chunk 到 SSE 事件的翻译
+
+`translate_chunk` 是 M1 §6.2 那套流式契约在服务端的落地，**两边的事件名必须一致**：
+
+| LangGraph 内部 mode | 发出的 SSE `event` | 说明 |
+|---|---|---|
+| `values` | `values` | 状态快照 |
+| `messages` | `messages` | 前端 SDK 认这个名；公开 API 参数名叫 `messages-tuple` |
+| `updates` | `updates` | 节点级增量 |
+| `custom` | `custom` | `StreamWriter` 转发 |
+
+**公开参数名和 wire 事件名不是一回事**，`stream_modes.py` 负责这层映射：请求里客户端写
+`messages-tuple`，映射到 LangGraph 的 `messages`，而 SSE 帧上的 `event:` 是 `messages`。
+三个名字听起来该统一，但前两个是 LangGraph Platform 已经定下的协议，改了就用不了官方 SDK。
+**把映射关进一个文件，别让它散进 router。**
+
+客户端传了不支持的 mode（`events`、或者内部名 `messages`）要 **422 拒绝，不要静默替换成
+`values`**。静默替换的症状是前端收到完全不同结构的数据，而它以为自己订的是增量。
+
 ### 6.3 关机排空
 
 进程退出时，lifespan 要先给 inflight task 设 abort、`task.cancel()`，
@@ -446,6 +692,29 @@ stream_bridge:
 
 注意 **gap 不影响 run 本身**，它继续跑。gap 只是这条订阅的终结。
 
+#### `StreamGap` 要带三个 id，不是一个光秃秃的标记
+
+```python
+@dataclass(frozen=True)
+class StreamGap:
+    requested_event_id: str | None            # 客户端请求的游标，或落后订阅者最后收到的那条
+    earliest_available_event_id: str | None   # 当前保留窗口下界
+    latest_available_event_id: str | None     # 当前保留窗口上界
+```
+
+三个都要，因为**两类消费者对 gap 的正确反应完全不同**：
+
+| 消费者 | 收到 gap 后 | 用哪个字段 |
+|---|---|---|
+| `sse_consumer`（浏览器） | 发一帧 `event: gap`，`recovery: reload_durable_state`，然后结束订阅 | 三个都透传，供客户端诊断 |
+| `wait_for_run_completion`（`/wait`） | **从保留窗口的尾部重新订阅**，继续等 END | `latest_available_event_id` |
+
+`/wait` 不需要完整重放，它只想知道什么时候结束。如果 `StreamGap` 只是个光秃秃的标记，
+`/wait` 就没有安全的续订点，只能把 gap 当成失败返回——而 run 其实还在正常跑。
+
+缓冲为空时三个字段都是 `None`（比如 run 刚创建、一条事件都还没发）。消费者要能处理这种情况：
+`/wait` 此时用 `None` 续订，等价于"从头订"，是对的。
+
 ### 7.4 内存实现的游标规则
 
 | 情况 | 行为 |
@@ -507,6 +776,80 @@ Content-Location: /api/threads/{tid}/runs/{run_id}
 
 跨源部署时 `Content-Location` 必须出现在 CORS 的 `Access-Control-Expose-Headers` 里，
 否则 SDK 读不到 `run_id`。
+
+#### 编帧函数
+
+```python
+def format_sse(event: str, data: Any, *, event_id: str | None = None) -> str:
+    """字段顺序 event -> data -> id -> 空行，对齐 LangGraph Platform 的 wire 格式。"""
+    frame = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n"
+    if event_id:
+        frame += f"id: {event_id}\n"
+    return frame + "\n"
+```
+
+`default=str` 是必需的兜底：`data` 里会混进 `datetime`、`UUID`、LangChain 的消息对象。
+一次序列化失败会让整条流在中间断掉，而且**异常发生在生成器里，HTTP 响应头早就发出去了**——
+客户端看到的是一个突然截断的流，没有任何错误信息。宁可让某个字段变成它的 `str()` 形式。
+
+#### 消费循环
+
+```python
+async def sse_consumer(bridge, record, request, run_mgr, *, apply_on_disconnect: bool = True):
+    last_event_id = request.headers.get("Last-Event-ID")
+    try:
+        async for entry in bridge.subscribe(record.run_id, last_event_id=last_event_id):
+            if await request.is_disconnected():        # ★ 每一项都查，包括心跳
+                break
+
+            if isinstance(entry, StreamGap):
+                yield format_sse("gap", {
+                    "code": "stream_replay_gap",
+                    "run_id": record.run_id,
+                    "requested_event_id": entry.requested_event_id,
+                    "earliest_available_event_id": entry.earliest_available_event_id,
+                    "latest_available_event_id": entry.latest_available_event_id,
+                    "recovery": "reload_durable_state",
+                })
+                return                                  # gap 之后不再续传
+
+            if entry is HEARTBEAT_SENTINEL:
+                yield ": heartbeat\n\n"                 # 注释行，无 event 无 id
+                continue
+
+            if entry is END_SENTINEL:
+                yield format_sse("end", None)
+                return
+
+            yield format_sse(entry.event, entry.data, event_id=entry.id or None)
+    finally:
+        if apply_on_disconnect and record.status in (RunStatus.pending, RunStatus.running):
+            if record.on_disconnect == DisconnectMode.cancel:
+                await run_mgr.cancel(record.run_id)
+```
+
+#### 心跳的真实用途不是保活
+
+这一点很容易误解。心跳的常见理由是"防止中间代理掐掉空闲连接"——那确实是收益之一，
+但**在这套设计里它有个更硬的作用：给消费循环一个醒来的机会去检查客户端是否断开。**
+
+`request.is_disconnected()` 只能在循环体里调用。如果模型思考了 90 秒一个 token 都没吐，
+没有心跳的话 `async for` 会在 `subscribe` 里一直挂着，这 90 秒内客户端早就关了页面，
+服务端却毫不知情，继续烧 token。心跳把"最坏情况下多久能发现断开"从**无上限**压到了
+`heartbeat_interval`。
+
+这也是为什么 `/wait` 也要订阅心跳——它不渲染任何东西，纯粹是为了周期性检查断开。
+
+**心跳帧是 SSE 注释行（`:` 开头），不是事件。** 它没有 `event:` 也没有 `id:`，SDK 的解码器
+会直接忽略。给它一个 id 是个真实的 bug：客户端会把心跳的 id 记成 `Last-Event-ID`，
+重连时带回来，而这个 id 在缓冲里根本不存在。
+
+#### `finally` 里的断开处理有个前置条件
+
+注意 `record.status in (pending, running)` 这个判断。没有它，一个**正常结束**的 run
+也会在客户端断开时走进 `cancel()`——因为 `finally` 对正常 `return` 同样执行。
+虽然 `cancel` 对终态记录是幂等的（返回 `not_cancellable`），但它会产生一条误导性的
+"取消失败"日志，并且在 M9 多实例下会白白打一次 store。
 
 ### 8.2 创建端和观察端的断开语义不同
 
@@ -594,7 +937,7 @@ M3 只会产生前四种，但**枚举现在就定全**。后两种是多进程�
 |---|---|
 | `runs.owner_worker_id` / `lease_expires_at` 两列 | M9 多实例。加列容易，改并发路径难 |
 | `operation_kind` 枚举 + 部分唯一索引 | 见 §5.3。后加等于放任并发写 checkpoint |
-| `RunRecord.ownership_lost` 标志 | M9：丢租约后本进程禁止再写终态 |
+| `RunRecord.ownership_lost` 标志 | M9：丢租约后本进程禁止再写终态，见 [M9 §3.1](2026-09-16-m9-production-design.md) |
 | `StreamBridge.supports_cross_process` | M9：路由据此决定 409 还是订阅 |
 | `RunStore` 抽象接口 | M4 换 SQL 时只换实现 |
 | `CancelOutcome` 的六个枚举值 | 见 §9.2 |
@@ -612,10 +955,12 @@ SSE 是有界的、会过期的直播；账本是完整的、用于历史回放�
 |---|---|
 | `test_run_manager.py` | 状态机全部合法/非法迁移；`create_or_reject` 并发只有一个赢；`try_start` 的双重 abort 检查 |
 | `test_thread_operation_lock.py` | 同 thread 并发两次 `POST /runs` → 第二次 409；非 run 操作不出现在列表 API |
-| `test_publish_end_always.py` | **注入各种失败路径**（模型异常、组图失败、启动栅栏拒绝、取消），断言 END 一定到达 |
-| `test_stream_bridge.py` | 有界裁剪；gap 后订阅停止；`Last-Event-ID` 续传；未知 id 的处理；心跳 |
+| `test_publish_end_always.py` | **注入各种失败路径**（模型异常、组图失败、启动栅栏拒绝、取消），断言 END 一定到达；**额外注入 `_finalize` 本身抛异常**，断言嵌套 finally 仍然发出 END |
+| `test_run_store_contract.py` | 准入冲突返回 `False` 而不是抛 `IntegrityError`；`start_run` 对非 pending 行返回 `False`；`update_status` 不能改写终态行；`update_run_completion` 拒绝替换不同的终态 |
+| `test_stream_bridge.py` | 有界裁剪；gap 后订阅停止；**`StreamGap` 三个 id 的取值正确**（含缓冲为空时全 `None`）；`Last-Event-ID` 续传；未知 id 的处理；心跳 |
+| `test_sse_translate.py` | 公开 `messages-tuple` 映射到内部 `messages`；不支持的 mode → 422 而不是降级成 `values`；`format_sse` 遇到 `datetime`/`UUID` 不抛异常 |
 | `test_cancel.py` | pending 取消不组图；running 取消在一轮内生效；取消不被后到的 success 覆盖 |
-| `test_disconnect.py` | 创建端断开触发取消；**join 断开不触发**；`/wait` 断开不返回半截 checkpoint |
+| `test_disconnect.py` | 创建端断开触发取消；**join 断开不触发**；`/wait` 断开不返回半截 checkpoint；**模型长时间无输出时，断开在一个心跳间隔内被发现**；正常结束后客户端断开**不**触发 `cancel()` |
 | `test_idempotency.py` | 同 key 复用同一 run；`idempotency_reused` 时不挂第二个 worker；不同 input 同 key → 409 |
 | `test_start_run_no_await.py` | **AST 断言**：`create_or_reject` 和 `create_task` 之间没有 `await` |
 | `test_sse_format.py` | 帧字段顺序；`Content-Location`；heartbeat 无 id |
@@ -634,6 +979,10 @@ SSE 是有界的、会过期的直播；账本是完整的、用于历史回放�
 - [ ] 带 `Idempotency-Key` 重复提交，复用同一个 run 而不是跑两遍
 - [ ] 模型调用抛异常时，SSE 仍然收到 `event: end`，run 状态是 `error`
 - [ ] `GET /join` 的客户端断开后，run **不**被取消
+- [ ] 让收尾逻辑（写终态那一步）抛异常，SSE 仍然收到 `event: end`
+- [ ] 模型思考 60 秒不吐 token，期间关掉浏览器，服务端在一个心跳间隔内取消该 run
+- [ ] `/wait` 在遇到 gap 后不返回失败，而是续订并等到真正的终态
+- [ ] `stream_mode: ["events"]` 返回 422，而不是静默变成 `values`
 - [ ] 浏览器用官方 `useStream` 直连，不写任何自定义解码器就能正常渲染流式输出
 
 最后一条是对"对齐 Platform 协议"这个决策的实际检验。
@@ -648,7 +997,7 @@ SSE 是有界的、会过期的直播；账本是完整的、用于历史回放�
 | 租约 / 心跳 / 孤儿回收 | M9。单进程下重启时把所有 inflight 当孤儿收掉就够了 |
 | SQL RunStore | M4。M3 用内存实现，但走同一个抽象接口 |
 | 持久化事件账本 | M4。M3 先留 publish 钩子位 |
-| 子代理的 `custom` 事件 | M8 |
+| 子代理的 `custom` 事件 | M8：`task_started` / `task_running` / `task_*` 终态，见 [M8 §3 / §14](2026-09-16-m8-subagents-design.md) |
 | `stream_subgraphs` | 子图的 `values`/`messages` 漏进主线程会污染对话，默认关掉 |
 | 人机确认（`Command(resume=...)`）| M6。但 `RunCreateRequest.command` 字段现在就留 |
 

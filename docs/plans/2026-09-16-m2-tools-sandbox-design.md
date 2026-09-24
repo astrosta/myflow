@@ -1,7 +1,7 @@
 # M2 工具与沙箱详细设计
 
-> 配套文档：[分阶段开发方案](greenfield-agent-service-roadmap.md) ·
-> [M0 地基](m0-foundation-design.md) · [M1 最小 Agent](m1-minimal-agent-design.md)
+> 配套文档：[分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md) ·
+> [M0 地基](2026-09-16-m0-foundation-design.md) · [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md)
 >
 > 本文细化 M2（2 周）。沿用包名：框架层 `agentkit.*`，应用层 `app.*`。
 
@@ -51,6 +51,41 @@
 | D7 | `bash` 工具：进程组、超时、后台进程、输出捕获 |
 | D8 | 工具三源汇聚 + 沙箱生命周期中间件 |
 | D9–10 | 测试：路径逃逸、并发写、错误契约、跨平台 |
+
+### M2 新增的文件
+
+```
+agentkit/sandbox/
+├── __init__.py                     # 只 re-export
+├── sandbox.py                   ★  # Sandbox ABC + 错误契约（契约写在 docstring 里）
+├── sandbox_provider.py          ★  # SandboxProvider ABC + 进程单例
+├── exceptions.py                ★  # SandboxError 家族，工具层按类型翻译
+├── security.py                     # is_host_bash_allowed / uses_local_sandbox_provider
+├── env_policy.py                   # build_sandbox_env（密钥擦除）
+├── path_patterns.py                # 输出反向遮蔽
+├── file_operation_lock.py          # (sandbox_id, path) 锁
+├── search.py                       # glob / grep 的共享实现
+├── middleware.py                   # SandboxMiddleware（生命周期）
+├── runtime.py                   ★  # ensure_sandbox_initialized —— 工具拿沙箱的唯一入口
+├── tools/
+│   ├── __init__.py                 # 导出工具对象供 config 的 use: 引用
+│   ├── file_tools.py               # read/write/str_replace/ls/glob/grep
+│   └── bash_tool.py                # 单独一个文件，它最复杂
+└── local/
+    ├── __init__.py
+    ├── local_sandbox.py            # Sandbox 实现：路径翻译、进程管理
+    ├── local_sandbox_provider.py   # 映射表构建、每线程实例缓存
+    └── list_dir.py                 # 树形渲染
+
+agentkit/tools/registry.py          # get_available_tools 三源汇聚（M1 建的空壳，M2 填实现）
+```
+
+**工具不要全塞进一个 `tools.py`。** DeerFlow 的对应文件长到了 2661 行，里面混着工具定义、
+沙箱获取、密钥注入、错误脱敏、Windows 编码处理。从一开始就按"文件工具 / bash / 运行时管道"
+分三块，边界和后面的中间件层是对齐的。
+
+特别是 `runtime.py` 要独立：它是**工具层和沙箱层之间唯一的桥**，M9 的授权门禁装在这一个文件里。
+混在工具文件里，门禁就会被复制成 N 份。
 
 ---
 
@@ -233,6 +268,48 @@ def get_sandbox_provider(**kwargs) -> SandboxProvider:
 M2 里本地 provider 两者差不多，但**语义现在就要分开写在 docstring 里**。远程 provider
 的 `reset()` 如果去销毁远程容器，测试里的一次配置切换就会把别的进程正在用的容器干掉。
 
+### 3.4 sandbox_id 要自带作用域
+
+`get()` 必须是纯内存查找（§3.1 规则二），这就要求 **id 本身携带足够的信息定位实例**，
+不能只是个随机 UUID 再去查表——查表意味着表要么在内存里（那还不如把作用域编进 id），
+要么在存储里（那就违反了"不做 IO"）。
+
+```python
+def _sandbox_id_for_thread(thread_id: str, user_id: str) -> str:
+    return f"local:{user_id}:{thread_id}"
+
+def _key_from_sandbox_id(sandbox_id: str) -> tuple[str, str] | None:
+    """反解回 (user_id, thread_id)；格式不符返回 None，不抛异常。"""
+    if not sandbox_id.startswith("local:"):
+        return None
+    user_id, sep, thread_id = sandbox_id[len("local:") :].partition(":")
+    return (user_id, thread_id) if sep and user_id and thread_id else None
+```
+
+`local:` 前缀还有第二个用途：工具层要判断"当前是不是本地沙箱"（决定要不要建目录、
+要不要做 Windows 路径转换），靠前缀匹配就够，不用回头问 provider。
+
+**同时保留一个无 thread 上下文的通用实例**（id 就是 `"local"`）。CLI、脚本、测试这些场景
+没有 thread，强制要求 thread_id 会让它们被迫编造一个。判断本地沙箱时两种形式都要认：
+`sandbox_id == "local" or sandbox_id.startswith("local:")`。
+
+#### 每线程实例要有上限
+
+这是个容易漏的内存泄漏：**长驻 Gateway 里 thread_id 的数量是无界的**。每个
+`LocalSandbox` 实例本身很便宜（一个小对象加一个映射列表），但无界增长就是无界增长。
+
+```python
+self._thread_sandboxes: OrderedDict[tuple[str, str], LocalSandbox] = OrderedDict()
+self._max_cached_threads = 256      # 超出时在下一次 acquire 驱逐 LRU
+```
+
+用 `OrderedDict` 做 LRU，`acquire` 时 `move_to_end`，超限时 `popitem(last=False)`。
+
+**驱逐的是缓存，不是沙箱本身。** 本地沙箱没有需要销毁的远程资源，被驱逐的实例下次
+`acquire` 时重建即可，磁盘上的文件不受影响。远程 provider 不能照抄这个策略——那里
+驱逐必须伴随真正的释放，否则容器会泄漏。所以这个上限属于 `LocalSandboxProvider` 的实现细节，
+**不要提到 `SandboxProvider` 抽象里**。
+
 ---
 
 ## 4. 虚拟路径系统（D3–4）
@@ -249,6 +326,56 @@ M2 里本地 provider 两者差不多，但**语义现在就要分开写在 docs
 **映射表在 `acquire` 时构建，绑定到那个 sandbox 实例。** 不要做成全局函数——
 不同 thread 的映射不同，不同 provider 的映射机制也不同（本地是路径翻译，
 Docker 是 volume mount，E2B 是上传）。
+
+#### 数据结构与两层来源
+
+```python
+@dataclass(frozen=True)
+class PathMapping:
+    container_path: str    # agent 看到的虚拟路径，如 /mnt/user-data/workspace
+    local_path: str        # 宿主实际路径
+    read_only: bool = False
+```
+
+映射分两层来源，**构建时机不同**：
+
+| 层 | 构建时机 | 内容 | 为什么 |
+|---|---|---|---|
+| 静态 | provider `__init__` | 公共技能目录、`config.yaml` 里的自定义 mount | 进程级不变，每个沙箱都一样 |
+| 每线程 | `acquire(thread_id, user_id=)` | `/mnt/user-data/*`、per-user 技能 | 依赖 thread_id 和 user_id |
+
+**静态那层绝不能包含任何依赖 `user_id` 的映射。** 这是个已经踩过的坑：在 `__init__` 里调
+`get_effective_user_id()` 绑定"当前用户"的自定义技能目录，之后**所有其他用户的沙箱**都会
+解析到第一个用户的目录。凡是 per-user 的，一律推迟到 `acquire`。
+
+#### 解析规则：最长前缀获胜
+
+映射之间**允许重叠**，查找时按 `container_path` 长度降序匹配第一个命中的：
+
+```python
+def _find_path_mapping(self, virtual_path: str) -> PathMapping | None:
+    for mapping in sorted(self._mappings, key=lambda m: len(m.container_path), reverse=True):
+        if virtual_path == mapping.container_path or virtual_path.startswith(mapping.container_path + "/"):
+            return mapping
+    return None
+```
+
+这条规则让一个**聚合父映射**成为可能，而它是必需的：
+
+```python
+PathMapping("/mnt/user-data",           ".../user-data"),            # 父，聚合
+PathMapping("/mnt/user-data/workspace", ".../user-data/workspace"),  # 子，更长，优先
+PathMapping("/mnt/user-data/uploads",   ".../user-data/uploads"),
+PathMapping("/mnt/user-data/outputs",   ".../user-data/outputs"),
+```
+
+没有那条父映射，`ls /mnt/user-data` 会因为找不到映射而报错——而在 Docker 里那是个真实目录，
+`ls` 能列出三个子目录。**两种 provider 的行为必须一致**，否则模型在本地学会的探索习惯
+换到容器就失效。加一条父映射就抹平了这个差异，代价是必须有最长前缀规则来保证子路径仍走子映射。
+
+注意匹配同样要卡**段边界**（`== prefix` 或 `startswith(prefix + "/")`），理由和 M0 §6.1 一样：
+纯 `startswith` 会让 `/mnt/user-dataX` 命中 `/mnt/user-data` 的映射。这个检查在 M0 的
+`Paths` 和 M2 的 provider 里各出现一次，**两处都要有**——它们防的是不同入口。
 
 ### 4.2 翻译发生在哪一层
 
@@ -292,6 +419,57 @@ Docker 是 volume mount，E2B 是上传）。
 被拒绝时的错误信息要给**可操作的恢复指引**，而不是干巴巴的 "permission denied"：
 如果模型在探测环境，告诉它用纯命令探测；如果它要访问文件，告诉它允许的虚拟路径是哪些。
 而且**不要在错误信息里重复被拒绝的那个路径**——模型很容易把它当成"再试一次"的提示。
+
+#### 检查顺序：先纯字符串，再查映射，最后才碰文件系统
+
+```python
+def resolve_sandbox_path(virtual_path: str, mappings: list[PathMapping]) -> Path:
+    # --- 第一组：纯语法，零 IO，最便宜也最容易绕过 ---
+    if "\x00" in virtual_path:
+        raise PermissionError(_REJECT_HINT)
+    if "://" in virtual_path:                       # file:// 及其他协议
+        raise PermissionError(_REJECT_HINT)
+    if re.match(r"^[A-Za-z]:[\\/]", virtual_path) or virtual_path.startswith("\\\\"):
+        raise PermissionError(_REJECT_HINT)         # 盘符 / UNC
+    if not virtual_path.startswith("/"):
+        raise PermissionError(_REJECT_HINT)         # 必须是绝对虚拟路径
+
+    # --- 第二组：查映射，仍然零 IO ---
+    mapping = _find_path_mapping(virtual_path, mappings)   # 最长前缀，卡段边界
+    if mapping is None:
+        raise PermissionError(_REJECT_HINT)
+
+    relative = virtual_path[len(mapping.container_path) :].lstrip("/")
+
+    # --- 第三组：触碰文件系统，最贵，放最后 ---
+    root = Path(mapping.local_path).resolve()
+    candidate = (root / relative).resolve()         # resolve() 会跟随符号链接
+    if not candidate.is_relative_to(root):
+        raise PermissionError(_REJECT_HINT)         # ".." 和符号链接逃逸一起挡在这里
+    return candidate
+```
+
+**顺序不是随意的。** 三组检查的成本差两个数量级：第一组是几次字符串比较，第三组的
+`resolve()` 是系统调用，且在网络挂载上可能很慢。把便宜的放前面，绝大多数恶意输入在零 IO
+的情况下就被拒了。反过来写，一个构造出来的深层路径能让每次拒绝都付出真实的磁盘代价。
+
+**`..` 和符号链接由同一行挡住。** 很多实现会先写个 `if ".." in path` 的字符串检查，然后
+以为搞定了——那挡不住符号链接，也挡不住 `a/b/../../..` 这种被正常化后才越界的路径。
+正确做法是**先 `resolve()` 再比前缀**，`is_relative_to` 一行同时覆盖两类逃逸。字符串层的
+`..` 检查可以作为快速拒绝加在第一组，但**不能替代**第三组。
+
+**`_REJECT_HINT` 是个常量，不插值被拒的路径。** 除了上面说的"模型会拿它再试一次"，
+还有个理由：统一的错误文本让所有拒绝路径产生同一条消息，模型更容易学会"这类路径不行"
+而不是逐个试探。提示内容应该是正向的——列出允许的虚拟前缀，而不是描述哪里错了。
+
+#### 一个必须承认的窗口：resolve 和 open 之间不是原子的
+
+`resolve()` 检查通过之后到真正 `open()` 之间，符号链接可以被换掉（TOCTOU）。要彻底关掉
+这个窗口需要 `openat` + `O_NOFOLLOW` 这类平台相关的原子操作。
+
+M2 **不做**这件事，理由是 §5.2 那条：本地沙箱本来就不是安全边界，在一个非边界上做原子性
+加固是错配的投入。真正需要隔离的场景走 Docker provider，那里边界由内核提供。
+但这个窗口要写在 docstring 里——**已知的缺口和未知的缺口，运维成本差很远。**
 
 ### 5.2 本地沙箱不是安全边界，这件事要说清楚
 
@@ -357,7 +535,101 @@ def build_sandbox_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 ## 6. 文件工具（D5–6）
 
-### 6.1 工具清单与语义要点
+### 6.1 工具怎么拿到沙箱：唯一入口 `ensure_sandbox_initialized`
+
+工具函数通过注入的 `runtime` 拿到状态和上下文，沙箱不是参数传进来的，而是从状态里解出来的。
+**这条链路必须只有一个实现**，因为 M9 的授权门禁、M9 的租约、M2 的懒初始化全都挂在这里。
+
+```python
+def ensure_sandbox_initialized(runtime: Runtime | None = None) -> Sandbox:
+    if runtime is None or runtime.state is None:
+        raise SandboxRuntimeError("Tool runtime not available")
+
+    # 1. 授权检查在复用和新建之前都要跑（见下方说明）
+    if not _AUTHORIZATION_CHECKED.get():
+        authorize_sandbox_execution(context=runtime.context or {}, app_config=safe_app_config())
+
+    # 2. 状态里已有就复用
+    sandbox_state = runtime.state.get("sandbox")
+    if sandbox_state and (sandbox_id := sandbox_state.get("sandbox_id")):
+        sandbox = get_sandbox_provider().get(sandbox_id)
+        if sandbox is not None:
+            runtime.context["sandbox_id"] = sandbox_id      # 供 after_agent 释放
+            return sandbox
+        # get() 返回 None 说明已被释放，落到下面重新获取
+
+    # 3. 懒初始化
+    thread_id = _resolve_runtime_thread_id(runtime)
+    if thread_id is None:
+        raise SandboxRuntimeError("Thread ID not available in runtime context")
+
+    provider = get_sandbox_provider()
+    sandbox_id = provider.acquire(thread_id, user_id=resolve_runtime_user_id(runtime))
+    runtime.state["sandbox"] = {"sandbox_id": sandbox_id}   # 跨工具调用存活
+
+    sandbox = provider.get(sandbox_id)
+    if sandbox is None:
+        _rollback_failed_acquire(provider, sandbox_id)      # 见下
+        raise SandboxNotFoundError("Sandbox not found after acquisition", sandbox_id=sandbox_id)
+
+    runtime.context["sandbox_id"] = sandbox_id
+    return sandbox
+```
+
+**四条不能省的细节：**
+
+**一、授权必须在复用路径上也检查，不能只在 acquire 时。** `sandbox_id` 一旦写进
+`ThreadState`，它会在整个会话里被复用。如果只在首次 acquire 时鉴权，那么角色被撤销、
+策略被改之后，这个 thread 仍然能一直用下去——权限变更对进行中的会话完全无效。
+**授权是执行时策略，不是 sandbox id 的终身属性。** M2 的 `authorize_sandbox_execution`
+是个空实现，但调用位置现在就放对。
+
+用一个 ContextVar 做单次运行内的去重（`_AUTHORIZATION_CHECKED`），避免同一轮里每个工具
+都重跑一次鉴权——它可能要查数据库。
+
+**二、thread_id 的解析顺序是 `context` 优先，`config.configurable` 兜底。**
+
+```python
+def _resolve_runtime_thread_id(runtime: Runtime) -> str | None:
+    if runtime.context and (tid := runtime.context.get("thread_id")):
+        return tid
+    if runtime.config:
+        return runtime.config.get("configurable", {}).get("thread_id")
+    return None
+```
+
+两个来源都要查：`configurable` 是 M1 定的图调用契约，`context` 是 M8 子代理会覆盖的那一份。
+只查后者，子代理场景会拿到父线程的 id。
+
+**三、写回要写两个地方，用途不同。** `runtime.state["sandbox"]` 让沙箱跨工具调用存活
+（它进 checkpoint，走 M1 那个 fail-closed 的 `merge_sandbox`）；`runtime.context["sandbox_id"]`
+是给 `after_agent` 的释放路径用的，不进 checkpoint。漏掉后者，沙箱不会被释放。
+
+**四、acquire 成功但 `get()` 返回 None 时必须回滚。** 这是个窄窗口（并发 reset、驱逐），
+但不回滚就会泄漏一次获取——本地 provider 只是缓存条目，远程 provider 就是一个没人认领的容器。
+**先回滚，再抛异常。**
+
+#### 同步和异步两份，异步路径必须用异步那份
+
+```python
+async def ensure_sandbox_initialized_async(runtime) -> Sandbox:
+    ...
+    sandbox_id = await provider.acquire_async(thread_id, user_id=...)
+```
+
+逻辑完全镜像，唯一区别是走 `acquire_async` 和异步版鉴权。这是 §3.1 规则一在工具层的落地：
+**异步工具调同步版本，会在 Docker provider 下把整个事件循环卡几秒。** 两份实现容易漂移，
+所以要有一条测试断言两者的行为一致（同样的 runtime 输入得到同样的 sandbox_id 和同样的状态写回）。
+
+同步工具在异步图里执行时，走"先异步初始化沙箱、再把同步工具体扔进线程池"的组合：
+
+```python
+async def _run_sync_tool_after_async_init(func, runtime, *args):
+    await ensure_sandbox_initialized_async(runtime)
+    return await asyncio.to_thread(func, runtime, *args)
+```
+
+### 6.2 工具清单与语义要点
 
 | 工具 | 要点 |
 |---|---|
@@ -376,7 +648,51 @@ def build_sandbox_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 （"正在读取配置文件"）。但**工具执行绝不能依赖这个字段**——它是可选的，默认空串，
 前端在缺失时用本地化的兜底文案。把它做成必填或让逻辑依赖它，会让第三方工具很难接。
 
-### 6.2 同路径写操作要串行化，锁的 key 是 `(sandbox_id, path)`
+#### 一个工具长什么样
+
+```python
+@tool
+def read_file(
+    path: str,
+    runtime: Runtime,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    description: str = "",
+) -> str:
+    """Read a text file from the sandbox.
+
+    Args:
+        path: Absolute virtual path, e.g. /mnt/user-data/workspace/main.py
+        start_line: 1-indexed first line to read (inclusive).
+        end_line: 1-indexed last line to read (inclusive).
+        description: Optional short label shown in the UI.
+    """
+    try:
+        sandbox = ensure_sandbox_initialized(runtime)
+        content = sandbox.read_file(path, start_line=start_line, end_line=end_line)
+        return mask_host_paths(content, sandbox)     # §4.3 反向遮蔽
+    except SandboxError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error: {_sanitize_error(e, runtime)}"
+```
+
+**工具返回错误字符串，不向外抛异常。** 这是 M2 要立的一条全局约定。工具抛异常会中断
+agent 循环，而绝大多数工具错误（文件不存在、路径非法、命令失败）是模型**可以自己恢复**的——
+它应该看到错误、改参数、重试。让它看到的方式就是把错误变成返回值。
+
+注意这和 §2.2 的错误契约不矛盾，两者是分层的：**沙箱层抛类型化异常，工具层捕获并翻译成
+字符串**。沙箱层的类型是给代码看的（工具层要能区分"不存在"和"读失败"），字符串是给模型看的。
+M6 会在这上面再加一层结构化元数据（`recoverable_by_model` 等），届时工具层的返回会从
+裸字符串升级成带元数据的结果——**所以现在不要让任何调用方去解析这个字符串的格式。**
+
+**兜底的 `except Exception` 要过脱敏。** 未预期异常的消息里可能带宿主路径、连接串、
+环境变量片段。`_sanitize_error` 至少要做 §4.3 的路径遮蔽，M9 加密钥遮蔽时也在这一处。
+
+**`runtime` 参数不出现在模型看到的 schema 里**，它由框架注入。这意味着 docstring 里
+**不要给它写 Args 说明**——那段文字会进模型的函数描述，白白占 token 还可能让模型尝试传它。
+
+### 6.3 同路径写操作要串行化，锁的 key 是 `(sandbox_id, path)`
 
 同一个 graph step 里两个工具可能同时写一个文件。需要一把按路径的锁：
 
@@ -404,7 +720,7 @@ def get_file_operation_lock(sandbox: Sandbox, path: str) -> threading.Lock:
 **必须用 `WeakValueDictionary`。** 长驻进程里路径是无限的（每个 thread 每个文件一个 key），
 普通 dict 会无限增长。弱引用让最后一个持有者释放后锁自动消失。
 
-### 6.3 Read-before-write 的钩子位
+### 6.4 Read-before-write 的钩子位
 
 M6 会加"写之前必须先读过"的门禁（防止模型凭空覆盖它没看过的文件）。M2 不实现，
 但 `write_file` 和 `str_replace` 的调用路径要留出**前置检查 + 后置标记**的位置，
@@ -535,7 +851,8 @@ class ToolConfig(BaseModel):
 |---|---|
 | `test_path_security.py` | `..` 穿越、符号链接逃逸、绝对路径逃逸、Windows 盘符、UNC、`file://`、空字节，每种都断言被拒且错误信息不回显被拒路径 |
 | `test_sandbox_contract.py` | **错误契约**：`list_dir` 缺失路径抛 `FileNotFoundError`、失败抛 `OSError`、空目录返回 `[]`；非法 `env` key 抛 `ValueError` |
-| `test_local_sandbox.py` | 虚拟路径双向翻译；输出反向遮蔽；不同 thread 的同名路径互不干扰 |
+| `test_local_sandbox.py` | 虚拟路径双向翻译；输出反向遮蔽；不同 thread 的同名路径互不干扰；**最长前缀**（`/mnt/user-data/workspace/x` 走子映射，`ls /mnt/user-data` 走父映射）；`/mnt/user-dataX` 不命中；**per-user 映射不被 `__init__` 绑死**（用户 A 建 provider、用户 B 的沙箱解析到 B 的目录）；每线程实例超上限后 LRU 驱逐且重建无损 |
+| `test_sandbox_runtime.py` | `ensure_sandbox_initialized` 的四条路径：状态复用、懒初始化、`get()` 返回 None 后重建、acquire 成功但 `get()` 失败时**回滚再抛**；`state` 和 `context` 两处都写回；thread_id 优先取 `context` 再取 `configurable`；**授权在复用路径上也被调用**；sync 与 async 两版对同一输入产生相同的 sandbox_id 和状态写回 |
 | `test_file_tools.py` | `str_replace` 多处匹配报错；`write_file` 追加 vs 覆盖；读文件行范围；截断标志正确 |
 | `test_file_lock.py` | 同沙箱同路径并发写串行化；**不同沙箱同路径不阻塞**；锁在无引用后被回收 |
 | `test_bash_tool.py` | 超时杀整个进程组；stdin 立即 EOF；后台进程不阻塞；大输出不 OOM |
@@ -559,6 +876,9 @@ class ToolConfig(BaseModel):
 - [ ] `python -m http.server &` 立即返回，不占满整轮
 - [ ] 默认配置下 bash 工具不在工具列表里；显式 `allow_host_bash: true` 后出现
 - [ ] 工具返回的内容里不含任何宿主机真实路径
+- [ ] 任何工具错误都以 `Error: ...` 字符串返回，agent 循环不中断，模型能改参数重试
+- [ ] `ls /mnt/user-data` 列出三个子目录（和 Docker 行为一致），而不是报"找不到映射"
+- [ ] 用户 A 启动进程、用户 B 发起会话，B 的沙箱解析到 B 自己的目录
 - [ ] blocking-IO 套件通过
 
 ---

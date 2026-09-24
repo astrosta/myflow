@@ -1,10 +1,10 @@
 # M5 前端 详细设计
 
-> 配套文档：[分阶段开发方案](greenfield-agent-service-roadmap.md) ·
-> [M1 最小 Agent](m1-minimal-agent-design.md) · [M2 工具与沙箱](m2-tools-sandbox-design.md) ·
-> [M3 Gateway 与流式](m3-gateway-streaming-design.md) · [M4 持久化](m4-persistence-design.md) ·
-> [M6 中间件体系](m6-middleware-design.md) · [M8 子代理委托](m8-subagents-design.md) ·
-> [M9 生产化](m9-production-design.md)
+> 配套文档：[分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md) ·
+> [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md) · [M2 工具与沙箱](2026-09-16-m2-tools-sandbox-design.md) ·
+> [M3 Gateway 与流式](2026-09-16-m3-gateway-streaming-design.md) · [M4 持久化](2026-09-16-m4-persistence-design.md) ·
+> [M6 中间件体系](2026-09-16-m6-middleware-design.md) · [M8 子代理委托](2026-09-16-m8-subagents-design.md) ·
+> [M9 生产化](2026-09-16-m9-production-design.md)
 >
 > 本文细化 M5（2 周，可与 M4 并行）。
 
@@ -62,6 +62,7 @@
 ```
 src/
 ├── app/          # 路由。/、/workspace/chats/[thread_id]、(auth)/login
+                  # M9 加 /workspace/scheduled-tasks
 ├── components/
 │   ├── ui/       # 从 shadcn 之类的 registry 生成，不手改，lint 忽略
 │   └── workspace/# 聊天页的组件

@@ -1,6 +1,8 @@
 from uu import encode
 from pydantic import BaseModel, Field, ConfigDict, PrivateAttr, model_validator
 from typing import Any,Self
+from agentkit.config.agents_config import AgentsConfig
+from agentkit.config.checkpointer_config import CheckpointerConfig
 from agentkit.config.model_config import ModelConfig
 from agentkit.config.reload_boundary import format_field_description
 import hashlib
@@ -17,6 +19,8 @@ from agentkit.config.file_signature import ConfigSignature, get_config_signature
 class AppConfig(BaseModel):
     config_version: int = Field(default=0)
     log_level: str = Field(default="info", description=format_field_description("log_level"))
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    checkpointer: CheckpointerConfig = Field(default_factory=CheckpointerConfig)
     models: list[ModelConfig] = Field(default_factory=list)
     model_config = ConfigDict(extra="allow")
     _models_by_name: dict[str, ModelConfig] = PrivateAttr(default_factory=dict)
@@ -49,6 +53,15 @@ class AppConfig(BaseModel):
         for m in self.models:
             by_name[m.name] = m
         self._models_by_name = by_name
+        return self
+
+    @model_validator(mode="after")
+    def _validate_agents_default_model(self) -> Self:
+        name = self.agents.default_model
+        if name is not None and name not in self._models_by_name:
+            raise ValueError(
+                f"agents.default_model {name!r} is not one of models[].name"
+            )
         return self
 
     @classmethod
@@ -97,7 +110,7 @@ def set_app_config(config: AppConfig) -> None:
     _app_config = config
     _app_config_path = None
     _app_config_signature = None
-    _app_config_is_custom = False
+    _app_config_is_custom = True
 
 def get_app_config() -> AppConfig:
     global _app_config, _app_config_path,  _app_config_signature, _app_config_is_custom

@@ -98,7 +98,10 @@ def create_chat_model(
 
     # name解析，取ModelConfig
     if name is None:
-        name = config.models[0].name
+        if config.agents.default_model is not None:
+            name = config.agents.default_model
+        else:
+            name = config.models[0].name
 
     model_config = config.get_model_config(name)
     if model_config is None:
