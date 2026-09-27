@@ -10,28 +10,12 @@ from agentkit.config.app_config import get_app_config
 from agentkit.models.factory import create_chat_model
 from agentkit.agents.thread_state import ThreadState
 from agentkit.agents.leader_agent.prompt import apply_prompt_template
+from agentkit.agents.leader_agent.runtime_keys import CLIENT_ASSEMBLY_KEYS, ASSEMBLY_INPUT_KEYS
 from agentkit.tools.registry import get_available_tools
 from langgraph.types import Checkpointer
 import logging
 
 logger = logging.getLogger(__name__)
-
-# 用户配置configurable
-CLIENT_ASSEMBLY_KEYS = frozenset(["model_name","reasoning_effort", "is_plan_mode","agent_name", "subagent_enabled", "thinking_enabled"])
-# worker写入configurable
-CHECKPOINT_COORDINATE_KEYS = frozenset(["thread_id", "checkpoint_ns", "checkpoint_id", "checkpoint_map"])
-
-# 只写runtime.context
-_SERVER_OWNED_KEYS = frozenset({"non_interactive","user_id","run_id","trace_id","is_internal"})
-
-# 只删不写。user_id 与上面重叠：删的是客户端带来的值，写的是认证结果。
-_CLIENT_IDENTITY_KEYS = frozenset({"user_id","owner_id","auth_user","auth_user_id"})
-
-# 可以出现在 runtime.context，禁止抄进 configurable。
-_CONTEXT_ONLY_KEYS = frozenset({"channel_user_id"})
-
-# non_interactive 不是客户端可传的键，但它改变工具列表，所以是装配输入（§3.3）。
-ASSEMBLY_INPUT_KEYS = CLIENT_ASSEMBLY_KEYS | {"non_interactive"}
 
 _MISSING = object()
 
@@ -78,7 +62,13 @@ def agent_cache_key(
 def make_agent(config: RunnableConfig):
     return assemble_agent(config).graph
 
-def assemble_agent(config: RunnableConfig, *, app_config: AppConfig | None = None, checkpointer: Checkpointer | None = None) -> AgentAssembly:
+def assemble_agent(
+    config: RunnableConfig,
+    *,
+    app_config: AppConfig | None = None, 
+    checkpointer: Checkpointer | None = None,
+) -> AgentAssembly:
+
     cfg = (config or {}).get("configurable", {})
     resolved_config = app_config or get_app_config()
 
@@ -93,10 +83,17 @@ def assemble_agent(config: RunnableConfig, *, app_config: AppConfig | None = Non
     model = create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_config, attach_tracing=False)
 
     # 组装工具
-    tools = apply_tool_filter(get_available_tools(app_config=resolved_config, cfg=cfg), cfg=cfg)
+    tools = apply_tool_filter(
+        get_available_tools(
+            model_name=model_name,
+            subagent_enabled=bool(_resolve_runtime_option(cfg, "subagent_enabled", None, False)),
+            app_config=resolved_config,
+        ),
+        cfg=cfg,
+    )
 
     # 组中间件
-    middlewares = build_middlewares(config, app_config=resolved_config)
+    middleware = build_middlewares(config, app_config=resolved_config)
 
     # 渲染系统提示词
     system_prompt = apply_prompt_template(
@@ -105,7 +102,7 @@ def assemble_agent(config: RunnableConfig, *, app_config: AppConfig | None = Non
         app_config=resolved_config,
     )
 
-    graph = _compile_agent(model=model, tools=tools, middlewares=middlewares, system_prompt=system_prompt, state_schema=ThreadState, checkpointer=checkpointer)
+    graph = _compile_agent(model=model, tools=tools, middleware=middleware, system_prompt=system_prompt, state_schema=ThreadState, checkpointer=checkpointer)
     return AgentAssembly(graph=graph, descriptor=None)
 
 @dataclass(frozen=True)
@@ -158,11 +155,11 @@ def apply_tool_filter(tools: list, cfg: dict) -> list:
 def build_middlewares(config: RunnableConfig, *, app_config: AppConfig | None = None) -> list:
     return []
 
-def _compile_agent(*, model, tools, middlewares, system_prompt, state_schema, checkpointer):
+def _compile_agent(*, model, tools, middleware, system_prompt, state_schema, checkpointer):
     kwargs = dict(
         model=model,
         tools=tools,
-        middlewares=middlewares,
+        middleware=middleware,
         system_prompt=system_prompt,
         state_schema=state_schema,
     )

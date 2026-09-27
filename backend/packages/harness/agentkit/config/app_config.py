@@ -4,6 +4,7 @@ from typing import Any,Self
 from agentkit.config.agents_config import AgentsConfig
 from agentkit.config.checkpointer_config import CheckpointerConfig
 from agentkit.config.model_config import ModelConfig
+from agentkit.config.tool_config import ToolConfig
 from agentkit.config.reload_boundary import format_field_description
 import hashlib
 import os
@@ -20,8 +21,14 @@ class AppConfig(BaseModel):
     config_version: int = Field(default=0)
     log_level: str = Field(default="info", description=format_field_description("log_level"))
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    max_recursion_limit: int = Field(
+        default=1000,
+        ge=1,
+        description="Hard server-side ceiling for a client-supplied run recursion_limit. Client values above this are clamped; prevents runaway LangGraph super-steps (LLM cost / DoS).",
+    )
     checkpointer: CheckpointerConfig = Field(default_factory=CheckpointerConfig)
     models: list[ModelConfig] = Field(default_factory=list)
+    tools: list[ToolConfig] = Field(default_factory=list)
     model_config = ConfigDict(extra="allow")
     _models_by_name: dict[str, ModelConfig] = PrivateAttr(default_factory=dict)
 
@@ -103,7 +110,6 @@ _app_config_path: Path | None = None
 _app_config_signature: ConfigSignature | None = None
 _app_config_is_custom = False                
 
-_current_app_config: ContextVar[AppConfig | None] = ContextVar("current_app_config", default=None)
 
 def set_app_config(config: AppConfig) -> None:
     global _app_config, _app_config_path, _app_config_signature, _app_config_is_custom
@@ -115,23 +121,18 @@ def set_app_config(config: AppConfig) -> None:
 def get_app_config() -> AppConfig:
     global _app_config, _app_config_path,  _app_config_signature, _app_config_is_custom
 
-   # 1. 作用域覆盖优先，且完全不碰磁盘
-    runtime_override = _current_app_config.get()
-    if runtime_override is not None:
-        return runtime_override
-
-    # 2. 注入的 mock 永不被磁盘重载顶掉
+    # 1. 注入的 mock 永不被磁盘重载顶掉
     if _app_config is not None and _app_config_is_custom:
         return _app_config
 
-    # 3. 路径或内容签名变了就重载
+    # 2. 路径或内容签名变了就重载
     resolved_path = AppConfig.resolve_config_path()
     current_signature = get_config_signature(resolved_path)
     should_reload = _app_config is None or _app_config_path != resolved_path or _app_config_signature != current_signature
     if should_reload:
         _load_and_cache_app_config(str(resolved_path))
 
-    # 4. 返回缓存
+    # 3. 返回缓存
     return _app_config
 
 def _load_and_cache_app_config(config_path: str | None = None) -> AppConfig:

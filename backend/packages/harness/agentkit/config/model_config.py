@@ -6,7 +6,7 @@ class ModelConfig(BaseModel):
     name: str = Field(default="default", description="Logical model name used by the factory")
     display_name: str | None = Field(default=None, description="Human-readable model name")
     description: str | None = Field(default=None, description="Model description")
-    provider_type: str = Field(default="deepseek", description="The type of the model provider")
+  #  provider_type: str = Field(default="deepseek", description="The type of the model provider")
     model: str = Field(default="deepseek-v4-flash", description="The model to use")
     base_url: str | None = Field(default="https://api.deepseek.com", description="The base URL for the model provider")
     use: str = Field(..., description="Class path of the model provider(e.g. langchain_openai.ChatOpenAI)",)

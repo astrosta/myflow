@@ -71,8 +71,8 @@ class _StreamTranslator:
             message, _metadata = _unpack_message_chunk(chunk)
             yield from self._translate_message_mode(message)
             return
-        if mode == "values":
-            yield from self._translate_values(chunk if isinstance(chunk, dict) else {})
+        # if mode == "values":
+        yield from self._translate_values(chunk if isinstance(chunk, dict) else {})
 
     def _translate_message_mode(self, message: Any) -> Iterator[StreamEvent]:
         if _is_ai(message):
@@ -164,6 +164,7 @@ class _StreamTranslator:
                 usage = None
             if step != "meta" and message_id is not None:
                 self.streamed_ids.add(message_id)
+                self.seen_ids.add(message_id)
             yield StreamEvent(type="messages-tuple", data=data)
 
     def _emit_tool(self, message: Any) -> Iterator[StreamEvent]:
@@ -172,6 +173,7 @@ class _StreamTranslator:
             return
         if message_id is not None:
             self.streamed_ids.add(message_id)
+            self.seen_ids.add(message_id)
         yield StreamEvent(
             type="messages-tuple",
             data={
@@ -361,7 +363,7 @@ class AgentClient:
         checkpointer = self._checkpointer if self._checkpointer is not None else get_checkpointer()
         user_id = self._resolve_user_id()
         config = self._build_config(thread_id, overrides)
-        context = {"thread_id": thread_id, "user_id": user_id}
+        # context = {"thread_id": thread_id, "user_id": user_id}
         assembly = self._ensure_agent(
             config,
             app_config=app_config,
@@ -371,7 +373,7 @@ class AgentClient:
         items = assembly.graph.stream(
             self._input_state(message),
             config=config,
-            context=context,
+            #context=context,
             stream_mode=list(LANGGRAPH_STREAM_MODES),
         )
         return translate_stream(items)
