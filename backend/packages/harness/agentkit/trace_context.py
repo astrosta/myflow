@@ -1,6 +1,6 @@
+import uuid
 from contextvars import ContextVar
 from typing import Final
-import uuid
 
 TRACE_METADATA_KEY = "myflow-trace_id"
 _current_trace_id: Final[ContextVar[str | None]] = ContextVar("myflow_current_trace_id", default=None)

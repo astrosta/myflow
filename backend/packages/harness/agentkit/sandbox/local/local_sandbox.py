@@ -15,7 +15,12 @@ from agentkit.sandbox.local.list_dir import render_tree
 from agentkit.sandbox.path_patterns import mask_host_paths
 from agentkit.sandbox.sandbox import GrepMatch, Sandbox
 from agentkit.sandbox.search import glob_search, grep_search
-from agentkit.sandbox.security import PathMapping, assert_writable, find_path_mapping, resolve_sandbox_path
+from agentkit.sandbox.security import (
+    PathMapping,
+    assert_writable,
+    find_path_mapping,
+    resolve_sandbox_path,
+)
 
 _MAX_READ_CHARS = 100_000
 _MAX_OUTPUT_BYTES = 1024 * 1024

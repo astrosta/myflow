@@ -9,9 +9,8 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai.chat_models.base import BaseChatOpenAI
 
-from agentkit.config.app_config import AppConfig
-from agentkit.config.model_config import ModelConfig
 import agentkit.models.factory as factory_mod
+from agentkit.config import AppConfig, ModelConfig
 from agentkit.models.factory import (
     _DEFAULT_STREAM_CHUNK_TIMEOUT_SECONDS,
     create_chat_model,

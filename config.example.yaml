@@ -44,7 +44,18 @@ models:
   #   max_tokens: 4096                   # 单次输出上限 —— 和上面那个不是一回事
   #   supports_vision: true
 
-  
+
+database:
+  backend: sqlite          # memory | sqlite | postgres   startup-only
+  sqlite_dir: .myflow
+  url: postgresql+asyncpg://...   # 仅 postgres
+  checkpoint_channel_mode: full   # full | delta，启动时冻结
+  postgres_schema: ""             # 非空时钉 search_path
+
+run_events:
+  backend: memory          # memory | db | jsonl          startup-only
+  max_trace_content: 10240 # 仅 db：category=trace 超此字节截断
+  track_token_usage: true  # RunJournal 是否把 usage 累到 RunRow
 
 # ------------------------------------------------------------
 # 以下 section M0 还不读，留着是为了让文件形状从一开始就稳定。

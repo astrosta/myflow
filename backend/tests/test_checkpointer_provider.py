@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from agentkit.config.checkpointer_config import CheckpointerConfig
+from agentkit.config import CheckpointerConfig
 from agentkit.runtime.checkpointer import provider
 
 

@@ -214,7 +214,7 @@ def test_values_only_human_message_is_synthesized_once() -> None:
 
 
 def test_fake_tool_progress_is_a_custom_stream_event() -> None:
-    from agentkit.tools.builtin.fake_tool import fake_tool
+    from agentkit.tools.builtin import fake_tool
 
     graph = StateGraph(MessagesState)
     graph.add_node("tools", ToolNode([fake_tool]))

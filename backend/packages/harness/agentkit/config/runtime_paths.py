@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+
 def project_root() -> Path:
     if env_root := os.getenv("MYFLOW_PROJECT_ROOT"):
         root = Path(env_root).resolve()

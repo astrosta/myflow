@@ -4,9 +4,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from agentkit.config.agents_config import AgentsConfig
-from agentkit.config.app_config import AppConfig
-from agentkit.config.checkpointer_config import CheckpointerConfig
+from agentkit.config import AgentsConfig, AppConfig, CheckpointerConfig
 from agentkit.config.reload_boundary import STARTUP_ONLY_FIELDS, STARTUP_ONLY_PREFIX
 
 

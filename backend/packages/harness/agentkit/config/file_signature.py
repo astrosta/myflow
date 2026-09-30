@@ -1,5 +1,5 @@
-from pathlib import Path
 import hashlib
+from pathlib import Path
 
 #(mtime, size, sha256) 三元组
 ConfigSignature = tuple[float | None, int | None, str | None]    

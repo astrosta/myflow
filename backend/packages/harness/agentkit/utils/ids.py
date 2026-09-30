@@ -1,5 +1,5 @@
-import re
 import hashlib
+import re
 
 _SAFE_USER_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 _UNSAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_\-]")

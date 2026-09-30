@@ -3,11 +3,14 @@ FastAPI装配 + lifespan
 """
 
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
-from agentkit.runtime.runs.services import build_run_services
-from agentkit.runtime.config import get_app_config
-from agentkit.runtime.task import cancel_detached
+
+from agentkit.runtime import cancel_detached
 from agentkit.runtime.checkpointer import close_checkpointer
+from agentkit.runtime.config import get_app_config
+from agentkit.runtime.runs.services import build_run_services
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

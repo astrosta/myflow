@@ -8,7 +8,7 @@ from collections.abc import Iterator
 
 from langgraph.types import Checkpointer
 
-from agentkit.config.checkpointer_config import CheckpointerConfig
+from agentkit.config import CheckpointerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def reset_checkpointer() -> None:
 
 
 def _resolve_checkpointer_config() -> CheckpointerConfig:
-    from agentkit.config.app_config import get_app_config
+    from agentkit.config import get_app_config
 
     return get_app_config().checkpointer
 

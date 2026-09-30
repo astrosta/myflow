@@ -2,9 +2,10 @@
 StreamBridge ABC、StreamEvent、StreamGap、哨兵
 """
 from __future__ import annotations
-import  abc
-from typing import Any, AsyncIterator
+
+import abc
 from dataclasses import dataclass
+from typing import Any, AsyncIterator
 
 HEARTBEAT_SENTINEL = StreamEvent(id="", event="__heartbeat__", data=None)
 END_SENTINEL       = StreamEvent(id="", event="__end__",       data=None)

@@ -1,7 +1,7 @@
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
-from agentkit.utils.custom_events import emit_custom_event
+from agentkit.utils import emit_custom_event
 
 
 @tool

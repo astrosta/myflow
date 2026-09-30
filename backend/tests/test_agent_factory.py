@@ -2,13 +2,12 @@ from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 
-from agentkit.agents.leader_agent.agent import (
+from agentkit.agents.leader_agent import (
     ASSEMBLY_INPUT_KEYS,
     agent_cache_key,
     assemble_agent,
 )
-from agentkit.config.app_config import AppConfig
-from agentkit.config.model_config import ModelConfig
+from agentkit.config import AppConfig, ModelConfig
 
 
 def _key(cfg: Mapping[str, Any] | None = None, *, app_config: AppConfig | None = None, checkpointer: Any = None, user_id: str = "default"):

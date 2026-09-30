@@ -2,23 +2,25 @@
 /runs、/stream、/wait、/join、/cancel
 """
 from typing import Any
-from fastapi import router, Request
+
+from fastapi import Request, router
 from fastapi.responses import StreamingResponse
-from backend.app.gateway.deps import get_run_services, caller_from_request
-from backend.app.gateway.run_models import (
-    RunLaunch,
+
+from agentkit.runtime.runs import CancelOutcome
+from backend.app.gateway import (
     RunCancelRequest,
-) 
-from backend.app.gateway.services import (
-    sse_response,
-    wait_for_run_completion,
-    _require_cancel_capability,
+    RunLaunch,
+    RunNotCancellable,
     RunNotFound,
     RunNotLocal,
-    RunNotCancellable,
     StartRunError,
+    caller_from_request,
+    get_run_services,
+    sse_response,
+    wait_for_run_completion,
 )
-from agentkit.runtime.runs import CancelOutcome
+from backend.app.gateway.services import _require_cancel_capability
+
 
 @router.get("/{thread_id}/runs/{run_id}/join")
 async def join_run(thread_id: str, run_id: str, request: Request) -> StreamingResponse:

@@ -1,36 +1,42 @@
 """
 start_run、sse_comsumer、format_sse
 """
+import asyncio
 import hashlib
 import logging
-import asyncio
-from typing import ClassVar, Any
+from typing import Any, ClassVar
 
-from fastapi import Request,HTTPException
+from fastapi import Request
 from fastapi.responses import StreamingResponse
-from pydantic.json_schema import ConfigDict
 from langchain_core.messages import BaseMessage
 from langchain_core.messages.utils import convert_to_messages
 
-from agentkit.trace_context import TRACE_METADATA_KEY, ensure_trace_id
-from agentkit.config import get_app_config, AppConfig
 from agentkit.agents.leader_agent import (
-    CHECKPOINT_COORDINATE_KEYS, CLIENT_ASSEMBLY_KEY_TYPES, CLIENT_ASSEMBLY_KEYS,
-    CLIENT_IDENTITY_KEYS, CONTEXT_ONLY_KEYS, SERVER_OWNED_KEYS,
+    CHECKPOINT_COORDINATE_KEYS,
+    CLIENT_ASSEMBLY_KEY_TYPES,
+    CLIENT_ASSEMBLY_KEYS,
+    CLIENT_IDENTITY_KEYS,
+    CONTEXT_ONLY_KEYS,
+    SERVER_OWNED_KEYS,
 )
-from agentkit.utils import validate_thread_id
-from agentkit.runtime.stream_modes import normalize_stream_modes, UnsupportedStreamModeError
-from agentkit.runtime.stream_bridge.base import StreamBridge
+from agentkit.config import AppConfig, get_app_config
+from agentkit.runtime.context import RunContext
 from agentkit.runtime.runs import (
-    RunStatus,
+    DisconnectMode,
     RunManager,
     RunRecord,
-    DisconnectMode,
+    RunStatus,
 )
-from agentkit.runtime.context import RunContext
+from agentkit.runtime.stream_bridge.base import StreamBridge
+from agentkit.runtime.stream_modes import (
+    UnsupportedStreamModeError,
+    normalize_stream_modes,
+)
+from agentkit.trace_context import TRACE_METADATA_KEY, ensure_trace_id
+from agentkit.utils import validate_thread_id
 
-from .run_models import RunCreateRequest, RunCaller, RunLaunch
 from .deps import RunServices
+from .run_models import RunCaller, RunCreateRequest, RunLaunch
 
 logger = logging.getLogger(__name__)
 _CLIENT_INPUT_CHANNELS = frozenset({"messages"})
@@ -214,7 +220,7 @@ async def _thread_access_allowed(thread_store, thread_id: str, caller: RunCaller
 def resolve_agent_factory(assistant_id: str ):
     if assistant_id != "lead_agent":
         raise AssistantNotFound(f"Assistant {assistant_id} not found")
-    from agentkit.agents.leader_agent.agent import assemble_agent
+    from agentkit.agents.leader_agent import assemble_agent
     return assemble_agent
 
 def normalize_input(raw: dict|None, *, command: Any, trusted: bool) -> dict:

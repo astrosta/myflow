@@ -3,18 +3,19 @@ run_agent
 """
 
 from __future__ import annotations
+
 import asyncio
 import logging
-from typing import Callable, Any, AsyncIterable, Mapping
-from agentkit.client import _unpack_stream_item
-from agentkit.runtime.streams.bridge import StreamBridge
-from agentkit.runtime.runs.manager import RunManager, RunRecord
-from agentkit.runtime.stream_modes import to_langgraph_stream_modes
-from agentkit.runtime.context import RunContext
-from agentkit.runtime.runs.schemas import RunStatus, RunStartOutcome
-from agentkit.runtime.task import spawn_detached
+from typing import Any, AsyncIterable, Callable, Mapping
+
 from langgraph.types import Overwrite
 
+from agentkit.runtime.context import RunContext
+from agentkit.runtime.runs.manager import RunManager, RunRecord
+from agentkit.runtime.runs.schemas import RunStartOutcome, RunStatus
+from agentkit.runtime.stream_bridge.base import StreamBridge
+from agentkit.runtime.stream_modes import to_langgraph_stream_modes
+from agentkit.runtime.task import spawn_detached
 
 logger = logging.getLogger(__name__)
 STREAM_RETENTION_SECONDS = 60.0      # END 之后桥缓冲再留多久，给晚到的 /join 续传

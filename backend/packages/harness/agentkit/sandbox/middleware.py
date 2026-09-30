@@ -7,7 +7,10 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langgraph.runtime import Runtime
 
-from agentkit.sandbox.runtime import reset_authorization_checked, resolve_runtime_user_id
+from agentkit.sandbox.runtime import (
+    reset_authorization_checked,
+    resolve_runtime_user_id,
+)
 from agentkit.sandbox.sandbox_provider import get_sandbox_provider
 
 

@@ -1,5 +1,7 @@
-from pydantic import BaseModel, Field
 from typing import Literal
+
+from pydantic import BaseModel, Field
+
 
 class StreamBridgeConfig(BaseModel):
     backend: Literal["memory", "redis"] = "memory"

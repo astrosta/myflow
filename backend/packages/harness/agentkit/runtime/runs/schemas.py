@@ -3,6 +3,7 @@ RunStatus、ThreadOperationKind、CancelOutcome
 """
 from enum import StrEnum
 
+
 class RunStatus(StrEnum):
     pending = "pending"
     running = "running"

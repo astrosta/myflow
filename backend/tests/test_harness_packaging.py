@@ -1,5 +1,5 @@
-from pathlib import Path
 import tomllib
+from pathlib import Path
 
 HARNESS_ROOT = Path(__file__).parent.parent / "packages" / "harness"
 

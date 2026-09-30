@@ -7,14 +7,14 @@ from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from agentkit.agents.leader_agent.agent import (
+from agentkit.agents.leader_agent import (
     ASSEMBLY_INPUT_KEYS,
     AgentAssembly,
     AgentCacheKey,
     agent_cache_key,
     assemble_agent,
 )
-from agentkit.config.app_config import AppConfig, get_app_config
+from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.checkpointer import get_checkpointer
 
 logger = logging.getLogger(__name__)

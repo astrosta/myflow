@@ -2,14 +2,17 @@
 RunContext
 """
 from __future__ import annotations
-from dataclasses import dataclass
+
 import dataclasses
-from langgraph.checkpoint.base import BaseCheckpointSaver
-from agentkit.runtime.store.thread import ThreadMetaStore
-from agentkit.runtime.store.event import RunEventStore
-from agentkit.runtime.config.app import AppConfig
-from agentkit.runtime.config.agent import AgentFactory
+from dataclasses import dataclass
 from typing import Any
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
+from agentkit.runtime.config.agent import AgentFactory
+from agentkit.runtime.config.app import AppConfig
+from agentkit.runtime.store.event import RunEventStore
+from agentkit.runtime.store.thread import ThreadMetaStore
 
 _PER_RUN_FIELDS = frozenset({
     "app_config",

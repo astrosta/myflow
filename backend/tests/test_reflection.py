@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agentkit.reflection.resolvers import resolve_class, resolve_variable
+from agentkit.reflection import resolve_class, resolve_variable
 
 
 def test_resolve_variable_returns_module_attribute():

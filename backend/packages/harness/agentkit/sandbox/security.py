@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from agentkit.config.app_config import get_app_config
+from agentkit.config import get_app_config
 
 _DEFAULT_PROVIDER = "agentkit.sandbox.local:LocalSandboxProvider"
 _REJECT_HINT = (

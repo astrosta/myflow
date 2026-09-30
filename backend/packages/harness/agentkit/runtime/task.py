@@ -2,7 +2,6 @@ import asyncio
 import contextvars
 from typing import Any, Coroutine
 
-
 _DETACHED: set[asyncio.Task] = set()
 
 

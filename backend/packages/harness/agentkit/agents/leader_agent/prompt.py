@@ -1,4 +1,4 @@
-from agentkit.config.app_config import AppConfig
+from agentkit.config import AppConfig
 
 SYSTEM_PROMPT_TEMPLATE = """
 <role>

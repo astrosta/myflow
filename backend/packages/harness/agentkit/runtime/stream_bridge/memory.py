@@ -1,9 +1,16 @@
-from typing import Any, AsyncIterator
 import asyncio
-from dataclasses import dataclass, field
-from collections import deque
-from agentkit.runtime.stream_bridge.base import StreamBridge, StreamGap, StreamEvent, END_SENTINEL, HEARTBEAT_SENTINEL
 import logging
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator
+
+from agentkit.runtime.stream_bridge.base import (
+    END_SENTINEL,
+    HEARTBEAT_SENTINEL,
+    StreamBridge,
+    StreamEvent,
+    StreamGap,
+)
 
 SUBSCRIBER_QUEUE_MAXSIZE = 64 # 投递队列：不可重放，满了就是这个订阅者落后了
 

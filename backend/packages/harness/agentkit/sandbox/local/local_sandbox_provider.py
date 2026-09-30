@@ -9,7 +9,7 @@ from agentkit.config.runtime_paths import runtime_home
 from agentkit.sandbox.local.local_sandbox import LocalSandbox
 from agentkit.sandbox.sandbox_provider import SandboxProvider
 from agentkit.sandbox.security import PathMapping, is_host_bash_allowed, sandbox_flag
-from agentkit.utils.ids import validate_user_id
+from agentkit.utils import validate_user_id
 
 _DEFAULT_USER_ID = "default"
 _MAX_CACHED_THREADS = 256

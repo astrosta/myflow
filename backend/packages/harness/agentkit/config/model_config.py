@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field
 
+
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 

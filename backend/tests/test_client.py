@@ -1,9 +1,8 @@
 import pytest
 
-from agentkit.agents.leader_agent.agent import ASSEMBLY_INPUT_KEYS, AgentAssembly
+from agentkit.agents.leader_agent import ASSEMBLY_INPUT_KEYS, AgentAssembly
 from agentkit.client import DEFAULT_USER_ID, AgentClient
-from agentkit.config.app_config import AppConfig
-from agentkit.config.checkpointer_config import CheckpointerConfig
+from agentkit.config import AppConfig, CheckpointerConfig
 from agentkit.runtime.checkpointer import provider
 
 

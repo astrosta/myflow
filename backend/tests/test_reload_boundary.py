@@ -3,7 +3,7 @@ from typing import Union, get_args, get_origin
 from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 
-from agentkit.config.app_config import AppConfig
+from agentkit.config import AppConfig
 from agentkit.config.reload_boundary import STARTUP_ONLY_FIELDS, STARTUP_ONLY_PREFIX
 
 

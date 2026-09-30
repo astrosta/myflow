@@ -54,8 +54,8 @@ def get_sandbox_provider(**kwargs: object) -> SandboxProvider:
         if _default_provider is not None:
             return _default_provider
 
-    from agentkit.config.app_config import get_app_config
-    from agentkit.reflection.resolvers import resolve_class
+    from agentkit.config import get_app_config
+    from agentkit.reflection import resolve_class
     from agentkit.sandbox.security import sandbox_use
 
     try:

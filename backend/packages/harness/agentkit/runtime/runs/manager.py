@@ -2,12 +2,19 @@
 RunManager、RunRecord、状态机
 """
 from __future__ import annotations
+
 import asyncio
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Literal
-from agentkit.runtime.runs.store.base import RunStore
-from agentkit.runtime.runs.schemas import RunStatus, ThreadOperationKind, DisconnectMode, RunStartOutcome, RunStartupError
+from typing import Literal
+
+from agentkit.runtime.runs.schemas import (
+    DisconnectMode,
+    RunStartOutcome,
+    RunStartupError,
+    RunStatus,
+    ThreadOperationKind,
+)
+from agentkit.runtime.runs.store import RunStore
 
 RUN_RECORD_RETENTION_SECONDS = 300.0
 _ACTIVE = frozenset({RunStatus.pending, RunStatus.running})

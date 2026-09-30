@@ -1,8 +1,11 @@
 from __future__ import annotations
+
 import logging
-from agentkit.config.app_config import AppConfig, get_app_config
-from agentkit.reflection.resolvers import resolve_class
+
 from langchain_core.language_models import BaseChatModel
+
+from agentkit.config import AppConfig, get_app_config
+from agentkit.reflection import resolve_class
 
 logger = logging.getLogger(__name__)
 
