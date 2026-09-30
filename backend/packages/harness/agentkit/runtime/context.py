@@ -4,7 +4,7 @@ RunContext
 from __future__ import annotations
 from dataclasses import dataclass
 import dataclasses
-from agentkit.runtime.checkpointer.base import BaseCheckpointerSaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from agentkit.runtime.store.thread import ThreadMetaStore
 from agentkit.runtime.store.event import RunEventStore
 from agentkit.runtime.config.app import AppConfig
@@ -23,7 +23,7 @@ _PER_RUN_FIELDS = frozenset({
 @dataclass(frozen=True, slots=True)
 class RunContext:
     # --- 进程级：lifespan 建一次 ---
-    checkpointer: BaseCheckpointerSaver
+    checkpointer: BaseCheckpointSaver
     thread_store: ThreadMetaStore
     event_store: RunEventStore | None = None
 

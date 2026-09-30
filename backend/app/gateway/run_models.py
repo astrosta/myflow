@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing import Any, Literal
 from dataclasses import dataclass
 
+from agentkit.runtime.runs import RunRecord
+
 class RunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -22,6 +24,11 @@ class RunCreateRequest(BaseModel):
     on_disconnect: Literal["cancel", "continue"] = "cancel"
     multitask_strategy: Literal["reject", "interrupt", "rollback"] = "reject"
 
+class RunCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["interrupt", "rollback"] = "interrupt"
+    wait: bool = False         # 等到 worker 收尾完成再返回（对齐官方 SDK 的 runs.cancel）
 
 class CallerKind(StrEnum):
     HTTP = "http"
@@ -46,6 +53,6 @@ class RunCaller:
         return cls(kind=CallerKind.INTERNAL, user_id=owner_user_id)
 
 @dataclass(frozen=True, slots=True)
-class RunLauch:
+class RunLaunch:
     record: RunRecord
     reused: bool 

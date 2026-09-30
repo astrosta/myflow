@@ -1,24 +1,36 @@
 """
 start_run、sse_comsumer、format_sse
 """
-from pydantic.json_schema import ConfigDict
-from backend.app.gateway.run_models import RunCreateRequest, RunCaller, RunLauch
-from backend.app.gateway.deps import RunServices
-from fastapi import HTTPException
-from agentkit.trace_context import TRACE_METADATA_KEY, ensure_trace_id
-from agentkit.config.app_config import get_app_config, AppConfig
-from agentkit.agents.leader_agent.runtime_keys import (
-    CHECKPOINT_COORDINATE_KEYS, CLIENT_ASSEMBLY_KEY_TYPES, CLIENT_ASSEMBLY_KEYS,
-    CLIENT_IDENTITY_KEYS, CONTEXT_ONLY_KEYS, SERVER_OWNED_KEYS,
-)
-from agentkit.utils.ids import validate_thread_id
-from agentkit.runtime.stream_modes import normalize_stream_modes, UnsupportedStreamModeError
-from typing import ClassVar, Any
-from langchain_core.messages import BaseMessage
-from langchain_core.messages.utils import convert_to_messages
 import hashlib
 import logging
 import asyncio
+from typing import ClassVar, Any
+
+from fastapi import Request,HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic.json_schema import ConfigDict
+from langchain_core.messages import BaseMessage
+from langchain_core.messages.utils import convert_to_messages
+
+from agentkit.trace_context import TRACE_METADATA_KEY, ensure_trace_id
+from agentkit.config import get_app_config, AppConfig
+from agentkit.agents.leader_agent import (
+    CHECKPOINT_COORDINATE_KEYS, CLIENT_ASSEMBLY_KEY_TYPES, CLIENT_ASSEMBLY_KEYS,
+    CLIENT_IDENTITY_KEYS, CONTEXT_ONLY_KEYS, SERVER_OWNED_KEYS,
+)
+from agentkit.utils import validate_thread_id
+from agentkit.runtime.stream_modes import normalize_stream_modes, UnsupportedStreamModeError
+from agentkit.runtime.stream_bridge.base import StreamBridge
+from agentkit.runtime.runs import (
+    RunStatus,
+    RunManager,
+    RunRecord,
+    DisconnectMode,
+)
+from agentkit.runtime.context import RunContext
+
+from .run_models import RunCreateRequest, RunCaller, RunLaunch
+from .deps import RunServices
 
 logger = logging.getLogger(__name__)
 _CLIENT_INPUT_CHANNELS = frozenset({"messages"})
@@ -58,8 +70,12 @@ class ModelNotAllowed(StartRunError):       status_code, code = 400, "model_not_
 class ThreadNotFound(StartRunError):        status_code, code = 404, "thread_not_found"
 class AssistantNotFound(StartRunError):     status_code, code = 404, "assistant_not_found"
 class CheckpointNotFound(StartRunError):    status_code, code = 404, "checkpoint_not_found"
+class RunNotFound(StartRunError):           status_code, code = 404, "run_not_found"
+class RunNotLocal(StartRunError):          status_code, code = 409, "run_not_local"
+class RunNotCancellable(StartRunError):    status_code, code = 409, "run_not_cancellable"
 class ThreadBusy(StartRunError):            status_code, code = 409, "thread_busy"
 class IdempotencyKeyReused(StartRunError):  status_code, code = 409, "idempotency_key_reused"
+class ClientDisconnected(StartRunError): status_code, code = 499, "client_disconnected"# 499：客户端在等待期间断开
 
 async def start_run(
     body: RunCreateRequest,
@@ -69,7 +85,7 @@ async def start_run(
     services: RunServices,
     idempotency_key: str | None = None,
     require_existing_thread: bool = False,
-) -> RunLauch:
+) -> RunLaunch:
     """
     """
     app_config = get_app_config()
@@ -434,3 +450,106 @@ def inject_server_owned(config: dict, caller: RunCaller, *, run_id: str, trace_i
         context["non_interactive"] = True
     if isinstance(channel_user_id := body_context.get("channel_user_id"), str):
         context["channel_user_id"] = channel_user_id     # 只进 context
+
+def format_sse(event: str, data: Any, *, event_id: str | None = None) -> str:
+    """字段顺序 event -> data -> id -> 空行，对齐 LangGraph Platform 的 wire 格式。"""
+    frame = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n"
+    if event_id:
+        frame += f"id: {event_id}\n"
+    return frame + "\n"
+
+async def sse_consumer(
+    bridge: StreamBridge,
+    record: RunRecord,
+    request: Request,
+    run_mgr: RunManager,
+    *,
+    apply_on_disconnect: bool = True,
+):
+    subscription = bridge.subscribe(record.run_id, last_event_id=request.headers.get("Last-Event-ID"))
+    try:
+        async for entry in subscription:
+            if await request.is_disconnected():
+                break
+
+            if isinstance(entry, StreamGap):
+                yield format_sse("gap",{
+                    "code": "stream_replay_gap",
+                    "run_id": record.run_id,
+                    "requested_event_id": entry.requested_event_id,
+                    "earliest_available_event_id": entry.earliest_available_event_id,
+                    "latest_available_event_id": entry.latest_available_event_id,
+                    "recovery": "reload_durable_state",
+                })
+                return
+            
+            if entry is HEARTBEAT_SENTINEL:
+                yield ": heartbeat\n\n"
+                continue
+
+            if entry is END_SENTINEL:
+                yield format_sse("end", None)
+                return
+            
+            yield format_sse(entry.event, entry.data, event_id=entry.id or None)
+    finally:
+        try:
+            await subscription.aclose()
+        except Exception:
+            logger.warning("Failed to close bridge subscription", exc_info=True)
+
+        if apply_on_disconnect and record.status in (RunStatus.pending, RunStatus.running):
+            if record.on_disconnect == DisconnectMode.cancel:
+                await run_mgr.cancel(record.run_id)
+
+def sse_response(services: RunServices, launch: RunLaunch, request: Request, *, apply_on_disconnect: bool = True) -> StreamingResponse:
+    record = launch.record
+    return StreamingResponse(
+        sse_consumer(
+            services.bridge, record, request, services.run_manager, apply_on_disconnect=apply_on_disconnect
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Content-Location": f"/api/threads/{record.thread_id}/runs/{record.run_id}",
+        },
+    )
+
+async def wait_for_run_completion(
+    services: RunServices, record: RunRecord, request: Request, *, apply_on_disconnect: bool = True
+) -> RunRecord:
+    """阻塞到这条 run 的 END。返回从 store 重读的记录，不是内存里那份快照。"""
+    cursor: str | None = None
+    try:
+        while True:
+            ended = False
+            subscription = services.bridge.subscribe(record.run_id, last_event_id=cursor)
+            try:
+                async for entry in subscription:
+                    if await request.is_disconnected():           # ★ 心跳给了这个判断一个节拍
+                        raise ClientDisconnected(f"Client disconnected while waiting for {record.run_id}")
+                    if isinstance(entry, StreamGap):
+                        cursor = entry.latest_available_event_id   # 从窗口尾部续订，不重放
+                        break                                      # 换一条订阅继续等
+                    if entry is HEARTBEAT_SENTINEL:
+                        continue
+                    if entry is END_SENTINEL:
+                        ended = True
+                        break
+                    cursor = entry.id                               # 只推进游标，不解析载荷
+            finally:
+                try:
+                    await subscription.aclose()                    # 同 §8.1：退出循环不会替你关
+                except Exception:
+                    logger.warning("Failed to close bridge subscription", exc_info=True)
+            if ended:
+                break
+    except ClientDisconnected:
+        if apply_on_disconnect and record.status in (RunStatus.pending, RunStatus.running):
+            if record.on_disconnect == DisconnectMode.cancel:
+                await services.run_manager.cancel(record.run_id)
+        raise                                          # 路由不要用当前 checkpoint 拼一个 200
+    final = await services.run_manager.get(record.run_id, user_id=record.user_id)
+    return final or record

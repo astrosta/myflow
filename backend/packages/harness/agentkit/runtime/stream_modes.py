@@ -1,46 +1,38 @@
 """公开 mode 名和 LangGraph 内部 mode 名的映射。"""
 
 from __future__ import annotations
+from typing import Literal
+from typing_extensions import get_args
 
-# 请求里的公开名 → LangGraph astream 的 stream_mode。
-# messages-tuple 是公开参数名；图内部和 SSE event 都叫 messages。
-PUBLIC_TO_INTERNAL: dict[str, str] = {
-    "values": "values",
-    "messages-tuple": "messages",
-    "updates": "updates",
-    "custom": "custom",
-}
+RunStreamMode = Literal["values", "messages-tuple", "updates", "debug", "tasks", "checkpoints", "custom"]
+SUPPORTED_RUN_STREAM_MODES: frozenset[str] = frozenset(get_args(RunStreamMode.__value__))
 
-
-class UnsupportedStreamModeError(Exception):
-    """客户端请求了网关不提供的 stream mode。"""
-
-    def __init__(self, mode: object) -> None:
-        self.mode = mode
-        supported = ", ".join(PUBLIC_TO_INTERNAL)
-        super().__init__(f"Unsupported stream mode {mode!r}; supported modes: {supported}")
+class UnsupportedStreamModeError(ValueError):
+    def __init__(self, modes: list[str]) -> None:
+        self.modes = tuple(dict.fromkeys(modes))          # 去重、保序，给 422 正文用
+        super().__init__(f"Unsupported stream mode(s): {', '.join(self.modes)}")
 
 
-def normalize_stream_modes(raw: str | list[str] | None) -> list[str]:
-    """校验公开 stream mode，并保留公开名。
-
-    ``None`` 变成 ``["values"]``。单个字符串包成单项列表。
-    内部名 ``messages``、以及 ``events`` 等未支持的名字抛
-    ``UnsupportedStreamModeError``，不静默换成 ``values``。
-    """
+def normalize_stream_modes(raw: list[str] | str | None) -> list[str]:
+    """入口校验：None / [] → ["values"]；str → [str]；未知或非 str → UnsupportedStreamModeError。"""
     if raw is None:
-        return ["values"]
-
-    modes = [raw] if isinstance(raw, str) else list(raw)
-    for mode in modes:
-        if mode not in PUBLIC_TO_INTERNAL:
-            raise UnsupportedStreamModeError(mode)
+        modes = ["values"]
+    elif isinstance(raw, str):
+        modes = [raw]
+    else:
+        modes = raw or ["values"]
+    unsupported = [
+        mode if isinstance(mode, str) else type(mode).__name__
+        for mode in modes
+        if not isinstance(mode, str) or mode not in SUPPORTED_RUN_STREAM_MODES
+    ]
+    if unsupported:
+        raise UnsupportedStreamModeError(unsupported)
     return modes
 
 
-def to_internal_stream_modes(public_modes: list[str]) -> list[str]:
-    """把已规范化的公开名映射成 LangGraph 内部 stream_mode。"""
-    try:
-        return [PUBLIC_TO_INTERNAL[mode] for mode in public_modes]
-    except KeyError as exc:
-        raise UnsupportedStreamModeError(exc.args[0]) from exc
+def to_langgraph_stream_modes(raw: list[str] | str | None) -> list[str]:
+    """公开名 → astream 的内部名。恒返回 list；只把 messages-tuple 换成 messages，其余原样。返回list,为了astream好处理"""
+    mapped = ["messages" if mode == "messages-tuple" else mode for mode in normalize_stream_modes(raw)]
+    return list(dict.fromkeys(mapped)) # 去重保序：values + messages-tuple + values → [values, messages]
+

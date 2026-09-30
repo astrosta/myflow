@@ -29,8 +29,6 @@ M3 不一样。它定义的是**并发模型**——谁能跑、谁在跑、跑�
 | W3  | 取消 / 断开 / 幂等 / `/wait` / `/join` + 边界测试        |
 
 
-
-
 ### M3 新增的文件
 
 **执行栈在 harness 层，HTTP 在 app 层**——这个划分是 M3 的一条硬边界：
@@ -70,8 +68,6 @@ M8 的子代理都要用 `RunManager` 的部分能力，让它依赖 Web 框架�
 M0 §4 的分层边界测试正是为这条服务的。
 
 ---
-
-
 
 ## 2. 对象模型：五个东西，职责不能混
 
@@ -117,8 +113,6 @@ HTTP / IM / 调度器 / 内部回调
 不等 agent 跑完。这是整个设计的核心分叉点。
 
 ---
-
-
 
 ## 3. HTTP 契约：直接对齐 LangGraph Platform
 
@@ -168,16 +162,12 @@ class RunCreateRequest(BaseModel):
 
 ---
 
-
-
 ## 4. `start_run`：唯一收敛点（W1）
 
 所有入口——浏览器、IM、调度器、MCP 通知、子代理完成回调——都走这一个函数。
 它们的差别只在三样东西：**谁在调（**`caller`**）**、**传进来的 context**、**要不要挂 SSE**。
 
 > **绝不为新入口开第二条执行栈。** 这是 M3 最重要的一条纪律。
-
-
 
 ### 4.1 签名：不收 `Request`
 
@@ -200,14 +190,14 @@ async def start_run(
 ```
 
 
-| 参数                        | 类型                 | 谁给                                                         | 含义                                            |
-| ------------------------- | ------------------ | ---------------------------------------------------------- | --------------------------------------------- |
-| `body`                    | `RunCreateRequest` | 路由由 FastAPI 绑定；内部调用方自己构造                                   | 请求本身。**只读**，start_run 不改它的任何字段                |
-| `thread_id`               | `str`              | URL 路径参数；内部调用方显式传                                          | checkpointer 的分区键。唯一可信来源，body 里的同名字段一律不看      |
-| `caller`                  | `RunCaller`        | `caller_from_request(request)` / `RunCaller.internal(...)` | 身份与权限。**所有身份相关的决定只看它**，不看 body                |
-| `services`                | `RunServices`      | `get_run_services(request)` / `app.state.run_services`     | 进程级单例的打包                                      |
-| `idempotency_key`         | `str | None`       | `Idempotency-Key` 头；调度器传 occurrence 键                      | **原始值**。加 scope 在 start_run 内部做（§4.5），调用方不能绕过 |
-| `require_existing_thread` | `bool`             | 默认 `False`；MCP 通知、子代理回调传 `True`                            | thread 不存在时 404，而不是顺手建一条（§4.6）                |
+| 参数                        | 类型                 | 谁给                                                         | 含义                                       |
+| ------------------------- | ------------------ | ---------------------------------------------------------- | ---------------------------------------- |
+| `body`                    | `RunCreateRequest` | 路由由 FastAPI 绑定；内部调用方自己构造                                   | 请求本身。**只读**，start_run 不改它的任何字段           |
+| `thread_id`               | `str`              | URL 路径参数；内部调用方显式传                                          | checkpointer 的分区键。唯一可信来源，body 里的同名字段一律不看 |
+| `caller`                  | `RunCaller`        | `caller_from_request(request)` / `RunCaller.internal(...)` | 身份与权限。**所有身份相关的决定只看它**，不看 body           |
+| `services`                | `RunServices`      | `get_run_services(request)` / `app.state.run_services`     | 进程级单例的打包                                 |
+| `idempotency_key`         | `str               | None`                                                      | `Idempotency-Key` 头；调度器传 occurrence 键    |
+| `require_existing_thread` | `bool`             | 默认 `False`；MCP 通知、子代理回调传 `True`                            | thread 不存在时 404，而不是顺手建一条（§4.6）           |
 
 
 **不收** `Request` **是 §1 那条规则的落地。** DeerFlow 的 `start_run` 收 `Request`，结果调度器和
@@ -287,8 +277,6 @@ class RunLaunch:
 | -------- | ------------------------------------------- | ------------------------------------------------------ |
 | `False`  | `record.task` 已挂上；状态可能已经是 running 甚至终态      | 挂 SSE / 返回 JSON / 订桥等 END                              |
 | `True`   | 任意状态；`record.task` 可能是 `None`（`store_only`） | 绝不再 `create_task`；`/wait` 不把当前 checkpoint 当这次的结果（§8.3） |
-
-
 
 
 #### 两类调用方长这样
@@ -457,15 +445,14 @@ async def start_run(body, *, thread_id, caller, services, idempotency_key=None, 
 `ctx.for_run(...)` 是 `dataclasses.replace` 的薄包装。§6.1 说 `RunContext` 打包基础设施，
 §6.2 的骨架又读 `ctx.run_config` / `ctx.graph_input` / `ctx.stream_modes`——两者不矛盾：
 lifespan 建的那份只有基础设施字段，start_run 派生出每 run 一份、补上本次的输入。
-§6.2 骨架里的 `assemble_agent` 就是这里的 `ctx.agent_factory`，M3 只有这一个。
+§6.1 的 `_call_agent_factory` 调的就是这里的 `ctx.agent_factory`（M3 默认 `assemble_agent`），
+再用 `unwrap_agent_graph` 取出裸图。
 
 `create_or_reject` **比 §5.4 多收一个可选的** `run_id`（缺省时自己生成）。第 12 步要把
 `run_id` 写进 `runtime.context`（M1 §3.3：M8 按它给委托计数），而准入在第 13 步。
 预分配还顺带解决了幂等判断的一个竞态，见 §4.5。
 
 ### 4.3 第 1–5 步：能早拒就早拒
-
-
 
 #### 1. 取消能力门
 
@@ -576,8 +563,6 @@ M9 的内部调用方不跳过这一步，而是按它代表的 owner 查：inte
 除非调用方传了 `require_existing_thread=True`——那条路径在 worker 第 0 步再严格校验一次。
 
 ### 4.4 第 6–10 步：把请求翻译成图的输入和 config
-
-
 
 #### 6. agent 工厂
 
@@ -728,8 +713,6 @@ def _clamp_recursion_limit(value: Any, ceiling: int) -> int:
 而 `body.config` 正是要落库回显的那份。
 - `checkpoint_ns` **显式写** `""`（M1 §3.1）。
 
-
-
 #### 10. checkpoint 选择
 
 ```python
@@ -759,8 +742,6 @@ checkpoint id 在这里自然查不到 → 404，跨 thread 分叉走不通。ch
 M4 的 delta 模式不能分叉，线性化改写在 worker 里做，这一步只负责校验和写坐标。
 
 ### 4.5 第 13–14 步：准入，然后立刻挂 task
-
-
 
 #### 13 和 14 之间不能有任何 `await`
 
@@ -812,10 +793,11 @@ HTTP 用户的原始 key 就不可能撞上同一 thread 上调度器的 occurre
 长度上限（255）在路由的 `Header(max_length=...)` 上。
 
 **判断"是不是复用"看** `record.run_id != run_id`**，不看** `record.idempotency_reused`**。**
-那个标志挂在共享的记录上，而且一旦置位就不会复原。`create_or_reject` 的 interrupt / rollback
-分支在登记新记录之后还有 await（§5.5：先插新行、再标旧 run）；同 key 的重试恰好在这个窗口到达，
-就会找到这条记录并把标志翻成 `True`。原始请求随后读到 `True`，以为自己是重试，于是不挂 worker——
-留下一条谁也不跑的 pending。预分配的 `run_id` 是这次调用私有的，重试改不了它。
+那个标志挂在共享的记录上，而且一旦置位就不会复原。只要 `create_or_reject` 在登记新记录之后
+还有 await，同 key 的重试就可能在那个窗口里找到这条记录、把标志翻成 `True`；原始请求随后读到
+`True`，以为自己是重试，于是不挂 worker——留下一条谁也不跑的 pending。M3 的准入在登记之后没有
+await（§5.4 第 5 步），但这是一条靠纪律维持的性质，M9 很可能打破它（§5.5）。预分配的 `run_id`
+是这次调用私有的，重试改不了它，所以不依赖那条纪律。
 
 只比对 `input` 和 `assistant_id`，它们回答"这一轮说了什么、对谁说"。开关不比：用户改了一下 UI
 开关再重试，仍然是同一轮；复用的 run 保持第一次的开关。内容不一致是 409（§5.7：复用 key 却改了内容，
@@ -857,8 +839,6 @@ worker 对外有两条硬义务：写终态（§5）、发 END（§6.2）。work
 - **这里不用** `asyncio.shield`，和 §5.5 不同：shield 要新建一个 task，而刚刚失败的正是建 task。
 - `except BaseException` **然后原样** `raise`**。** 不管是什么异常，僵尸行的后果都一样；
 补偿做完，异常照常往上走，路由返回 500。
-
-
 
 ### 4.6 `run_after_metadata`：worker 的第 0 步
 
@@ -1084,11 +1064,63 @@ def inject_server_owned(config: dict, caller: RunCaller, *, run_id: str, trace_i
 
 ---
 
-
-
 ## 5. RunManager（W1）
 
 它是**登记处**，不是执行器。图执行在 worker 里，SSE 在 StreamBridge 里。
+RunManager 只回答三件事：这条 thread 现在能不能开一个新操作、某个 run 走到了状态机的哪一格、
+取消信号怎么送到 worker 手里。
+
+#### 公开方法
+
+
+| 方法                                                             | 谁调                      | 做什么                                            | 见         |
+| -------------------------------------------------------------- | ----------------------- | ---------------------------------------------- | --------- |
+| `create_or_reject(...) -> RunRecord`                           | start_run               | 准入一个 run，得到 pending 记录                         | §5.4      |
+| `reserve_thread_operation(thread_id, *, kind, user_id)`        | compact、`POST /state` 等 | 非 run 操作的短命占位（async context manager）           | §5.3      |
+| `try_start(run_id) -> RunStartOutcome`                         | worker                  | pending → running 的唯一入口                        | §5.6      |
+| `fail_start_if_pending(run_id, *, error) -> bool`              | start_run、worker 第 0 步  | 挂不上 task / 严格校验失败时把 pending 收成 error           | §5.6      |
+| `wait_for_prior_finalizing(thread_id, run_id, *, abort_event)` | worker                  | 等同 thread 更早的 run 收完尾                          | §5.6      |
+| `update_run_progress(run_id, totals)`                          | worker                  | 运行中的 token 快照                                  | §5.6      |
+| `complete(run_id, *, status, error, totals) -> bool`           | worker 收尾               | 终态 + 汇总一次写完                                    | §5.6      |
+| `cancel(run_id, *, action) -> CancelOutcome`                   | cancel 路由、SSE 断开        | 协作式取消                                          | §5.9、§9   |
+| `get(run_id, *, user_id) -> RunRecord | None`                  | 路由                      | 内存优先，再从 store hydrate                          | §5.1      |
+| `list_by_thread(thread_id, *, user_id, limit)`                 | 路由                      | 只列 run，不列预留                                    | §5.1      |
+| `has_inflight(thread_id) -> bool`                              | compact 等               | 本进程有没有活跃 run（含收尾中）                             | §5.3      |
+| `has_later_run(thread_id, run_id) -> bool`                     | worker 收尾               | 同 thread 是否已有更新的 run（旧 run 不得把 thread 写回 idle） | §6.2      |
+| `schedule_cleanup(run_id)`                                     | worker 收尾               | 延迟摘除内存记录                                       | §5.8      |
+| `shutdown(*, timeout)`                                         | lifespan                | 置 `_closing`、排空 worker                         | §5.9、§6.3 |
+
+
+它不 publish 任何东西（§2 第二条），也不认识 thread_store、checkpointer、StreamBridge——
+thread 状态投影和 END 帧都是 worker 的事。
+
+#### 构造与内部状态
+
+```python
+# agentkit/runtime/runs/manager.py
+RUN_RECORD_RETENTION_SECONDS = 300.0
+
+
+class RunManager:
+    def __init__(self, store: RunStore, *, retention_seconds: float = RUN_RECORD_RETENTION_SECONDS) -> None:
+        self._store = store
+        self._retention_seconds = retention_seconds
+        self._runs: dict[str, RunRecord] = {}
+        self._runs_by_thread: dict[str, dict[str, None]] = {}   # 有序集合：保持准入顺序，§5.6 靠它判断"更早"
+        self._lock = asyncio.Lock()
+        self._cleanup_tasks: set[asyncio.Task] = set()
+        self._closing = False                       # shutdown 置位；之后 _admit 拒新准入（§6.3）
+```
+
+`store` **不是可选参数。** M3 传 `MemoryRunStore`。DeerFlow 允许 `store=None`，结果每个方法都长出
+一条 `if self._store is None` 分支——那条分支 M4 之后没人测，却一直留在代码里。
+
+**一把进程锁，两条持锁纪律：**
+
+1. 只有准入（§5.4）在持锁期间 await store：本地检查、store 插入、登记内存必须是一个原子单元。
+2. 其余方法一律"锁内改内存，锁外写 store"。持锁 await 会把所有 thread 的准入排到一次慢 IO 后面。
+
+M9 多实例下准入如果成了瓶颈，换成按 `thread_id` 分片的锁，上面两条不变。
 
 ### 5.1 双层存储
 
@@ -1105,10 +1137,64 @@ def inject_server_owned(config: dict, caller: RunCaller, *, run_id: str, trace_i
 hydrate 出来的记录标 `store_only=True`，没有本地 `task`。
 如果顺序反了，一个 live run 会被换成一份没有 `task` 的快照——取消就失效了。
 
-**创建必须先写 store 再进内存。** 写 store 失败要回滚内存，避免"内存里有、库里没有"。
+**内存命中也要过属主。** store 的 `get` 带 `user_id` 过滤，内存这一层不过滤的话，M9 里任何人
+拿到别人的 `run_id` 就能读到 live 记录，进而取消它。DeerFlow 的 `get` 在内存命中时直接返回。
+
+```python
+async def get(self, run_id: str, *, user_id: str | None) -> RunRecord | None:
+    async with self._lock:
+        record = self._runs.get(run_id)
+    if record is None:
+        row = await self._store.get(run_id, user_id=user_id)
+        async with self._lock:
+            record = self._runs.get(run_id)          # store 往返期间可能刚登记了同一个 run
+        if record is None:
+            return _record_from_row(row) if row is not None else None      # store_only=True
+    return record if user_id is None or record.user_id == user_id else None
+```
+
+await 之后**再查一次内存**不是多余的：store 往返期间同一个 run 可能刚被准入登记，
+这时返回 store 里那份快照，就是"live run 被换成没有 task 的快照"。
+
+**创建必须先写 store 再进内存。** 顺序反过来的话，store 失败时要回滚内存，而回滚本身可能被
+取消打断，留下"内存里有、库里没有"。先 store 后内存，失败时内存里什么都没有，不需要回滚。
 
 `_runs` **和** `_runs_by_thread` **必须在同一次持锁、中间不 await 里一起改。**
-否则按 thread 列 run 会漏掉刚创建的那条。
+否则按 thread 列 run 会漏掉刚创建的那条。所以两者只经这两个函数修改：
+
+```python
+def _index_run_locked(self, record: RunRecord) -> None:
+    self._runs[record.run_id] = record
+    self._runs_by_thread.setdefault(record.thread_id, {})[record.run_id] = None
+
+
+def _unindex_run_locked(self, record: RunRecord) -> None:
+    self._runs.pop(record.run_id, None)
+    bucket = self._runs_by_thread.get(record.thread_id)
+    if bucket is not None:
+        bucket.pop(record.run_id, None)
+        if not bucket:
+            del self._runs_by_thread[record.thread_id]
+
+
+def _thread_records_locked(self, thread_id: str) -> list[RunRecord]:
+    return [self._runs[run_id] for run_id in self._runs_by_thread.get(thread_id, ())]
+```
+
+两步写进同一个同步函数，"中间不 await"就由结构保证，不靠记性。`_thread_records_locked`
+直接下标取、不做防御：两个结构只经上面两个函数修改，不一致就是 bug，应该在测试里炸出来，
+而不是静默漏掉一条 run。
+
+```python
+async def list_by_thread(self, thread_id: str, *, user_id: str | None, limit: int = 100) -> list[RunRecord]:
+    rows = await self._store.list_by_thread(thread_id, user_id=user_id, limit=limit)   # 只含 run，已过属主
+    async with self._lock:
+        live = {record.run_id: record for record in self._thread_records_locked(thread_id)}
+    return [live.get(row["run_id"]) or _record_from_row(row) for row in rows]
+```
+
+分页和属主过滤都以 store 为准，内存只负责把 live 对象换进去，这样从列表里拿到的记录也能取消。
+创建是先写 store 的，所以任何 live run 都已经在 store 里，列表不会漏掉刚准入的那条。
 
 `get()` 是 async（要访问 store），所有调用都得 `await`。这个签名现在定下来，
 M4 接 SQL 时不用改所有调用点。
@@ -1176,45 +1262,63 @@ class RunRecord:
 #### `RunStore` 接口：M3 要实现的十个方法
 
 ```python
+# agentkit/runtime/runs/store/base.py
+ACTIVE_STATUSES = frozenset({"pending", "running"})
+
+
 class RunStore(abc.ABC):
     # --- 准入：唯一一个必须原子的方法 ---
     @abc.abstractmethod
     async def create_thread_operation_atomic(
-        self, record: dict, *, kind: ThreadOperationKind
+        self, row: dict, *, kind: ThreadOperationKind, supersede_active: bool = False
     ) -> bool:
         """在 (thread_id) WHERE status IN ('pending','running') 的部分唯一索引上抢位。
-        返回 False 表示该 thread 已有活跃操作。不要抛 IntegrityError 给上层。"""
 
-    # --- 状态迁移 ---
+        supersede_active=True（interrupt / rollback）：先把该 thread 上活跃的 run 行标成 interrupted
+        再插入，两步在同一个原子操作里；活跃行里有非 run 的预留时不顶替，返回 False。
+        返回 False 表示没抢到位（thread 忙，或幂等键已被占）。不要抛 IntegrityError 给上层。"""
+
+    # --- 状态迁移：全部是对活跃行的 CAS ---
     @abc.abstractmethod
     async def start_run(self, run_id: str) -> bool:
-        """pending -> running 的 CAS。返回 False 表示已不是 pending（多半被取消了）。"""
+        """pending -> running。返回 False 表示已不是 pending（多半被取消了）。"""
 
     @abc.abstractmethod
-    async def update_status(self, run_id: str, status: RunStatus, *, error: str | None = None) -> None:
-        """必须带 status IN ('pending','running') 守卫：终态行不接受后到的写入。"""
+    async def update_status(
+        self, run_id: str, status: RunStatus, *, error: str | None = None, stop_reason: str | None = None
+    ) -> bool:
+        """WHERE status IN ('pending','running')。返回 False 表示行已是终态或不存在。"""
 
     @abc.abstractmethod
-    async def update_run_completion(self, run_id: str, *, status: RunStatus, **totals) -> None:
-        """终态 + token 汇总一次写完。拒绝替换一个**不同的**终态。"""
+    async def update_run_progress(self, run_id: str, **totals: Any) -> None:
+        """WHERE status = 'running'。CAS 落空就静默返回：run 已终态，进度数字不再有意义。"""
 
-    # --- 读 ---
+    @abc.abstractmethod
+    async def update_run_completion(
+        self, run_id: str, *, status: RunStatus, error: str | None = None, **totals: Any
+    ) -> bool:
+        """终态 + token 汇总一次写完。WHERE status IN ('pending','running') OR status = :status：
+        同一个终态可以写两遍（崩溃重试），换成另一个终态被拒，返回 False。"""
+
+    # --- 读：user_id 没有默认值 ---
     @abc.abstractmethod
     async def get(self, run_id: str, *, user_id: str | None) -> dict | None: ...
+
     @abc.abstractmethod
-    async def list_by_thread(self, thread_id: str, *, user_id: str | None, limit: int = 100) -> list[dict]: ...
+    async def list_by_thread(self, thread_id: str, *, user_id: str | None, limit: int = 100) -> list[dict]:
+        """只返回 operation_kind='run' 的行，created_at DESC。"""
+
     @abc.abstractmethod
     async def list_inflight(self) -> list[dict]:
-        """启动时回收孤儿用：所有 pending/running 的行。"""
+        """启动时回收孤儿用：所有 pending/running 的行，不按 user_id 过滤。"""
+
+    @abc.abstractmethod
+    async def get_by_idempotency_key(self, scoped_key: str) -> dict | None: ...
 
     # --- 删 ---
     @abc.abstractmethod
     async def delete_thread_operation(self, run_id: str, *, user_id: str | None) -> None:
-        """释放非 run 的短命预留行（compact 等）。"""
-
-    # --- 幂等 ---
-    @abc.abstractmethod
-    async def get_by_idempotency_key(self, scoped_key: str) -> dict | None: ...
+        """释放非 run 的短命预留行。对 operation_kind='run' 的行调用要抛 ValueError。"""
 
     # --- M9 预留：M3 不实现，但签名现在定 ---
     # renew_lease / claim_for_takeover / request_cancel /
@@ -1227,6 +1331,10 @@ class RunStore(abc.ABC):
 （用户手快点了两次发送），不是异常。让它冒到路由层意味着每个调用点都要 catch 一个
 数据库特定的异常类型——而 SQLite 和 Postgres 抛的还不是同一个。
 
+`False` 有两种含义：thread 忙，或者幂等键已被占。返回值不区分它们，调用方紧接着查一次
+`get_by_idempotency_key` 就能分清（§5.4）——两个 worker 同时拿同一个键准入时，输的那个
+正是靠这一查拿到赢家的 run。
+
 **二、所有读方法都带** `user_id` **参数。** M3 只有单用户，传 `None` 即可。但这个参数位现在留着，
 M9 加多租户时改的是实现，不是几十个调用点。更关键的是**默认值不能是** `None`——
 `user_id: str | None` 但不给默认值，强迫每个调用点显式表态"我这里确实要全局查"。
@@ -1235,6 +1343,74 @@ M9 加多租户时改的是实现，不是几十个调用点。更关键的是**
 **三、**`update_status` **和** `update_run_completion` **分开。** 前者是中途的状态变更，后者是终态
 加汇总的一次性写入。合并成一个方法会让"终态守卫"这条规则难以表达——中途变更允许覆盖，
 终态不允许。
+
+三个 CAS 方法（`start_run`、`update_status`、`update_run_completion`）都返回 `bool`。
+`False` 是正常结果——取消和完成撞车（§9.3）、崩溃后重复收尾——调用方据此决定要不要改内存、
+要不要告警。返回 `None` 的话，这些竞态只能靠再读一遍 store 去猜。
+
+#### 行和记录的互转
+
+```python
+def _record_to_row(record: RunRecord) -> dict:
+    """只取第一组和第三组字段；StrEnum 存成普通字符串。"""
+
+
+def _record_from_row(row: dict) -> RunRecord:
+    """第二组（task、abort_event、start_lock…）全部是新建的空值，并标 store_only=True。"""
+    return RunRecord(
+        run_id=row["run_id"],
+        thread_id=row["thread_id"],
+        assistant_id=row.get("assistant_id"),
+        status=RunStatus(row.get("status") or RunStatus.pending),
+        on_disconnect=DisconnectMode(row.get("on_disconnect") or DisconnectMode.cancel),
+        operation_kind=ThreadOperationKind(row.get("operation_kind") or ThreadOperationKind.run),
+        metadata=row.get("metadata") or {},
+        kwargs=row.get("kwargs") or {},
+        # ……其余第一组、第三组字段按名抄，缺省 None / 0 / {}
+        store_only=True,
+    )
+```
+
+缺列时的缺省值（`pending` / `cancel` / `run`）是给 M4 迁移前的旧行准备的：加列之前写入的行
+读回来不能炸。hydrate 出来的记录**不进** `_runs`：`_runs` 只放本进程拥有或刚刚拥有过的记录，
+放进去就没人负责 cleanup，还会在准入时被当成本地活跃 run。
+
+#### 内存实现：原子性来自"没有 await"
+
+```python
+# agentkit/runtime/runs/store/memory.py
+class MemoryRunStore(RunStore):
+    def __init__(self) -> None:
+        self._rows: dict[str, dict] = {}
+        self._run_id_by_idempotency_key: dict[str, str] = {}
+
+    async def create_thread_operation_atomic(self, row, *, kind, supersede_active=False) -> bool:
+        # 函数体内没有 await，事件循环不会在中间切走——这就是全部的原子性。
+        # 以后谁要在这里加 await，必须先加一把锁。
+        key = row.get("idempotency_key")
+        if key is not None and key in self._run_id_by_idempotency_key:
+            return False
+        active = [r for r in self._rows.values() if r["thread_id"] == row["thread_id"] and r["status"] in ACTIVE_STATUSES]
+        if active:
+            if not supersede_active or any(r["operation_kind"] != ThreadOperationKind.run for r in active):
+                return False
+            for r in active:
+                r["status"], r["updated_at"] = RunStatus.interrupted.value, row["created_at"]
+        self._rows[row["run_id"]] = {**row, "operation_kind": kind.value}
+        if key is not None:
+            self._run_id_by_idempotency_key[key] = row["run_id"]
+        return True
+
+    async def get(self, run_id, *, user_id):
+        row = self._rows.get(run_id)
+        if row is None or (user_id is not None and row.get("user_id") != user_id):
+            return None
+        return copy.deepcopy(row)        # 读方法一律返回副本
+```
+
+内存实现要和 M4 的 SQL 实现跑**同一套契约测试**（§11 的 `test_run_store_contract.py`）。
+读方法返回副本是契约的一部分：调用方改了拿到的 dict，不能改到存储里——SQL 实现天然如此，
+内存实现不复制的话，测试在内存上过、到 M4 才发现有代码依赖了"改返回值就改了库"。
 
 ### 5.2 状态机只有六个状态
 
@@ -1248,12 +1424,64 @@ M9 加多租户时改的是实现，不是几十个调用点。更关键的是**
           interrupted / error    success / error / timeout / interrupted
 ```
 
+
+| 从         | 到                               | 谁触发                              | 方法                            |
+| --------- | ------------------------------- | -------------------------------- | ----------------------------- |
+| ——        | `pending`                       | 准入                               | `create_or_reject`            |
+| `pending` | `running`                       | worker 启动栅栏                      | `try_start`                   |
+| `pending` | `interrupted`                   | 启动前被取消；被 interrupt / rollback 顶替 | `cancel` / `create_or_reject` |
+| `pending` | `error`                         | task 挂不上；严格 thread 校验失败          | `fail_start_if_pending`       |
+| `running` | `success` / `error` / `timeout` | worker 收尾                        | `complete`                    |
+| `running` | `interrupted`                   | 取消；被顶替                           | `cancel` / `create_or_reject` |
+| 终态        | 任何                              | ——                               | 一律拒绝                          |
+
+
+`timeout` 由 worker 的整体超时产生（`asyncio.timeout` 包住整轮执行，时长来自配置）。
+M3 可以先不配超时，但状态和迁移现在就要在。
+
+```python
+_ACTIVE = frozenset({RunStatus.pending, RunStatus.running})
+_ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
+    RunStatus.pending: frozenset({RunStatus.running, RunStatus.interrupted, RunStatus.error}),
+    RunStatus.running: frozenset({RunStatus.success, RunStatus.error, RunStatus.timeout, RunStatus.interrupted}),
+}
+
+
+class InvalidRunTransition(RuntimeError):
+    """活跃状态下的非法迁移：调用顺序错了，是 bug。"""
+
+
+def _transition_locked(record: RunRecord, target: RunStatus, *, error: str | None = None) -> bool:
+    """改内存状态。返回 False 表示记录已是终态——竞态里的输家，正常结果。"""
+    if record.status not in _ACTIVE:
+        return False
+    if target not in _ALLOWED_TRANSITIONS[record.status]:
+        raise InvalidRunTransition(f"{record.run_id}: {record.status} -> {target}")
+    record.status = target
+    if error is not None:
+        record.error = error
+    record.updated_at = now_iso()
+    return True
+```
+
+**"不允许"分两种，处理方式相反。** 从终态出发的迁移是竞态的输家（取消之后才到的完成、
+重复收尾），返回 `False`，调用方照常往下走。从活跃状态出发、但目标不在表里的迁移
+（比如 pending 直接到 success，说明 worker 跳过了 `try_start`）是调用顺序错了，要抛。
+混成一种的话，要么竞态把进程炸掉，要么 bug 被静默吞掉。
+
+`record.status =`  **在整个包里只出现在这个函数里。** §11 的 `test_run_manager.py` 用 grep 钉住：
+状态迁移的规则只有写在一处，才能用一张表测全。
+
 `finalizing` **不是状态机上的一档。** 它是 `RunRecord` 上的一个布尔标志，
 表示 worker 在 `finally` 里收尾（写标题、同步 thread 状态），
 此时它**仍然占着"每 thread 一条活跃"的名额**。
 
 把它做成一个状态会污染所有 `status IN (...)` 的查询，而它的唯一作用是让下一个 run
 的 `wait_for_prior_finalizing` 知道要等。
+
+它**只在本进程内存里占位**。取消会立刻把 store 行写成 `interrupted`（§5.9），部分唯一索引从那一刻起
+就不再算它；worker 这时可能还在 `finally` 里回滚 checkpoint。M3 单进程靠准入的本地检查兜住
+（§5.4 第 2 步把 `finalizing` 的记录也算作占位）；跨进程的收尾期占位是 M9 的事。
 
 另一个要点：**thread 元数据的** `running` **只在** `try_start` **成功之后才写。**
 pending 阶段被取消的话，侧栏不该先闪一下 busy 再改回来。
@@ -1262,12 +1490,15 @@ pending 阶段被取消的话，侧栏不该先闪一下 busy 再改回来。
 
 ```python
 class ThreadOperationKind(StrEnum):
-    RUN = "run"
-    CHECKPOINT_WRITE = "checkpoint_write"   # compact、POST /state
-    ARTIFACT_WRITE = "artifact_write"
-    BRANCH = "branch"
-    DELETE = "delete"
+    run = "run"
+    checkpoint_write = "checkpoint_write"   # compact、POST /state
+    artifact_write = "artifact_write"
+    branch = "branch"
+    delete = "delete"
 ```
+
+成员名用小写，和 `RunStatus.pending`、`DisconnectMode.cancel` 一致；`RunRecord` 的缺省值写的就是
+`ThreadOperationKind.run`。
 
 所有 kind 共享 store 上的同一个**部分唯一索引**：
 
@@ -1286,7 +1517,45 @@ compact 和对话就能并发写 checkpoint，结果是静默的状态损坏—�
 - **列表 API 要过滤掉** `operation_kind != 'run'` **的行。** 用户不该在"对话历史"里
 看到一条 compact 记录。
 
+```python
+@asynccontextmanager
+async def reserve_thread_operation(
+    self, thread_id: str, *, kind: ThreadOperationKind, user_id: str | None
+) -> AsyncIterator[RunRecord]:
+    if kind is ThreadOperationKind.run:
+        raise ValueError("normal runs must be admitted with create_or_reject()")
+    record = await self._admit(
+        thread_id, None, kind=kind, multitask_strategy="reject", user_id=user_id,
+        on_disconnect=DisconnectMode.continue_,          # 预留没有 SSE 连接，这个字段只是为了填满必填项
+    )
+    try:
+        yield record
+    finally:
+        try:
+            await self._store.delete_thread_operation(record.run_id, user_id=record.user_id)
+        except Exception:
+            logger.warning("Failed to release thread operation %s", record.run_id, exc_info=True)
+        finally:
+            async with self._lock:
+                self._unindex_run_locked(record)
 
+
+async def has_inflight(self, thread_id: str) -> bool:
+    async with self._lock:
+        return any(
+            r.operation_kind is ThreadOperationKind.run and (r.status in _ACTIVE or r.finalizing)
+            for r in self._thread_records_locked(thread_id)
+        )
+```
+
+- **预留只走** `reject`**，也不能被顶替。** 对一条持有预留的 thread 发 interrupt / rollback，
+得到的是 409（§5.4 第 2 步），而不是把 compact 掐在半路——写到一半的 checkpoint 就是损坏的状态。
+- **释放用准入时记下的** `record.user_id`，不读当时的请求上下文。`finally` 可能跑在别的
+context 里（客户端断开、lifespan 收尾），那时读到的身份不可靠。
+- **store 删行失败，内存照样摘。** 代价是那条 thread 在下次启动回收（M4 `recover_inflight_runs`）
+之前一直是忙的。宁可忙，也不要留一条内存里有、却没人会释放的记录。M4 给这次删除加有限重试。
+- `has_inflight` 只数 `run`，并把收尾中的也算上：compact 这类调用方关心的是
+"有没有人还在写这条 thread 的 checkpoint"。
 
 ### 5.4 准入：只用 `create_or_reject`
 
@@ -1298,6 +1567,104 @@ compact 和对话就能并发写 checkpoint，结果是静默的状态损坏—�
 留下一行谁也不认领的幽灵 pending。
 
 跨进程靠唯一索引，不靠这把进程锁——进程锁只是为了让本进程的三步保持原子。
+
+```python
+_STRATEGIES = frozenset({"reject", "interrupt", "rollback"})
+
+
+async def create_or_reject(
+    self,
+    thread_id: str,
+    assistant_id: str | None,
+    *,
+    run_id: str | None = None,                 # start_run 预分配（§4.5）；缺省时这里生成
+    on_disconnect: DisconnectMode = DisconnectMode.cancel,
+    multitask_strategy: str = "reject",
+    metadata: dict | None = None,
+    kwargs: dict | None = None,                # 脱敏后的原始请求（§4.5）
+    model_name: str | None = None,
+    user_id: str | None = None,
+    idempotency_key: str | None = None,        # 已加 scope（§4.5）
+) -> RunRecord:
+    return await self._admit(
+        thread_id, assistant_id, kind=ThreadOperationKind.run, run_id=run_id,
+        on_disconnect=on_disconnect, multitask_strategy=multitask_strategy,
+        metadata=metadata or {}, kwargs=kwargs or {}, model_name=model_name,
+        user_id=user_id, idempotency_key=idempotency_key,
+    )
+
+
+async def _admit(self, thread_id, assistant_id, *, kind, run_id=None, multitask_strategy="reject",
+                 idempotency_key=None, user_id=None, **fields) -> RunRecord:
+    if multitask_strategy not in _STRATEGIES:
+        raise UnsupportedStrategyError(multitask_strategy)
+    now = now_iso()
+    record = RunRecord(
+        run_id=run_id or new_run_id(), thread_id=thread_id, assistant_id=assistant_id,
+        status=RunStatus.pending, operation_kind=kind, multitask_strategy=multitask_strategy,
+        user_id=user_id, idempotency_key=idempotency_key, created_at=now, updated_at=now, **fields,
+    )
+    supersede = multitask_strategy != "reject"
+
+    async with self._lock:
+        # 1. 幂等：先内存，再 store。命中就直接返回，不看 thread 忙不忙，也不看 _closing
+        if idempotency_key is not None:
+            if (reused := await self._find_idempotent_locked(idempotency_key, thread_id, user_id)) is not None:
+                return reused
+
+        if self._closing:
+            raise ConflictError("Gateway is shutting down")
+
+        # 2. 本进程占位：活跃的、还在收尾的，都算
+        occupants = [r for r in self._thread_records_locked(thread_id) if r.status in _ACTIVE or r.finalizing]
+        if occupants and not supersede:
+            raise ConflictError(f"Thread {thread_id} already has an active operation")
+        if any(r.operation_kind is not ThreadOperationKind.run for r in occupants):
+            raise ConflictError(f"Thread {thread_id} has an active non-run operation")
+
+        # 3. store 抢位：跨进程的真相
+        admitted = await self._store.create_thread_operation_atomic(
+            _record_to_row(record), kind=kind, supersede_active=supersede,
+        )
+        if not admitted:
+            if idempotency_key is not None:
+                if (reused := await self._find_idempotent_locked(idempotency_key, thread_id, user_id)) is not None:
+                    return reused              # 另一个 worker 拿同一个键先到了一步
+            raise ConflictError(f"Thread {thread_id} already has an active operation")
+
+        # 4. 登记内存：必须在 store 成功之后（§5.1）
+        self._index_run_locked(record)
+
+        # 5. 顶替旧 run：只改内存，不 await（§5.5）
+        for old in occupants:
+            _abort_locked(old, action=multitask_strategy)
+    return record
+
+
+async def _find_idempotent_locked(self, key: str, thread_id: str, user_id: str | None) -> RunRecord | None:
+    existing = next((r for r in self._runs.values() if r.idempotency_key == key), None)
+    if existing is None and (row := await self._store.get_by_idempotency_key(key)) is not None:
+        existing = _record_from_row(row)
+    if existing is None:
+        return None
+    if existing.thread_id != thread_id or existing.user_id != user_id:
+        raise RuntimeError("idempotency key resolved to a different thread or user")   # scope 保证不会发生
+    existing.idempotency_reused = True
+    return existing
+```
+
+五步的顺序各有理由：
+
+- **第 1 步在第 2 步之前。** 重试一个还在跑的 run，应该拿回那个 run，而不是 409。
+- **第 2 步把** `finalizing` **也算作占位**，并且预留不可顶替。所以 `reject` 碰到收尾中的旧 run 也是 409——
+刚点完停止马上发送，窗口通常只有几十毫秒；前端"停止后立刻发送"的路径应该用 `interrupt`。
+- **第 3 步返回** `False` **后再查一次幂等键**，这就是 §5.1"三个签名细节"第一条说的分辨方式。
+- **第 4 步在 store 成功之后**，失败时内存里什么都没有。
+- **第 5 步之后直接返回。** 登记之后没有 await，是 §5.5 那个边角在 M3 里不存在的原因。
+
+内存里最多只有保留期（§5.8）内的记录，幂等查找用线性扫描就够了；另建索引的话，
+它就成了第三个必须和 `_runs` 同步修改的结构。`RuntimeError` 那一行在正确的 scope（§4.5）下
+走不到——键里已经编进了 owner 和 thread——走到了就是 scope 写错了，应该大声失败而不是把别人的 run 返回出去。
 
 ### 5.5 `multitask_strategy`
 
@@ -1314,8 +1681,47 @@ compact 和对话就能并发写 checkpoint，结果是静默的状态损坏—�
 `interrupt`/`rollback` 的顺序是：**先原子插入新行，再去标记旧 run**。
 反过来做，两者之间的窗口里这条 thread 是"空闲"的，第三个请求能挤进来。
 
-还有一个边角要处理：标记旧 run 之后如果调用方自己被取消了，
-要用 `shield` 把刚准入、还没人看见的新 run 收成终态，否则它会永远挂在 pending。
+M3 把两步压进 store 的同一次原子调用（`supersede_active=True`），内存侧的标记在锁内同步完成：
+
+```python
+def _abort_locked(record: RunRecord, *, action: str) -> None:
+    """顶替（§5.4 第 5 步）和取消（§5.9）共用的内存侧动作。store 行由调用方负责：
+    顶替时已在准入第 3 步的同一个原子操作里标好，取消时在锁外补写。"""
+    was_running = record.status is RunStatus.running
+    if not _transition_locked(record, RunStatus.interrupted):
+        return                                   # 已是终态、只是还在收尾：不用再管
+    record.abort_action = action                 # "interrupt" / "rollback"，worker 在 finally 里照做
+    record.abort_event.set()
+    record.finalizing = record.task is not None and not record.task.done()
+    if was_running and record.finalizing:
+        record.task.cancel()                     # pending 只置 abort，不 cancel（§4.6）
+```
+
+旧 run 的 worker 在下一轮 astream 看到 abort（running 的还会收到 `CancelledError`），在 `finally` 里
+按 `abort_action` 回滚或保留 checkpoint、写终态、发 END，最后清掉 `finalizing`。新 run 的 worker
+在 `try_start` 之前 `wait_for_prior_finalizing`（§5.6）——所以 rollback 之后的新一轮，
+一定是从回滚完的 checkpoint 开始的。
+
+还有一个边角：登记之后如果还有 await，调用方在那个 await 上被取消，刚准入、还没人看见的新 run
+就会永远挂在 pending。M3 的做法是让这个窗口不存在：准入第 5 步之后直接返回。这是一条靠纪律维持的
+性质——M9 如果要在这里加"通知远端 owner"之类的 await，就必须同时加上补偿：
+
+```python
+try:
+    await self._notify_remote_owners(superseded)       # M9 才有的 await
+except asyncio.CancelledError:
+    cleanup = asyncio.create_task(self._close_unseen_admission(record))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)              # 调用方反复被取消，也要等补偿跑完
+        except asyncio.CancelledError:
+            pass
+    raise
+```
+
+`_close_unseen_admission` 把新行用 `update_status(interrupted)` 收掉，再从内存摘除。同一套补偿
+也适用于准入第 3 步：SQL 实现的插入可能在调用方被取消时已经提交。M3 的内存 store 在那一步
+没有让出点，不会发生；M4 要把插入 shield 住，插入成功就走这段补偿。
 
 ### 5.6 `try_start`：启动栅栏
 
@@ -1334,37 +1740,276 @@ store.start_run() CAS             →  False 则当作已取消
 `start_run` 里"准入和挂 task 之间不许 await"的纪律，配合这个栅栏，
 保证了 pending 阶段的取消能在**模型调用之前**生效。
 
+```python
+class RunStartOutcome(StrEnum):
+    started = "started"
+    cancelled = "cancelled"
+
+
+class RunStartupError(RuntimeError):
+    """store 没法确认启动结果。worker 按 error 收尾。"""
+
+
+async def try_start(self, run_id: str) -> RunStartOutcome:
+    async with self._lock:
+        record = self._runs.get(run_id)
+    if record is None:
+        raise RunStartupError(f"Cannot start unknown run {run_id}")
+    async with record.start_lock:
+        async with self._lock:                                   # ① 不做 IO 就能拒掉的先拒
+            if record.abort_event.is_set() or record.status is not RunStatus.pending:
+                return RunStartOutcome.cancelled
+        try:
+            started = await self._store.start_run(run_id)        # ② CAS，在管理器锁外
+        except Exception as exc:
+            raise RunStartupError(f"Failed to start run {run_id}") from exc
+        async with self._lock:                                   # ③ CAS 期间到达的取消
+            if started and not record.abort_event.is_set():
+                _transition_locked(record, RunStatus.running)
+                return RunStartOutcome.started
+            if not started:                                      # store 说它已经不是 pending
+                _transition_locked(record, RunStatus.interrupted)
+                record.abort_event.set()
+                return RunStartOutcome.cancelled
+        # CAS 把行改成了 running，但取消先到：补写 interrupted，兜住 cancel 那次写 store 失败的情况
+        await self._store.update_status(run_id, RunStatus.interrupted)
+        return RunStartOutcome.cancelled
+```
+
+**store 抛异常不能当成 cancelled。** CAS 可能已经提交、行已经是 running；当成取消直接返回，
+就留下一行没人收尾的 running。抛 `RunStartupError`，worker 走 error 收尾（§6.2），`complete`
+的 CAS 不管 store 行是 pending 还是 running 都能把它收掉。
+
+#### 启动失败、等前一个收尾
+
+```python
+async def fail_start_if_pending(self, run_id: str, *, error: str) -> bool:
+    async with self._lock:
+        record = self._runs.get(run_id)
+        if record is None or record.status is not RunStatus.pending:
+            return False                         # 已经启动的交给 worker 自己的收尾路径
+        _transition_locked(record, RunStatus.error, error=error)
+        record.abort_event.set()                 # 随后的 try_start 走 cancelled
+    await self._store.update_status(run_id, RunStatus.error, error=error)
+    return True
+
+
+async def wait_for_prior_finalizing(
+    self, thread_id: str, run_id: str, *, abort_event: asyncio.Event | None = None, poll_interval: float = 0.01
+) -> None:
+    while True:
+        async with self._lock:
+            prior: list[RunRecord] = []
+            for record in self._thread_records_locked(thread_id):
+                if record.run_id == run_id:
+                    break
+                prior.append(record)
+            else:
+                return                           # 自己已不在登记表里，没什么可等
+            if not any(r.finalizing for r in prior):
+                return
+        if abort_event is not None and abort_event.is_set():
+            return                               # 自己被取消了就别等，交给 try_start 去拒
+        await asyncio.sleep(poll_interval)
+```
+
+`fail_start_if_pending` 置 abort 那一行是 §4.6 能成立的前提：worker 第 0 步严格校验失败后照常进
+`run_agent`，靠的就是 `try_start` 看到这一位直接返回 cancelled、不组图。
+
+"更早"按 `_runs_by_thread` 的插入顺序判断，这就是它用有序 dict 而不是 `set` 的原因。只等排在
+自己前面的：排在后面的 run 在收尾，与这一轮无关。轮询间隔 10 ms——收尾窗口很短，而换成
+`Condition` 需要每一次写 `finalizing` 都经过通知，§6.2 的骨架是直接赋值的。
+§6.2 骨架调用这个方法时要传 `run_id` 和 `abort_event=record.abort_event`。
+
+#### 运行中的快照与收尾
+
+```python
+@dataclass(frozen=True, slots=True)
+class RunTotals:
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    llm_call_count: int = 0
+    lead_agent_tokens: int = 0
+    subagent_tokens: int = 0
+    middleware_tokens: int = 0
+    token_usage_by_model: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        attributed = self.lead_agent_tokens + self.subagent_tokens + self.middleware_tokens
+        total = self.total_input_tokens + self.total_output_tokens
+        if attributed != total:
+            logger.error("Token attribution %d does not add up to total %d", attributed, total)
+
+
+async def update_run_progress(self, run_id: str, totals: RunTotals) -> None:
+    async with self._lock:
+        record = self._runs.get(run_id)
+        if record is None or record.status is not RunStatus.running:
+            return
+        _apply_totals(record, totals)
+    await self._store.update_run_progress(run_id, **asdict(totals))
+
+
+async def complete(
+    self, run_id: str, *, status: RunStatus, error: str | None = None, totals: RunTotals | None = None
+) -> bool:
+    """worker 收尾的唯一出口。返回 False 表示终态已经被别人定了（多半是取消）。"""
+    if status in _ACTIVE:
+        raise ValueError(f"complete() needs a terminal status, got {status}")
+    async with self._lock:
+        record = self._runs[run_id]
+        won = _transition_locked(record, status, error=error)
+        if totals is not None:
+            _apply_totals(record, totals)
+        final_status, final_error = record.status, record.error      # 输了就是赢家的终态
+    written = await self._store.update_run_completion(
+        run_id, status=final_status, error=final_error, **(asdict(totals) if totals else {}),
+    )
+    return won and written
+```
+
+- **分解对不上只打 error，不抛。** "三个维度之和等于总数"是记账的不变量（§5.1），但收尾路径上的
+一次记账 bug 不该让终态写不进去。测试里把这条日志当失败。
+- **输给取消也要把 token 写进去。** 被取消的 run 同样花了钱。用赢家的终态去写，store 的
+"同一个终态可以写两遍"正好放行，而"换成另一个终态"被拒——这就是 §9.3 说的"已经被接受的取消，
+不能被后到的 success 覆盖"。
+- **终态和汇总一次写完。** 分两次写，中间崩溃会留下"终态有了、token 全是 0"的行，账单少算。
+- `complete` 不碰 `finalizing`、END、cleanup：那是 worker 嵌套 `finally` 的事（§6.2）。
+§6.2 骨架里的 `_finalize(...)` 就是调这个方法，之后再 `schedule_cleanup`（§5.8）。
+
 ### 5.7 幂等键必须加 scope
 
 ```python
-scoped_key = hash(f"{owner_id}:{thread_id}:{raw_key}")
+# §4.5 的 scope_idempotency_key：在 start_run 里做，所有入口共用
+scoped_key = "run:" + sha256("\0".join((caller.kind, caller.user_id or "", thread_id, raw_key)))
+```
+
+```sql
+CREATE UNIQUE INDEX ON runs (idempotency_key) WHERE idempotency_key IS NOT NULL;
 ```
 
 store 上的幂等索引是**进程全局**的。直接用客户端传来的 `Idempotency-Key`，
 两个不同用户用了同一个字符串（比如 `"1"`）就会串号——A 的重试拿到 B 的 run。
 
-命中已有 key 时返回那条记录并设 `idempotency_reused=True`。
-**调用方看到这个标志就不能再** `create_task`，否则同一个 run 会跑两遍。
+命中已有 key 时返回那条记录并设 `idempotency_reused=True`（§5.4 第 1 步，以及第 3 步失败后的复查）。
+**调用方看到这个标志就不能再** `create_task`，否则同一个 run 会跑两遍。start_run 判断"是不是复用"
+比对的是预分配的 `run_id`，不读这个标志（§4.5）：标志挂在共享记录上、置位后不复原，
+只适合"这条记录被复用过"这类观察。
 
-如果重试的 `input` 和第一次不一致，路由层返回 409——这说明客户端复用了 key 但改了内容，
-是 bug 不是重试。
+如果重试的 `input` 和第一次不一致，start_run 抛 `IdempotencyKeyReused`，路由编成 409（§4.5）——
+这说明客户端复用了 key 但改了内容，是 bug 不是重试。
+
+键跟着 run 行走：行还在，键就一直有效；M4 的保留策略清掉 runs 行时，键随之失效。
+索引只管非空键，没带 `Idempotency-Key` 的请求不受影响。
 
 ### 5.8 结束后延迟 GC
 
 ```python
-await run_manager.cleanup(run_id, delay=300)
+def schedule_cleanup(self, run_id: str) -> None:
+    task = asyncio.create_task(
+        self._cleanup_after(run_id, self._retention_seconds),
+        context=contextvars.Context(),           # 空 context：不攥住请求的 user / trace
+    )
+    self._cleanup_tasks.add(task)                # 事件循环只弱引用 task，这里留强引用
+    task.add_done_callback(self._cleanup_tasks.discard)
+
+
+async def _cleanup_after(self, run_id: str, delay: float) -> None:
+    await asyncio.sleep(delay)
+    async with self._lock:
+        record = self._runs.get(run_id)
+        if record is None:
+            return
+        if record.status in _ACTIVE or record.finalizing:
+            logger.warning("Refusing to clean up active run %s", run_id)
+            return
+        self._unindex_run_locked(record)
 ```
 
 run 结束后不要立刻从内存注册表摘掉。晚到的 `/join` 请求（用户刚好在这时刷新页面）
-需要拿到 live 引用才能读到完整的结束状态。5 分钟是个够用的经验值。
+需要拿到 live 引用才能读到完整的结束状态。5 分钟（`retention_seconds`）是个够用的经验值。
+
+- **调度，不 await。** 早先的写法是在 worker 里 `await run_manager.cleanup(run_id, delay=300)`，
+那会让 worker task 在 run 结束后再活 5 分钟：关机排空（§6.3）要等它，`asyncio.gather` 以为 run 还在跑。
+- **空 context。** `create_task` 默认复制当前 context，延迟任务会把请求的 user、trace 这些 ContextVar
+攥住 5 分钟，连同它们引用的对象。
+- **只摘终态且不在收尾的。** 活记录被摘掉，准入的本地占位检查（§5.4 第 2 步）就看不见它，thread 会被当成空闲。
+- **store 里的行不删。** run 历史本来就该留着（`list_by_thread`）。内存 store 的行随进程重启消失；
+M4 的持久行归保留策略管。
+- `shutdown` 时取消所有还没到点的 cleanup：进程要退出了，内存本来就要整个丢掉。
+
+### 5.9 `cancel()` 与关机
+
+§9 讲取消的协议和 HTTP 映射，这里只讲 RunManager 里改了什么。
+
+```python
+class CancelOutcome(StrEnum):
+    cancelled = "cancelled"
+    not_active_locally = "not_active_locally"
+    not_cancellable = "not_cancellable"
+    unknown = "unknown"
+    requested = "requested"          # M9
+    taken_over = "taken_over"        # M9
+
+
+async def cancel(self, run_id: str, *, action: Literal["interrupt", "rollback"] = "interrupt") -> CancelOutcome:
+    async with self._lock:
+        record = self._runs.get(run_id)
+        if record is not None:
+            if record.status is RunStatus.interrupted and record.abort_event.is_set():
+                return CancelOutcome.cancelled                   # 重复取消：幂等
+            if record.status not in _ACTIVE:
+                return CancelOutcome.not_cancellable
+            _abort_locked(record, action=action)                 # 和顶替旧 run 是同一件事（§5.5）
+    if record is None:
+        row = await self._store.get(run_id, user_id=None)        # 属主已由路由用 get(..., user_id=) 查过
+        if row is None:
+            return CancelOutcome.unknown
+        return CancelOutcome.not_active_locally if row["status"] in ACTIVE_STATUSES else CancelOutcome.not_cancellable
+    await self._store.update_status(run_id, RunStatus.interrupted)
+    return CancelOutcome.cancelled
+```
+
+**取消立刻写** `interrupted`**，不等 worker。** worker 可能卡在一次不理会取消的工具调用里；
+等它自己写的话，用户点了停止，界面上却一直是 running。`_abort_locked` 同时置上 `finalizing`，
+所以在 worker 真正退出之前，这条 thread 在本进程里仍然是占着的（§5.2）。
+
+**胜负在锁内决出，store 只负责落盘。** 取消和完成各自先在管理器锁内做内存迁移：先到的赢，
+后到的 `_transition_locked` 返回 `False`。锁外的 store 写入带的永远是内存胜者的终态
+（`complete` 输了就写赢家的状态，§5.6），所以两次写入谁先落盘都不影响结果。
+这是 §9.3"取消不被后到的 success 覆盖"在单进程里的实现；跨进程由 M9 的 CAS 接手。
+
+M3 只会产生前四种结果，和 §9.2 的表对应：本进程内存里有、还活着 → `cancelled`；
+内存里有、已终态 → `not_cancellable`；内存里没有、store 里还活着（M3 单进程下只可能是重启前留下的孤儿）
+→ `not_active_locally`；哪里都没有 → `unknown`。
+
+```python
+async def shutdown(self, *, timeout: float) -> None:
+    """§6.3 的第一步：拒新准入，再让 run 自己停，超时再强制。之后 lifespan 才能关 checkpointer。"""
+    async with self._lock:
+        self._closing = True
+        live = [r for r in self._runs.values() if r.status in _ACTIVE and r.task is not None and not r.task.done()]
+        for record in live:
+            record.abort_action = "interrupt"
+            record.abort_event.set()
+            if record.status is RunStatus.running:
+                record.task.cancel()                             # pending 只置 abort（§4.6）
+    if live:
+        _, stuck = await asyncio.wait([r.task for r in live], timeout=timeout)
+        for task in stuck:
+            task.cancel()                                        # 强制：§4.6 说的唯一例外
+        if stuck:
+            await asyncio.wait(stuck, timeout=1.0)
+    for task in list(self._cleanup_tasks):
+        task.cancel()
+```
+
+关机**不替 worker 写终态**：只置 abort，由 worker 的 `finally` 走正常收尾（写 `interrupted`、发 END）。
+超时后还没退出的 task 被强制取消，它们留下的活跃行由下次启动时的孤儿回收收掉（§13、M4 `recover_inflight_runs`）。
 
 ---
 
-
-
 ## 6. Worker（W2）
-
-
 
 ### 6.1 阶段
 
@@ -1383,9 +2028,165 @@ run_after_metadata(record)      尽量补 thread_meta（可被 abort 打断）
          9. finally: ★ publish_end ★
 ```
 
-第 6 步的 `RunContext` 用一个 dataclass 打包基础设施（checkpointer、thread_store、
-event_store、回调），不要让 `run_agent` 的参数列表随阶段增长无限变长。
-M4–M10 每个阶段都会往里加东西。
+
+| #   | 阶段                                           | 失败 / 取消时                                          | 终态                               |
+| --- | -------------------------------------------- | ------------------------------------------------- | -------------------------------- |
+| 0   | `run_after_metadata` 补 thread 行（§4.6）        | 只告警；严格模式 → `fail_start_if_pending`                | ——                               |
+| 1   | `wait_for_prior_finalizing`                  | 自己被 abort 就不再等                                    | ——                               |
+| 2   | `try_start`                                  | cancelled → 直接 `return`                           | `interrupted`（或第 0 步写下的 `error`） |
+| 3   | thread 状态 → running                          | 抛 → 走 except                                      | `error`                          |
+| 4   | 捕获回滚点（§6.4）                                  | 捕获失败只告警，run 照跑，之后的 rollback 退化成 interrupt         | ——                               |
+| 5   | publish `metadata`                           | 抛 → 走 except                                      | `error`                          |
+| 6   | `_call_agent_factory` + `unwrap_agent_graph` | 抛 → 走 except（多半是模型配置坏了）                           | `error`                          |
+| 7   | astream：解包 → 序列化 → publish                   | abort → `interrupted`；超时 → `timeout`；异常 → `error` | 见左                               |
+| 8   | `_finalize`：回滚、终态、投影                         | 每一步单独兜底，互不连累                                      | ——                               |
+| 9   | END                                          | 内层 `finally`，不会被跳过                                | ——                               |
+
+
+`run_agent` 只收四个参数：桥、RunManager、记录、`RunContext`。M4–M10 每个阶段都会往里加东西，
+加在 `RunContext` 上，不加在参数列表上。
+
+```python
+# agentkit/runtime/context.py
+_PER_RUN_FIELDS = frozenset({"app_config", "agent_factory", "run_config", "graph_input", "stream_modes"})
+
+
+@dataclass(frozen=True, slots=True)
+class RunContext:
+    # --- 进程级：lifespan 建一次 ---
+    checkpointer: BaseCheckpointSaver           # M1 §5 的 provider；M3 是内存 saver，M4 换 SQL
+    thread_store: ThreadMetaStore
+    event_store: RunEventStore | None = None    # M4
+
+    # --- 每 run：start_run 用 for_run() 填（§4.2），进程级那份上恒为缺省值 ---
+    app_config: AppConfig | None = None         # 入口取的快照
+    agent_factory: AgentFactory | None = None
+    run_config: dict | None = None
+    graph_input: Any = None
+    stream_modes: tuple[str, ...] = ()          # 公开名；映射成 LangGraph 名在 §6.2
+
+    def for_run(self, **per_run: Any) -> RunContext:
+        if missing := _PER_RUN_FIELDS - per_run.keys():
+            raise TypeError(f"for_run() missing per-run fields: {sorted(missing)}")
+        if extra := per_run.keys() - _PER_RUN_FIELDS:
+            raise TypeError(f"for_run() cannot override infrastructure: {sorted(extra)}")
+        return dataclasses.replace(self, **per_run)
+```
+
+- `frozen`：进程级那份被所有 run 共享，worker 改一个字段就改到了别人的 run。
+- `for_run` **两头都卡**：少给一个每 run 字段，worker 要到第 6 步才会因为 `None` 报一个莫名其妙的错；
+多给一个基础设施字段，一个 run 就能悄悄换掉自己的 checkpointer。两种都在构造时拒绝。
+- **checkpointer 要传给工厂。** M1 §3.1 写的是"M1/M3 阶段不传 checkpointer"，但 M3 的 `/state`、
+回滚点（§6.4）和经 HTTP 的多轮对话都依赖它。这里传进程级的内存 saver，M4 换成 SQL saver 时
+这一行不用动。
+
+两个运行参数本阶段加进 `AppConfig`，和 §4.4 的 `max_recursion_limit` 一起：
+
+```python
+# agentkit/config/runs_config.py
+class RunsConfig(BaseModel):
+    timeout_seconds: float | None = Field(default=None, gt=0)      # 整轮执行的上限；None = 不限
+    shutdown_timeout_seconds: float = Field(default=10.0, gt=0)    # §6.3 排空时等 worker 的时间
+```
+
+`timeout_seconds` 从每 run 的 `app_config` 快照里读，改 YAML 对下一个 run 生效；
+`shutdown_timeout_seconds` 在关机那一刻读当前配置。两者都不是 STARTUP_ONLY。
+
+#### `run_agent` 的四个参数
+
+```python
+# agentkit/runtime/runs/worker.py
+AgentFactory = Callable[..., Any]     # 返回 AgentAssembly 或裸图；解包见下
+
+
+async def run_agent(
+    bridge: StreamBridge,
+    run_manager: RunManager,
+    record: RunRecord,
+    ctx: RunContext,
+) -> None:
+    """一条 run 从启动栅栏到 END 的全过程。不返回值：终态写在 store 里，事件写在桥上。"""
+```
+
+
+| 参数            | 类型             | 谁持有             | 生命周期        | worker 对它做什么                                                                                                          |
+| ------------- | -------------- | --------------- | ----------- | --------------------------------------------------------------------------------------------------------------------- |
+| `bridge`      | `StreamBridge` | 进程（lifespan）    | 进程级         | `publish` / `publish_end`；不 `create`、不按订阅者计数取消                                                                        |
+| `run_manager` | `RunManager`   | 进程              | 进程级         | `wait_for_prior_finalizing` / `try_start` / `complete` / `update_run_progress` / `has_later_run` / `schedule_cleanup` |
+| `record`      | `RunRecord`    | 本 run 的 live 对象 | 准入到 cleanup | 读 `run_id` / `thread_id` / `abort_event` / `abort_action` / `status`；**不**改 `status`（只经 manager）                      |
+| `ctx`         | `RunContext`   | `for_run()` 的快照 | 本 run       | 读五个每 run 字段 + 进程级 `checkpointer` / `thread_store`                                                                     |
+
+
+`ctx.run_config` 是 §4.2 第 11 步写好的那份，worker 不再过白名单、不再碰 `secrets`：
+
+```python
+# start_run 交给 worker 的 run_config（密钥已剥离）
+{
+    "configurable": {"thread_id": str, "user_id": str | None, ...},   # 无 secrets
+    "context": {...},                                                # 服务端键已注入（M1 §3.3）
+    "recursion_limit": int,                                          # 已按 max_recursion_limit 钳制
+    "callbacks": list | None,                                        # 可选；M1 的追踪回调挂在这里
+}
+```
+
+`ctx.graph_input` 是第 9 步规范化后的图输入：`{"messages": [...]}`，或 M6 才启用的 `Command`。
+`ctx.stream_modes` 是公开名的元组（`("values", "messages-tuple")`），映射成 LangGraph 名在 §6.2。
+
+#### 组图：工厂签名与解包
+
+M1 §3.1 的工厂有三层。worker 调的是第 2 层，拿到的可能是 `AgentAssembly`，也可能是第三方测试工厂返回的裸图：
+
+```python
+# agentkit/agents/lead_agent/agent.py（M1 已定；这里只写 worker 怎么调）
+def assemble_agent(
+    config: dict,
+    *,
+    app_config: AppConfig | None = None,
+    checkpointer: Any | None = None,
+) -> AgentAssembly: ...
+
+
+def unwrap_agent_graph(result: Any) -> Any:
+    """对 AgentAssembly 取 .graph；对裸图是恒等。按类型判断，不 duck-type .graph。"""
+    return result.graph if isinstance(result, AgentAssembly) else result
+
+
+def _call_agent_factory(factory: AgentFactory, run_config: dict, *, app_config, checkpointer) -> Any:
+    """第三方 / 测试工厂可能不收 app_config、checkpointer；按签名传，不盲传。"""
+    params = inspect.signature(factory).parameters
+    kwargs: dict[str, Any] = {}
+    if "app_config" in params:
+        kwargs["app_config"] = app_config
+    if "checkpointer" in params:
+        kwargs["checkpointer"] = checkpointer
+    return factory(run_config, **kwargs)
+```
+
+- **checkpointer 一定要传（工厂收的话）。** M1 §3.1 写过"M1/M3 阶段不传"，但那是当时还没有 `/state` 和回滚。
+M3 的多轮对话、`GET /state`、§6.4 的回滚点都靠这份进程级 saver。不传，每次 `astream` 都是无状态的，
+thread_id 只剩文件隔离（M2）的意义。
+- **解包按** `isinstance(AgentAssembly)`**，不按** `hasattr(result, "graph")`**。** 一张裸图碰巧带 `.graph`
+属性就会被拆错。
+- **工厂抛异常就是第 6 步失败**，走 `error` 终态。常见原因是模型配置坏了、白名单里的模型在装配时才发现不可用。
+不要在 worker 里再调一次 `create_agent` 绕过工厂——那会漏掉中间件和提示词。
+
+#### worker 不准做的事
+
+这些和 §4 / §5 的纪律对称，散进实现里就会长出第二条执行栈：
+
+
+| 不准                                                        | 为什么                                                   |
+| --------------------------------------------------------- | ----------------------------------------------------- |
+| `from fastapi import ...` / 抛 `HTTPException`             | worker 在 harness 层；HTTP 映射是路由的事                       |
+| `await record.task`                                       | 那就是自己。写成这样会自死锁                                        |
+| 调 `create_or_reject` / `cancel` / `fail_start_if_pending` | 准入和取消是 manager / start_run 的事；worker 只认 `abort_event` |
+| `record.status = ...`                                     | 终态只经 `_transition_locked`（§5.2）                       |
+| 吞 `CancelledError`                                        | lifespan 的 `asyncio.wait` 会以为 task 正常结束               |
+| `await` 桥清理或 `schedule_cleanup` 的延迟                       | worker 会多活 60 秒 / 5 分钟，关机排空被拖死                        |
+| `graph.astream(..., subgraphs=True)`                      | 子图 `values` 漏进主线程会污染会话视图（§13）；M8 才开，且事件名必须带 namespace |
+| 在模型实例上再挂一份 `UsageCollector`                               | 重复计数 + 重复 span（M1 §3.6）                               |
+| 自己 `get_checkpointer()` / `get_app_config()`              | 用 `ctx` 里那份快照；入口解析一次（M1 §3.1）                         |
+
 
 ### 6.2 `finally` 里必须 `publish_end`
 
@@ -1399,52 +2200,85 @@ M4–M10 每个阶段都会往里加东西。
 #### 骨架：`publish_end` 要在最内层的 finally
 
 ```python
-async def run_agent(bridge, run_manager, record, ctx: RunContext) -> None:
-    run_id = record.run_id
+class RunAborted(Exception):
+    """worker 在检查点上发现 abort_event 已置位。"""
+
+    def __init__(self, action: str) -> None:
+        super().__init__(action)
+        self.action = action
+
+
+STREAM_RETENTION_SECONDS = 60.0      # END 之后桥缓冲再留多久，给晚到的 /join 续传（§7）
+
+
+async def run_agent(bridge: StreamBridge, run_manager: RunManager, record: RunRecord, ctx: RunContext) -> None:
+    run_id, thread_id = record.run_id, record.thread_id
+    terminal, error, error_type = RunStatus.interrupted, None, None   # try_start 拒绝、提前 return 时的终态
+    rollback: RollbackPoint | None = None
+    usage = UsageCollector(run_manager, run_id)                        # §6.5
+    deadline: asyncio.Timeout | None = None
+    timeout_s: float | None = None
     try:
-        await run_manager.wait_for_prior_finalizing(record.thread_id)
+        await run_manager.wait_for_prior_finalizing(thread_id, run_id, abort_event=record.abort_event)
 
         if await run_manager.try_start(run_id) is RunStartOutcome.cancelled:
             return                                    # 不组图。END 由 finally 负责
 
-        await ctx.thread_store.set_status(record.thread_id, "running")
-        rollback_point = await _capture_checkpoint_head(ctx, record.thread_id)
+        await ctx.thread_store.set_status(thread_id, "running")        # §5.2：启动成功之后才写
+        rollback = await capture_rollback_point(ctx, thread_id)          # §6.4；捕获失败返回 None
+        await bridge.publish(run_id, "metadata", {"run_id": run_id, "thread_id": thread_id})
 
-        await bridge.publish(run_id, "metadata", {"run_id": run_id, "thread_id": record.thread_id})
-
-        assembly = assemble_agent(ctx.run_config, app_config=ctx.app_config)
-
-        async for mode, chunk in assembly.graph.astream(
-            ctx.graph_input, config=ctx.run_config, stream_mode=ctx.stream_modes
-        ):
-            if record.abort_event.is_set():           # ★ 每一轮都查
-                raise RunAborted(record.abort_action)
-            for event, data in translate_chunk(mode, chunk):
-                await bridge.publish(run_id, event, data)
-
+        _install_runtime(ctx.run_config, record)                         # ToolRuntime.context 靠它
+        assembly = _call_agent_factory(
+            ctx.agent_factory, ctx.run_config,
+            app_config=ctx.app_config, checkpointer=ctx.checkpointer,
+        )
+        graph = unwrap_agent_graph(assembly)
+        timeout_s = ctx.app_config.runs.timeout_seconds if ctx.app_config is not None else None
+        deadline = asyncio.timeout(timeout_s)                            # 从这里开始计时；None = 不限
+        async with deadline:
+            await _stream_graph(bridge, record, ctx, graph, usage)        # ★ 每一帧都查 abort
         terminal, error = RunStatus.success, None
 
-    except RunAborted as aborted:
+    except RunAborted:
         terminal, error = RunStatus.interrupted, None
-        if aborted.action == "rollback":
-            await _restore_checkpoint(ctx, record.thread_id, rollback_point)
     except asyncio.CancelledError:
         terminal, error = RunStatus.interrupted, None
         raise                                          # 不吞，但终态要写
+    except TimeoutError as exc:
+        if deadline is not None and deadline.expired():
+            terminal, error_type = RunStatus.timeout, "TimeoutError"
+            error = f"Run exceeded {timeout_s}s"
+        else:                                          # 图里别处抛的内置 TimeoutError，不是整轮超时
+            terminal, error, error_type = RunStatus.error, _public_error(exc), type(exc).__name__
     except Exception as exc:
-        terminal, error = RunStatus.error, str(exc)
+        terminal, error, error_type = RunStatus.error, _public_error(exc), type(exc).__name__
         logger.exception("Run %s failed", run_id)
 
     finally:
         record.finalizing = True
         try:
-            # 收尾可能很多：写终态、标题生成、token 汇总、事件账本落盘（M4）。
-            # 这里面任何一步都可能抛。
-            await _finalize(run_manager, record, ctx, terminal, error)
+            # 收尾可能很多：回滚、写终态、token 汇总、事件账本落盘（M4）、标题投影（M6）。
+            # 每一步都可能抛，_finalize 自己逐步兜底（见下）。
+            await _finalize(
+                bridge, run_manager, record, ctx,
+                terminal=terminal, error=error, error_type=error_type, rollback=rollback, usage=usage,
+            )
         finally:
             # ★ 无论收尾成功与否，流必须结束。
             await bridge.publish_end(run_id)
             record.finalizing = False
+            run_manager.schedule_cleanup(run_id)                         # §5.8：5 分钟后摘内存记录
+            spawn_detached(bridge.cleanup(run_id, delay=STREAM_RETENTION_SECONDS))
+
+
+_PUBLIC_ERROR_MAX_CHARS = 2000
+
+
+def _public_error(exc: BaseException) -> str:
+    """会进 runs.error、error 帧，并被 API 回显：只要类型名和截断后的消息，不带 traceback。"""
+    message = str(exc).strip() or type(exc).__name__
+    return f"{type(exc).__name__}: {message[:_PUBLIC_ERROR_MAX_CHARS]}"
 ```
 
 `publish_end` **放在嵌套的内层** `finally`**，不是和收尾逻辑并列。** 这是全节最重要的一行结构。
@@ -1460,19 +2294,164 @@ lifespan 的排空逻辑以为这个 task 正常结束了。但也不能只 `rai
 
 `try_start` **返回 cancelled 时直接** `return`**，不是** `raise`**。** 这条路径是"这个 run 在组图之前
 就被取消了"，是预期内的正常流程。`finally` 仍然会跑，`publish_end` 仍然会发——订阅者收到
-一个只有 metadata 和 end 的流，这是对的。
+一个只有 end 的流，这是对的——`metadata` 帧在第 5 步，排在启动栅栏之后，没启动的 run 不假装自己开始过。
+
+**回滚不在 except 里做，挪到** `_finalize`**。** 早先的骨架只在 `except RunAborted` 分支里回滚。可是
+§5.9 的 `cancel()` 对 running 的 run 会 `task.cancel()`，worker 收到的多半是 `CancelledError` 而不是
+`RunAborted`——rollback 就这样被跳过了，而且只在"用户点了回滚、模型正在一次长调用里"这种组合下出现。
+收尾时按 `record.abort_event` 和 `record.abort_action` 判断，两条路径都覆盖。
+
+**超时要看** `deadline.expired()`**。** HTTP 客户端、沙箱调用抛出的内置 `TimeoutError` 同样会落进这个
+except；只有 deadline 自己到期才是 `timeout` 终态，其余照普通 `error` 处理。deadline 在组完 agent
+之后才建：`asyncio.timeout()` 在构造时就开始计时，放在函数开头的话，等前一个 run 收尾的时间也算进去了。
+
+**每个 except 分支只算终态，不做 IO。** 写 store、发帧都集中在 `_finalize`。在 except 里做 IO，
+那次 IO 自己抛的异常会盖掉原来的异常，而且同一段逻辑要在四个分支里各写一遍。
+
+**两个 cleanup 都是调度出去的，不 await。** 桥的缓冲留 60 秒（重放窗口，给晚到的 `/join` 续传），
+RunRecord 留 5 分钟（状态窗口，§5.8），长短不同、用途不同。await 其中任何一个，worker task
+都要多活那么久。
+
+**收尾期间再来的** `CancelledError` **不要** `uncancel()`**。** DeerFlow 后来给 finalize IO 加了
+`task.uncancel()`，因为回滚和账本落盘可能要几秒，关机强制阶段会把这段 IO 打断。M3 的收尾短
+（回滚 + `complete` + 投影），`_best_effort` 只接 `Exception`，强制取消会穿过收尾、落到内层
+`finally` 发 END。`uncancel()` 会让 lifespan 的 `asyncio.wait` 以为 task 正常结束，而它其实
+还在写 checkpoint——关机顺序就乱了。M4 账本变长之后再单独做可中断的收尾，不要提前引入。
+
+**第 3 步** `thread_store.set_status("running")` **失败就让 run 失败。** 此时 `try_start` 已经把
+RunStore 写成 running；except 走 `complete(error)`，两边重新对齐。M4 的 SQL thread_store
+若把这一步改成 best-effort，要在同一条注释里写清"RunStore 已是 running、侧栏可能还是 idle"。
+
+#### Runtime 注入
+
+LangGraph CLI / Server 调图时会自己建 `Runtime`。worker 走的是 `graph.astream(config=...)`，
+不传官方的 `context=` 参数，所以要手动挂：
+
+```python
+def _install_runtime(run_config: dict, record: RunRecord) -> None:
+    """让中间件和工具经 ToolRuntime.context 读到 thread_id / run_id。"""
+    from langgraph.runtime import Runtime
+
+    context = dict(run_config.get("context") or {})
+    context.setdefault("thread_id", record.thread_id)
+    context.setdefault("run_id", record.run_id)
+    run_config["context"] = context
+    runtime = Runtime(context=context, store=None)          # M4 才挂 store
+    run_config.setdefault("configurable", {})["__pregel_runtime"] = runtime
+```
+
+`thread_id` / `run_id` 在 §4.2 第 11 步已经写进 context；这里 `setdefault` 是防御测试工厂
+直接构造 `RunContext`、绕过 `start_run` 的路径。`__pregel_runtime` 是 LangGraph 的内部键，
+双下划线前缀表示运行时通道，用户 context 白名单进不来（M1 §3.3）。
+
+```python
+# agentkit/runtime/tasks.py
+_DETACHED: set[asyncio.Task] = set()
+
+
+def spawn_detached(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+    """不属于任何请求的后台任务：空 context、留强引用（理由同 §5.8）。"""
+    task = asyncio.create_task(coro, context=contextvars.Context())
+    _DETACHED.add(task)
+    task.add_done_callback(_DETACHED.discard)
+    return task
+
+
+def cancel_detached() -> None:
+    for task in list(_DETACHED):
+        task.cancel()
+```
+
+#### `_finalize`：收尾按"终态可见"切成三段
+
+```python
+async def _finalize(
+    bridge: StreamBridge,
+    run_manager: RunManager,
+    record: RunRecord,
+    ctx: RunContext,
+    *,
+    terminal: RunStatus,
+    error: str | None,
+    error_type: str | None,
+    rollback: RollbackPoint | None,
+    usage: UsageCollector,
+) -> None:
+    run_id, thread_id = record.run_id, record.thread_id
+
+    # ① 终态之前：必须在"终态可见"之前落盘的写入
+    if record.abort_event.is_set() and record.abort_action == "rollback":
+        await _best_effort("rollback", restore_rollback_point(ctx, rollback))      # §6.4
+    # M4：事件账本 flush 放在这里
+
+    # ② 终态 + token，一次写完。输给取消时写的是赢家的终态（§5.6）
+    await _best_effort("complete", run_manager.complete(run_id, status=terminal, error=error, totals=usage.totals()))
+    final = record.status
+
+    # ③ 依赖终态的投影
+    if final in (RunStatus.error, RunStatus.timeout):
+        await _best_effort("error frame", bridge.publish(run_id, "error", {
+            "error": error_type or "RunError",
+            "message": record.error or final.value,
+        }))
+    if not await run_manager.has_later_run(thread_id, run_id):
+        await _best_effort("thread status", ctx.thread_store.set_status(thread_id, _thread_status(final)))
+    # M6：从 checkpoint 读 title，投影到 thread 的 display_name；M9：释放租约
+
+
+async def _best_effort(step: str, awaitable: Awaitable[Any]) -> None:
+    try:
+        await awaitable
+    except Exception:
+        logger.exception("Finalize step %r failed", step)
+
+
+def _thread_status(status: RunStatus) -> str:
+    return "error" if status in (RunStatus.error, RunStatus.timeout) else "idle"
+
+
+# RunManager 上的只读辅助（§5 公开方法表里的一行）
+async def has_later_run(self, thread_id: str, run_id: str) -> bool:
+    async with self._lock:
+        run_ids = [r.run_id for r in self._thread_records_locked(thread_id) if r.operation_kind is ThreadOperationKind.run]
+    return run_id in run_ids and run_ids[-1] != run_id
+```
+
+- **为什么按"终态可见"切。** 终态一写，store 行就离开部分唯一索引（§5.3），别的进程可以准入了。
+所以要改 checkpoint 的写入（回滚、M4 的账本）必须在 ② 之前做完；只依赖终态的投影放在 ② 之后。
+- **每一步单独兜底。** 回滚失败不能让终态写不进去，终态写失败不能让 thread 卡在 running。
+`_best_effort` 只接 `Exception`：收尾期间再来一次取消（关机的强制阶段）照样往上抛，
+内层 `finally` 仍然会发 END。
+- `error` **帧看的是** `record.status`**（胜者），不是** `terminal`**。** 取消先到的话，worker 自己撞上的异常
+就不该再报给前端。字段对齐 LangGraph Platform（`error` + `message`），`useStream` 的 `onError`
+拿到的就是它。它必须排在 END 之前：END 之后订阅就结束了。
+- **thread 状态只由同 thread 最后一个 run 写。** interrupt / rollback 顶替时，旧 run 的收尾可能晚于
+新 run 启动；它把 thread 写回 idle，侧栏就显示空闲，而新 run 正在跑。
+- **用户取消投影成** `idle`**，不是** `interrupted`**。** LangGraph Platform 里 thread 的 `interrupted`
+表示"有一个人机确认在等回复"（M6），不是"被用户停了"。
+
+
+| `_finalize` 关键字        | 来源                                     | 收尾怎么用                                                                                                |
+| ---------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `terminal`             | 各 except 分支算出的意图终态                     | 交给 `complete`；取消先到时 manager 会忽略它，改写赢家的状态                                                             |
+| `error` / `error_type` | `_public_error` / `type(exc).__name__` | `error` 进 store；`error_type` 进 error 帧的 `error` 字段。取消获胜时帧不发                                          |
+| `rollback`             | 第 4 步的 `RollbackPoint | None`          | 仅当 `abort_event` 且 `abort_action=="rollback"` 才还原；`None` 抛 `RollbackUnavailable`，被 `_best_effort` 吃掉 |
+| `usage`                | 本 run 的 `UsageCollector`               | `totals()` 和终态一次写入；即使图没跑过（`try_start` 拒绝）也交一份全 0                                                     |
+
 
 #### chunk 到 SSE 事件的翻译
 
-`translate_chunk` 是 M1 §6.2 那套流式契约在服务端的落地，**两边的事件名必须一致**：
+服务端这一侧**不做** M1 §6.2 客户端那套去重和 usage 合并——`useStream` 自己按 id 合并消息，
+token 由 §6.5 的回调统计。worker 只做三件事：解包、序列化、命名。事件名对齐 LangGraph Platform 的 wire：
 
 
-| LangGraph 内部 mode | 发出的 SSE `event` | 说明                                       |
-| ----------------- | --------------- | ---------------------------------------- |
-| `values`          | `values`        | 状态快照                                     |
-| `messages`        | `messages`      | 前端 SDK 认这个名；公开 API 参数名叫 `messages-tuple` |
-| `updates`         | `updates`       | 节点级增量                                    |
-| `custom`          | `custom`        | `StreamWriter` 转发                        |
+| LangGraph 内部 mode                 | 发出的 SSE `event` | 说明                                       |
+| --------------------------------- | --------------- | ---------------------------------------- |
+| `values`                          | `values`        | 状态快照                                     |
+| `messages`                        | `messages`      | 前端 SDK 认这个名；公开 API 参数名叫 `messages-tuple` |
+| `updates`                         | `updates`       | 节点级增量                                    |
+| `custom`                          | `custom`        | `StreamWriter` 转发                        |
+| `debug` / `tasks` / `checkpoints` | 同名透传            | M3 不解释载荷；客户端订了就原样发出                      |
 
 
 **公开参数名和 wire 事件名不是一回事**，`stream_modes.py` 负责这层映射：请求里客户端写
@@ -1480,8 +2459,179 @@ lifespan 的排空逻辑以为这个 task 正常结束了。但也不能只 `rai
 三个名字听起来该统一，但前两个是 LangGraph Platform 已经定下的协议，改了就用不了官方 SDK。
 **把映射关进一个文件，别让它散进 router。**
 
+```python
+# agentkit/runtime/stream_modes.py
+RunStreamMode = Literal[
+    "values", "messages-tuple", "updates", "debug", "tasks", "checkpoints", "custom",
+]
+SUPPORTED_RUN_STREAM_MODES: frozenset[str] = frozenset(get_args(RunStreamMode.__value__))
+
+
+class UnsupportedStreamModeError(ValueError):
+    def __init__(self, modes: list[str]) -> None:
+        self.modes = tuple(dict.fromkeys(modes))          # 去重、保序，给 422 正文用
+        super().__init__(f"Unsupported stream mode(s): {', '.join(self.modes)}")
+
+
+def normalize_stream_modes(raw: list[str] | str | None) -> list[str]:
+    """入口校验：None / [] → ["values"]；str → [str]；未知或非 str → UnsupportedStreamModeError。"""
+    if raw is None:
+        modes = ["values"]
+    elif isinstance(raw, str):
+        modes = [raw]
+    else:
+        modes = raw or ["values"]
+    unsupported = [
+        mode if isinstance(mode, str) else type(mode).__name__
+        for mode in modes
+        if not isinstance(mode, str) or mode not in SUPPORTED_RUN_STREAM_MODES
+    ]
+    if unsupported:
+        raise UnsupportedStreamModeError(unsupported)
+    return modes
+
+
+def to_langgraph_stream_modes(raw: list[str] | str | None) -> list[str]:
+    """公开名 → astream 的内部名。恒返回 list；只把 messages-tuple 换成 messages，其余原样。"""
+    mapped = ["messages" if mode == "messages-tuple" else mode for mode in normalize_stream_modes(raw)]
+    return list(dict.fromkeys(mapped))                    # 去重保序：values + messages-tuple + values → [values, messages]
+```
+
 客户端传了不支持的 mode（`events`、或者内部名 `messages`）要 **422 拒绝，不要静默替换成**
 `values`。静默替换的症状是前端收到完全不同结构的数据，而它以为自己订的是增量。
+`normalize_stream_modes` 在 §4.2 第 3 步已经跑过一遍；worker 再跑是为了把公开名映成内部名，
+并且保证 `astream` 拿到的永远是 list。
+
+#### `_stream_graph` 的参数与 `astream` 关键字
+
+```python
+async def _stream_graph(
+    bridge: StreamBridge,
+    record: RunRecord,
+    ctx: RunContext,
+    graph: Any,
+    usage: UsageCollector,
+) -> None:
+    lg_modes = to_langgraph_stream_modes(ctx.stream_modes)       # messages-tuple → messages，去重；恒为 list
+    callbacks = [*(ctx.run_config.get("callbacks") or ()), usage]
+    config = {**ctx.run_config, "callbacks": callbacks}           # 回调只挂调用根（M1 §3.6）
+    configurable = dict(config.get("configurable") or {})
+    configurable.setdefault("thread_id", record.thread_id)
+    config["configurable"] = configurable
+
+    stream = graph.astream(
+        ctx.graph_input,
+        config=config,
+        stream_mode=lg_modes,
+        subgraphs=False,                                          # §13：M3 关掉；M8 才开
+    )
+    try:
+        async for item in stream:
+            _raise_if_aborted(record)                             # 先查再发：已取消的 run 不再往桥上写
+            mode, chunk, namespace = unpack_stream_item(item)
+            await bridge.publish(
+                record.run_id,
+                sse_event_name(mode, namespace),
+                serialize(chunk, mode=mode),
+            )
+            await usage.maybe_report()                            # §6.5：节流的进度快照
+    finally:
+        await _close_quietly(stream)
+
+
+def _raise_if_aborted(record: RunRecord) -> None:
+    if record.abort_event.is_set():
+        raise RunAborted(record.abort_action)
+```
+
+
+| `astream` 关键字                          | M3 取值                                       | 为什么这样                                                                    |
+| -------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------ |
+| 位置参数 `input`                           | `ctx.graph_input`                           | §4.2 第 9 步规范化后的消息列表或（M6）`Command`                                        |
+| `config`                               | `run_config` + 调用根 callbacks + `thread_id`  | `recursion_limit`、checkpoint 坐标、Runtime 都在这份 config 里                    |
+| `stream_mode`                          | `to_langgraph_stream_modes(...)` 的 **list** | 永远 list，见下                                                               |
+| `subgraphs`                            | `False`                                     | 子图 `values`/`messages` 漏进主线程会覆盖会话视图                                      |
+| `interrupt_before` / `interrupt_after` | **不传**                                      | `RunCreateRequest` 没有这两个字段（`extra="forbid"`）；M6 人机确认走 `Command`，不靠节点中断列表 |
+
+
+worker **不**在这里改 `interrupt_before_nodes` 这类图上的可变属性。工厂每次调用返回一张新图
+（或缓存键命中的同一张，M1 §6.4），往图对象上写会漏到下一个共用这张图的 run。
+
+```python
+def unpack_stream_item(item: Any) -> tuple[str, Any, tuple[str, ...]]:
+    if isinstance(item, tuple) and len(item) == 3:           # subgraphs=True：(namespace, mode, chunk)
+        namespace, mode, chunk = item
+        return str(mode), chunk, tuple(namespace)
+    if isinstance(item, tuple) and len(item) == 2:           # stream_mode 是 list：恒为 (mode, chunk)
+        mode, chunk = item
+        return str(mode), chunk, ()
+    return "values", item, ()                                # 防御：不该走到。单 mode 字符串才会产裸 chunk
+
+
+def sse_event_name(mode: str, namespace: tuple[str, ...]) -> str:
+    return "|".join((mode, *namespace)) if namespace else mode       # 子图帧：values|<ns>（M8）
+
+
+async def _close_quietly(stream: AsyncIterator[Any]) -> None:
+    try:
+        await stream.aclose()
+    except Exception:
+        logger.warning("Failed to close graph stream", exc_info=True)
+```
+
+- `stream_mode` **永远传 list。** LangGraph 对 list 一律产出 `(mode, chunk)`，哪怕只有一个 mode；
+传字符串才产出裸 chunk——而单个 `messages` mode 的裸 chunk 本身又是 `(message, metadata)` 二元组，
+和 `(mode, chunk)` 长得一样，分不出来。`to_langgraph_stream_modes` 保证返回 list，
+这里就不需要 M1 客户端那种"单模式退化"的防御。
+- **先查 abort 再 publish。** 这个检查点只在有帧到达时才有；模型一次长调用期间没有帧，
+这段时间里的取消靠 §5.9 对 running run 的 `task.cancel()` 打断。两者合起来才覆盖所有时刻。
+- **不管怎么离开循环都要** `aclose()`**。** 异常或 abort 跳出 `async for` 时，异步生成器不会立刻关闭，
+要等 GC，而 GC 可能发生在别的 context 里；在那之前，图里进行中的模型请求、checkpointer 写入都挂着。
+关闭失败只告警：这时已经有一个异常在路上（abort、错误或取消），关闭的异常不能盖掉它；
+正常跑完的生成器已经耗尽，`aclose()` 是空操作。
+- **子图帧的事件名带 namespace。** M3 不订阅子图，namespace 恒为空。M8 打开之后，子代理的 `values`
+快照要是用裸 `values` 发出去，SDK 会拿子代理的局部状态覆盖整个会话视图（roadmap M8 第 4 条）。
+
+#### 序列化
+
+```python
+# agentkit/runtime/serialization.py（M1 的嵌入式客户端用同一个）
+def serialize(chunk: Any, *, mode: str) -> Any:
+    if mode == "messages":                               # (message_chunk, metadata) → [message, metadata]
+        message, metadata = chunk
+        return [to_jsonable(message), to_jsonable(metadata) if isinstance(metadata, dict) else {}]
+    if mode == "values" and isinstance(chunk, dict):
+        return {k: to_jsonable(v) for k, v in chunk.items() if not k.startswith("__pregel_")}
+    return to_jsonable(chunk)
+
+
+def to_jsonable(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Mapping):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [to_jsonable(v) for v in obj]
+    if hasattr(obj, "model_dump"):                       # LangChain 消息、pydantic 模型
+        return to_jsonable(obj.model_dump())
+    return str(obj)
+```
+
+- `messages` **帧的 data 是** `[message, metadata]` **两元素数组**，这是 LangGraph Platform 的 wire 形状，SDK 按它解。
+- `values` **只剥** `__pregel_`***。** 那是运行时内部对象，既序列化不了也不该外泄。`__interrupt__` 要留着：
+SDK 从 values 帧里识别中断，M6 的人机确认靠它。
+- `to_jsonable` **最后兜底** `str()`，和 §8 `format_sse` 的 `default=str` 是同一个态度：宁可某个字段
+变成字符串，也不要一次序列化失败把整条流从中间截断。放在这里而不是只靠 `format_sse`，
+是因为 M4 的事件账本拿的也是这份结果。
+- `messages` **的 chunk 必须是二元组。** 不是就按普通对象走 `to_jsonable`，不要假设解包。
+LangGraph 偶发把一条裸 message 交出来时，硬拆会让整轮 `error`，前面已经发出的 delta 全废。
+- **publish 本身抛异常要往上走。** 桥满了会裁旧帧（§7），不会因为慢订阅者反压 worker；
+桥自己坏了（实现 bug）才抛，这时 run 应当 `error`，不是假装还在流。
+
+`metadata` 帧（第 5 步）不走 `_stream_graph`：`useStream` 的 `onCreated` 从
+`Content-Location` 拿 `run_id`，但 SDK 仍要求流里出现一次 `event: metadata`，载荷至少含
+`run_id` 和 `thread_id`。它排在启动栅栏之后、第一帧图输出之前；`try_start` 拒绝的 run 不发
+这帧，订阅者只收到 END。
 
 ### 6.3 关机排空
 
@@ -1491,13 +2641,283 @@ lifespan 的排空逻辑以为这个 task 正常结束了。但也不能只 `rai
 顺序反了的话，LangGraph 内部的 `aput` 会打到已关闭的连接池，
 产生一个关不掉的异常循环，进程无法正常退出。
 
+```python
+# app/gateway/app.py
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.run_services = services = build_run_services(get_app_config())
+    try:
+        yield
+    finally:
+        timeout = get_app_config().runs.shutdown_timeout_seconds
+        await services.run_manager.shutdown(timeout=timeout)          # ① 拒新准入、置 abort、等 worker 收尾（§5.9）
+        cancel_detached()                                             # ② 还没到点的桥缓冲清理，随进程一起丢
+        # M4：关事件账本；M9 §3：停心跳、抽干孤儿回收、停扩展 / 通道 / 调度器
+        await close_checkpointer(services.run_context.checkpointer)    # ③ 最后才关 checkpointer 连接池
+```
+
+- **① 等的是 worker 自己的** `finally`**。** 回滚的 checkpoint 写入、终态、END 都在那里完成；
+只有超时之后才强制取消（§5.9）。被强制取消的 run 留下的活跃行，由下次启动时的孤儿回收收掉
+（M4 `recover_inflight_runs`）。
+- **排空期间拒绝新准入。** `shutdown` 第一件事是置 `_closing`（§5.9），之后 `_admit` 在幂等查找
+之后、占位检查之前抛 `ConflictError`。幂等命中仍返回已有记录：关机那几秒里的重试不该再开新
+run，但同一把 key 的查询还应该拿到原来的那条。否则调度器和 IM 通道在排空窗口里还能塞进新
+run，而它们注定会被强制取消。409 正好落进 M9 §4.6 的"线程忙 → 退回 queued"，调度
+occurrence 会在别的实例或重启之后重跑。
+- `shutdown_timeout_seconds` **要小于部署平台的优雅退出期限。** K8s 的 `terminationGracePeriodSeconds`
+默认 30 秒；排空等得比它久，③ 还没执行进程就被 SIGKILL 了，异常循环照样出现。默认 10 秒留足余量。
+
+### 6.4 回滚点：捕获与还原
+
+```python
+@dataclass(frozen=True, slots=True)
+class RollbackPoint:
+    thread_id: str
+    checkpoint_config: dict | None                       # 运行前 head 的坐标；None = 运行前是空 thread
+    messages: tuple[Any, ...] = ()                       # 运行前的完整消息列表
+    pending_writes: tuple[tuple[str, str, Any], ...] = ()
+
+
+class RollbackUnavailable(RuntimeError):
+    """运行前的状态没有捕获到，回滚无从做起。"""
+
+
+async def capture_rollback_point(ctx: RunContext, thread_id: str) -> RollbackPoint | None:
+    """None 表示捕获失败：之后的 rollback 请求退化成 interrupt（fail-closed）。"""
+    try:
+        head = await ctx.checkpointer.aget_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
+    except Exception:
+        logger.warning("Rollback point capture failed for %s; rollback disabled for this run", thread_id, exc_info=True)
+        return None
+    if head is None:
+        return RollbackPoint(thread_id=thread_id, checkpoint_config=None)
+    checkpoint = head.checkpoint if isinstance(head.checkpoint, Mapping) else {}
+    channels = checkpoint.get("channel_values")
+    if not isinstance(channels, Mapping):
+        logger.warning("Rollback point for %s has no channel_values; rollback disabled", thread_id)
+        return None
+    return RollbackPoint(
+        thread_id=thread_id,
+        checkpoint_config=head.config,
+        messages=tuple(channels.get("messages") or ()),
+        pending_writes=tuple(head.pending_writes or ()),
+    )
+
+
+async def restore_rollback_point(ctx: RunContext, point: RollbackPoint | None) -> None:
+    if point is None:
+        raise RollbackUnavailable("pre-run state was not captured")
+    if point.checkpoint_config is None:
+        await ctx.checkpointer.adelete_thread(point.thread_id)          # 运行前是空 thread：回到空
+        return
+    mutation = build_state_mutation_graph(
+        "rollback_restore",
+        checkpointer=ctx.checkpointer,
+        state_schema=get_thread_state_schema(),                         # M1 ThreadState；M6 中间件加通道时跟
+    )
+    restored = await mutation.aupdate_state(
+        point.checkpoint_config,
+        {"messages": Overwrite(list(point.messages))},
+        as_node="rollback_restore",
+    )
+    for task_id, writes in _group_writes_by_task(point.pending_writes):
+        await ctx.checkpointer.aput_writes(restored, writes, task_id=task_id)
+
+
+def build_state_mutation_graph(
+    node_name: str,
+    *,
+    checkpointer: BaseCheckpointSaver,
+    state_schema: type | dict,
+) -> Any:
+    """只有一个空节点的图，专门用来 aupdate_state。和 agent 图共享通道表，不共享节点。"""
+    from langgraph.graph import StateGraph
+
+    builder = StateGraph(state_schema)
+
+    async def _noop(state: Any) -> dict:
+        return {}
+
+    builder.add_node(node_name, _noop)
+    builder.set_entry_point(node_name)
+    builder.set_finish_point(node_name)
+    return builder.compile(checkpointer=checkpointer)
+
+
+def _group_writes_by_task(
+    pending_writes: tuple[tuple[str, str, Any], ...],
+) -> list[tuple[str, list[tuple[str, Any]]]]:
+    """LangGraph pending_writes 是 (task_id, channel, value)；aput_writes 要按 task 一组。"""
+    grouped: dict[str, list[tuple[str, Any]]] = {}
+    for task_id, channel, value in pending_writes:
+        grouped.setdefault(task_id, []).append((channel, value))
+    return list(grouped.items())
+```
+
+`RollbackPoint` / 两个函数的参数：
+
+
+| 符号                           | 参数                                          | 含义                                                                                     |
+| ---------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `capture_rollback_point`     | `ctx`, `thread_id`                          | 读 `checkpoint_ns=""` 的 head。不收 `checkpoint_id`：回滚的是运行前的 head，不是客户端指定的分叉点               |
+| `restore_rollback_point`     | `ctx`, `point`                              | `point is None` 抛 `RollbackUnavailable`（`_finalize` 的 `_best_effort` 吃掉，退化成 interrupt） |
+| `build_state_mutation_graph` | `node_name`, `checkpointer`, `state_schema` | `node_name` 同时是唯一节点和 `as_node`；schema 必须是 thread 实际用的那份                                |
+| `_group_writes_by_task`      | `pending_writes`                            | 保序：同一 `task_id` 的写入按捕获时的顺序重放                                                           |
+
+
+捕获读的 config 固定为 `{"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}`。
+`checkpoint_ns` 空字符串是根图；写成别的会读到子图的 head，回滚就把主对话还原成子代理的局部状态。
+`messages` 通道缺失时记 `()`，不要当成捕获失败——空 thread 的第一条 run 就没有消息。
+`channel_values` 本身缺失才算捕获失败（返回 `None`）。
+
+- **捕获时机：**`try_start` **之后、组图之前。** 第 1 步的 `wait_for_prior_finalizing` 保证了被顶替的上一个
+run 已经写完它的回滚；更早捕获，拿到的可能是它回滚之前的状态。
+- **分叉，不删除。** 在运行前的 checkpoint 上写一个子 checkpoint，它成为新的 head；被取消的那一轮留在
+历史里，可以审计。只有"运行前是空 thread"才 `adelete_thread`。
+- `Overwrite` **必须有。** `messages` 通道的 reducer 是 `add_messages`，普通更新会把旧列表合并进当前列表，
+而不是替换它。
+- **用只有一个空节点的状态图来写，不用 agent 图。** 用 agent 图 `aupdate_state` 时 `as_node` 选得不对，
+新 head 会带着待执行的任务，下一个 run 一启动就先把它跑了。这个图和 agent 图共享通道表，
+schema 要用 thread 实际的 state schema：M6 的中间件会往里加通道，用基础 `ThreadState` 会把它们静默丢掉。
+- **pending writes 重新挂上。** 运行前 checkpoint 上还没被消费的写入（比如上一轮留下的中断）要跟着还原。
+- **失败都是 fail-closed。** 捕获失败就不回滚、只当 interrupt；还原失败只记日志，终态仍是 `interrupted`。
+用户看到的是"停了，但没回滚"，这比写一半状态、假装回滚成功诚实。
+- M4 的 delta 模式里，原始 checkpoint 不带物化好的消息列表，`channel_values` 读不到完整状态。
+那时捕获要改走 `CheckpointStateAccessor`，还原改成在当前 head 上整体替换——DeerFlow 在这里吃过亏：
+delta 模式下分叉，会把被放弃那一支的写入重放回来。
+
+### 6.5 token 统计
+
+```python
+PROGRESS_REPORT_INTERVAL_SECONDS = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class _Usage:
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0                       # M3 记进桶，不从 input 里扣；M9 账单再拆
+
+    @property
+    def total(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+class UsageCollector(AsyncCallbackHandler):
+    """挂在图的调用根（M1 §3.6）。M3 全部记在 lead；M6 按 middleware: 标签分流，M8 从 ToolMessage 补子代理。"""
+
+    run_inline = True                                    # 见下：并行工具的回调按顺序在事件循环上跑
+
+    def __init__(self, run_manager: RunManager, run_id: str) -> None:
+        self._run_manager, self._run_id = run_manager, run_id
+        self._by_model: dict[str, dict[str, int]] = {}
+        self._calls = 0
+        self._counted_llm_run_ids: set[str] = set()      # LangChain 的 llm run_id，不是 Gateway 的 run_id
+        self._last_report = time.monotonic()
+
+    async def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID | None = None,
+        tags: list[str] | None = None,                   # M3 忽略；M6 认 middleware:* / M8 认 subagent:
+        **kwargs: Any,
+    ) -> None:
+        usage = _extract_usage(response)
+        if usage.total <= 0:
+            return                                       # 等同一次 llm run 的 usage 回放，见下
+        rid = str(run_id) if run_id is not None else None
+        if rid is not None and rid in self._counted_llm_run_ids:
+            return
+        if rid is not None:
+            self._counted_llm_run_ids.add(rid)
+        self._calls += 1
+        model = _model_name(response) or "unknown"
+        bucket = self._by_model.setdefault(model, {"input": 0, "output": 0, "cache_read": 0})
+        bucket["input"] += usage.input_tokens
+        bucket["output"] += usage.output_tokens
+        bucket["cache_read"] += usage.cache_read_tokens
+
+    def totals(self) -> RunTotals:
+        input_tokens = sum(bucket["input"] for bucket in self._by_model.values())
+        output_tokens = sum(bucket["output"] for bucket in self._by_model.values())
+        return RunTotals(
+            total_input_tokens=input_tokens,
+            total_output_tokens=output_tokens,
+            llm_call_count=self._calls,
+            lead_agent_tokens=input_tokens + output_tokens,
+            token_usage_by_model={model: dict(bucket) for model, bucket in self._by_model.items()},
+        )
+
+    async def maybe_report(self) -> None:
+        now = time.monotonic()
+        if now - self._last_report >= PROGRESS_REPORT_INTERVAL_SECONDS:
+            self._last_report = now
+            await self._run_manager.update_run_progress(self._run_id, self.totals())
+
+
+def _extract_usage(response: LLMResult) -> _Usage:
+    """优先 message.usage_metadata；没有再看 llm_output['token_usage']。缺字段当 0。"""
+    input_tokens = output_tokens = cache_read = 0
+    for generation in itertools.chain.from_iterable(response.generations or ()):
+        message = getattr(generation, "message", None)
+        meta = dict(getattr(message, "usage_metadata", None) or {})
+        if not meta:
+            llm_output = getattr(response, "llm_output", None) or {}
+            meta = dict(llm_output.get("token_usage") or llm_output.get("usage") or {})
+            if "prompt_tokens" in meta and "input_tokens" not in meta:
+                meta["input_tokens"] = meta["prompt_tokens"]
+            if "completion_tokens" in meta and "output_tokens" not in meta:
+                meta["output_tokens"] = meta["completion_tokens"]
+        input_tokens += int(meta.get("input_tokens") or 0)
+        output_tokens += int(meta.get("output_tokens") or 0)
+        details = meta.get("input_token_details") or {}
+        if isinstance(details, Mapping):
+            cache_read += int(details.get("cache_read") or 0)
+    return _Usage(input_tokens, output_tokens, cache_read)
+
+
+def _model_name(response: LLMResult) -> str | None:
+    for generation in itertools.chain.from_iterable(response.generations or ()):
+        message = getattr(generation, "message", None)
+        meta = getattr(message, "response_metadata", None) or {}
+        if isinstance(meta, Mapping) and (name := meta.get("model_name") or meta.get("model")):
+            return str(name)
+    return None
+```
+
+
+| 方法 / 字段          | 签名要点                               | 不变量                                                                        |
+| ---------------- | ---------------------------------- | -------------------------------------------------------------------------- |
+| `run_inline`     | 类属性 `True`                         | 回调在触发它的 task 上同步跑完，并行工具不会把 `_calls += 1` 交错成漏计或双计                          |
+| `on_llm_end`     | `response`, `run_id=`, `tags=`     | `tags` M3 不读；`run_id` 是 LangChain 的一次 LLM 调用 id，用来去重                       |
+| `_extract_usage` | 只读 `usage_metadata` / `llm_output` | 不读流里的消息；客户端没订 `messages-tuple` 时流里根本没有 token                               |
+| `totals()`       | 无参，可重入                             | 各桶 `input`/`output` 之和 = `RunTotals` 的两个总数；M3 的 `lead_agent_tokens` = 两者之和 |
+| `maybe_report()` | 无参                                 | 5 秒节流；失败由 `update_run_progress` 自己吞（§5.6 对非 running 静默）                    |
+
+
+- **按** `on_llm_end` **记，不按流里的消息记。** 客户端没订 `messages-tuple` 时，流里根本没有 token 信息；
+M6 中间件自己的模型调用（摘要、标题）也不经过流。
+- **挂在调用根，只挂一份。** 模型实例上再挂一份就会重复计数，还会产生重复的 span（M1 §3.6）。
+- **同一 LangChain** `run_id` **只计一次。** 流式提供商会先打一次 usage 为空的 `on_llm_end`，再回放一次
+带齐 usage 的。先到的空包直接 return，等回放；回放还是空（提供商始终不给 usage）就漏计这一次——
+宁可漏，也不要先加 0 再加实数把 `_calls` 加成 2，或者空包先占了 `run_id` 把后面的实数挡掉。
+所以**空包既不加** `_calls`**，也不进** `_counted_llm_run_ids`。
+- `run_inline = True` **不能省。** `AsyncCallbackHandler` 默认把 `on_llm_end` 调度成独立 task。
+并行工具一开，两个回调会同时跑 `self._calls += 1`，事件循环上的交错读写不是原子的。
+`run_inline` 让回调在 LangChain 触发它的那个点上跑完再继续，记账顺序等于回调触发顺序。
+- **取不到模型名记进** `"unknown"` **桶**，不丢数：总数必须等于各桶之和。
+- `cache_read` **记进桶，不从** `input` **里扣。** `usage_metadata.input_tokens` 已经含缓存命中；
+再减一次账单就少了。M9 要拆价时读桶里的 `cache_read`，不改 M3 的总数不变量。
+- **进度快照 5 秒节流。** 每次模型调用都写一次 store，到 M4 的 SQL 上会被放大；最终值由 `complete`
+一次写定（§5.6），节流丢掉的中间值不影响账单。快照只在有帧到达时才可能触发，模型长时间不出帧的
+那一段不会上报，终态会补上。
+- M3 全部记在 lead 名下，三个维度之和恒等于总数。M6 按 `middleware:*` 标签分到 `middleware_tokens`，
+M8 从子代理的 `ToolMessage.additional_kwargs` 补 `subagent_tokens`，不变量由 `RunTotals` 守（§5.6）。
+
 ---
 
-
-
 ## 7. StreamBridge（W2）
-
-
 
 ### 7.1 为什么需要这层
 
@@ -1604,11 +3024,7 @@ M9 换 Redis 时这个标志变 True，路由逻辑一行不用改。
 
 ---
 
-
-
 ## 8. SSE 层（W2）
-
-
 
 ### 8.1 帧格式
 
@@ -1697,8 +3113,6 @@ async def sse_consumer(bridge, record, request, run_mgr, *, apply_on_disconnect:
                 await run_mgr.cancel(record.run_id)
 ```
 
-
-
 #### 心跳的真实用途不是保活
 
 这一点很容易误解。心跳的常见理由是"防止中间代理掐掉空闲连接"——那确实是收益之一，
@@ -1757,11 +3171,7 @@ sse_consumer(bridge, record, apply_on_disconnect: bool)
 
 ---
 
-
-
 ## 9. 取消（W3）
-
-
 
 ### 9.1 协作式，路由层绝不直接 `task.cancel()`
 
@@ -1781,8 +3191,6 @@ worker 在图的每一轮和 `try_start` 之前检查 `abort_event`。
 
 - `interrupt`：保留已写进 checkpoint 的内容
 - `rollback`：回滚到本 run 开始前的 checkpoint（worker 第 4 步捕获的那个点）
-
-
 
 ### 9.2 `CancelOutcome` → HTTP 映射由路由查表，不要自己猜
 
@@ -1810,8 +3218,6 @@ M3 只会产生前四种，但**枚举现在就定全**。后两种是多进程�
 
 ---
 
-
-
 ## 10. 为 M4 / M9 预留的位
 
 这些**现在不实现，但接口/字段现在就留**。加字段容易，改所有并发路径难。
@@ -1834,36 +3240,38 @@ SSE 是有界的、会过期的直播；账本是完整的、用于历史回放�
 
 ---
 
-
-
 ## 11. 测试清单（W3）
 
 
-| 文件                                 | 覆盖                                                                                                                                                                                                       |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_run_manager.py`              | 状态机全部合法/非法迁移；`create_or_reject` 并发只有一个赢；`try_start` 的双重 abort 检查                                                                                                                                         |
-| `test_thread_operation_lock.py`    | 同 thread 并发两次 `POST /runs` → 第二次 409；非 run 操作不出现在列表 API                                                                                                                                                  |
-| `test_publish_end_always.py`       | **注入各种失败路径**（模型异常、组图失败、启动栅栏拒绝、取消），断言 END 一定到达；**额外注入** `_finalize` **本身抛异常**，断言嵌套 finally 仍然发出 END                                                                                                       |
-| `test_run_store_contract.py`       | 准入冲突返回 `False` 而不是抛 `IntegrityError`；`start_run` 对非 pending 行返回 `False`；`update_status` 不能改写终态行；`update_run_completion` 拒绝替换不同的终态                                                                        |
-| `test_stream_bridge.py`            | 有界裁剪；gap 后订阅停止；`StreamGap` **三个 id 的取值正确**（含缓冲为空时全 `None`）；`Last-Event-ID` 续传；未知 id 的处理；心跳                                                                                                               |
-| `test_sse_translate.py`            | 公开 `messages-tuple` 映射到内部 `messages`；不支持的 mode → 422 而不是降级成 `values`；`format_sse` 遇到 `datetime`/`UUID` 不抛异常                                                                                              |
-| `test_cancel.py`                   | pending 取消不组图；running 取消在一轮内生效；取消不被后到的 success 覆盖                                                                                                                                                        |
-| `test_disconnect.py`               | 创建端断开触发取消；**join 断开不触发**；`/wait` 断开不返回半截 checkpoint；**模型长时间无输出时，断开在一个心跳间隔内被发现**；正常结束后客户端断开**不**触发 `cancel()`                                                                                             |
-| `test_idempotency.py`              | 同 key 复用同一 run；`idempotency_reused` 时不挂第二个 worker；不同 input 同 key → 409；**重叠重试把共享记录的** `idempotency_reused` **翻成 True 时，原始请求仍是** `reused=False` **并挂上 worker**；HTTP 和 internal 用同一个原始 key 不串号             |
-| `test_start_run_no_await.py`       | **AST 断言**：`create_or_reject` 和 `create_task` 之间没有 `await`                                                                                                                                               |
-| `test_start_run_validation.py`     | 第 1–12 步逐步注入失败：run store、bridge、thread_store 都没有新写入；每步的状态码和 §4.2 的表一致；`StartRunError` 编成 `{detail, code}`；外部调用方发 `system` 消息、写 `sandbox` 通道、带 `command` 都是 422；`recursion_limit` 超上限被钳制、`true` 被拒        |
-| `test_run_context_whitelist.py`    | 三个袋子同一套规则、`context` 优先；未知键 422，`__` / 身份 / 坐标 / `user_role` 静默丢；`secrets` 不进 `configurable`、不进落库的 kwargs；`non_interactive` / `channel_user_id` 只认 internal 的顶层 `context`；`is_internal=False` 也写进 context |
-| `test_start_run_attach_failure.py` | `create_task` 抛异常：记录变 `error`、END 到达、协程被 close、同一 thread 能再开新 run                                                                                                                                        |
-| `test_run_after_metadata.py`       | thread_store 挂住 → 5 秒后照常开跑；pending 阶段 abort 不等元数据；严格模式下 thread 已删 → `error` + END、不组图；元数据阶段被 cancel → 仍然收到 END，task 仍以 cancelled 结束                                                                      |
-| `test_sse_format.py`               | 帧字段顺序；`Content-Location`；heartbeat 无 id                                                                                                                                                                  |
+| 文件                                 | 覆盖                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_run_manager.py`              | 状态机全部合法/非法迁移：从终态出发返回 `False`，活跃状态下的非法迁移抛 `InvalidRunTransition`；`record.status =` 只出现在 `_transition_locked`（grep）；`create_or_reject` 并发只有一个赢；预留不能被 interrupt 顶替；pending 被顶替或取消时 task 没有被 `cancel()`；`try_start` 的双重 abort 检查；store 抛异常时 `try_start` 抛 `RunStartupError` 而不是返回 cancelled；`get` 内存命中也按 `user_id` 过滤；cancel 与 complete 任意交错，store 终态总等于内存里的胜者，token 在输家一侧也写进去；`schedule_cleanup` 不摘活跃记录、不带请求的 ContextVar；`_closing` 后新准入 409、幂等命中仍返回旧记录；`has_later_run` 只看同 thread 的 run 行 |
+| `test_thread_operation_lock.py`    | 同 thread 并发两次 `POST /runs` → 第二次 409；非 run 操作不出现在列表 API                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `test_publish_end_always.py`       | **注入各种失败路径**（模型异常、组图失败、启动栅栏拒绝、取消），断言 END 一定到达；**额外注入** `_finalize` **本身抛异常**，断言嵌套 finally 仍然发出 END                                                                                                                                                                                                                                                                                                                                                                                      |
+| `test_run_store_contract.py`       | 准入冲突返回 `False` 而不是抛 `IntegrityError`；`start_run` 对非 pending 行返回 `False`；`update_status` 不能改写终态行；`update_run_completion` 拒绝替换不同的终态、同一终态可以重复写；`supersede_active` 在同一原子操作里标旧行、插新行，遇到非 run 预留返回 `False`；同一幂等键第二次插入返回 `False` 且 `get_by_idempotency_key` 取得回赢家；`update_run_progress` 对非 running 行静默；`delete_thread_operation` 对 run 行抛 `ValueError`；读方法返回副本。内存实现和 M4 的 SQL 实现跑同一套                                                                                                            |
+| `test_stream_bridge.py`            | 有界裁剪；gap 后订阅停止；`StreamGap` **三个 id 的取值正确**（含缓冲为空时全 `None`）；`Last-Event-ID` 续传；未知 id 的处理；心跳                                                                                                                                                                                                                                                                                                                                                                                              |
+| `test_sse_translate.py`            | 公开 `messages-tuple` 映射到内部 `messages`；不支持的 mode → 422 而不是降级成 `values`；`format_sse` 遇到 `datetime`/`UUID` 不抛异常                                                                                                                                                                                                                                                                                                                                                                             |
+| `test_cancel.py`                   | pending 取消不组图；running 取消在一轮内生效；取消不被后到的 success 覆盖                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `test_disconnect.py`               | 创建端断开触发取消；**join 断开不触发**；`/wait` 断开不返回半截 checkpoint；**模型长时间无输出时，断开在一个心跳间隔内被发现**；正常结束后客户端断开**不**触发 `cancel()`                                                                                                                                                                                                                                                                                                                                                                            |
+| `test_idempotency.py`              | 同 key 复用同一 run；`idempotency_reused` 时不挂第二个 worker；不同 input 同 key → 409；**重叠重试把共享记录的** `idempotency_reused` **翻成 True 时，原始请求仍是** `reused=False` **并挂上 worker**；HTTP 和 internal 用同一个原始 key 不串号                                                                                                                                                                                                                                                                                            |
+| `test_start_run_no_await.py`       | **AST 断言**：`create_or_reject` 和 `create_task` 之间没有 `await`                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `test_start_run_validation.py`     | 第 1–12 步逐步注入失败：run store、bridge、thread_store 都没有新写入；每步的状态码和 §4.2 的表一致；`StartRunError` 编成 `{detail, code}`；外部调用方发 `system` 消息、写 `sandbox` 通道、带 `command` 都是 422；`recursion_limit` 超上限被钳制、`true` 被拒                                                                                                                                                                                                                                                                                       |
+| `test_run_context_whitelist.py`    | 三个袋子同一套规则、`context` 优先；未知键 422，`__` / 身份 / 坐标 / `user_role` 静默丢；`secrets` 不进 `configurable`、不进落库的 kwargs；`non_interactive` / `channel_user_id` 只认 internal 的顶层 `context`；`is_internal=False` 也写进 context                                                                                                                                                                                                                                                                                |
+| `test_start_run_attach_failure.py` | `create_task` 抛异常：记录变 `error`、END 到达、协程被 close、同一 thread 能再开新 run                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `test_run_after_metadata.py`       | thread_store 挂住 → 5 秒后照常开跑；pending 阶段 abort 不等元数据；严格模式下 thread 已删 → `error` + END、不组图；元数据阶段被 cancel → 仍然收到 END，task 仍以 cancelled 结束                                                                                                                                                                                                                                                                                                                                                     |
+| `test_sse_format.py`               | 帧字段顺序；`Content-Location`；heartbeat 无 id                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `test_run_agent.py`                | `try_start` 拒绝仍发 END、不组图、不发 metadata；`RunAborted(interrupt/rollback)` 终态 `interrupted`，rollback 才调 `restore`；整轮 `TimeoutError` 且 `deadline.expired()` → `timeout`，图内 `TimeoutError` → `error`；`CancelledError` 先写 `interrupted` 再 raise；`_finalize` 抛异常仍发 END；`thread_store.set_status("running")` 抛 → `error` + END；AST：`run_agent` 恰 4 个参数、模块不 import FastAPI                                                                                                                         |
+| `test_stream_graph.py`             | `astream` 的 `stream_mode` 恒为 list、`subgraphs=False`；先 abort 再 publish（已取消的帧不进桥）；离开循环必 `aclose`（异常路径也是）；`unpack` 三元/二元/裸 chunk；`sse_event_name` 空 ns 是裸 mode、有 ns 是 `mode|ns`；`serialize(messages)` 是两元素数组；`values` 剥 `__pregel_*`、留 `__interrupt__`                                                                                                                                                                                                                                     |
+| `test_stream_modes.py`             | `None`/`[]` → `["values"]`；`messages-tuple` → 内部 `messages`、去重保序；`events` / 内部名 `messages` / 非 str → `UnsupportedStreamModeError`；不静默降级                                                                                                                                                                                                                                                                                                                                                 |
+| `test_rollback_point.py`           | 空 thread → `checkpoint_config is None`，还原走 `adelete_thread`；有 head 时 `aupdate_state` 带 `Overwrite` 且 `as_node="rollback_restore"`；`channel_values` 缺失返回 `None`；`messages` 缺失记 `()`；捕获抛异常返回 `None` 且之后 rollback 退化；`pending_writes` 按 `task_id` 分组重放；mutation 图只有一个空节点                                                                                                                                                                                                                   |
+| `test_usage_collector.py`          | 同一 LangChain `run_id` 两次 `on_llm_end` 只计一次；先空 usage 再回放只计回放、`_calls==1`；始终为空则 `_calls==0`；`llm_output.token_usage` 的 `prompt_tokens` 回退；未知模型进 `"unknown"`；各桶之和等于总数；`cache_read` 不从 `input` 扣除；`run_inline is True`                                                                                                                                                                                                                                                                      |
+| `test_shutdown_drain.py`           | `shutdown` 置 `_closing` 后新准入 409、幂等重试仍返回旧记录；pending 只置 abort 不 `task.cancel()`；强制阶段才 cancel 未退出的 task；checkpointer 在 worker 排空之后才关；`cancel_detached` 在关连接池之前                                                                                                                                                                                                                                                                                                                            |
 
 
 倒数第二个用 AST 静态检查有点不寻常，但这条规则是"看起来完全无害的一行代码会造成严重后果"
 的典型，code review 拦不住它。同类的还有 M2 那个 blocking-IO gate。
 
 ---
-
-
 
 ## 12. 验收清单
 
@@ -1884,8 +3292,6 @@ SSE 是有界的、会过期的直播；账本是完整的、用于历史回放�
 
 ---
 
-
-
 ## 13. 刻意不做的事
 
 
@@ -1901,8 +3307,6 @@ SSE 是有界的、会过期的直播；账本是完整的、用于历史回放�
 
 
 ---
-
-
 
 ## 14. 一句话总结
 

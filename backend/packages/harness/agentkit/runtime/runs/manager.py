@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from agentkit.runtime.runs.store.base import RunStore
 from agentkit.runtime.runs.schemas import RunStatus, ThreadOperationKind, DisconnectMode, RunStartOutcome, RunStartupError
-from openai import ConflictError
 
 RUN_RECORD_RETENTION_SECONDS = 300.0
 _ACTIVE = frozenset({RunStatus.pending, RunStatus.running})
@@ -118,8 +117,6 @@ def _record_from_row(row: dict) -> RunRecord:
     )
 
 
-
-
 def _transition_locked(record: RunRecord, target: RunStatus, *, error: str | None = None) -> bool:
     """改内存状态。返回 False 表示记录已是终态——竞态里的输家，正常结果。"""
     if record.status not in _ACTIVE:
@@ -140,6 +137,8 @@ def _abort_locked(record: RunRecord, *, action: str) -> None:
         return                                   # 已是终态、只是还在收尾：不用再管
     record.abort_action = action                 # "interrupt" / "rollback"，worker 在 finally 里照做
     record.abort_event.set()
+    if record.finalizing:
+        return
     record.finalizing = record.task is not None and not record.task.done()
     if was_running and record.finalizing:
         record.task.cancel()    
@@ -155,6 +154,7 @@ class RunManager:
         self._closing = False
     
     async def get(self, run_id: str, *, user_id: str | None) -> RunRecord | None:
+        """从缓存和store里获取RunRecord，若不存在返回None"""
         async with self._lock:
             record = self._runs.get(run_id)
         if record is None:
@@ -351,43 +351,6 @@ class RunManager:
                 return                               # 自己被取消了就别等，交给 try_start 去拒
             await asyncio.sleep(poll_interval)
 
-    def schedule_cleanup(self, run_id: str) -> None:
-        task = asyncio.create_task(
-            self._cleanup_after(run_id, self._retention_seconds),
-            context=contextvars.Context(),           # 空 context：不攥住请求的 user / trace
-        )
-        self._cleanup_tasks.add(task)                # 事件循环只弱引用 task，这里留强引用
-        task.add_done_callback(self._cleanup_tasks.discard)
-
-
-    async def _cleanup_after(self, run_id: str, delay: float) -> None:
-        await asyncio.sleep(delay)
-        async with self._lock:
-            record = self._runs.get(run_id)
-            if record is None:
-                return
-            if record.status in _ACTIVE or record.finalizing:
-                logger.warning("Refusing to clean up active run %s", run_id)
-                return
-            self._unindex_run_locked(record)
-
-@dataclass(frozen=True, slots=True)
-class RunTotals:
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    llm_call_count: int = 0
-    lead_agent_tokens: int = 0
-    subagent_tokens: int = 0
-    middleware_tokens: int = 0
-    token_usage_by_model: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        attributed = self.lead_agent_tokens + self.subagent_tokens + self.middleware_tokens
-        total = self.total_input_tokens + self.total_output_tokens
-        if attributed != total:
-            logger.error("Token attribution %d does not add up to total %d", attributed, total)
-
-
     async def update_run_progress(self, run_id: str, totals: RunTotals) -> None:
         async with self._lock:
             record = self._runs.get(run_id)
@@ -395,7 +358,6 @@ class RunTotals:
                 return
             _apply_totals(record, totals)
         await self._store.update_run_progress(run_id, **asdict(totals))
-
 
     async def complete(
         self, run_id: str, *, status: RunStatus, error: str | None = None, totals: RunTotals | None = None
@@ -452,3 +414,34 @@ class RunTotals:
                 await asyncio.wait(stuck, timeout=1.0)
         for task in list(self._cleanup_tasks):
             task.cancel()
+
+    def schedule_cleanup(self, run_id: str) -> None:
+        task = asyncio.create_task(
+            self._cleanup_after(run_id, self._retention_seconds),
+            context=contextvars.Context(),           # 空 context：不攥住请求的 user / trace
+        )
+        self._cleanup_tasks.add(task)                # 事件循环只弱引用 task，这里留强引用
+        task.add_done_callback(self._cleanup_tasks.discard)
+
+
+    async def _cleanup_after(self, run_id: str, delay: float) -> None:
+        await asyncio.sleep(delay)
+        async with self._lock:
+            record = self._runs.get(run_id)
+            if record is None:
+                return
+            if record.status in _ACTIVE or record.finalizing:
+                logger.warning("Refusing to clean up active run %s", run_id)
+                return
+            self._unindex_run_locked(record)
+    
+    async def has_later_run(self, thread_id: str, run_id: str) -> bool:
+        async with self._lock:
+            run_ids = [r.run_id for r in self._thread_records_locked(thread_id) if r.operation_kind is ThreadOperationKind.run]
+        return run_id in run_ids and run_ids[-1] != run_id
+
+class ConflictError(Exception):
+    """Raised when multitask_strategy=reject and thread has inflight runs."""
+
+class UnsupportedStrategyError(Exception):
+    """Raised when a multitask_strategy value is not yet implemented."""    
