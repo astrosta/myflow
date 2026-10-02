@@ -4,6 +4,7 @@ start_run、sse_comsumer、format_sse
 import asyncio
 import hashlib
 import logging
+import json
 from typing import Any, ClassVar
 
 from fastapi import Request
@@ -26,14 +27,24 @@ from agentkit.runtime.runs import (
     RunManager,
     RunRecord,
     RunStatus,
+    ConflictError,
 )
-from agentkit.runtime.stream_bridge.base import StreamBridge
+from agentkit.runtime.stream_bridge import (
+    StreamBridge,
+    StreamGap,
+    HEARTBEAT_SENTINEL,
+    END_SENTINEL,
+)
 from agentkit.runtime.stream_modes import (
     UnsupportedStreamModeError,
     normalize_stream_modes,
 )
 from agentkit.trace_context import TRACE_METADATA_KEY, ensure_trace_id
-from agentkit.utils import validate_thread_id
+from agentkit.utils import new_run_id, validate_thread_id
+from agentkit.runtime.runs import (
+    run_after_metadata,
+    AgentFactory,
+)
 
 from .deps import RunServices
 from .run_models import RunCaller, RunCreateRequest, RunLaunch
@@ -63,8 +74,7 @@ DEFAULT_RECURSION_LIMIT = 100
 _PASSTHROUGH_CONFIG_KEYS = frozenset({"tags", "run_name"})
 _HANDLED_CONFIG_KEYS = _PASSTHROUGH_CONFIG_KEYS | {"recursion_limit", "metadata", "configurable", "context"}
 
-# thread metadata存储超时时间
-THREAD_METADATA_SETUP_TIMEOUT_SECONDS = 5.0
+
 
 class StartRunError(Exception):
     status_code: ClassVar[int] = 400
@@ -217,7 +227,7 @@ async def _thread_access_allowed(thread_store, thread_id: str, caller: RunCaller
         return not require_existing or await thread_store.exists(thread_id, user_id=None) is not None
     return await thread_store.check_access(thread_id, caller.user_id, require_existing=require_existing)
 
-def resolve_agent_factory(assistant_id: str ):
+def resolve_agent_factory(assistant_id: str) -> AgentFactory:
     if assistant_id != "lead_agent":
         raise AssistantNotFound(f"Assistant {assistant_id} not found")
     from agentkit.agents.leader_agent import assemble_agent
@@ -326,6 +336,38 @@ def _ensure_same_admission(record: RunRecord, body: RunCreateRequest) -> None:
     if stored.get("input") != body.input or record.assistant_id != body.assistant_id:
         raise IdempotencyKeyReused("Idempotency-Key already used with a different request")
 
+def redact_config_secrets(config: dict | None) -> dict | None:
+    """Copy of the client config safe to store and echo. The live run config is untouched."""
+    if config is None:
+        return None
+    return _redact_secrets(config)
+
+
+def redact_context_secrets(context: dict | None) -> dict | None:
+    """Same strip as ``redact_config_secrets``, for the top-level context bag."""
+    if context is None:
+        return None
+    return _redact_secrets(context)
+
+
+def _redact_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _redact_secrets(item)
+            for key, item in value.items()
+            if not _is_redacted_key(key)
+        }
+    if isinstance(value, list):
+        return [_redact_secrets(item) for item in value]
+    return value
+
+
+def _is_redacted_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    return key == REQUEST_SECRETS_KEY or key == "trace_id" or key == TRACE_METADATA_KEY or key.startswith("__")
+
+
 def _persisted_kwargs(body: RunCreateRequest) -> dict:
     return {
         "input": body.input,                              # 原始值：幂等比对和 run API 回显都用它
@@ -337,70 +379,17 @@ async def _abandon_unattached_run(services: RunServices, record: RunRecord, exc:
     await services.run_manager.fail_start_if_pending(record.run_id, error=f"Failed to attach run worker: {exc!r}")
     await services.bridge.publish_end(record.run_id)
 
+def _validate_secrets(where: str, value: Any) -> dict[str, str]:
+    """Request secrets stay a flat string map. They are copied so the body is not aliased."""
+    if not isinstance(value, dict):
+        raise RunRequestInvalid(f"{where}.secrets must be an object of strings")
+    cleaned: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            raise RunRequestInvalid(f"{where}.secrets must be an object of strings")
+        cleaned[key] = item
+    return cleaned
 
-async def run_after_metadata(
-    record: RunRecord,
-    run_ctx: RunContext,
-    *,
-    bridge: StreamBridge,
-    run_manager: RunManager,
-    owner_user_id: str | None,
-    require_existing_thread: bool,
-) -> None:
-    """worker task 的入口：尽力补 thread 行，然后把控制权交给 run_agent"""
-    interrupted: asyncio.CancelledError | None = None
-    try:
-        failure = await _ensure_thread_metadata_bounded(
-            record, run_ctx.thread_store, owner_user_id=owner_user_id, require_existing=require_existing_thread,
-        )
-    except asyncio.CancelledError as exc:
-        interrupted, failure = exc, None
-        record.abort_event.set()
-
-    if failure is not None:
-        if require_existing_thread:
-            await run_manager.fail_start_if_pending(record.run_id, error=f"Thread verification failed: {failure!r}")
-        else:
-            logger.warning("Failed to ensure thread_meta for %s (non-fatal): %s", record.run_id, failure)
-    
-    await run_agent(bridge, run_manager, record, run_ctx)
-    if interrupted is not None:
-        raise interrupted
-    
-async def _ensure_thread_metadata_bounded(record, thread_store, *, owner_user_id, require_existing) -> BaseExecption | None:
-    """最多等 5 秒，abort 一到就放手。返回 None 表示就绪或已被 abort；否则返回失败原因。"""
-    setup = asyncio.create_task(
-        _ensure_thread_metadata(thread_store, record, owner_user_id=owner_user_id, require_existing=require_existing)
-    )
-    aborted = asyncio.create_task(record.abort_event.wait())
-    try:
-        done, _ =await asyncio.wait(
-            {setup, aborted}, timeout=THREAD_METADATA_SETUP_TIMEOUT_SECONDS, return_when = asyncio.FIRST_COMPLETED
-        )
-    finally:
-        aborted.cancel()
-        if not setup.done():
-            setup.cancel()
-            setup.add_done_callback(_log_detached_setup_result)
-    
-    if setup in done:
-        return None if setup.cancelled() else setup.exception()
-    if aborted in done:
-        return None
-    return TimeoutError(f"thread metadate setup exceeded {THREAD_METADATA_SETUP_TIMEOUT_SECONDS} seconds")
-
-async def _ensure_thread_metadata(thread_store, record, *, owner_user_id, require_existing) -> BaseException | None:
-    if await thread_store.get_metadata(record.run_id) is not None:
-        return
-    
-    if require_existing:
-        return LookupError(f"Thread {record.thread_id} was deleted during run admission")
-    
-    await thread_store.create(
-        record.thread_id,
-        assistant_id=record.assistant_id,
-        metadata={k:v for k, v in record.metadata.items() if k not in _RESERVED_METADATA_KEYS},
-    )
 
 def collect_client_switches(body: RunCreateRequest) -> dict[str, Any]:
     config = body.config or {}

@@ -1,3 +1,15 @@
+import copy
+from datetime import UTC, datetime
+
+from agentkit.runtime.runs.schemas import RunStatus, ThreadOperationKind
+from agentkit.runtime.runs.store.base import ACTIVE_STATUSES, RunStore
+
+_TERMINAL = frozenset({"success", "error", "timeout", "interrupted"})
+
+
+def _status(value) -> str:
+    return getattr(value, "value", value)
+
 
 class MemoryRunStore(RunStore):
     def __init__(self) -> None:
@@ -21,8 +33,81 @@ class MemoryRunStore(RunStore):
             self._run_id_by_idempotency_key[key] = row["run_id"]
         return True
 
+    async def start_run(self, run_id: str) -> bool:
+        row = self._rows.get(run_id)
+        if row is None or row["status"] != "pending":
+            return False
+        row["status"] = "running"
+        row["updated_at"] = datetime.now(UTC).isoformat()
+        return True
+
+    async def update_status(
+        self, run_id: str, status: RunStatus, *, error: str | None = None, stop_reason: str | None = None
+    ) -> bool:
+        row = self._rows.get(run_id)
+        if row is None or row["status"] not in ACTIVE_STATUSES:
+            return False
+        row["status"] = _status(status)
+        row["error"] = error
+        row["stop_reason"] = stop_reason
+        row["updated_at"] = datetime.now(UTC).isoformat()
+        return True
+
+    async def update_run_progress(self, run_id: str, **totals) -> None:
+        row = self._rows.get(run_id)
+        if row is None or row["status"] != "running":
+            return
+        row.update(totals)
+
+    async def update_run_completion(self, run_id: str, *, status, error: str | None = None, **totals) -> bool:
+        row = self._rows.get(run_id)
+        if row is None:
+            return False
+        target = _status(status)
+        current = row["status"]
+        if current in _TERMINAL and current != target:
+            return False
+        if current not in ACTIVE_STATUSES and current != target:
+            return False
+        row.update(totals)
+        row["status"] = target
+        row["error"] = error
+        row["updated_at"] = datetime.now(UTC).isoformat()
+        return True
+
     async def get(self, run_id, *, user_id):
         row = self._rows.get(run_id)
         if row is None or (user_id is not None and row.get("user_id") != user_id):
             return None
         return copy.deepcopy(row)
+
+    async def list_by_thread(self, thread_id: str, *, user_id: str | None, limit: int = 100) -> list[dict]:
+        rows = [
+            row
+            for row in self._rows.values()
+            if row["thread_id"] == thread_id and row.get("operation_kind") == ThreadOperationKind.run
+        ]
+        if user_id is not None:
+            rows = [row for row in rows if row.get("user_id") == user_id]
+        rows.sort(key=lambda row: row.get("created_at") or "", reverse=True)
+        return [copy.deepcopy(row) for row in rows[:limit]]
+
+    async def list_inflight(self) -> list[dict]:
+        return [copy.deepcopy(row) for row in self._rows.values() if row["status"] in ACTIVE_STATUSES]
+
+    async def get_by_idempotency_key(self, scoped_key: str) -> dict | None:
+        run_id = self._run_id_by_idempotency_key.get(scoped_key)
+        if run_id is None:
+            return None
+        return copy.deepcopy(self._rows[run_id])
+
+    async def delete_thread_operation(self, run_id: str, *, user_id: str | None) -> None:
+        row = self._rows.get(run_id)
+        if row is None or (user_id is not None and row.get("user_id") != user_id):
+            return
+        if row.get("operation_kind") == ThreadOperationKind.run:
+            raise ValueError(f"delete_thread_operation refuses to delete run history for {run_id}")
+        self._rows.pop(run_id, None)
+        key = row.get("idempotency_key")
+        if key is not None and self._run_id_by_idempotency_key.get(key) == run_id:
+            del self._run_id_by_idempotency_key[key]

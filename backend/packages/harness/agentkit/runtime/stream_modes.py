@@ -7,7 +7,7 @@ from typing import Literal
 from typing_extensions import get_args
 
 RunStreamMode = Literal["values", "messages-tuple", "updates", "debug", "tasks", "checkpoints", "custom"]
-SUPPORTED_RUN_STREAM_MODES: frozenset[str] = frozenset(get_args(RunStreamMode.__value__))
+SUPPORTED_RUN_STREAM_MODES: frozenset[str] = frozenset(get_args(RunStreamMode))
 
 class UnsupportedStreamModeError(ValueError):
     def __init__(self, modes: list[str]) -> None:

@@ -58,6 +58,11 @@ class MemoryStreamBridge(StreamBridge):
             buffer.events.popleft()
         self._fanout(buffer, item)
 
+    async def cleanup(self, run_id: str, *, delay: float = 0) -> None:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self._buffers.pop(run_id, None)
+
     async def publish_end(self, run_id: str) -> None:
         buffer = self._buffers.get(run_id)
         if buffer.ended:

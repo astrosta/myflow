@@ -2,13 +2,16 @@
 /runs、/stream、/wait、/join、/cancel
 """
 from typing import Any
+from typing_extensions import Annotated
 
 from fastapi import Request, router
 from fastapi.responses import StreamingResponse
+from fastapi.param_functions import Header
 
-from agentkit.runtime.runs import CancelOutcome
+from agentkit.runtime.runs import CancelOutcome, ConflictError
 from backend.app.gateway import (
     RunCancelRequest,
+    RunCreateRequest,
     RunLaunch,
     RunNotCancellable,
     RunNotFound,
@@ -19,8 +22,11 @@ from backend.app.gateway import (
     sse_response,
     wait_for_run_completion,
 )
-from backend.app.gateway.services import _require_cancel_capability
-
+from backend.app.gateway.run_models import run_to_wire
+from backend.app.gateway.services import (
+    _require_cancel_capability,
+    start_run,
+)
 
 @router.get("/{thread_id}/runs/{run_id}/join")
 async def join_run(thread_id: str, run_id: str, request: Request) -> StreamingResponse:
@@ -60,3 +66,17 @@ async def cancel_run(
         final = await wait_for_run_completion(services, record, request, apply_on_disconnect=False)
         return {"outcome": outcome.value, "run": run_to_wire(final)}
     return {"outcome": outcome.value}
+
+@router.post("/{thread_id}/runs/stream")
+async def stream_run(
+    thread_id: str,
+    body: RunCreateRequest,
+    request: Request,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=255)] = None,
+) -> StreamingResponse:
+    services = get_run_services(request)
+    launch = await start_run(
+        body, thread_id=thread_id, caller=caller_from_request(request),
+        services=services, idempotency_key=idempotency_key,
+    )
+    return sse_response(services, launch, request)   # §8：编帧、Content-Location、断开语义

@@ -7,9 +7,6 @@ import abc
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
-HEARTBEAT_SENTINEL = StreamEvent(id="", event="__heartbeat__", data=None)
-END_SENTINEL       = StreamEvent(id="", event="__end__",       data=None)
-
 @dataclass(frozen=True, slots=True)
 class StreamGap:
     requested_event_id: str | None # 客户端请求的游标，或落后订阅者最后收到的那条
@@ -21,6 +18,9 @@ class StreamEvent:
     id: str # 事件id
     event: str # 事件类型
     data: Any # 事件数据
+
+HEARTBEAT_SENTINEL = StreamEvent(id="", event="__heartbeat__", data=None)
+END_SENTINEL       = StreamEvent(id="", event="__end__",       data=None)
 
 class StreamBridge(abc.ABC):
     supports_cross_process: bool = False

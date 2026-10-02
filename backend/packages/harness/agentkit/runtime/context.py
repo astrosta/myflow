@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from agentkit.runtime.config.agent import AgentFactory
-from agentkit.runtime.config.app import AppConfig
-from agentkit.runtime.store.event import RunEventStore
-from agentkit.runtime.store.thread import ThreadMetaStore
+from agentkit.config import AppConfig
+
+if TYPE_CHECKING:
+    from agentkit.persistence.thread_meta.base import ThreadMetaStore
+    from agentkit.runtime.events.store.base import RunEventStore
+    from agentkit.runtime.runs.store.base import RunStore
+    from agentkit.runtime.runs.worker import AgentFactory
 
 _PER_RUN_FIELDS = frozenset({
     "app_config",
@@ -28,6 +31,7 @@ class RunContext:
     # --- 进程级：lifespan 建一次 ---
     checkpointer: BaseCheckpointSaver
     thread_store: ThreadMetaStore
+    run_store: RunStore
     event_store: RunEventStore | None = None
 
     # --- 每个run 每次使用for_run更新---

@@ -1,13 +1,15 @@
 """
 RunCreateRequest(HTTP和内部launch共用)
 """
-
+from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agentkit.persistence.base import iso_utc
 from agentkit.runtime.runs import RunRecord
 
 
@@ -57,4 +59,29 @@ class RunCaller:
 @dataclass(frozen=True, slots=True)
 class RunLaunch:
     record: RunRecord
-    reused: bool 
+    reused: bool
+
+
+def run_to_wire(record: RunRecord) -> dict[str, Any]:
+    """Public run JSON for cancel(wait=true). Process-local fields stay off the response."""
+    return {
+        "run_id": record.run_id,
+        "thread_id": record.thread_id,
+        "assistant_id": record.assistant_id,
+        "status": getattr(record.status, "value", record.status),
+        "created_at": _wire_time(record.created_at),
+        "updated_at": _wire_time(record.updated_at),
+        "metadata": dict(record.metadata or {}),
+        "kwargs": dict(record.kwargs or {}),
+        "multitask_strategy": record.multitask_strategy,
+        "on_disconnect": getattr(record.on_disconnect, "value", record.on_disconnect),
+        "error": record.error,
+    }
+
+
+def _wire_time(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return iso_utc(value)
+    if value in (None, ""):
+        return None
+    return str(value) 

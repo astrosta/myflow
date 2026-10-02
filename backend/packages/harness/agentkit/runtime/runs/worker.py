@@ -6,19 +6,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncIterable, Callable, Mapping
+import inspect
+from typing import Any, AsyncIterable, Callable, Mapping, Awaitable
+from dataclasses import asdict, dataclass
+
 
 from langgraph.types import Overwrite
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from agentkit.agents.thread_state import get_thread_state_schema
 from agentkit.runtime.context import RunContext
+from agentkit.runtime.events.journal import RunJournal
 from agentkit.runtime.runs.manager import RunManager, RunRecord
 from agentkit.runtime.runs.schemas import RunStartOutcome, RunStatus
+from agentkit.runtime.runs.usage import UsageCollector
 from agentkit.runtime.stream_bridge.base import StreamBridge
 from agentkit.runtime.stream_modes import to_langgraph_stream_modes
 from agentkit.runtime.task import spawn_detached
+from agentkit.agents.leader_agent import unwrap_agent_graph
+from agentkit.agents.leader_agent.runtime_keys import CLIENT_IDENTITY_KEYS
+from agentkit.trace_context import TRACE_METADATA_KEY
 
 logger = logging.getLogger(__name__)
 STREAM_RETENTION_SECONDS = 60.0      # END 之后桥缓冲再留多久，给晚到的 /join 续传
+# thread metadata存储超时时间
+THREAD_METADATA_SETUP_TIMEOUT_SECONDS = 5.0
+# 身份和 trace 属于这一轮 run，不抄进跨 run 的 thread 行。
+_RESERVED_METADATA_KEYS = CLIENT_IDENTITY_KEYS | {TRACE_METADATA_KEY}
 AgentFactory = Callable[..., Any]
 
 class RunAborted(Exception):
@@ -26,6 +40,79 @@ class RunAborted(Exception):
         super().__init__(action)
         self.action = action
 
+async def run_after_metadata(
+    record: RunRecord,
+    run_ctx: RunContext,
+    *,
+    bridge: StreamBridge,
+    run_manager: RunManager,
+    owner_user_id: str | None,
+    require_existing_thread: bool,
+) -> None:
+    """worker task 的入口：尽力补 thread 行，然后把控制权交给 run_agent"""
+    interrupted: asyncio.CancelledError | None = None
+    try:
+        failure = await _ensure_thread_metadata_bounded(
+            record, run_ctx.thread_store, owner_user_id=owner_user_id, require_existing=require_existing_thread,
+        )
+    except asyncio.CancelledError as exc:
+        interrupted, failure = exc, None
+        record.abort_event.set()
+
+    if failure is not None:
+        if require_existing_thread:
+            await run_manager.fail_start_if_pending(record.run_id, error=f"Thread verification failed: {failure!r}")
+        else:
+            logger.warning("Failed to ensure thread_meta for %s (non-fatal): %s", record.run_id, failure)
+    
+    await run_agent(bridge, run_manager, record, run_ctx)
+    if interrupted is not None:
+        raise interrupted
+
+
+def _log_detached_setup_result(task: asyncio.Task) -> None:
+    """Read a setup task we stopped waiting for, so its failure is logged instead of lost."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.warning("Detached thread metadata setup failed", exc_info=error)
+
+
+async def _ensure_thread_metadata_bounded(record, thread_store, *, owner_user_id, require_existing) -> BaseException | None:
+    """最多等 5 秒，abort 一到就放手。返回 None 表示就绪或已被 abort；否则返回失败原因。"""
+    setup = asyncio.create_task(
+        _ensure_thread_metadata(thread_store, record, owner_user_id=owner_user_id, require_existing=require_existing)
+    )
+    aborted = asyncio.create_task(record.abort_event.wait())
+    try:
+        done, _ =await asyncio.wait(
+            {setup, aborted}, timeout=THREAD_METADATA_SETUP_TIMEOUT_SECONDS, return_when = asyncio.FIRST_COMPLETED
+        )
+    finally:
+        aborted.cancel()
+        if not setup.done():
+            setup.cancel()
+            setup.add_done_callback(_log_detached_setup_result)
+    
+    if setup in done:
+        return None if setup.cancelled() else setup.exception()
+    if aborted in done:
+        return None
+    return TimeoutError(f"thread metadate setup exceeded {THREAD_METADATA_SETUP_TIMEOUT_SECONDS} seconds")
+
+async def _ensure_thread_metadata(thread_store, record, *, owner_user_id, require_existing) -> BaseException | None:
+    if await thread_store.get_metadata(record.run_id) is not None:
+        return
+    
+    if require_existing:
+        return LookupError(f"Thread {record.thread_id} was deleted during run admission")
+    
+    await thread_store.create(
+        record.thread_id,
+        assistant_id=record.assistant_id,
+        metadata={k:v for k, v in record.metadata.items() if k not in _RESERVED_METADATA_KEYS},
+    )
 
 async def run_agent(
     bridge: StreamBridge,
@@ -38,6 +125,7 @@ async def run_agent(
     terminal, error, error_type = RunStatus.interrupted, None, None #try_start 拒绝、提前return时的终态
     rollback: RollbackPoint | None = None 
     usage = UsageCollector(run_manager, run_id)
+    journal = _open_journal(ctx, record)
     deadline: asyncio.Timeout | None = None
     timeout_s: float | None = None
 
@@ -47,7 +135,7 @@ async def run_agent(
         if await run_manager.try_start(run_id) is RunStartOutcome.cancelled:
             return
 
-        await ctx.thread_store.set_status(thread_id, "running")
+        await ctx.thread_store.update_status(thread_id, "running", user_id=record.user_id)
         rollback = await capture_rollback_point(ctx, thread_id)
         await bridge.publish(run_id, "metadata", {"run_id": run_id, "thread_id": thread_id})
         
@@ -58,7 +146,7 @@ async def run_agent(
         timeout_s = ctx.app_config.runs.timeout_seconds if ctx.app_config is not None else None
         deadline = asyncio.timeout(timeout_s) #开始计时
         async with deadline:
-            await _stream_graph(bridge, record, ctx, graph, usage) #每一帧都查abort
+            await _stream_graph(bridge, record, ctx, graph, usage, journal) #每一帧都查abort
         terminal, error = RunStatus.success, None
 
     except RunAborted:
@@ -84,6 +172,7 @@ async def run_agent(
             await _finalize(
                 bridge, run_manager, record, ctx,
                 terminal=terminal, error=error, error_type=error_type, rollback=rollback, usage=usage,
+                journal=journal,
             )
         finally:
             #无论收尾是否成功，流必须结束
@@ -133,11 +222,26 @@ async def _finalize(
     error_type: str | None,
     rollback: RollbackPoint | None,
     usage: UsageCollector,
+    journal: RunJournal | None = None,
 ) -> None:
     run_id, thread_id = record.run_id, record.thread_id
 
+    if journal is not None:
+        await _best_effort("journal flush", journal.flush())
+
     if record.abort_event.is_set() and record.abort_action == "rollback":
         await _best_effort("rollback", restore_rollback_point(ctx, rollback))
+
+    #M4
+    if record.ownership_lost:
+        return
+    
+    await ctx.run_store.update_run_completion(
+        run_id,
+        status=getattr(terminal, "value", terminal),
+        error=error,
+        **asdict(usage.totals()),
+    )
 
     await _best_effort("complete", run_manager.complete(run_id, status=terminal, error=error, totals=usage.totals()))
     final = record.status
@@ -149,7 +253,11 @@ async def _finalize(
         }))
 
     if not await run_manager.has_later_run(thread_id, run_id):
-        await _best_effort("thread status", ctx.thread_store.set_status(thread_id, _thread_status(final)))
+        await _best_effort(
+            "thread status",
+            ctx.thread_store.update_status(thread_id, _thread_status(final), user_id=record.user_id),
+        )
+    #M6
 
 async def _best_effort(step: str, awaitable: Awaitable[Any]) -> None:
     try:
@@ -162,15 +270,35 @@ def _thread_status(status: RunStatus) -> str:
 
 
 
+def _open_journal(ctx: RunContext, record: RunRecord) -> RunJournal | None:
+    """One ledger producer per run. Token totals stay on UsageCollector."""
+    if ctx.event_store is None:
+        return None
+    settings = getattr(ctx.app_config, "run_events", None)
+    if settings is None:
+        return RunJournal(ctx.event_store, record)
+    return RunJournal(
+        ctx.event_store,
+        record,
+        batch_size=settings.batch_size,
+        flush_interval=settings.flush_interval,
+        track_token_usage=settings.track_token_usage,
+        max_trace_content=settings.max_trace_content,
+    )
+
+
 async def _stream_graph(
     bridge: StreamBridge,
     record: RunRecord,
     ctx: RunContext,
     graph: Any,
     usage: UsageCollector,
+    journal: RunJournal | None,
 ) -> None:
     lg_modes = to_langgraph_stream_modes(ctx.stream_modes)
     callbacks = [*(ctx.run_config.get("callbacks") or ()), usage]
+    if journal is not None:
+        callbacks.append(journal)
     config = {**ctx.run_config, "callbacks": callbacks}
     configurable = dict(config.get("configurable") or {})
     configurable.setdefault("thread_id", record.thread_id)
@@ -259,7 +387,7 @@ class RollbackPoint:
 class RollbackUnavailable(RuntimeError):
     """运行前的状态没有捕获到，回滚无从做起。"""
 
-def capture_rollback_point(ctx: RunContext, thread_id: str) -> RollbackPoint | None:
+async def capture_rollback_point(ctx: RunContext, thread_id: str) -> RollbackPoint | None:
     """None 表示捕获失败：之后的 rollback 请求退化成 interrupt（fail-closed）。"""
     try:
         head = await ctx.checkpointer.aget_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})

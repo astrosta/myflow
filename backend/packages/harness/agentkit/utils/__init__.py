@@ -1,9 +1,10 @@
-from agentkit.utils.ids import make_safe_user_id, validate_thread_id, validate_user_id
+from agentkit.utils.ids import make_safe_user_id, new_run_id, validate_thread_id, validate_user_id
 
 __all__ = [
     "aemit_custom_event",
     "emit_custom_event",
     "make_safe_user_id",
+    "new_run_id",
     "validate_thread_id",
     "validate_user_id",
 ]

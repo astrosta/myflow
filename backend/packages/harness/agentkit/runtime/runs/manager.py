@@ -4,17 +4,27 @@ RunManager、RunRecord、状态机
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from typing import Literal
+import logging
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, asdict
+from typing import Literal, AsyncIterator
+import contextvars
 
+from agentkit.persistence.base import now_iso
 from agentkit.runtime.runs.schemas import (
     DisconnectMode,
     RunStartOutcome,
     RunStartupError,
     RunStatus,
     ThreadOperationKind,
+    CancelOutcome,
+    InvalidRunTransition,
 )
 from agentkit.runtime.runs.store import RunStore
+from agentkit.runtime.runs.totals import RunTotals
+from agentkit.utils.ids import new_run_id
+
+logger = logging.getLogger(__name__)
 
 RUN_RECORD_RETENTION_SECONDS = 300.0
 _ACTIVE = frozenset({RunStatus.pending, RunStatus.running})
@@ -135,6 +145,20 @@ def _transition_locked(record: RunRecord, target: RunStatus, *, error: str | Non
         record.error = error
     record.updated_at = now_iso()
     return True
+
+
+def _apply_totals(record: RunRecord, totals: RunTotals) -> None:
+    """Copy a usage snapshot onto the live record. The model buckets are copied too."""
+    record.total_input_tokens = totals.total_input_tokens
+    record.total_output_tokens = totals.total_output_tokens
+    record.llm_call_count = totals.llm_call_count
+    record.lead_agent_tokens = totals.lead_agent_tokens
+    record.subagent_tokens = totals.subagent_tokens
+    record.middleware_tokens = totals.middleware_tokens
+    record.token_usage_by_model = {
+        model: dict(bucket) for model, bucket in totals.token_usage_by_model.items()
+    }
+
 
 def _abort_locked(record: RunRecord, *, action: str) -> None:
     """顶替（§5.4 第 5 步）和取消（§5.9）共用的内存侧动作。store 行由调用方负责：
@@ -398,7 +422,7 @@ class RunManager:
             row = await self._store.get(run_id, user_id=None)        # 属主已由路由用 get(..., user_id=) 查过
             if row is None:
                 return CancelOutcome.unknown
-            return CancelOutcome.not_active_locally if row["status"] in ACTIVE_STATUSES else CancelOutcome.not_cancellable
+            return CancelOutcome.not_active_locally if row["status"] in _ACTIVE else CancelOutcome.not_cancellable
         await self._store.update_status(run_id, RunStatus.interrupted)
 
         return CancelOutcome.cancelled

@@ -1,5 +1,6 @@
 import hashlib
 import re
+from uuid import uuid4
 
 _SAFE_USER_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 _UNSAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_\-]")
@@ -17,6 +18,11 @@ def make_safe_user_id(raw: str) -> str:
 
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"{sanitized}-{digest}"
+
+def new_run_id() -> str:
+    """32 hex chars. Fits ``runs.run_id`` (String(64)) and ``^[A-Za-z0-9_\\-]+$``."""
+    return uuid4().hex
+
 
 def validate_thread_id(thread_id: str) -> str:
     if not isinstance(thread_id, str) or not _THREAD_ID_PATTERN.fullmatch(thread_id):

@@ -8,6 +8,13 @@ STARTUP_ONLY_FIELDS: dict[str,str] = {
     "checkpointer.type": (
         "get_checkpointer() 首次调用时按 type 创建单例；重载后的 AppConfig 不会重建它"
     ),
+    "database.backend": "init_engine() / make_checkpointer() 在 lifespan 里绑死",
+    "database.sqlite_dir": "SQLite 文件路径在引擎创建时解析为绝对路径",
+    "database.postgres_url": "连接串在引擎和 checkpointer 池创建时捕获",
+    "database.postgres_schema": "search_path 钉在 connect_args 上",
+    "database.checkpoint_channel_mode": "编译进图的通道表，跨进程必须一致",
+    "database.pool_size": "ORM 连接池在 create_async_engine 时定容",
+    "run_events.backend": "make_run_event_store() 在 lifespan 里构造一次",
 }
 
 def format_field_description(field_path: str, *, field_doc: str|None=None) -> str:

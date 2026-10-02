@@ -1,5 +1,4 @@
 import itertools
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -9,25 +8,9 @@ from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import LLMResult
 
 from agentkit.runtime.runs.manager import RunManager
+from agentkit.runtime.runs.totals import RunTotals
 
-logger = logging.getLogger(__name__)
 PROGRESS_REPORT_INTERVAL_SECONDS = 5.0
-
-@dataclass(frozen=True, slots=True)
-class RunTotals:
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    llm_call_count: int = 0
-    lead_agent_tokens: int = 0
-    subagent_tokens: int = 0
-    middleware_tokens: int = 0
-    token_usage_by_model: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        attributed = self.lead_agent_tokens + self.subagent_tokens + self.middleware_tokens
-        total = self.total_input_tokens + self.total_output_tokens
-        if attributed != total:
-            logger.error("Token attribution %d does not add up to total %d", attributed, total)
 
 @dataclass(frozen=True, slots=True)
 class _Usage:

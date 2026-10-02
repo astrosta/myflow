@@ -3,6 +3,7 @@ from agentkit.runtime.runs.manager import (
     RunManager,
     RunRecord,
     UnsupportedStrategyError,
+    ConflictError,
 )
 from agentkit.runtime.runs.schemas import (
     CancelOutcome,
@@ -12,6 +13,10 @@ from agentkit.runtime.runs.schemas import (
     RunStartupError,
     RunStatus,
     ThreadOperationKind,
+)
+from agentkit.runtime.runs.worker import (
+    AgentFactory,
+    run_after_metadata,
 )
 
 __all__ = [
@@ -26,4 +31,7 @@ __all__ = [
     "RunStatus",
     "ThreadOperationKind",
     "UnsupportedStrategyError",
+    "AgentFactory",
+    "ConflictError",
+    "run_after_metadata",
 ]
