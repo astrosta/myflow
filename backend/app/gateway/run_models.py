@@ -1,38 +1,121 @@
-"""
-RunCreateRequest(HTTP和内部launch共用)
-"""
+"""Caller identity, launch result, and the run request models shared with internal callers."""
+
 from __future__ import annotations
+
+import re
 from dataclasses import dataclass
-from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
-from agentkit.persistence.base import iso_utc
 from agentkit.runtime.runs import RunRecord
+from backend.app.gateway.models.request import _THREAD_ID_PATTERN
+from backend.app.gateway.models.response import run_to_wire
+
+_THREAD_ID = re.compile(_THREAD_ID_PATTERN)
+
+__all__ = [
+    "CallerKind",
+    "RunCaller",
+    "RunCancelRequest",
+    "RunCreateRequest",
+    "RunLaunch",
+    "run_to_wire",
+]
 
 
 class RunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    assistant_id: str | None = Field(default=None, description="agent name")
-    input: dict[str, Any] | None =  Field(default=None, description="input data(e.g. {messages: [...]})")
-    command: dict[str, Any] | None =  Field(default=None, description="Langgraph Command")
-    config: dict[str, Any] | None =  Field(default=None, description="RunnableConfig overrides")
-    context: dict[str, Any] | None =  Field(default=None, description="context overrides (model_name, thinking_enabled, etc.)")
-    metadata: dict[str, Any] | None =  Field(default=None, description="Metadata")
-    checkpoint_id: str | None =  Field(defaut=None, description="Checkpoint ID")
-    checkpoint: dict[str, Any] | None =  Field(default=None, description="Checkpoint")
-    stream_mode: list[str] | None =  Field(default=None, description="Stream mode")
+    assistant_id: str = Field(min_length=1, max_length=128)
+    input: dict[str, Any] | None = None
+    command: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+    config: dict[str, Any] | None = None
+    context: dict[str, Any] | None = None
+    checkpoint_id: str | None = Field(default=None, max_length=128)
+    checkpoint: dict[str, Any] | None = None
+    stream_mode: list[str] | str | None = None
+    stream_subgraphs: bool = False
     on_disconnect: Literal["cancel", "continue"] = "cancel"
     multitask_strategy: Literal["reject", "interrupt", "rollback"] = "reject"
+    webhook: None = None
+    on_completion: None = None
+    after_seconds: None = None
+    feedback_keys: None = None
+    if_not_exists: Literal["create"] = "create"
+    stream_resumable: Literal[False] | None = None
+
+    @model_validator(mode="after")
+    def validate_configurable_thread_id(self) -> RunCreateRequest:
+        if not isinstance(self.config, dict):
+            return self
+        configurable = self.config.get("configurable")
+        if not isinstance(configurable, dict) or "thread_id" not in configurable:
+            return self
+        raw = configurable["thread_id"]
+        if raw is not None and not _THREAD_ID.match(str(raw)):
+            raise PydanticCustomError("thread_id", "thread_id must match ^[A-Za-z0-9_-]{1,64}$")
+        return self
+
+    @field_validator(
+        "stream_resumable",
+        "webhook",
+        "on_completion",
+        "after_seconds",
+        "feedback_keys",
+        "if_not_exists",
+        "multitask_strategy",
+        mode="before",
+    )
+    @classmethod
+    def reject_unsupported_run_options(cls, value: Any, info: ValidationInfo) -> Any:
+        if info.field_name in {"multitask_strategy", "if_not_exists"} and not isinstance(value, str):
+            return value
+        allowed = {
+            "webhook": None,
+            "on_completion": None,
+            "after_seconds": None,
+            "feedback_keys": None,
+            "if_not_exists": "create",
+            "multitask_strategy": {"reject", "rollback", "interrupt"},
+            "stream_resumable": {None, False},
+        }[info.field_name]
+        ok = value in allowed if isinstance(allowed, set) else value == allowed
+        if not ok:
+            raise PydanticCustomError(
+                "unsupported_run_option",
+                "Run option '{option}' is not supported",
+                {"option": info.field_name},
+            )
+        return value
+
+    @field_validator("stream_mode", mode="before")
+    @classmethod
+    def reject_unsupported_stream_modes(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        from agentkit.runtime.stream_modes import UnsupportedStreamModeError, normalize_stream_modes
+
+        try:
+            normalize_stream_modes(value)
+        except UnsupportedStreamModeError as exc:
+            raise PydanticCustomError(
+                "unsupported_stream_mode",
+                "Unsupported stream mode(s): {modes}",
+                {"modes": ", ".join(exc.modes)},
+            ) from exc
+        return value
+
 
 class RunCancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: Literal["interrupt", "rollback"] = "interrupt"
-    wait: bool = False         # 等到 worker 收尾完成再返回（对齐官方 SDK 的 runs.cancel）
+    wait: bool = False
+
 
 class CallerKind(StrEnum):
     HTTP = "http"
@@ -59,29 +142,4 @@ class RunCaller:
 @dataclass(frozen=True, slots=True)
 class RunLaunch:
     record: RunRecord
-    reused: bool
-
-
-def run_to_wire(record: RunRecord) -> dict[str, Any]:
-    """Public run JSON for cancel(wait=true). Process-local fields stay off the response."""
-    return {
-        "run_id": record.run_id,
-        "thread_id": record.thread_id,
-        "assistant_id": record.assistant_id,
-        "status": getattr(record.status, "value", record.status),
-        "created_at": _wire_time(record.created_at),
-        "updated_at": _wire_time(record.updated_at),
-        "metadata": dict(record.metadata or {}),
-        "kwargs": dict(record.kwargs or {}),
-        "multitask_strategy": record.multitask_strategy,
-        "on_disconnect": getattr(record.on_disconnect, "value", record.on_disconnect),
-        "error": record.error,
-    }
-
-
-def _wire_time(value: Any) -> str | None:
-    if isinstance(value, datetime):
-        return iso_utc(value)
-    if value in (None, ""):
-        return None
-    return str(value) 
+    reused: bool 

@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+/**
+ * 根样式只放"每个页面都要用"的东西：设计令牌、重置、排版基线。
+ *
+ * 刻意**不**放 markdown 排版和代码块配色（M5 §2 的静态根边界）：
+ * 它们只在聊天页用到，放进这里会让落地页为一个它根本不渲染的功能
+ * 多下载几百 KB 的 CSS。聊天页的样式在
+ * app/workspace/chats/[thread_id]/chat.css 里。
+ */
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans SC",
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  --color-surface: #ffffff;
+  --color-surface-muted: #f7f7f8;
+  --color-line: #e6e7ea;
+  --color-line-strong: #d3d5da;
+  --color-ink: #17181c;
+  --color-ink-muted: #61646d;
+  --color-ink-faint: #8b8f99;
+  --color-accent: #1f2937;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-surface);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/**
+ * 键盘可达性：所有可聚焦元素默认有一圈深的 outline。
+ *
+ * **必须放在 @layer base 里。** Tailwind v4 把工具类放在 `@layer utilities`，
+ * 而**没有进任何 layer 的规则优先级高于所有 layer 内的规则**（和 specificity 无关）。
+ * 之前这条写在顶层，于是 textarea 上的 `focus-visible:outline-none`
+ * 无论怎么写都盖不掉它——聚焦时那个近黑色的矩形框一直在。
+ */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* 细滚动条：聊天流的滚动条出现得比内容还显眼是一种视觉噪音 */
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+
+.thin-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background-color: var(--color-line-strong);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}

@@ -15,6 +15,8 @@ STARTUP_ONLY_FIELDS: dict[str,str] = {
     "database.checkpoint_channel_mode": "编译进图的通道表，跨进程必须一致",
     "database.pool_size": "ORM 连接池在 create_async_engine 时定容",
     "run_events.backend": "make_run_event_store() 在 lifespan 里构造一次",
+    "stream_bridge.backend": "create_stream_bridge() 在 lifespan 里构造一次；换后端要重建单例",
+    "sandbox.use": "get_sandbox_provider() 首次调用时按 use 创建单例；重载后的 AppConfig 不会重建它",
 }
 
 def format_field_description(field_path: str, *, field_doc: str|None=None) -> str:

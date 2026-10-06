@@ -1,0 +1,102 @@
+import Link from "next/link";
+
+import { Skeleton } from "@/components/ui/skeleton";
+import type { ThreadSummary } from "@/core/types";
+import { cn, formatTimestamp } from "@/lib/utils";
+
+/**
+ * 会话列表（纯展示：数据由外层容器传进来）。
+ *
+ * 侧栏不自己取数，是因为"列表怎么来的"（分页、失效、乐观插入）属于
+ * 服务端状态，应该由 TanStack Query 在容器里管；这里只负责画出来。
+ */
+export interface SidebarProps {
+  threads: readonly ThreadSummary[];
+  activeThreadId?: string | null;
+  loading?: boolean;
+  error?: string | null;
+  onRefresh?: () => void;
+  className?: string;
+}
+
+export function Sidebar({
+  threads,
+  activeThreadId = null,
+  loading = false,
+  error = null,
+  onRefresh,
+  className,
+}: SidebarProps) {
+  return (
+    <aside
+      aria-label="会话列表"
+      className={cn("flex h-full w-64 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50", className)}
+    >
+      <div className="flex items-center gap-2 px-3 py-3">
+        <Link className="text-sm font-semibold text-neutral-900" href="/">
+          MyFlow
+        </Link>
+        {onRefresh ? (
+          <button
+            className="ml-auto rounded px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-200/60 hover:text-neutral-800"
+            onClick={onRefresh}
+            type="button"
+          >
+            刷新
+          </button>
+        ) : null}
+      </div>
+
+      <div className="px-3 pb-3">
+        <Link
+          className="flex h-9 w-full items-center justify-center rounded-md border border-neutral-300 bg-white text-xs font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900"
+          href="/workspace"
+        >
+          ＋ 新对话
+        </Link>
+      </div>
+
+      <nav className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+        {loading && threads.length === 0 ? (
+          <div className="space-y-2 px-1" aria-hidden>
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-9 w-full" />
+          </div>
+        ) : null}
+
+        {error ? (
+          <p className="px-2 py-1 text-[11px] leading-relaxed text-red-600" role="alert">
+            {error}
+          </p>
+        ) : null}
+
+        {!loading && !error && threads.length === 0 ? (
+          <p className="px-2 py-2 text-xs leading-relaxed text-neutral-400">还没有会话，点上面的「新对话」开始。</p>
+        ) : null}
+
+        <ul className="space-y-0.5">
+          {threads.map((thread) => {
+            const active = thread.thread_id === activeThreadId;
+            const title = thread.display_name?.trim() ? thread.display_name : "新对话";
+            return (
+              <li key={thread.thread_id}>
+                <Link
+                  aria-current={active ? "page" : undefined}
+                  className={cn(
+                    "block rounded-md px-2 py-1.5 transition-colors",
+                    active ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-600 hover:bg-white/70 hover:text-neutral-900",
+                  )}
+                  href={"/workspace/chats/" + thread.thread_id}
+                >
+                  <span className="block truncate text-xs">{title}</span>
+                  <span className="block text-[10px] text-neutral-400">{formatTimestamp(thread.updated_at)}</span>
+                </Link>
+              </li>
+            );
+          })}
+        </ul>
+      </nav>
+    </aside>
+  );
+}

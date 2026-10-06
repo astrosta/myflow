@@ -363,7 +363,7 @@ class AgentClient:
         checkpointer = self._checkpointer if self._checkpointer is not None else get_checkpointer()
         user_id = self._resolve_user_id()
         config = self._build_config(thread_id, overrides)
-        # context = {"thread_id": thread_id, "user_id": user_id}
+        context = {"thread_id": thread_id, "user_id": user_id}
         assembly = self._ensure_agent(
             config,
             app_config=app_config,
@@ -373,7 +373,7 @@ class AgentClient:
         items = assembly.graph.stream(
             self._input_state(message),
             config=config,
-            #context=context,
+            context=context,
             stream_mode=list(LANGGRAPH_STREAM_MODES),
         )
         return translate_stream(items)

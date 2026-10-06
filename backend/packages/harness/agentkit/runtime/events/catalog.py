@@ -8,6 +8,18 @@ from agentkit.runtime.events.constants import (
 )
 
 
+# §4.3 的取值集合：list_messages / list_events 靠它分区，后加意味着历史行没有正确的值。
+RUN_EVENT_CATEGORIES = frozenset({
+    "message",
+    "trace",
+    "outputs",
+    "error",
+    "subagent",
+    "context",
+    "workspace",
+})
+
+
 @dataclass(frozen=True, slots=True)
 class RunEventDefinition:
     event_type: str

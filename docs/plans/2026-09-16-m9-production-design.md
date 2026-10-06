@@ -5,7 +5,8 @@
 > [M2 工具与沙箱](2026-09-16-m2-tools-sandbox-design.md) · [M3 Gateway 与流式](2026-09-16-m3-gateway-streaming-design.md) ·
 > [M4 持久化](2026-09-16-m4-persistence-design.md) · [M5 前端](2026-09-16-m5-frontend-design.md) ·
 > [M6 中间件体系](2026-09-16-m6-middleware-design.md) · [M7 MCP 与技能](2026-09-16-m7-mcp-skills-design.md) ·
-> [M8 子代理委托](2026-09-16-m8-subagents-design.md)
+> [M8 子代理委托](2026-09-16-m8-subagents-design.md) ·
+> [路由层详细设计](2026-09-16-router-layer-design.md)
 >
 > 本文细化 M9（3–4 周，四条主线内部可并行，9E 默认跳过）。沿用包名：框架层 `agentkit.*`，应用层 `app.*`。
 > 读完应能按文件树、接口、陷阱、测试清单直接开工。
@@ -75,10 +76,11 @@ app/
 │   ├── auth/
 │   │   ├── models.py                ★  # User：id / email / password_hash / system_role / token_version
 │   │   ├── jwt.py / password.py / session_cookie.py
-│   │   └── routers.py               ★  # initialize / login / register / logout / me / change-password
+│   │   └── routers.py               ★  # prefix=/v1/auth，§2.12
 │   └── routers/
-│       ├── scheduled_tasks.py       ★
-│       └── channel_connections.py   ★
+│       ├── scheduled_tasks.py       ★  # prefix=/scheduled-tasks
+│       ├── channels.py              ★  # prefix=/channels；表在 persistence/channel_connections
+│       └── feedback.py              ★  # prefix=/runs，/ {run_id}/feedback
 ├── scheduler/
 │   └── service.py                   ★  # 只决定何时；dispatch 调 start_run
 └── channels/
@@ -381,6 +383,204 @@ M9 的内置 provider 是 AllowAll（接口在，策略全放行）。工具级 
 `auth.enabled=false` 仅用于单人演示。此时 AuthMiddleware 注入一个固定的
 `auth-disabled` 用户，所有数据进该用户桶。生产启动若 `GATEWAY_WORKERS>1`
 且 `auth.enabled=false` → **拒绝启动**（和 9B 的预检放一起）。
+
+### 2.12 路由
+
+路由层 §3.2 把四组划给 M9：`/api/v1/auth/**`、`/api/scheduled-tasks/**`、`/api/channels/**`、`/api/runs/{run_id}/feedback`。
+错误体仍是 `{detail, code, trace_id}`。业务路由不 `try/except` 拼状态码。
+`create_app` 给这四个 router 加 `/api`；各自的 `prefix` 写在文件里。
+
+白名单是 §2.5 那份。白名单以外先过 AuthMiddleware，再过下面的 `require_scope`。
+未登录是 401 `unauthenticated`，函数体不跑。缺 scope 是已有的 403 `permission_denied`。
+
+```python
+# app/gateway/deps.py
+def caller_from_request(request: Request) -> RunCaller:
+    """M3 的匿名实现到这里换成读中间件。body 里的身份仍然不看。"""
+    auth = getattr(request.state, "auth", None)
+    if auth is None:
+        return RunCaller(kind=CallerKind.HTTP, user_id=None)
+    kind = CallerKind.INTERNAL if auth.kind == "internal" else CallerKind.HTTP
+    scopes = frozenset(auth.scopes) if auth.scopes is not None else None
+    return RunCaller(kind=kind, user_id=auth.user_id, scopes=scopes, user_role=auth.role)
+```
+
+`auth.scopes is None` 表示会话用户，不按 scope 裁。PAT 带具体集合。内部 token 是 `CallerKind.INTERNAL`，`user_id` 来自 `X-DeerFlow-Owner-User-Id`，而且只有 AuthMiddleware 读这只头（§2.9）。
+
+#### 认证 `app/gateway/auth/routers.py`
+
+`prefix="/v1/auth"`。这些路由在白名单上的，不再套 `require_scope`。
+
+| Method | Path | 请求 | 成功 | 谁能打 |
+| --- | --- | --- | --- | --- |
+| GET | `/api/v1/auth/setup-status` | 无 | `{"needs_setup": bool}` | 公开 |
+| POST | `/api/v1/auth/initialize` | `InitializeRequest` | 201，`UserResponse`，并设 cookie | 公开，且库里还没有 admin |
+| POST | `/api/v1/auth/login/local` | `LoginRequest` | 200，`LoginResponse`，并设 cookie | 公开 |
+| POST | `/api/v1/auth/register` | `RegisterRequest` | 201，`UserResponse`，并设 cookie | 公开；`auth.allow_registration` 为假则 403 `registration_closed` |
+| POST | `/api/v1/auth/logout` | 无 | 200 `{"ok": true}`，清 cookie | 公开。有会话就作废，没有也 200 |
+| GET | `/api/v1/auth/providers` | 无 | `{"local": true}` | 公开。OIDC 不在本阶段（§12） |
+| GET | `/api/v1/auth/me` | 无 | `UserResponse` | 已登录 |
+| POST | `/api/v1/auth/change-password` | `ChangePasswordRequest` | 200 `{"ok": true}`，`token_version += 1`，重签 cookie | **仅会话**。PAT 打这条 → 403 `session_required` |
+
+```python
+# app/gateway/auth/models.py  （请求模型 extra="forbid"，放在 auth 包里，不进 run 的 request.py）
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+    remember_me: bool = False
+
+class InitializeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+
+class RegisterRequest(InitializeRequest):
+    pass
+
+class ChangePasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    system_role: Literal["admin", "user"]
+
+class LoginResponse(BaseModel):
+    expires_in: int
+    needs_setup: bool
+```
+
+`UserResponse` 没有 `password_hash`，没有 `token_version`。`LoginResponse` 没有 token 字符串（§2.4）。Set-Cookie 由 `session_cookie.py` 写，路由只调用它。
+
+| 情形 | HTTP | `code` |
+| --- | --- | --- |
+| 邮箱不存在或密码错 | 401 | `invalid_credentials`。两种情况同一个 detail，不透露哪个错了 |
+| 同一 peer IP 超过 `max_login_attempts` | 429 | `login_rate_limited` |
+| 已有 admin 再 initialize | 409 | `admin_already_exists` |
+| 改密时当前密码错 | 401 | `invalid_credentials` |
+| change-password 的调用方是 PAT | 403 | `session_required` |
+
+登录计数用 TCP peer IP。只有 peer 落在 `AUTH_TRUSTED_PROXIES` 里才读 `X-Real-IP`（§2.5）。
+
+`logout` 清 access cookie 和 CSRF cookie，并且这个响应上不再签发新的 CSRF（§2.4）。
+
+#### 定时任务 `app/gateway/routers/scheduled_tasks.py`
+
+`prefix="/scheduled-tasks"`。每条都要同时有 `threads:write` 和 `runs:create`（§4.9）。缺一即 403。
+
+```python
+# app/gateway/deps.py
+def require_all_scopes(*scopes: str) -> Callable[[Request], RunCaller]:
+    def _dep(request: Request) -> RunCaller:
+        caller = caller_from_request(request)
+        missing = [scope for scope in scopes if not caller.allows(scope)]
+        if missing:
+            raise RunPermissionDenied(f"missing scope: {', '.join(missing)}")
+        return caller
+    return _dep
+```
+
+| Method | Path | 请求 | 成功 | 说明 |
+| --- | --- | --- | --- | --- |
+| GET | `/api/scheduled-tasks` | `limit` 1..200，默认 50 | `Page[ScheduledTaskResponse]` | 只列 `user_id=caller.user_id` |
+| POST | `/api/scheduled-tasks` | `ScheduledTaskCreateRequest` | 201，`ScheduledTaskResponse` | 非法时区或 cron → 422 `invalid_schedule` |
+| GET | `/api/scheduled-tasks/{task_id}` | `TaskId` | `ScheduledTaskResponse` | 不是自己的 → 404 `scheduled_task_not_found` |
+| PATCH | `/api/scheduled-tasks/{task_id}` | `ScheduledTaskPatchRequest` | 200 | 有 queued/launching/running 的 occurrence → 409 `task_active`（§4.7） |
+| POST | `.../{task_id}/pause` | 无 | 200 | 把 queued 标 cancelled；launching/running 拒绝，409 `task_active` |
+| POST | `.../{task_id}/resume` | 无 | 200 | 同样：有活跃 occurrence 则 409 |
+| POST | `.../{task_id}/trigger` | 无 | 202 `{"occurrence_id": ...}` | 允许在 paused 上手动跑。已有非终态 occurrence 则复用那一行，不另开 |
+| DELETE | `.../{task_id}` | 无 | `{"deleted": task_id}` | 规则同 pause |
+| GET | `.../{task_id}/runs` | `limit` | `Page[OccurrenceResponse]` | occurrence，不是 Gateway run |
+
+```python
+# app/gateway/models/request.py
+TaskId = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+
+class ScheduledTaskCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=200)
+    prompt: str = Field(min_length=1, max_length=8000)
+    schedule_type: Literal["cron", "once"]
+    schedule_spec: dict[str, str]          # cron: {"cron": "0 * * * *"}；once: {"run_at": ISO}
+    timezone: str = Field(min_length=1, max_length=64)
+    context_mode: Literal["fresh_thread_per_run", "reuse_thread"] = "fresh_thread_per_run"
+    thread_id: str | None = None           # 仅 reuse_thread；必须是 caller 自己的 thread
+```
+
+`thread_id` 若给出，先 `require_visible_thread`。看不见是 404 `thread_not_found`，不是 403。
+`overlap_policy` 不在请求里。服务端固定写 `enqueue`（§4.4）。客户端传这个字段 → 422 `invalid_request`。
+
+路由调用 `app/scheduler/service.py` 的仓储方法，不自己 `create_task`，也不调用 `start_run`。手动 trigger 只插入或复用 occurrence。真正开跑仍是 poller 的 `launching` 状态（§4.3）。
+
+`ScheduledTaskResponse` 含 `id`、`title`、`status`、`schedule_type`、`schedule_spec`、`timezone`、`context_mode`、`thread_id`、`next_run_at`、`last_run_id`、`last_error`。时间是 ISO-8601、`Z` 结尾。没有 `lease_owner`。
+
+#### 通道 `app/gateway/routers/channels.py`
+
+`prefix="/channels"`。`{name}` 只允许本阶段的两个平台：`slack`、`telegram`。其它 → 422 `invalid_request`。
+
+| Method | Path | 能力 | 成功 | 说明 |
+| --- | --- | --- | --- | --- |
+| GET | `/api/channels` | `channels:read` | `{"channels": [ChannelStatus]}` | 平台是否启用、自己有没有绑定。没有 bot token |
+| POST | `/api/channels/{name}/bind` | `channels:write` | 201 `{"code": ..., "expires_in": 600}` | 码只出现在这个响应里（§5.4） |
+| DELETE | `/api/channels/{name}/bind` | `channels:write` | `{"deleted": name}` | 删的是这个 caller 的绑定 |
+| POST | `/api/channels/{name}/restart` | `admin` | `{"restarted": name}` | 重启本进程里的那个平台连接，不是用户绑定 |
+
+`ChannelStatus` 的字段：`name`、`enabled`、`bound`、`external_account_id`（已绑定才有，是平台账号 id，不是 token）。
+
+消费绑定码发生在通道的入站消息里，不另开 HTTP。码错、过期、用过，入站都当无效，聊天里不回显码。HTTP 这边没有「提交码」的路由。
+
+#### 反馈 `app/gateway/routers/feedback.py`
+
+`prefix="/runs"`。路径是 `/api/runs/{run_id}/feedback`，不把 `thread_id` 再放进 URL。thread 从 run 行读。
+
+| Method | Path | 能力 | 成功 |
+| --- | --- | --- | --- |
+| PUT | `/api/runs/{run_id}/feedback` | `runs:read` | 200 `FeedbackResponse`。同一 caller + run + `message_id` 再 PUT 是覆盖 |
+| GET | `/api/runs/{run_id}/feedback` | `runs:read` | `{"feedback": FeedbackResponse \| null}` |
+
+```python
+# app/gateway/models/request.py
+class FeedbackPutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    rating: Literal[-1, 1]
+    comment: str | None = Field(default=None, max_length=2000)
+    message_id: str | None = Field(default=None, max_length=64)
+```
+
+`message_id` 缺省表示对整次 run。先 `run_manager.get(run_id, user_id=caller.user_id)`，没有或不属于 caller → 404 `run_not_found`。不单开 `feedback_not_found`：GET 没有记录时 `feedback` 是 `null`，不是 404。
+
+`FeedbackResponse` 有 `feedback_id`、`run_id`、`thread_id`、`message_id`、`rating`、`comment`、`created_at`。没有 `user_id`。评论原样返回，不进系统提示词。
+
+#### 错误
+
+| 异常 | HTTP | `code` | 所属文件 |
+| --- | --- | --- | --- |
+| `Unauthenticated` | 401 | `unauthenticated` | `app/gateway/auth_middleware.py`。白名单外没有有效会话、PAT 或内部 token |
+| `InvalidCredentials` | 401 | `invalid_credentials` | `app/gateway/auth/routers.py` |
+| `LoginRateLimited` | 429 | `login_rate_limited` | 同上 |
+| `AdminAlreadyExists` | 409 | `admin_already_exists` | 同上 |
+| `RegistrationClosed` | 403 | `registration_closed` | 同上 |
+| `SessionRequired` | 403 | `session_required` | 同上。PAT 打了只允许会话的路由 |
+| `InvalidSchedule` | 422 | `invalid_schedule` | `app/gateway/routers/scheduled_tasks.py` |
+| `ScheduledTaskNotFound` | 404 | `scheduled_task_not_found` | 同上 |
+| `TaskActive` | 409 | `task_active` | 同上 |
+| `RunNotFound` | 404 | `run_not_found` | 已有。反馈和别人的 run 都用它 |
+
+这些类带 `status_code` 和 `code`，登记进路由层的 `_handle_domain_error`。`detail` 不含密码、绑定码、bot token、内部 token。
+
+#### 不做
+
+| 不做 | 理由 |
+| --- | --- |
+| OIDC 的 `/oauth`、`/callback` | §12。白名单前缀先留着，路由不注册，所以打过去是 404 不是 401 |
+| PAT 的签发路由 | 同上，W4 可选。`caller_from_request` 已经能读 PAT 的 scopes |
+| `POST /api/channels/{name}/bind` 的码从聊天回读 | §5.4。没有第二条 HTTP 把码再取出来 |
+| 反馈路由放在 `/api/threads/{id}/runs/{id}/feedback` | 路由层的路径是 `/api/runs/{run_id}/feedback`。thread 从 run 行取，避免两个 id 不一致还得再判一次 |
+| 调度路由里 `start_run` | poller 才是唯一会进入 `launching` 的地方（§4.3） |
+
 
 ---
 
@@ -1001,7 +1201,8 @@ M4 的混合 bootstrap 仍然适用。M9 新增 revision（不要改已 stamp �
 | `test_identity_boundary.py` | 优先级链；**图构建和中间件落在同一个桶**（两个用户交错请求） |
 | `test_make_safe_user_id.py` | 邮箱 → 稳定目录安全 id；已安全则原样；不同输入不共桶 |
 | `test_repository_auto_scope.py` | `AUTO` 无上下文抛错不退化全局；显式 `None` 才全局；跨用户 get 返回 None |
-| `test_auth_gate.py` | OpenAPI 里非白名单默认 401；cookie 存在但 tv 不匹配 401；JWT 不出现在响应体 |
+| `test_auth_gate.py` | OpenAPI 里非白名单默认 401 `unauthenticated`；cookie 存在但 tv 不匹配 401；JWT 不出现在响应体；PAT 打 change-password → 403 `session_required` |
+| `test_m9_routes.py` | initialize 第二次 409 `admin_already_exists`；登录失败不区分邮箱和密码；调度 PATCH 在活跃 occurrence 上 409 `task_active`；trigger 不调用 `start_run`；别人的 task/run 是 404；反馈 PUT 后再 GET 是覆盖；绑定响应含码，GET /channels 不含码和 token |
 | `test_csrf.py` | POST 缺 header 拒；bootstrap 不要求 token 但拒 hostile Origin；坏 Bearer 不回退 cookie |
 | `test_token_version.py` | 改密后旧 cookie 立刻 401；新 cookie 可用 |
 | `test_owner_404.py` | 访问别人的 thread/run/artifact 一律 404 |
@@ -1041,7 +1242,9 @@ TDD：W1 先写身份剥离和 AUTO fail-closed；W2 先写 ownership_lost 负�
 - [ ] 调度 run 的工具集没有 `ask_clarification`；网页 run 塞 `non_interactive` 无效
 - [ ] IM 群聊里连发三条消息，不会漏回、不会串线程
 - [ ] **开启记忆后在 IM 里对话，群里看不到任何 `<memory>` / `<durable_context_data>` 内容**
-- [ ] 新加一条 `/api/foo` 路由，不改白名单，未登录访问是 401
+- [ ] 新加一条 `/api/foo` 路由，不改白名单，未登录访问是 401 `unauthenticated`
+- [ ] `POST /api/v1/auth/login/local` 的响应体和 `Authorization` 头都没有 token；cookie 里有
+- [ ] `PUT /api/runs/{id}/feedback` 对别人的 run 是 404 `run_not_found`
 
 第三条要真的用 `kill -9` 做，不要用优雅关闭——优雅关闭走的是完全不同的代码路径。
 最后第二条建议每个已实现的通道都跑一遍。

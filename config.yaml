@@ -1,0 +1,81 @@
+# ============================================================
+# MyFlow 配置模板 —— 复制为 config.yaml 后编辑（config.yaml 已 gitignored）
+#   cp config.example.yaml config.yaml
+# ============================================================
+
+# schema 版本。改 schema 时 bump；加载时比对，过低会提示升级。
+config_version: 1
+
+# 只影响 myflow / app 两个 logger，不动第三方库。
+# startup-only: 改了要重启（apply_logging_level 只在启动时跑一次）
+log_level: info
+
+# 下一条消息生效。default_model 必须是下面 models[].name 之一。
+agents:
+  default_model: deepseek-v4-flash
+
+# startup-only: 改了要重启（按 type 创建的单例不会随热重载重建）
+# M1 只认 memory。
+checkpointer:
+  type: memory
+
+# ------------------------------------------------------------
+# 模型。列表顺序有意义：不指定模型时用第一个。
+# 以 $ 开头的值从环境变量读取；读不到会直接报错，不会静默变成空串。
+# ------------------------------------------------------------
+models:
+  - name: deepseek-v4-flash
+    use: langchain_deepseek:ChatDeepSeek
+    model: deepseek-v4-flash
+    api_key: $DEEPSEEK_API_KEY
+    base_url: https://api.deepseek.com   # 是 base_url 不是 api_base（见 §7.4 坑一）
+    supports_thinking: true
+    when_thinking_enabled:
+      extra_body:
+        thinking: { type: enabled }
+
+  # - name: gpt-4o                       # 唯一标识，API 和前端用这个名字选模型
+  #   display_name: GPT-4o               # 给人看的，不会传给 provider
+  #   description: OpenAI 旗舰多模态模型
+  #   use: langchain_openai:ChatOpenAI   # 反射类路径。这是代码执行入口，故本文件不可 API 写
+  #   model: gpt-4o                      # provider 侧的模型 ID
+  #   api_key: $OPENAI_API_KEY
+  #   context_window: 128000             # 总窗口（prompt + completion），UI 算占用率用
+  #   max_tokens: 4096                   # 单次输出上限 —— 和上面那个不是一回事
+  #   supports_vision: true
+
+  
+
+# 本地沙箱是路径映射，不是隔离。宿主 bash 默认关闭；本机可信环境可打开。
+# sandbox.use 是 startup-only：改了要重启。
+sandbox:
+  use: agentkit.sandbox.local:LocalSandboxProvider
+  allow_host_bash: true
+  bash_command_timeout: 600
+  mounts: []
+
+# ------------------------------------------------------------
+# 以下 section 留着是为了让文件形状从一开始就稳定。
+# 整段注释掉会被 YAML 解析成 null，加载器当作"缺失"走默认值（见 §5.7）。
+# ------------------------------------------------------------
+# sandbox:         # M2
+# database:        # M4   startup-only
+# summarization:   # M6
+# plugins:         # M10  startup-only，且会导致代码被 import
+database:
+  backend: sqlite          # memory | sqlite | postgres   startup-only
+  sqlite_dir: .myflow
+  url: postgresql+asyncpg://...   # 仅 postgres
+  checkpoint_channel_mode: full   # full | delta，启动时冻结
+  postgres_schema: ""             # 非空时钉 search_path
+
+run_events:
+  backend: memory          # memory | db | jsonl          startup-only
+  max_trace_content: 10240 # 仅 db：category=trace 超此字节截断
+  track_token_usage: true  # RunJournal 是否把 usage 累到 RunRow
+
+# 直播帧的桥：进程级单例，lifespan 里建一次（backend 是 startup-only）。
+stream_bridge:
+  backend: memory                  # memory | redis（M9）    startup-only
+  queue_maxsize: 256               # 每 run 保留的数据事件数，决定"能重放多久"
+  heartbeat_interval_seconds: 15   # 0 = 关掉心跳（只给嵌入式用）

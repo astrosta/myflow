@@ -253,8 +253,8 @@ class RunManager:
         *,
         run_id: str | None = None,                 # start_run 预分配（§4.5）；缺省时这里生成
         on_disconnect: DisconnectMode = DisconnectMode.cancel,
-        multitask_strategy: str = "reject",
         metadata: dict | None = None,
+        multitask_strategy: str = "reject",
         kwargs: dict | None = None,                # 脱敏后的原始请求（§4.5）
         model_name: str | None = None,
         user_id: str | None = None,
@@ -282,13 +282,13 @@ class RunManager:
         async with self._lock:
             # 先获取幂等record，命中直接返回
             if idempotency_key is not None:
-                if (reused := await self._find_idempotency_key(idempotency_key, thread_id, user_id)) is not None:
+                if (reused := await self._find_idempotent_locked(idempotency_key, thread_id, user_id)) is not None:
                     return reused
 
             if self._closing:
                 raise ConflictError("Gateway is shutting down")
 
-            occupants = {r for r in self._thread_records_locked(thread_id) if r.status in _ACTIVE or r.finalizing}
+            occupants = [r for r in self._thread_records_locked(thread_id) if r.status in _ACTIVE or r.finalizing]
             if occupants and not supersede:
                 raise ConflictError(f"Thread {thread_id} already has an active operation")
             if any(r.operation_kind is not ThreadOperationKind.run for r in occupants):
@@ -470,6 +470,19 @@ class RunManager:
         async with self._lock:
             run_ids = [r.run_id for r in self._thread_records_locked(thread_id) if r.operation_kind is ThreadOperationKind.run]
         return run_id in run_ids and run_ids[-1] != run_id
+
+    async def later_run_is_running(self, thread_id: str, run_id: str) -> bool:
+        """True when a run admitted after this one has already entered running."""
+        async with self._lock:
+            records = [r for r in self._thread_records_locked(thread_id) if r.operation_kind is ThreadOperationKind.run]
+        seen_self = False
+        for record in records:
+            if record.run_id == run_id:
+                seen_self = True
+                continue
+            if seen_self and record.status is RunStatus.running:
+                return True
+        return False
 
 class ConflictError(Exception):
     """Raised when multitask_strategy=reject and thread has inflight runs."""

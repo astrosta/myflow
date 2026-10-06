@@ -8,6 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from agentkit.config import get_app_config
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine_from_config
@@ -18,6 +19,15 @@ from agentkit.runtime.checkpointer import make_checkpointer
 from agentkit.runtime.events.store import make_run_event_store
 from agentkit.runtime.run_services import build_run_services
 from agentkit.runtime.runs.store import make_run_store
+from backend.app.gateway.errors import install_error_handlers
+from backend.app.gateway.middleware.trace import TraceMiddleware
+from backend.app.gateway.routers import (
+    artifacts,
+    models,
+    thread_runs,
+    threads,
+    uploads,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,4 +67,33 @@ async def lifespan(app: FastAPI):
         await close_engine()
 
 
-app = FastAPI(lifespan=lifespan)
+def install_middleware(app: FastAPI) -> None:
+    """Starlette runs the last added middleware first. Trace stays inside CORS."""
+    app.add_middleware(TraceMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Location", "X-Trace-Id"],
+    )
+
+
+def create_app() -> FastAPI:
+    application = FastAPI(
+        title="agentkit gateway",
+        version="1.0.0",
+        redirect_slashes=False,
+        lifespan=lifespan,
+    )
+    install_middleware(application)
+    install_error_handlers(application)
+    application.include_router(threads.router)
+    application.include_router(thread_runs.router)
+    application.include_router(models.router)
+    application.include_router(uploads.router)
+    application.include_router(artifacts.router)
+    return application
+
+
+app = create_app()

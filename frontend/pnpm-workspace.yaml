@@ -1,0 +1,9 @@
+# pnpm 11 起，构建脚本白名单这类设置只在这里读，
+# package.json 里的 "pnpm" 字段已经不生效（只会打一条 warning）。
+#
+# unrs-resolver 的 postinstall 是 napi-rs 的绑定校验/兜底；它同时提供
+# 各平台的 optionalDependencies 预编译包。这里显式放行，而不是留着一个
+# 没填的占位值——占位值会让每次 pnpm install 都以
+# ERR_PNPM_IGNORED_BUILDS 失败，本地和 docker build 都跑不起来。
+allowBuilds:
+  unrs-resolver: true

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from agentkit.persistence.base import Base
 from agentkit.runtime.events.constants import (
     RUN_EVENT_CATEGORY_MAX_LENGTH,
+    RUN_EVENT_ID_MAX_LENGTH,
     RUN_EVENT_TYPE_MAX_LENGTH,
 )
 
@@ -16,8 +17,8 @@ class RunEventRow(Base):
     __tablename__ = "run_events"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(RUN_EVENT_ID_MAX_LENGTH), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(RUN_EVENT_ID_MAX_LENGTH), nullable=False)
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     event_type: Mapped[str] = mapped_column(String(RUN_EVENT_TYPE_MAX_LENGTH), nullable=False)
     category: Mapped[str] = mapped_column(String(RUN_EVENT_CATEGORY_MAX_LENGTH), nullable=False)

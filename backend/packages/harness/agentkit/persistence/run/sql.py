@@ -8,7 +8,8 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 
-from agentkit.persistence.base import iso_utc, row_to_dict
+from agentkit.persistence.base import decode_keyset_cursor, encode_keyset_cursor, iso_utc, row_to_dict
+from agentkit.persistence.json_compat import json_value_matches
 from agentkit.persistence.run.model import RunRow
 from agentkit.runtime.runs.schemas import RunStatus
 from agentkit.runtime.runs.store.base import ACTIVE_STATUSES, RunStore
@@ -21,11 +22,11 @@ _DATETIME_COLUMNS = ("created_at", "updated_at", "lease_expires_at", "cancel_req
 
 
 def _encode_cursor(row: RunRow) -> str:
-    return f"{iso_utc(row.created_at)}|{row.run_id}"
+    return encode_keyset_cursor("desc", iso_utc(row.created_at) or "", row.run_id)
 
 
-def _parse_cursor(cursor: str) -> tuple[datetime, str]:
-    created_at, _, run_id = cursor.partition("|")
+def _parse_cursor(cursor: str, *, order: str = "desc") -> tuple[datetime, str]:
+    created_at, run_id = decode_keyset_cursor(cursor, order=order)
     return datetime.fromisoformat(created_at.replace("Z", "+00:00")), run_id
 
 
@@ -153,16 +154,36 @@ class SqlRunStore(RunStore):
         user_id=AUTO,
         limit: int = 100,
         before: str | None = None,
+        order: str = "desc",
+        statuses: frozenset | None = None,
+        metadata: dict | None = None,
     ) -> list[dict]:
         stmt = select(RunRow).where(RunRow.thread_id == thread_id, RunRow.operation_kind == "run")
         if (uid := resolve_user_id(user_id, method_name="RunStore.list_by_thread")) is not None:
             stmt = stmt.where(RunRow.user_id == uid)
+        if statuses is not None:
+            allowed = [getattr(item, "value", item) for item in statuses]
+            stmt = stmt.where(RunRow.status.in_(allowed))
+        for key, expected in (metadata or {}).items():
+            stmt = stmt.where(json_value_matches(RunRow.metadata_json, key, expected))
         if before is not None:
-            stmt = stmt.where(tuple_(RunRow.created_at, RunRow.run_id) < _parse_cursor(before))
-        stmt = stmt.order_by(RunRow.created_at.desc(), RunRow.run_id.desc()).limit(limit)
+            created_at, run_id = _parse_cursor(before, order=order)
+            key = tuple_(RunRow.created_at, RunRow.run_id)
+            bound = (created_at, run_id)
+            stmt = stmt.where(key < bound if order == "desc" else key > bound)
+        if order == "asc":
+            stmt = stmt.order_by(RunRow.created_at.asc(), RunRow.run_id.asc())
+        else:
+            stmt = stmt.order_by(RunRow.created_at.desc(), RunRow.run_id.desc())
+        stmt = stmt.limit(limit)
         async with self._sf() as session:
             rows = (await session.scalars(stmt)).all()
-        return [self._row_to_dict(row) for row in rows]
+        page = []
+        for row in rows:
+            body = self._row_to_dict(row)
+            body["cursor"] = encode_keyset_cursor(order, iso_utc(row.created_at) or "", row.run_id)
+            page.append(body)
+        return page
 
     async def update_status(
         self, run_id: str, status: RunStatus, *, error: str | None = None, stop_reason: str | None = None

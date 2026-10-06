@@ -37,6 +37,19 @@ class ThreadMetaStore(abc.ABC):
         user_id=AUTO,
     ) -> list[dict]: ...
 
+    async def search_page(
+        self,
+        *,
+        user_id: str | None,
+        metadata=None,
+        status: str | None = None,
+        limit: int = 51,
+        cursor: str | None = None,
+        order: str = "desc",
+    ) -> list[dict]:
+        """Keyset page. Each row carries a non-persistent ``cursor`` key. Subclasses override this."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     async def update_display_name(self, thread_id, display_name, *, user_id=AUTO) -> None: ...
 

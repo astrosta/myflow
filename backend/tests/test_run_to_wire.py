@@ -23,7 +23,7 @@ def test_run_to_wire_keeps_the_public_run_and_drops_process_fields() -> None:
         multitask_strategy="interrupt",
     )
 
-    body = run_to_wire(record)
+    body = run_to_wire(record).model_dump()
 
     assert body == {
         "run_id": "run-1",
@@ -36,7 +36,11 @@ def test_run_to_wire_keeps_the_public_run_and_drops_process_fields() -> None:
         "kwargs": {"input": {"messages": ["hi"]}},
         "multitask_strategy": "interrupt",
         "on_disconnect": "cancel",
+        "model_name": None,
         "error": "cancelled",
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "llm_call_count": 0,
     }
     assert "user_id" not in body
     assert "task" not in body

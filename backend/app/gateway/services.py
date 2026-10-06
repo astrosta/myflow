@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import logging
 import json
+from contextlib import asynccontextmanager
 from typing import Any, ClassVar
 
 from fastapi import Request
@@ -20,6 +21,8 @@ from agentkit.agents.leader_agent import (
     CONTEXT_ONLY_KEYS,
     SERVER_OWNED_KEYS,
 )
+from agentkit.agents.middlewares.provenance import PROVENANCE_KEYS
+from agentkit.utils.messages import ORIGINAL_USER_CONTENT_KEY
 from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.context import RunContext
 from agentkit.runtime.runs import (
@@ -62,9 +65,14 @@ _DROPPED_KEYS = (
 
 _CREDDENTIAL_METADATA_KEYS = frozenset({"auth_token"})
 
-# 客户端不能伪造的 additional_kwargs 键。M3 为空，但剥离函数和调用点现在就接好；
-# M6 并入 PROVENANCE_KEYS | {ORIGINAL_USER_CONTENT_KEY, "hide_from_ui", ...}（M6 §4.1、§4.7）。
-SERVER_OWNED_MESSAGE_KEYS: frozenset[str] = frozenset()
+# 客户端不能伪造的 additional_kwargs 键。internal 请求只保留 original_user_content。
+_SERVER_OWNED_MESSAGE_KEYS = PROVENANCE_KEYS | {
+    ORIGINAL_USER_CONTENT_KEY,
+    "hide_from_ui",
+    "dynamic_context_reminder",
+    "reminder_date",
+}
+SERVER_OWNED_MESSAGE_KEYS: frozenset[str] = _SERVER_OWNED_MESSAGE_KEYS
 
 #保留的metadata key，不放到RunConfigable的metadata里面，TRACE_METADATA_KEY重新生成
 _RESERVED_METADATA_KEYS = CLIENT_IDENTITY_KEYS | {TRACE_METADATA_KEY}
@@ -224,7 +232,7 @@ def _check_model_allowed(model_name: str | None, app_config: AppConfig) -> str| 
 
 async def _thread_access_allowed(thread_store, thread_id: str, caller: RunCaller, *, require_existing: bool) -> bool:
     if caller.user_id is None: #检查thread id是否存在
-        return not require_existing or await thread_store.exists(thread_id, user_id=None) is not None
+        return not require_existing or await thread_store.get(thread_id, user_id=None) is not None
     return await thread_store.check_access(thread_id, caller.user_id, require_existing=require_existing)
 
 def resolve_agent_factory(assistant_id: str) -> AgentFactory:
@@ -252,26 +260,41 @@ def normalize_input(raw: dict|None, *, command: Any, trusted: bool) -> dict:
 
     converted = []
     for index, item in enumerate(messages):
+        if isinstance(item, dict):
+            strip_server_owned_message_keys(item, internal=trusted)
         try:
             [message] = convert_to_messages([item])
         except (ValueError, TypeError, NotImplementedError) as exc:
             raise RunRequestInvalid(f"Invalid message at input.messages[{index}]: {exc}") from exc
+        if not isinstance(item, dict):
+            message = _strip_message_object(message, internal=trusted)
         if not trusted:
             if message.type not in _CLIENT_MESSAGE_TYPES:
                 raise RunRequestInvalid(f"input.messages[{index}]: role {message.type!r} is not accepted from clients")
-            message = _strip_server_owned_keys(message)
         converted.append(message)
     return {**raw, "messages": converted}
 
 
-def _strip_server_owned_keys(message: BaseMessage) -> BaseMessage:
-    kept = {k: v for k, v in message.additional_kwargs.items() if k not in SERVER_OWNED_MESSAGE_KEYS}
-    if kept == message.additional_kwargs:
+def strip_server_owned_message_keys(message: dict, *, internal: bool) -> None:
+    """就地删除客户端伪造的服务端键。internal=True 时保留 original_user_content。"""
+    kwargs = message.get("additional_kwargs")
+    if not isinstance(kwargs, dict):
+        return
+    for key in _SERVER_OWNED_MESSAGE_KEYS:
+        if internal and key == ORIGINAL_USER_CONTENT_KEY:
+            continue
+        kwargs.pop(key, None)
+
+
+def _strip_message_object(message: BaseMessage, *, internal: bool) -> BaseMessage:
+    carrier = {"additional_kwargs": dict(message.additional_kwargs)}
+    strip_server_owned_message_keys(carrier, internal=internal)
+    if carrier["additional_kwargs"] == message.additional_kwargs:
         return message
-    return message.model_copy(update={"additional_kwargs": kept})
+    return message.model_copy(update={"additional_kwargs": carrier["additional_kwargs"]})
 
 def _build_run_metadata(raw: dict|None) -> dict:
-    metadata = {k:v for k,v in raw.items() if k not in _RESERVED_METADATA_KEYS}
+    metadata = raw if isinstance(raw, dict) else {}
     metadata[TRACE_METADATA_KEY] = ensure_trace_id()
     return metadata
 
@@ -511,6 +534,75 @@ def sse_response(services: RunServices, launch: RunLaunch, request: Request, *, 
             "Content-Location": f"/api/threads/{record.thread_id}/runs/{record.run_id}",
         },
     )
+
+
+async def delete_thread(services: RunServices, thread_id: str, caller: RunCaller) -> None:
+    """Refuse the delete while a run is still pending or running, then drop the projection row."""
+    active = await services.run_store.list_by_thread(
+        thread_id,
+        user_id=caller.user_id,
+        limit=1,
+        statuses=frozenset({RunStatus.pending, RunStatus.running}),
+    )
+    if active:
+        raise ThreadBusy(f"Thread {thread_id} has an active run")
+    row = await services.run_context.thread_store.get(thread_id, user_id=caller.user_id)
+    if row is None:
+        raise ThreadNotFound(f"Thread {thread_id} not found")
+    await services.run_context.thread_store.delete(thread_id, user_id=caller.user_id)
+
+
+@asynccontextmanager
+async def reserve_checkpoint_write(services: RunServices, thread_id: str, *, user_id: str | None):
+    """Hold the thread while a checkpoint write runs. An active operation becomes ThreadBusy."""
+    from agentkit.runtime.runs.schemas import ThreadOperationKind
+
+    try:
+        async with services.run_manager.reserve_thread_operation(
+            thread_id,
+            kind=ThreadOperationKind.checkpoint_write,
+            user_id=user_id,
+        ):
+            yield
+    except ConflictError as exc:
+        raise ThreadBusy(str(exc)) from exc
+
+
+async def compact_thread_context(
+    services: RunServices,
+    thread_id: str,
+    *,
+    user_id: str | None,
+    force: bool,
+    keep: tuple | None,
+    model_name: str | None,
+    raise_on_failure: bool,
+):
+    """Run the shared summarizer and write one new checkpoint. None means there was nothing to compact."""
+    del user_id, raise_on_failure
+    from agentkit.agents.middlewares.summarization_middleware import (
+        SummaryGenerationError,
+        compact_thread_context as write_compacted_state,
+        create_summarization_middleware,
+    )
+    from backend.app.gateway.errors import CompactionDisabled, SummarizationFailed
+
+    middleware = create_summarization_middleware(keep=keep, run_model_name=model_name)
+    if middleware is None:
+        raise CompactionDisabled("Summarization is disabled")
+    try:
+        outcome = await write_compacted_state(
+            services.run_context.checkpointer,
+            thread_id,
+            middleware=middleware,
+            force=force,
+        )
+    except SummaryGenerationError as exc:
+        raise SummarizationFailed("Failed to compact thread context") from exc
+    if not outcome.compacted:
+        return None
+    return outcome
+
 
 async def wait_for_run_completion(
     services: RunServices, record: RunRecord, request: Request, *, apply_on_disconnect: bool = True

@@ -1,7 +1,8 @@
 # M2 工具与沙箱详细设计
 
 > 配套文档：[分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md) ·
-> [M0 地基](2026-09-16-m0-foundation-design.md) · [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md)
+> [M0 地基](2026-09-16-m0-foundation-design.md) · [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md) ·
+> [路由层详细设计](2026-09-16-router-layer-design.md)
 >
 > 本文细化 M2（2 周）。沿用包名：框架层 `agentkit.*`，应用层 `app.*`。
 
@@ -10,6 +11,7 @@
 ## 1. M2 的范围
 
 **做什么：** 让 agent 能在受控环境里读写文件、执行命令，并把三类工具来源汇聚成一个入口。
+浏览器进出这些文件只走 §10 的四条路由。
 
 **M2 的核心命题只有一句：现在只实现本地沙箱，但接口必须按"沙箱在另一台机器上"来设计。**
 
@@ -49,7 +51,7 @@
 | D3–4 | `LocalSandboxProvider` + 路径映射 + 路径安全 |
 | D5–6 | 文件工具：`read_file` / `write_file` / `str_replace` / `ls` / `glob` / `grep` |
 | D7 | `bash` 工具：进程组、超时、后台进程、输出捕获 |
-| D8 | 工具三源汇聚 + 沙箱生命周期中间件 |
+| D8 | 工具三源汇聚 + 沙箱生命周期中间件 + 上传/产物路由（§10） |
 | D9–10 | 测试：路径逃逸、并发写、错误契约、跨平台 |
 
 ### M2 新增的文件
@@ -78,6 +80,15 @@ agentkit/sandbox/
     └── list_dir.py                 # 树形渲染
 
 agentkit/tools/registry.py          # get_available_tools 三源汇聚（M1 建的空壳，M2 填实现）
+
+app/gateway/
+├── thread_access.py                # require_visible_thread，threads 路由与 §10 共用
+├── thread_files.py              ★  # 上传落盘、列表、删除、打开产物；路由不碰路径
+├── models/response.py              # 追加 UploadResponse / UploadedFileInfo
+├── errors.py                       # §10.4 的六个异常
+└── routers/
+    ├── uploads.py               ★  # POST/GET list/DELETE uploads
+    └── artifacts.py             ★  # GET artifacts/{path}
 ```
 
 **工具不要全塞进一个 `tools.py`。** DeerFlow 的对应文件长到了 2661 行，里面混着工具定义、
@@ -845,7 +856,223 @@ class ToolConfig(BaseModel):
 
 ---
 
-## 10. 测试清单（D9–10）
+## 10. 上传与产物路由（D8）
+
+路由层 §3.2 把四条路由划给 M2。错误体、能力门、`ThreadId`、静态段顺序沿用路由层，不另写一套。
+`create_app` 的 `include_router` 在路由层 §7.1。本节只定义 handler 和落盘。
+
+这四条路由是浏览器和沙箱之间的口。路径翻译只用 §5.1 的 `resolve_sandbox_path`，router 里不出现 `Path(...) / filename`。
+
+### 10.1 路由表
+
+| Method | Path | 请求 | 成功响应 | 能力 | 所属文件 |
+| --- | --- | --- | --- | --- | --- |
+| POST | `/api/threads/{thread_id}/uploads` | `multipart` 字段 `files` | `UploadResponse`（201） | `threads:write` | `app/gateway/routers/uploads.py` |
+| GET | `/api/threads/{thread_id}/uploads/list` | 无 | `UploadListResponse`（200） | `threads:read` | 同上 |
+| DELETE | `/api/threads/{thread_id}/uploads/{filename}` | 路径参数 | `DeletedUploadResponse`（200） | `threads:write` | 同上 |
+| GET | `/api/threads/{thread_id}/artifacts/{path:path}` | `?download=` | 文件字节，无 `response_model` | `threads:read` | `app/gateway/routers/artifacts.py` |
+
+两个 router 的 `prefix` 都是 `/threads`，`create_app` 再加 `/api`。
+
+`GET .../uploads/list` 必须写在 `DELETE .../uploads/{filename}` 前面。后写的话，`DELETE /uploads/list` 仍会命中 `{filename}`，那是允许的（文件就可以叫 `list`）。不能加的是 `GET /uploads/{filename}`：它会把 `list` 吃掉，列表接口变成 404。上传文件不从 HTTP 按名字下载，agent 用虚拟路径 `/mnt/user-data/uploads/{filename}` 去读。
+
+不分页。一个 thread 的上传目录有上限（§10.2），列表就是这一个目录的全集。套 `Page` 会让客户端以为后面还有一页。
+
+### 10.2 参数
+
+```python
+# app/gateway/routers/uploads.py
+UploadFilename = Annotated[str, Path(min_length=1, max_length=255)]
+```
+
+`UploadFilename` 不靠正则收口。合法文件名含中文和空格；正则要么漏掉它们，要么挡不住 `..`。形状检查在 `app/gateway/thread_files.py::check_upload_filename`，DELETE 和 POST 共用。
+
+| 输入 | 结果 | `code` |
+| --- | --- | --- |
+| 空串、超过 255、含 `/` `\` 或 NUL、名为 `.` 或 `..`、含 `..` 这一段 | 422 | `invalid_upload` |
+| 通过检查但目录里没有这个文件（DELETE） | 404 | `upload_not_found` |
+| `thread_id` 不是 `ThreadId` | 422 | `invalid_request`（路由层 §7.2，进不了函数） |
+
+`thread_id` 的类型是 `app/gateway/models/request.py` 的 `ThreadId`。属主检查调用 `app/gateway/thread_access.py::require_visible_thread`，不在本文件再写一次 `thread_store.get`。行不存在或不是这个 caller 的，都是 404 `thread_not_found`。所以上传之前要先 `POST /api/threads`。
+
+```yaml
+# config.yaml
+uploads:
+  max_files_per_request: 10
+  max_files_per_thread: 100
+  max_file_size_bytes: 10485760      # 10 MiB
+  max_total_size_bytes: 33554432     # 单次请求合计
+```
+
+| 配置 | 超过时 | `code` |
+| --- | --- | --- |
+| `max_file_size_bytes` / `max_total_size_bytes` | 413 | `upload_too_large` |
+| `max_files_per_request` | 422 | `invalid_upload` |
+| `max_files_per_thread` | 409 | `upload_limit_reached` |
+
+大小在读流时累计，不是先把 body 收完再量。到顶立刻停，并删掉已经写下的临时文件。
+
+产物路径是 URL 里的 `{path:path}`，没有前导斜杠。服务层先拼成 `"/"` + `path`，再跑 §5.1。只允许落在 `/mnt/user-data/outputs` 下面（最长前缀，卡段边界）。`uploads` 和 `workspace` 不从这条路由读。
+
+| 产物路径 | 结果 | `code` |
+| --- | --- | --- |
+| 空字节、`://`、盘符、UNC、不是绝对虚拟路径、不在 `outputs` 下、`resolve` 之后逃出根 | 422 | `invalid_artifact_path` |
+| 语法合法，文件不存在，或解析结果是目录 | 404 | `artifact_not_found` |
+
+422 的 `detail` 用 §5.1 的 `_REJECT_HINT`，不把客户端传来的路径拼进去。
+
+`download` 是 `Query` 上的 `bool`，默认 `false`。
+
+### 10.3 响应
+
+```python
+# app/gateway/models/response.py
+class UploadedFileInfo(BaseModel):
+    filename: str                       # 落盘名。重名时带 _N 后缀
+    original_filename: str              # 客户端原始文件名（已通过 check_upload_filename）
+    size: int
+    virtual_path: str                   # 恒为 /mnt/user-data/uploads/{filename}
+    modified: str                       # ISO-8601，Z 结尾
+
+
+class UploadResponse(BaseModel):
+    files: list[UploadedFileInfo]
+
+
+class UploadListResponse(BaseModel):
+    files: list[UploadedFileInfo]
+    count: int
+
+
+class DeletedUploadResponse(BaseModel):
+    deleted: str                        # 被删的 filename，不是虚拟路径
+```
+
+响应里没有宿主机路径。`path`、`artifact_url` 都不出现：前者会把 `.myflow/users/...` 漏给浏览器（违反 §4.3），后者让客户端依赖一条还没承诺的下载 URL。
+
+同一次请求里两个文件净化后同名，后一个在扩展名前加 `_2`、`_3`。`report.pdf` 第二次变成 `report_2.pdf`。后缀加在扩展名前面，避免把 `.pdf` 弄丢。
+
+产物响应是 `FileResponse`，不是 JSON。
+
+| 头 | 值 | 谁加 |
+| --- | --- | --- |
+| `Content-Type` | 按扩展名的小表；不认识就是 `application/octet-stream` | `app/gateway/thread_files.py::open_artifact` |
+| `Content-Disposition` | `inline`，或 `attachment` | 见下 |
+| `X-Trace-Id` | 当前 trace | 路由层 §12 的中间件 |
+
+`text/html`、`application/xhtml+xml`、`image/svg+xml` 永远是 `attachment`，不管 `download`。这三类在浏览器里会执行。其余类型只在 `download=true` 时用 `attachment`。`filename` 只用 basename，并按 RFC 5987 编码，不把虚拟路径写进头里。
+
+### 10.4 handler
+
+```python
+# app/gateway/routers/uploads.py
+router = APIRouter(prefix="/threads", tags=["uploads"])
+
+
+@router.get("/{thread_id}/uploads/list", response_model=UploadListResponse)
+async def list_uploads(
+    thread_id: ThreadId,
+    caller: Annotated[RunCaller, Depends(require_scope("threads:read"))],
+    services: Annotated[RunServices, Depends(get_run_services)],
+) -> UploadListResponse:
+    await require_visible_thread(services, thread_id, caller)   # app/gateway/thread_access.py
+    files = await list_upload_dir(thread_id, caller.user_id)    # app/gateway/thread_files.py
+    return UploadListResponse(files=files, count=len(files))
+
+
+@router.post("/{thread_id}/uploads", status_code=201, response_model=UploadResponse)
+async def create_uploads(
+    thread_id: ThreadId,
+    files: Annotated[list[UploadFile], File()],
+    caller: Annotated[RunCaller, Depends(require_scope("threads:write"))],
+    services: Annotated[RunServices, Depends(get_run_services)],
+) -> UploadResponse:
+    await require_visible_thread(services, thread_id, caller)
+    if not files:
+        raise UploadInvalid("At least one file is required")
+    saved = await save_uploads(thread_id, caller.user_id, files)
+    return UploadResponse(files=saved)
+
+
+@router.delete("/{thread_id}/uploads/{filename}", response_model=DeletedUploadResponse)
+async def delete_upload(
+    thread_id: ThreadId,
+    filename: UploadFilename,
+    caller: Annotated[RunCaller, Depends(require_scope("threads:write"))],
+    services: Annotated[RunServices, Depends(get_run_services)],
+) -> DeletedUploadResponse:
+    await require_visible_thread(services, thread_id, caller)
+    check_upload_filename(filename)                              # 不通过则 UploadInvalid
+    await delete_upload_file(thread_id, caller.user_id, filename)
+    return DeletedUploadResponse(deleted=filename)
+```
+
+`GET /list` 的声明在 `POST` 和 `DELETE` 前面。FastAPI 按声明顺序匹配。
+
+```python
+# app/gateway/routers/artifacts.py
+router = APIRouter(prefix="/threads", tags=["artifacts"])
+
+
+@router.get("/{thread_id}/artifacts/{path:path}")
+async def get_artifact(
+    thread_id: ThreadId,
+    path: str,
+    download: Annotated[bool, Query()] = False,
+    caller: Annotated[RunCaller, Depends(require_scope("threads:read"))],
+    services: Annotated[RunServices, Depends(get_run_services)],
+) -> FileResponse:
+    await require_visible_thread(services, thread_id, caller)
+    opened = await open_artifact(thread_id, caller.user_id, path, download=download)
+    return opened.response
+```
+
+这条没有 `response_model`。路由层 §13.2 的白名单要加上 `("GET", "/api/threads/{thread_id}/artifacts/{path:path}")`。
+
+| 步骤 | 上传 | 列表 / 删除 | 产物 |
+| --- | --- | --- | --- |
+| 1 | `threads:write` 在进函数之前 | 列表是 `threads:read`，删除是 `threads:write` | `threads:read` |
+| 2 | `require_visible_thread` | 同左 | 同左 |
+| 3 | `save_uploads`：校验、限流、临时文件、改名 | 列表只读目录；删除先 `check_upload_filename` 再删 | `open_artifact`：§5.1，然后确认是普通文件 |
+| 4 | `UploadResponse` | `UploadListResponse` 或 `DeletedUploadResponse` | `FileResponse` |
+
+```python
+# app/gateway/thread_files.py
+async def save_uploads(thread_id: str, user_id: str | None, files: list[UploadFile]) -> list[UploadedFileInfo]:
+    """读和写都放进 asyncio.to_thread。路由在事件循环上，目录 IO 不在。
+
+    每个文件先写入同目录的 .upload-{uuid}.part，大小和总数都过了再 rename。
+    中途失败删掉已写的 part，已改名的文件也删掉，这次请求要么全进目录，要么一个都不留。
+    """
+```
+
+虚拟路径是 `/mnt/user-data/uploads/{filename}`。物理位置由该 thread 的 `PathMapping` 决定（§4.1），`user_id` 来自 `caller`，不来自表单字段。
+
+六个异常放在 `app/gateway/errors.py`，不继承 `StartRunError`。登记方式和 M1 的 `ModelNotFound` 一样：类上带 `status_code` 和 `code`，走 `_handle_domain_error`。
+
+| 异常 | HTTP | `code` | 谁抛 |
+| --- | --- | --- | --- |
+| `UploadInvalid` | 422 | `invalid_upload` | 文件名、空列表、单次个数 |
+| `UploadTooLarge` | 413 | `upload_too_large` | 单文件或单次合计超限 |
+| `UploadLimitReached` | 409 | `upload_limit_reached` | 该 thread 已有 `max_files_per_thread` 个文件 |
+| `UploadNotFound` | 404 | `upload_not_found` | DELETE 时目录里没有 |
+| `ArtifactPathInvalid` | 422 | `invalid_artifact_path` | §5.1 拒绝，或前缀不是 `outputs` |
+| `ArtifactNotFound` | 404 | `artifact_not_found` | 路径合法但不是一个现存文件 |
+
+### 10.5 这条路由不做什么
+
+| 不做 | 理由 |
+| --- | --- |
+| 上传时把 PDF / Office 转成 Markdown | 转换器失败会让「文件已收到」和「目录里有什么」对不上。M2 原样落盘 |
+| `PUT` 改产物、`Range` 断点 | 路由层没把它们划给 M2。读是整文件 |
+| 从 `.skill` 压缩包里抽一个成员 | 那是技能包的读法，不是产物文件 |
+| 在路由里 `chmod` 或拼宿主机路径 | 权限和映射属于 provider。HTTP 层只交虚拟路径和字节 |
+| 上传进一个还没有 thread 行的 id | 404。否则磁盘上会出现一条没有任何元数据的目录 |
+
+
+---
+
+## 11. 测试清单（D9–10）
 
 | 文件 | 覆盖 |
 |---|---|
@@ -858,6 +1085,8 @@ class ToolConfig(BaseModel):
 | `test_bash_tool.py` | 超时杀整个进程组；stdin 立即 EOF；后台进程不阻塞；大输出不 OOM |
 | `test_tools_assembly.py` | 三源去重与优先级；重名告警；name 不一致告警；宿主 bash 默认被过滤 |
 | `blocking_io/test_sandbox_async.py` | 异步路径不调同步 `acquire`；`get()` 不做 IO |
+| `test_uploads_router.py` | 空 `files` → 422 `invalid_upload`；`../x` 与含 `/` 的文件名 → 422，detail 不含该路径；超限 → 413 / 409；同名第二次得到 `report_2.pdf`；响应 JSON 不含宿主机路径；`GET .../uploads/list` 不被当成文件名；别人的 thread → 404 `thread_not_found` |
+| `test_artifacts_router.py` | `outputs` 下的文件 200；`uploads` 与 `workspace` 前缀 → 422 `invalid_artifact_path`；`..` 逃逸 → 422 且 detail 是 `_REJECT_HINT`；缺文件 → 404；`.html` / `.svg` 的 `Content-Disposition` 是 `attachment` |
 
 最后那个 blocking-IO 套件是 M2 引入的新测试层，**建议单独一条 CI gate**。
 它在后面每个阶段都会救命，因为"在事件循环上偷偷做了阻塞 IO"这类 bug 在功能测试里完全看不出来，
@@ -865,7 +1094,7 @@ class ToolConfig(BaseModel):
 
 ---
 
-## 11. 验收清单
+## 12. 验收清单
 
 - [ ] 模型在沙箱里写 Python 脚本并 `bash` 执行成功
 - [ ] `../../etc/passwd`、`C:\Windows\System32`、指向外部的符号链接全部被拒，错误信息可操作
@@ -880,10 +1109,12 @@ class ToolConfig(BaseModel):
 - [ ] `ls /mnt/user-data` 列出三个子目录（和 Docker 行为一致），而不是报"找不到映射"
 - [ ] 用户 A 启动进程、用户 B 发起会话，B 的沙箱解析到 B 自己的目录
 - [ ] blocking-IO 套件通过
+- [ ] `POST .../uploads` 写入的文件，agent 能用 `/mnt/user-data/uploads/{filename}` 读到，响应里没有宿主机路径
+- [ ] `GET .../artifacts/...` 只能读 `outputs`；`uploads`、`..`、不存在的文件分别是 422、422、404
 
 ---
 
-## 12. 刻意不做的事
+## 13. 刻意不做的事
 
 | 不做 | 理由 |
 |---|---|
@@ -896,9 +1127,9 @@ class ToolConfig(BaseModel):
 
 ---
 
-## 13. 一句话总结
+## 14. 一句话总结
 
 M2 写的代码里，90% 是本地实现，10% 是抽象——但价值分布正好相反。
 
 判断 M2 做得对不对，只需要一个检验：**把 `LocalSandboxProvider` 整个删掉换成 Docker 实现，
-工具层和 agent 层需要改几行？** 答案应该是零。
+工具层、agent 层和 §10 的四条路由需要改几行？** 答案应该是零。路由只认虚拟路径。

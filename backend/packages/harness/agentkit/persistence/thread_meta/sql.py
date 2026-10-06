@@ -102,6 +102,47 @@ class SqlThreadMetaStore(ThreadMetaStore):
             rows = (await session.scalars(statement)).all()
         return [row_to_dict(row) for row in rows]
 
+    async def search_page(
+        self,
+        *,
+        user_id: str | None,
+        metadata=None,
+        status: str | None = None,
+        limit: int = 51,
+        cursor: str | None = None,
+        order: str = "desc",
+    ) -> list[dict]:
+        from agentkit.persistence.base import decode_keyset_cursor, encode_keyset_cursor, iso_utc
+        from sqlalchemy import tuple_
+
+        owner = resolve_thread_user(user_id, "search_page")
+        statement = select(ThreadMetaRow)
+        if owner is not None:
+            statement = statement.where(ThreadMetaRow.user_id == owner)
+        if status is not None:
+            statement = statement.where(ThreadMetaRow.status == status)
+        for key, expected in (metadata or {}).items():
+            statement = statement.where(json_value_matches(ThreadMetaRow.metadata_json, key, expected))
+        if cursor is not None:
+            updated_at, thread_id = decode_keyset_cursor(cursor, order=order)
+            stamp = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            key = tuple_(ThreadMetaRow.updated_at, ThreadMetaRow.thread_id)
+            bound = (stamp, thread_id)
+            statement = statement.where(key < bound if order == "desc" else key > bound)
+        if order == "asc":
+            statement = statement.order_by(ThreadMetaRow.updated_at.asc(), ThreadMetaRow.thread_id.asc())
+        else:
+            statement = statement.order_by(ThreadMetaRow.updated_at.desc(), ThreadMetaRow.thread_id.desc())
+        statement = statement.limit(limit)
+        async with self._sf() as session:
+            rows = (await session.scalars(statement)).all()
+        page = []
+        for row in rows:
+            body = row_to_dict(row)
+            body["cursor"] = encode_keyset_cursor(order, iso_utc(row.updated_at) or "", row.thread_id)
+            page.append(body)
+        return page
+
     async def update_display_name(self, thread_id, display_name, *, user_id=AUTO) -> None:
         await self._write(
             thread_id,

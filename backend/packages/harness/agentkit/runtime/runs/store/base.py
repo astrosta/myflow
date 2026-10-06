@@ -45,8 +45,18 @@ class RunStore(abc.ABC):
     async def get(self, run_id: str, *, user_id: str | None) -> dict | None: ...
 
     @abc.abstractmethod
-    async def list_by_thread(self, thread_id: str, *, user_id: str | None, limit: int = 100) -> list[dict]:
-        """只返回 operation_kind='run' 的行，created_at DESC。"""
+    async def list_by_thread(
+        self,
+        thread_id: str,
+        *,
+        user_id: str | None,
+        limit: int = 100,
+        before: str | None = None,
+        order: str = "desc",
+        statuses: frozenset | None = None,
+        metadata: dict | None = None,
+    ) -> list[dict]:
+        """只返回 operation_kind='run' 的行。每行多一个 cursor。"""
 
     @abc.abstractmethod
     async def list_inflight(self) -> list[dict]:

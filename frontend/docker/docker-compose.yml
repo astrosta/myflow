@@ -1,0 +1,57 @@
+# =============================================================================
+# M5 §7 本地/单机部署：两个服务
+#
+#   frontend        —— 本仓库的 Next.js 镜像（nginx + Next standalone 同容器），
+#                      对外只发布一个端口（默认 2026）。
+#   myflow-gateway  —— M3 提供的网关，容器内监听 0.0.0.0:8001。
+#                      这里只用 image 占位：镜像由 M3 构建，**前端仓库不 build 后端**。
+#                      它在 compose 网络里只用服务名访问（http://myflow-gateway:8001），
+#                      **不要**给它加 ports —— 那会凭空多出一个暴露面。
+#
+# 用法：
+#   cd frontend/docker
+#   docker compose up -d --build
+#
+# 发布端口的安全约束（§7.3）：
+#   所有 published port **必须显式写绑定地址**。默认 127.0.0.1，只有显式设置
+#   BIND_HOST=0.0.0.0 时才对外，是"有意为之"而不是"忘了写"。
+#   改完跑一下 `node scripts/check-compose-ports.mjs`（在仓库根或 frontend/ 里都行），
+#   它会扫所有 compose 文件并逐条断言——肉眼 review 这两种写法只差几个字符，看不出来。
+# =============================================================================
+
+name: myflow
+
+services:
+  frontend:
+    # 构建上下文是 frontend/（不是仓库根）：pnpm-lock.yaml / pnpm-workspace.yaml
+    # 都在那一层，Dockerfile 里也是按这个前提写的。
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: myflow-frontend:local
+    restart: unless-stopped
+    depends_on:
+      myflow-gateway:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      # 浏览器侧的同源前缀；nginx 把 /api 反代到网关
+      NEXT_PUBLIC_API_BASE_URL: /api
+      # 服务端（RSC / route handler）直连网关用，名字和 .env.example 保持一致
+      GATEWAY_INTERNAL_URL: http://myflow-gateway:8001
+    ports:
+      # ✓ 显式绑定地址（BIND_HOST，默认 loopback）。
+      # ✗ 绝不能写成 "${PORT:-2026}:2026"：那等于绑 0.0.0.0，整个局域网都能访问（§7.3）。
+      #   两种写法只差几个字符，所以有 scripts/check-compose-ports.mjs 兜底。
+      - "${BIND_HOST:-127.0.0.1}:${PORT:-2026}:2026"
+
+  myflow-gateway:
+    # TODO(M3)：把 tag 换成 M3 实际发布的镜像。
+    image: myflow-gateway:local
+    restart: unless-stopped
+    expose:
+      # 只对 compose 网络暴露。容器内监听 0.0.0.0 是对的（§7.3），
+      # 但**绝不能**出现在 ports: 里。
+      - "8001"
+    environment:
+      MYFLOW_CONFIG_PATH: /app/config.yaml

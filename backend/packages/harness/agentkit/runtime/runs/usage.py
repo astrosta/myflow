@@ -52,8 +52,9 @@ class UsageCollector(AsyncCallbackHandler):
             self._counted_llm_run_ids.add(rid)
         self._calls += 1
         model = _model_name(response) or "unknown"
-        bucket = self.by_model.setdefault(model, {"input": 0, "output": 0, "cache_read": 0})
+        bucket = self._by_model.setdefault(model, {"input": 0, "output": 0, "cache_read": 0})
         bucket["input"] += usage.input_tokens
+        
         bucket["output"] += usage.output_tokens
         bucket["cache_read"] += usage.cache_read_tokens
 
@@ -99,5 +100,5 @@ def _model_name(response: LLMResult) -> str | None:
         message = getattr(generation, "message", None)
         meta = getattr(message, "response_metadata", None) or {}
         if isinstance(meta, Mapping) and (name := meta.get("model_name") or meta.get("model")):
-            return message.str(name)
+            return str(name)
     return None

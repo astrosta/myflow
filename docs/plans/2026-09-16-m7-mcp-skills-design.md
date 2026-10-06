@@ -4,7 +4,8 @@
 > [M0 地基](2026-09-16-m0-foundation-design.md) · [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md) ·
 > [M2 工具与沙箱](2026-09-16-m2-tools-sandbox-design.md) · [M3 Gateway 与流式](2026-09-16-m3-gateway-streaming-design.md) ·
 > [M4 持久化](2026-09-16-m4-persistence-design.md) · [M5 前端](2026-09-16-m5-frontend-design.md) ·
-> [M6 中间件体系](2026-09-16-m6-middleware-design.md)
+> [M6 中间件体系](2026-09-16-m6-middleware-design.md) ·
+> [路由层详细设计](2026-09-16-router-layer-design.md)
 >
 > 本文细化 M7（2 周，可与 M8 并行）。沿用包名：框架层 `agentkit.*`，应用层 `app.*`。
 
@@ -35,7 +36,7 @@ M7 **不做** MCP 长时任务、技能沙箱投影、SkillScan、托管集成�
 
 | 天 | 内容 |
 |---|---|
-| D1–2 | **运行时可写配置的并发写**（两者共同的地基）+ Gateway `PUT`/`PATCH` |
+| D1–2 | **运行时可写配置的并发写**（两者共同的地基）+ §2.4 的六条路由 |
 | D3–5 | 技能：加载、解析、slash 合同、激活中间件、`allowed-tools` 策略 |
 | D6–8 | MCP：客户端、三种 transport、缓存失效、前缀、会话池 |
 | D9 | MCP 凭据四层 + fail-closed + 非法值不回显 |
@@ -79,8 +80,10 @@ agentkit/tools/builtins/tool_search.py
 agentkit/tools/mcp_metadata.py         # tag_mcp_tool / is_mcp_tool
 agentkit/runtime/secret_context.py     # slash 路径 + 决策键；进 REDACTED_CONTEXT_KEYS
 
-app/gateway/routers/mcp.py
-app/gateway/routers/skills.py
+app/gateway/mcp_wire.py            # 打码 / 打码回写；路由不碰磁盘
+app/gateway/skills_catalog.py       # 扫描结果 → SkillResponse
+app/gateway/routers/mcp.py          # prefix=/mcp
+app/gateway/routers/skills.py       # prefix=/skills
 
 contracts/slash_skill_contract.json    # 前后端 slash 语法钉死
 ```
@@ -221,22 +224,207 @@ MCP 缓存自己的路径解析要 **catch `FileNotFoundError` 当"未配置"**�
 一次加载。失效时 `_cache_generation += 1`，等着的 waiter 看到 generation 变了
 就重来。
 
-### 2.4 Gateway API（配置面）
+### 2.4 路由
 
-| 方法 | 行为 |
-|---|---|
-| `GET /api/mcp/config` | 返回当前 JSON；`user_auth.users` 的值打码 |
-| `PUT /api/mcp/config` | 整份校验后替换 `mcpServers`；**不碰** `skills` / `mcpInterceptors` |
-| `PATCH /api/mcp/config` | 只改一台服务器的 `enabled`；启用时才跑该台的校验 |
-| `POST /api/mcp/cache/reset` | 本进程缓存 + 会话池退役；每个 worker 要分别打 |
-| `GET /api/skills` | 扫描 + 合并 enabled |
-| `PATCH /api/skills/{name}` | `{enabled: bool}`，RMW 同一把锁 |
-| `POST /api/skills/reload` | 管理员、本进程；清 prompt LRU，等扫描 |
+错误体、`extra="forbid"`、能力门沿用[路由层](2026-09-16-router-layer-design.md)。
+两个 router 各自 `prefix`，`create_app` 再加 `/api`。不要和 threads/runs 写在同一个文件里。
 
-PUT 打码回写：客户端把 `****` 原样 POST 回来时，用磁盘上的真值补回去，
-不要把打码字符串存成凭据。
+| Method | Path | 请求 | 成功响应 | 能力 | 所属文件 |
+| --- | --- | --- | --- | --- | --- |
+| GET | `/api/mcp/config` | 无 | `McpConfigResponse`（200） | `admin` | `app/gateway/routers/mcp.py` |
+| PUT | `/api/mcp/config` | `McpConfigUpdateRequest` | `McpConfigResponse`（200） | `admin` | 同上 |
+| PATCH | `/api/mcp/config` | `McpServerEnabledPatch` | `McpConfigResponse`（200） | `admin` | 同上 |
+| POST | `/api/mcp/cache/reset` | 无 | `McpCacheResetResponse`（200） | `admin` | 同上 |
+| GET | `/api/skills` | 无 | `SkillsListResponse`（200） | `skills:read` | `app/gateway/routers/skills.py` |
+| POST | `/api/skills/reload` | 无 | `SkillReloadResponse`（200） | `admin` | 同上 |
+| PATCH | `/api/skills/{name}` | `SkillUpdateRequest` | `SkillResponse`（200） | `admin` | 同上 |
 
-启用 stdio 服务器时跑 §5.7 的命令允许列表。禁用不校验——已经坏掉的配置也要能关。
+`GET /api/skills` 不是 `admin`。斜杠菜单要给每个登录用户看已启用技能，和模型目录的 `models:read` 同一条理由。写 `extensions_config.json`、看 MCP 配置、清缓存，才是 `admin`。
+
+`POST /skills/reload` 必须写在 `PATCH /skills/{name}` 前面。反了之后一旦再加 `GET /skills/{name}`，`reload` 会被当成技能名。
+
+#### 参数
+
+```python
+# app/gateway/models/request.py
+_NAME = r"^[A-Za-z0-9_-]{1,64}$"
+SkillName = Annotated[str, Path(pattern=_NAME)]
+
+class McpConfigUpdateRequest(BaseModel):
+    """整份替换 mcpServers。没有 skills、没有 mcpInterceptors。"""
+    model_config = ConfigDict(extra="forbid")
+    mcp_servers: dict[str, McpServerWrite] = Field(alias="mcpServers")
+
+class McpServerEnabledPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(pattern=_NAME)
+    enabled: bool
+
+class SkillUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+```
+
+`McpServerWrite` 是写入用的服务器对象：`enabled`、`type`（或别名 `transport`）、`command`、`args`、`env`、`headers`、`url`、`tool_name_prefix`、两个 timeout。`extra="forbid"`。`type` 与 `transport` 都在时，`type` 赢（§2.1）。
+
+| 参数 | 约束 | 失败 |
+| --- | --- | --- |
+| `SkillName` / patch 的 `name` / `mcpServers` 的键 | `^[A-Za-z0-9_-]{1,64}$` | 422 `invalid_request`。斜杠和 `..` 进不了文件名 |
+| `SkillUpdateRequest.enabled` | 必填 `bool` | 缺字段 422 `invalid_request` |
+| PUT 里多出来的顶层键（`skills`、`mcpInterceptors`、`middlewares`） | `extra="forbid"` | 422 `invalid_request`。这两类会 import 代码，只许改文件（§11） |
+
+技能目录名在扫描时用同一条正则。对不上的目录打日志并跳过，不出现在 `GET /api/skills` 里。否则列表里有名字、PATCH 却 422。
+
+#### 响应与打码
+
+```python
+# app/gateway/models/response.py
+_MASK = "****"
+
+class SkillResponse(BaseModel):
+    name: str
+    description: str
+    category: Literal["public", "custom"]   # 不是磁盘路径
+    enabled: bool
+
+class SkillsListResponse(BaseModel):
+    skills: list[SkillResponse]
+
+class SkillReloadResponse(BaseModel):
+    reloaded: bool = True                    # 只表示这个 worker
+
+class McpCacheResetResponse(BaseModel):
+    reset: bool = True
+
+class McpConfigResponse(BaseModel):
+    mcp_servers: dict[str, dict[str, Any]] = Field(alias="mcpServers")
+```
+
+`app/gateway/mcp_wire.py` 的 `mask_mcp_config` 把 `env`、`headers`、`user_auth.users` 里每个非空字符串换成 `"****"`。`null` 仍是 `null`。响应里没有原始凭据，也没有宿主机路径。
+
+PUT 的回写在同一个文件的 `restore_masked_secrets`：
+
+| 客户端送来的值 | 磁盘上原来有这个键 | 写入 |
+| --- | --- | --- |
+| `"****"` | 有 | 磁盘上的原值 |
+| `"****"` | 没有（新服务器或新键） | 422 `invalid_extensions_config`。打码串不能变成凭据 |
+| 其它字符串 | 不论 | 用客户端的新值 |
+| 键被省略 | 有 | 删掉。PUT 是整份替换 `mcpServers`，不是 merge |
+
+PUT **不改**文件里的 `skills` 和 `mcpInterceptors`。读出整份 JSON，只换 `mcpServers` 这一键，再原子写回。
+
+#### handler
+
+读改写都在 `asyncio.to_thread` 里完成，锁在那个线程里拿（§2.2）。路由里不出现 `extensions_config_write_lock`。
+
+```python
+# app/gateway/routers/mcp.py
+router = APIRouter(prefix="/mcp", tags=["mcp"])
+
+
+@router.get("/config", response_model=McpConfigResponse)
+async def get_mcp_config(
+    caller: Annotated[RunCaller, Depends(require_scope("admin"))],
+) -> McpConfigResponse:
+    del caller
+    return mask_mcp_config(await asyncio.to_thread(read_extensions_config))
+
+
+@router.put("/config", response_model=McpConfigResponse)
+async def put_mcp_config(
+    body: McpConfigUpdateRequest,
+    caller: Annotated[RunCaller, Depends(require_scope("admin"))],
+) -> McpConfigResponse:
+    del caller
+    saved = await asyncio.to_thread(replace_mcp_servers, body)
+    return mask_mcp_config(saved)
+
+
+@router.patch("/config", response_model=McpConfigResponse)
+async def patch_mcp_server(
+    body: McpServerEnabledPatch,
+    caller: Annotated[RunCaller, Depends(require_scope("admin"))],
+) -> McpConfigResponse:
+    del caller
+    saved = await asyncio.to_thread(set_mcp_server_enabled, body.name, body.enabled)
+    return mask_mcp_config(saved)
+
+
+@router.post("/cache/reset", response_model=McpCacheResetResponse)
+async def reset_mcp_cache(
+    caller: Annotated[RunCaller, Depends(require_scope("admin"))],
+) -> McpCacheResetResponse:
+    del caller
+    await asyncio.to_thread(reset_local_mcp_cache)   # agentkit/mcp/cache.py，只清本进程
+    return McpCacheResetResponse()
+```
+
+```python
+# app/gateway/routers/skills.py
+router = APIRouter(prefix="/skills", tags=["skills"])
+
+
+@router.get("", response_model=SkillsListResponse)
+async def list_skills(
+    caller: Annotated[RunCaller, Depends(require_scope("skills:read"))],
+) -> SkillsListResponse:
+    del caller
+    return SkillsListResponse(skills=await asyncio.to_thread(load_skill_catalog))
+
+
+@router.post("/reload", response_model=SkillReloadResponse)
+async def reload_skills(
+    caller: Annotated[RunCaller, Depends(require_scope("admin"))],
+) -> SkillReloadResponse:
+    del caller
+    await asyncio.to_thread(clear_skill_prompt_cache)   # 本进程；不清别的 worker
+    return SkillReloadResponse()
+
+
+@router.patch("/{name}", response_model=SkillResponse)
+async def update_skill(
+    name: SkillName,
+    body: SkillUpdateRequest,
+    caller: Annotated[RunCaller, Depends(require_scope("admin"))],
+) -> SkillResponse:
+    del caller
+    return await asyncio.to_thread(set_skill_enabled, name, body.enabled)
+```
+
+| 步骤 | MCP 写 | 技能 PATCH | 只读 |
+| --- | --- | --- | --- |
+| 1 | `admin` 在进函数之前 | 同左 | 配置是 `admin`；技能列表是 `skills:read` |
+| 2 | `to_thread` 里拿双锁，读文件 | 同左，改的是 `skills.{name}.enabled` | 不加写锁 |
+| 3 | 启用 stdio 时跑 §5.7；禁用跳过命令检查 | 名字不在扫描结果里 → `SkillNotFound` | `mask_mcp_config` 或 `load_skill_catalog` |
+| 4 | `restore_masked_secrets`，只替换 `mcpServers`，原子写，再 `reload_extensions_config` | 同一把锁，不改 `mcpServers` | — |
+
+`set_mcp_server_enabled` 找不到 `name` 抛 `McpServerNotFound`。已经坏掉的服务器也要能关掉，所以 `enabled=false` 不跑允许列表。`enabled=true` 且 `type=stdio` 时 `command` 不在允许列表里 → `StdioCommandRejected`。远程 transport 不跑这三项。
+
+`POST /cache/reset` 和 `POST /skills/reload` 只影响打到的这个进程。多 worker 要逐个打，或者等 §2.3 的内容签名自己失效。响应里不要承诺「全集群已刷新」。
+
+显式配置路径的文件中途不见了：`from_file` 抛 `FileNotFoundError`，路由不接，落到 500 `internal_error`。日志里有路径，响应里没有。
+
+#### 错误
+
+| 异常 | HTTP | `code` | 谁抛 | 所属文件 |
+| --- | --- | --- | --- | --- |
+| `McpServerNotFound` | 404 | `mcp_server_not_found` | PATCH 的 `name` 不在文件里 | `app/gateway/errors.py` |
+| `SkillNotFound` | 404 | `skill_not_found` | PATCH 的目录没被扫描收进目录 | 同上 |
+| `StdioCommandRejected` | 422 | `stdio_command_rejected` | 启用时 `command` 不在允许列表（§5.7） | 同上 |
+| `InvalidExtensionsConfig` | 422 | `invalid_extensions_config` | 打码串没有原值可还原；校验失败又不是命令允许列表 | 同上 |
+
+`detail` 不包含 `env` / `headers` 的值，也不包含被拒绝的命令行。命令被拒时只说允许的裸名字集合。
+
+#### 不做
+
+| 不做 | 理由 |
+| --- | --- |
+| `POST /api/skills/install`、custom 技能的读写和回滚 | §11：M7 不做扫描和 per-user custom。启用开关只改 JSON 里的 `enabled` |
+| 写入 `mcpInterceptors` / `middlewares` | 会 import 代码 |
+| 路由里直接 `open(extensions_config.json)` | 双锁和原子写只在 `extensions_config.py` |
+| 把 `GET /mcp/config` 开放给 `skills:read` | 打码之后的形状仍是运维配置。选择器要的是技能名，不是服务器令牌 |
+| 在 reset 路由里广播到其它 worker | M7 没有跨进程控制面。签名失效是那条路 |
+
 
 ---
 
@@ -736,6 +924,7 @@ Promotion audit（可选）必须在 SkillToolPolicy **之外**（更外的 wrap
 | 文件 | 覆盖 |
 |---|---|
 | `test_config_concurrent_write.py` | 并发 RMW 不丢更新；崩溃不留半截文件；仅 `EBUSY` 退化；其它 errno 抛；技能 PATCH 与 MCP PUT 交叉不丢 |
+| `test_mcp_skills_routes.py` | `GET /skills` 要 `skills:read` 不要 `admin`；PUT/PATCH/reload/mcp 要 `admin`；`POST /skills/reload` 不会被当成技能名；`skills` / `mcpInterceptors` 出现在 PUT body → 422；`"****"` 还原原值，没有原值 → 422 `invalid_extensions_config`；响应 JSON 不含原始 env；启用非法 stdio `command` → 422 `stdio_command_rejected` 且 detail 无命令行；禁用坏配置仍 200；未知技能 404 `skill_not_found` |
 | `test_config_lock_in_worker.py` | 锁在 `to_thread` worker 内持有；取消 awaiting task 不提前放锁 |
 | `test_config_signature.py` | 同秒编辑、mtime 倒退、换更老文件 → 判定已变更；加载中签名变化走会话退役 |
 | `test_extensions_path.py` | 显式路径缺失 → FileNotFoundError；搜索模式缺失 → None |
@@ -765,6 +954,8 @@ caplog 文本里。
 
 - [ ] 配一个 MCP server（stdio / SSE / HTTP 各一次），重启后工具可用
 - [ ] 通过 API 启用/禁用一台 MCP，**不重启**当前 worker 即生效（其它 worker 要 `cache/reset` 或等签名失效）
+- [ ] `GET /api/mcp/config` 的 `env` / `headers` 只有 `"****"` 或 `null`；把 `"****"` 原样 PUT 回去不改磁盘上的真值
+- [ ] 缺 `admin` 的令牌调 PUT/PATCH/reload → 403；只有 `skills:read` 的令牌仍能 `GET /api/skills`
 - [ ] 两个并发 PATCH（一个改技能、一个改 MCP），两个改动都在文件里
 - [ ] 写配置的瞬间 kill 进程，重启后 JSON 仍是完整合法文件
 - [ ] 新建 `skills/public/foo/SKILL.md`（中文正文），Windows 上模型能发现

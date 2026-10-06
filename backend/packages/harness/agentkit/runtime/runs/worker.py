@@ -23,6 +23,7 @@ from agentkit.runtime.runs.usage import UsageCollector
 from agentkit.runtime.stream_bridge.base import StreamBridge
 from agentkit.runtime.stream_modes import to_langgraph_stream_modes
 from agentkit.runtime.task import spawn_detached
+from agentkit.runtime.user_context import AUTO
 from agentkit.agents.leader_agent import unwrap_agent_graph
 from agentkit.agents.leader_agent.runtime_keys import CLIENT_IDENTITY_KEYS
 from agentkit.trace_context import TRACE_METADATA_KEY
@@ -101,17 +102,22 @@ async def _ensure_thread_metadata_bounded(record, thread_store, *, owner_user_id
         return None
     return TimeoutError(f"thread metadate setup exceeded {THREAD_METADATA_SETUP_TIMEOUT_SECONDS} seconds")
 
-async def _ensure_thread_metadata(thread_store, record, *, owner_user_id, require_existing) -> BaseException | None:
-    if await thread_store.get_metadata(record.run_id) is not None:
+async def _ensure_thread_metadata(thread_store, record, *, owner_user_id, require_existing) -> None:
+    """threads_meta 缺了才 INSERT。失败一律抛出，由 _ensure_thread_metadata_bounded 收成返回值。"""
+    # 后台 task 上没有 HTTP 的 ContextVar（M4 §3.3），owner 必须显式传；传不出则退回 AUTO，
+    # 由 resolve_user_id 抛 MissingUserContextError —— 读不到用户就失败，绝不写成全局行。
+    user_id = owner_user_id if owner_user_id is not None else AUTO
+    if await thread_store.get(record.thread_id, user_id=user_id) is not None:
         return
-    
+
     if require_existing:
-        return LookupError(f"Thread {record.thread_id} was deleted during run admission")
-    
+        raise LookupError(f"Thread {record.thread_id} was deleted during run admission")
+
     await thread_store.create(
         record.thread_id,
         assistant_id=record.assistant_id,
-        metadata={k:v for k, v in record.metadata.items() if k not in _RESERVED_METADATA_KEYS},
+        user_id=user_id,
+        metadata={k: v for k, v in record.metadata.items() if k not in _RESERVED_METADATA_KEYS},
     )
 
 async def run_agent(
@@ -138,8 +144,6 @@ async def run_agent(
         await ctx.thread_store.update_status(thread_id, "running", user_id=record.user_id)
         rollback = await capture_rollback_point(ctx, thread_id)
         await bridge.publish(run_id, "metadata", {"run_id": run_id, "thread_id": thread_id})
-        
-        _install_runtime(ctx.run_config, record)
 
         assembly = _call_agent_factory(ctx.agent_factory, ctx.run_config, app_config=ctx.app_config,checkpointer=ctx.checkpointer)
         graph = unwrap_agent_graph(assembly)
@@ -199,18 +203,6 @@ def _public_error(exc: BaseException) -> str:
     message = str(exc).strip() or type(exc).__name__
     return f"{type(exc).__name__}: {message[:_PUBLIC_ERROR_MAX_CHARS]}"
 
-def _install_runtime(run_config: dict, record: RunRecord) -> None:
-    """将thread_id和run_id注入到ToolRuntime里面"""
-    from langgraph.runtime import Runtime
-
-    context = dict(run_config.get("context") or {})
-    context.setdefault("thread_id", record.thread_id)
-    context.setdefault("run_id", record.run_id)
-    run_config["context"] = context
-    runtime = Runtime(context=context, store=None)
-    run_config.setdefault("configurable", {})["__pregel_runtime"] = runtime
-
-
 async def _finalize(
     bridge: StreamBridge,
     run_manager: RunManager,
@@ -235,7 +227,9 @@ async def _finalize(
     #M4
     if record.ownership_lost:
         return
-    
+
+    await _best_effort("title fallback", _fallback_thread_title(run_manager, record, ctx))
+
     await ctx.run_store.update_run_completion(
         run_id,
         status=getattr(terminal, "value", terminal),
@@ -258,6 +252,61 @@ async def _finalize(
             ctx.thread_store.update_status(thread_id, _thread_status(final), user_id=record.user_id),
         )
     #M6
+
+async def _fallback_thread_title(run_manager: RunManager, record: RunRecord, ctx: RunContext | None) -> None:
+    """Persist a local title when the first turn never reached after_model."""
+    if ctx is None or await run_manager.later_run_is_running(record.thread_id, record.run_id):
+        return
+    from agentkit.agents.middlewares.title_middleware import fallback_title_from_state
+    from agentkit.config.title_config import TitleConfig
+
+    channels = await _checkpoint_channels(ctx, record.thread_id)
+    existing = channels.get("title") if isinstance(channels, Mapping) else None
+    if isinstance(existing, str) and existing.strip():
+        await ctx.thread_store.update_display_name(record.thread_id, existing, user_id=record.user_id)
+        return
+
+    source: Mapping[str, Any] = {}
+    if isinstance(channels, Mapping) and channels.get("messages"):
+        source = {
+            "messages": channels.get("messages"),
+            "title": existing,
+            "uploaded_files": channels.get("uploaded_files"),
+        }
+    elif isinstance(ctx.graph_input, Mapping):
+        source = ctx.graph_input
+    if not source:
+        return
+
+    title_config = ctx.app_config.title if ctx.app_config is not None else TitleConfig()
+    result = fallback_title_from_state(source, title_config=title_config)
+    title = result.get("title") if isinstance(result, Mapping) else None
+    if not isinstance(title, str) or not title.strip():
+        return
+
+    head = await _checkpoint_head(ctx, record.thread_id)
+    if head is not None and getattr(head, "config", None):
+        mutation = build_state_mutation_graph(
+            "title_fallback",
+            checkpointer=ctx.checkpointer,
+            state_schema=get_thread_state_schema(),
+        )
+        await mutation.aupdate_state(head.config, {"title": title}, as_node="title_fallback")
+    await ctx.thread_store.update_display_name(record.thread_id, title, user_id=record.user_id)
+
+
+async def _checkpoint_head(ctx: RunContext, thread_id: str) -> Any:
+    return await ctx.checkpointer.aget_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
+
+
+async def _checkpoint_channels(ctx: RunContext, thread_id: str) -> Mapping[str, Any] | None:
+    head = await _checkpoint_head(ctx, thread_id)
+    if head is None:
+        return None
+    checkpoint = head.checkpoint if isinstance(head.checkpoint, Mapping) else {}
+    channels = checkpoint.get("channel_values")
+    return channels if isinstance(channels, Mapping) else None
+
 
 async def _best_effort(step: str, awaitable: Awaitable[Any]) -> None:
     try:
@@ -303,10 +352,14 @@ async def _stream_graph(
     configurable = dict(config.get("configurable") or {})
     configurable.setdefault("thread_id", record.thread_id)
     config["configurable"] = configurable
+    context = dict(config.pop("context", None) or {})
+    context.setdefault("thread_id", record.thread_id)
+    context.setdefault("run_id", record.run_id)
 
     stream = graph.astream(
         ctx.graph_input,
         config=config,
+        context=context,
         stream_mode=lg_modes,
         subgraphs=False,
     )

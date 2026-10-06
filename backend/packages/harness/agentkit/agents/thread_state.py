@@ -14,7 +14,11 @@ class SandboxState(TypedDict):
 
 
 class ThreadDataState(TypedDict, total=False):
-    """Reserved for M2. M1 does not write it."""
+    """Absolute host paths for this thread's sandbox directories."""
+
+    workspace_path: str
+    uploads_path: str
+    outputs_path: str
 
 
 class ViewedImageData(TypedDict):

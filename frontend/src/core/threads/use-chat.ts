@@ -1,0 +1,354 @@
+"use client";
+
+import { useStream } from "@langchain/langgraph-sdk/react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+import { toChatMessages } from "../api/adapt";
+import { getApiClient } from "../api/client";
+import { WILDCARD_THREAD, registerRecoveryContext } from "../api/fetch-with-gap";
+import type { StreamRecoveryEvent } from "../api/gap";
+import { DEFAULT_PAGE_SIZE, fetchMessagePage } from "../api/messages-feed";
+import { sanitizeChatStreamModes } from "../api/stream-mode";
+import { getThreadState } from "../api/threads";
+import { uploadFiles } from "../api/uploads";
+import { buildMessageGroups } from "../messages/group";
+import {
+  createHistoryWindow,
+  hasMoreBefore,
+  loadedFloorSeq,
+  loadedMessages,
+  prependOlderPage,
+  replaceNewestPage,
+  type MessagePage,
+} from "../messages/history";
+import { messageKey } from "../messages/identity";
+import { mergeMessages, type TurnBaseline } from "../messages/order";
+import type { ChatMessage, ThreadState } from "../types";
+import type { ChatController } from "./chat-controller";
+import { foldUpdateFrame, isRelevantUpdateFrame } from "./stream-state";
+import { createOptimisticHumanMessage, createTurnBaseline } from "./turn-baseline";
+
+export const DEFAULT_ASSISTANT_ID = "lead_agent";
+
+/**
+ * 停止之后安排一次跟进刷新的延迟（§5.1）。
+ *
+ * SDK 的停止可能通过 "abort + 发射后不管的 cancel" 完成，在后端的标题生成
+ * 落库之前就返回了。只失效一次的话，侧栏里会留着"新对话"这个占位标题。
+ */
+export const STOP_FOLLOW_UP_REFRESH_MS = 1_500;
+
+const messagesQueryKey = (threadId: string | null) => ["messages", threadId] as const;
+
+export interface UseChatOptions {
+  /**
+   * `null` = 这个会话还没有 thread（`/workspace` 的新会话入口）。
+   * SDK 会在第一次 submit 时自己建一个，然后回调 `onThreadCreated`。
+   *
+   * 这么做而不是"进页面就建一个空 thread"，是因为后者会往侧栏塞一堆
+   * 没人用过的空会话——用户只是路过工作区，不该留下垃圾。
+   */
+  threadId: string | null;
+  assistantId?: string;
+  /** thread 建好之后的回调：用来把 URL 换成 `/workspace/chats/{id}` */
+  onThreadCreated?: (threadId: string) => void;
+}
+
+/**
+ * 聊天页的状态装配点。
+ *
+ * 这里刻意只做"接线"：所有顺序、折叠、分组的判断都在 core/ 的纯函数里，
+ * 这个 hook 的职责是把 SDK 的流、分页的历史和乐观消息喂给它们。
+ */
+export function useChat({
+  threadId,
+  assistantId = DEFAULT_ASSISTANT_ID,
+  onThreadCreated,
+}: UseChatOptions): ChatController {
+  const queryClient = useQueryClient();
+
+  /**
+   * 这个会话真正在用的 thread id。
+   *
+   * `threadId` 传 null 表示"还没落地的新会话"，SDK 会在第一次 submit 时自己建一个。
+   * 建完之后 **必须把它记下来**：不然这个 hook 里所有以 threadId 为键的东西
+   * （历史 query、gap 恢复注册、附件上传）会一直以为"还没有 thread"——
+   * 历史永远不加载，账本里那条 `llm.human.input` 也就永远回不来，
+   * 用户消息会卡在"发送中…"一辈子。
+   *
+   * 注意这条路径**不能靠重新挂载解决**：URL 是用 `history.replaceState` 换的
+   * （见 chat-route），组件不会重建，所以只能在这里接住。
+   */
+  const [createdThreadId, setCreatedThreadId] = useState<string | null>(null);
+  const effectiveThreadId = threadId ?? createdThreadId;
+  const hasThread = effectiveThreadId !== null;
+  const client = useMemo(() => getApiClient(), []);
+
+  /** §3.1：主聊天流**强制**成增量模式。请求层还会再覆盖一次 body（见 client.ts） */
+  const streamModes = useMemo(() => sanitizeChatStreamModes(null), []);
+
+  const [recovery, setRecovery] = useState<StreamRecoveryEvent | null>(null);
+  const [optimistic, setOptimistic] = useState<ChatMessage[]>([]);
+  const [turnBaseline, setTurnBaseline] = useState<TurnBaseline | null>(null);
+  const [olderPages, setOlderPages] = useState<MessagePage[]>([]);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+
+  // ---- 持久化历史 ----
+  const newestPage = useQuery({
+    queryKey: [...messagesQueryKey(effectiveThreadId), "newest"],
+    queryFn: ({ signal }) => {
+      // enabled 已经挡住了 null 的情况，这里只是让类型收窄
+      if (effectiveThreadId === null) throw new Error("no thread yet");
+      return fetchMessagePage(effectiveThreadId, { limit: DEFAULT_PAGE_SIZE, signal });
+    },
+    // 还没有 thread 就没有历史可拉；第一次 submit 建出 thread 后会重新取
+    enabled: hasThread,
+  });
+
+  /**
+   * §4.4：**历史缓存失效时保留已加载的页。**
+   *
+   * 结构上就保证了这一点：`olderPages` 是本地状态，重取第一页只换 `pages[0]`，
+   * 碰不到更旧的页。已经建立的排序位置因此不会被丢掉，列表不会重新洗牌。
+   */
+  const historyWindow = useMemo(() => {
+    let acc = createHistoryWindow();
+    if (newestPage.data) acc = replaceNewestPage(acc, newestPage.data);
+    for (const page of olderPages) acc = prependOlderPage(acc, page);
+    return acc;
+  }, [newestPage.data, olderPages]);
+
+  const history = useMemo(() => loadedMessages(historyWindow), [historyWindow]);
+  const floorSeq = useMemo(() => loadedFloorSeq(historyWindow), [historyWindow]);
+  const moreBefore = useMemo(() => hasMoreBefore(historyWindow), [historyWindow]);
+
+  // ---- 实时流 ----
+  const stream = useStream<ThreadState>({
+    assistantId,
+    threadId,
+    client,
+    /**
+     * §3.3：用 SDK 自带的节流——"同一个宏任务内到达的更新先合并再通知 React"。
+     * 不要换成固定毫秒数的延迟，那在连续流上会变成尾部防抖，
+     * 表现为"模型说完了但界面还在挤牙膏"。
+     */
+    throttle: true,
+    /** §5.1：刷新时 join 正在跑的 run，而不是重新发一次消息 */
+    reconnectOnMount: true,
+    /**
+     * SDK 在第一次 submit 时把 thread 建出来，id 从这里回来。
+     * 侧栏要立刻刷新，否则新会话不会出现在列表里。
+     */
+    onThreadId: (newThreadId) => {
+      setCreatedThreadId(newThreadId);
+      queryClient.invalidateQueries({ queryKey: ["threads"] });
+      onThreadCreated?.(newThreadId);
+    },
+    onUpdateEvent: (data, { mutate }) => {
+      // §3.2：无关的帧要在调用 SDK 的状态改写器**之前**就拒掉
+      if (!isRelevantUpdateFrame(data)) return;
+      mutate((prev) => foldUpdateFrame(prev as ThreadState, data) as never);
+    },
+    onFinish: () => {
+      setTurnBaseline(null);
+      /**
+       * 用**前缀** key 失效，不按具体 threadId。
+       *
+       * SDK 在 mount 时就把 options 固定住了，所以这个闭包拿到的是**当时的**
+       * effectiveThreadId —— 新会话首轮时它还是 null，"if (hasThread)" 会直接
+       * 跳过失效，于是 run 结束后账本永远不重拉，用户消息卡在"发送中…"。
+       * `["messages"]` 是所有消息 query 的公共前缀，绕开这个过期闭包。
+       */
+      queryClient.invalidateQueries({ queryKey: ["messages"] });
+    },
+  });
+
+  const streamMessages = useMemo(
+    () => toChatMessages(stream.messages as unknown[] | undefined),
+    [stream.messages],
+  );
+
+  /**
+   * §5.2：把恢复语义注册给 gap 包装层。
+   *
+   * 依赖全是稳定引用（`client`/`queryClient`/`threadId`），所以这个 effect
+   * 只在换会话时重跑一次——注册表在 gap 发生的那一刻必须已经有值，
+   * 反复注册/注销会留下一个空窗期。
+   */
+  useEffect(() => {
+    /**
+     * 还没有 thread 时注册到**通配键**上：第一次 submit 会就地建出 thread，
+     * 从"请求发出"到"thread 建好"这段窗口里的 gap 也必须能恢复——
+     * 否则它会表现为一次正常的流结束（§5.2 明确禁止的那种）。
+     * 回调收到的 thread_id 是从请求 URL 里解析出来的，不依赖注册时的值。
+     */
+    return registerRecoveryContext(effectiveThreadId ?? WILDCARD_THREAD, {
+      reloadDurableState: async (resolvedThreadId) => {
+        // §5.2 第 3 条：用 `values` 重载持久化的线程状态（§3.1 那个例外）
+        // 不用 SDK 的 getState：网关返回 { values, checkpoint_id, checkpoint_ns }，
+        // 和 Platform 那套 { values, next, checkpoint, metadata, tasks } 对不上。
+        await getThreadState(resolvedThreadId);
+        await queryClient.refetchQueries({ queryKey: messagesQueryKey(resolvedThreadId) });
+      },
+      onRecovery: (event) => {
+        setRecovery(event);
+        // 上层要清掉乐观状态、失效历史缓存、给用户看一个恢复提示
+        setOptimistic([]);
+        setTurnBaseline(null);
+        // 同样用前缀：恢复回调也可能被旧闭包调用
+        queryClient.invalidateQueries({ queryKey: ["messages"] });
+      },
+    });
+  }, [effectiveThreadId, client, queryClient]);
+
+  /**
+   * 乐观消息什么时候该消失。
+   *
+   * **不能按 id 判。** SDK 会把它自己那份人类消息放进 `stream.messages`，
+   * 而那份的 id 是 SDK 重新生成的（实测 ids 分别是 `human-1` 和客户端给的
+   * `local-xxx`），我们传进去的 id 并不会原样出现在流里。
+   *
+   * 可靠的信号是**基线**：提交那一刻屏幕上已有的身份集合。提交之后
+   * 流里冒出来的、不在基线里的人类消息，就是我们刚发的那条。
+   *
+   * 不做这一步的后果不只是"消息重了一条"：多出来的那条人类消息会把
+   * 正在流的 AI 消息挤进**上一轮**，于是它被当成终态答案而不是"处理中"，
+   * 步骤面板整条都不出现。
+   */
+  const optimisticConfirmed = useMemo(() => {
+    if (!optimistic.length) return false;
+    const baselineKeys = turnBaseline?.keys;
+    return streamMessages.some(
+      (message) => message.type === "human" && !baselineKeys?.has(messageKey(message)),
+    );
+  }, [optimistic.length, streamMessages, turnBaseline]);
+
+  // ---- 合并 + 分组 ----
+  const messages = useMemo(
+    () =>
+      mergeMessages({
+        history,
+        stream: streamMessages,
+        optimistic: optimisticConfirmed ? [] : optimistic,
+        loadedFloorSeq: floorSeq,
+        turnBaseline,
+      }),
+    [history, streamMessages, optimistic, optimisticConfirmed, floorSeq, turnBaseline],
+  );
+
+  const groups = useMemo(
+    () =>
+      buildMessageGroups({
+        messages,
+        // 流式期间纯内容 AI 消息留在"处理中"分组（§6.1）
+        streaming: Boolean(stream.isLoading),
+      }),
+    [messages, stream.isLoading],
+  );
+
+  const loadOlder = useCallback(async () => {
+    // 还没有 thread 就没有更早的页可翻
+    if (effectiveThreadId === null) return;
+    const cursor = historyWindow.pages.at(-1)?.nextBeforeSeq ?? null;
+    if (cursor === null || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const page = await fetchMessagePage(effectiveThreadId, { beforeSeq: cursor });
+      setOlderPages((prev) => [...prev, page]);
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [effectiveThreadId, historyWindow, loadingOlder]);
+
+  const submit = useCallback(
+    async (text: string, files?: readonly File[]) => {
+      if (!text.trim()) return;
+
+      // 先传文件再起 run：M6 的 UploadsMiddleware 在 `before_agent` 里
+      // 把上传清单注入对话，所以提交本身只带文本。
+      //
+      // threadId 为 null 时不允许带附件（UI 也把附件按钮禁掉了）：上传需要一个
+      // 已存在的 thread，而这里若是先建 thread 再 submit，SDK 会**再建一个**，
+      // 于是文件传到了 A、对话跑在 B。
+      if (files?.length) {
+        if (effectiveThreadId === null) throw new Error("请先发送一条消息，再上传附件");
+        await uploadFiles(effectiveThreadId, files);
+      }
+
+      const optimisticMessage = createOptimisticHumanMessage({ text });
+      /**
+       * §4.4：本地提交的那一轮要记一个身份基线。
+       * 基线取的是**提交这一刻**屏幕上的所有身份，之后才分得清
+       * "流新发布的步骤"和"本来就在那儿的步骤"。
+       */
+      setTurnBaseline(createTurnBaseline(messages, messageKey(optimisticMessage), null));
+      setOptimistic((prev) => [...prev, optimisticMessage]);
+
+      try {
+        await stream.submit(
+          // 身份由客户端定：M6 的动态上下文中间件会把它改名为 X__user，
+          // UI 侧的身份归一化让两条认成同一个可见轮次（§4.4）
+          { messages: [{ type: "human", content: text, id: optimisticMessage.id }] } as never,
+          {
+            streamMode: streamModes as never,
+            /**
+             * 显式写出来，哪怕它和默认值一样。
+             *
+             * **断开连接就该取消这一轮**（M3 §8.2 的创建端语义）：用户关掉页面
+             * 的意图就是"别跑了"，让它继续烧 token 是错的。要做"刷新续流"靠的是
+             * §5.1 的 join——重新连上去订阅同一个 run，而不是让 run 在你不在的时候
+             * 接着跑。
+             */
+            onDisconnect: "cancel",
+          },
+        );
+      } catch (error) {
+        setOptimistic((prev) => prev.filter((item) => item.id !== optimisticMessage.id));
+        setTurnBaseline(null);
+        throw error;
+      }
+    },
+    [stream, streamModes, effectiveThreadId, messages],
+  );
+
+  const stop = useCallback(async () => {
+    await stream.stop();
+    // §5.1：立刻失效相关缓存，**并安排一次跟进刷新**
+    queryClient.invalidateQueries({ queryKey: messagesQueryKey(effectiveThreadId) });
+    queryClient.invalidateQueries({ queryKey: ["threads"] });
+    globalThis.setTimeout(() => {
+      queryClient.invalidateQueries({ queryKey: ["threads"] });
+    }, STOP_FOLLOW_UP_REFRESH_MS);
+  }, [stream, queryClient, effectiveThreadId]);
+
+  const dismissRecovery = useCallback(() => setRecovery(null), []);
+
+  const state = useMemo(() => {
+    const values = (stream.values ?? {}) as ThreadState;
+    return {
+      ...values,
+      artifacts: values.artifacts ?? [],
+      todos: values.todos ?? null,
+    } satisfies ThreadState;
+  }, [stream.values]);
+
+  return {
+    threadId: effectiveThreadId,
+    groups,
+    messages,
+    state,
+    artifacts: state.artifacts ?? [],
+    todos: state.todos ?? [],
+    streaming: Boolean(stream.isLoading),
+    threadLoading: Boolean(stream.isThreadLoading) || newestPage.isLoading,
+    loadingOlder,
+    hasMoreBefore: moreBefore,
+    error: stream.error ? String((stream.error as Error).message ?? stream.error) : null,
+    recovery,
+    dismissRecovery,
+    submit,
+    stop,
+    loadOlder,
+  };
+}

@@ -81,7 +81,20 @@ class MemoryRunStore(RunStore):
             return None
         return copy.deepcopy(row)
 
-    async def list_by_thread(self, thread_id: str, *, user_id: str | None, limit: int = 100) -> list[dict]:
+    async def list_by_thread(
+        self,
+        thread_id: str,
+        *,
+        user_id: str | None,
+        limit: int = 100,
+        before: str | None = None,
+        order: str = "desc",
+        statuses: frozenset | None = None,
+        metadata: dict | None = None,
+    ) -> list[dict]:
+        from agentkit.persistence.base import decode_keyset_cursor, encode_keyset_cursor
+        from agentkit.persistence.json_compat import python_value_matches
+
         rows = [
             row
             for row in self._rows.values()
@@ -89,8 +102,29 @@ class MemoryRunStore(RunStore):
         ]
         if user_id is not None:
             rows = [row for row in rows if row.get("user_id") == user_id]
-        rows.sort(key=lambda row: row.get("created_at") or "", reverse=True)
-        return [copy.deepcopy(row) for row in rows[:limit]]
+        if statuses is not None:
+            allowed = {getattr(item, "value", item) for item in statuses}
+            rows = [row for row in rows if str(getattr(row.get("status"), "value", row.get("status"))) in allowed]
+        if metadata:
+            rows = [
+                row
+                for row in rows
+                if all(python_value_matches((row.get("metadata") or {}).get(key), expected) for key, expected in metadata.items())
+            ]
+        reverse = order != "asc"
+        rows.sort(key=lambda row: (row.get("created_at") or "", row.get("run_id") or ""), reverse=reverse)
+        if before is not None:
+            created_at, run_id = decode_keyset_cursor(before, order=order)
+            if order == "desc":
+                rows = [row for row in rows if (row.get("created_at") or "", row.get("run_id") or "") < (created_at, run_id)]
+            else:
+                rows = [row for row in rows if (row.get("created_at") or "", row.get("run_id") or "") > (created_at, run_id)]
+        page = []
+        for row in rows[:limit]:
+            copied = copy.deepcopy(row)
+            copied["cursor"] = encode_keyset_cursor(order, str(copied.get("created_at") or ""), copied["run_id"])
+            page.append(copied)
+        return page
 
     async def list_inflight(self) -> list[dict]:
         return [copy.deepcopy(row) for row in self._rows.values() if row["status"] in ACTIVE_STATUSES]

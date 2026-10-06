@@ -9,7 +9,7 @@ from agentkit.runtime.events.store.base import RunEventStore
 from agentkit.runtime.runs.manager import RunManager
 from agentkit.runtime.runs.store.base import RunStore
 from agentkit.runtime.stream_bridge.base import StreamBridge
-from agentkit.runtime.stream_bridge.memory import MemoryStreamBridge
+from agentkit.runtime.stream_bridge.provider import create_stream_bridge
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,10 +32,9 @@ def build_run_services(
     event_store: RunEventStore,
 ) -> RunServices:
     """Wire the stores created after ``init_engine_from_config``."""
-    del app_config
     return RunServices(
         run_manager=RunManager(run_store),
-        bridge=MemoryStreamBridge(),
+        bridge=create_stream_bridge(app_config.stream_bridge),  # 进程级单例（§7.5）
         run_context=RunContext(
             checkpointer=checkpointer,
             thread_store=thread_meta,

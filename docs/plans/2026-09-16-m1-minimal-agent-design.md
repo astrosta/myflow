@@ -1,7 +1,8 @@
 # M1 最小 Agent 详细设计
 
 > 配套文档：[分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md) ·
-> [M0 地基详细设计](2026-09-16-m0-foundation-design.md)
+> [M0 地基详细设计](2026-09-16-m0-foundation-design.md) ·
+> [路由层详细设计](2026-09-16-router-layer-design.md)
 >
 > 本文细化 M1（1–2 周）。沿用 M0 的包名：框架层 `agentkit.*`，应用层 `app.*`。
 
@@ -11,7 +12,7 @@
 
 **做什么：** 一个能多轮对话、能调工具、能流式输出的 agent，通过嵌入式 Python 客户端和 CLI 调用。
 
-**关键判断：M1 真正的产出不是"agent 能跑"，而是四份契约。**
+**关键判断：M1 真正的产出不是"agent 能跑"，而是五份契约。**
 
 
 | 契约                                               | 谁会依赖它                                   |
@@ -20,9 +21,10 @@
 | `configurable` 运行时参数                             | M3 的 HTTP 入参校验、M5 的 UI 开关、M9 的调度器/IM 入口 |
 | 流式事件契约（`values` / `messages` / `custom` / `end`） | M3 的 SSE、M5 的前端渲染、M8 的子代理进度             |
 | agent 工厂签名                                       | M3 的 worker、M9 的自定义 agent、M10 的扩展系统     |
+| 模型目录的两条 GET（§7）                                 | M5 的模型选择器、M3 的模型白名单                     |
 
 
-这四份契约定错了，后面每个阶段都要迁移数据或改协议。agent 循环本身反而是最容易替换的部分。
+这五份契约定错了，后面每个阶段都要迁移数据或改协议。agent 循环本身反而是最容易替换的部分。
 
 **不做什么：**
 
@@ -30,7 +32,7 @@
 | 不做               | 因为                          |
 | ---------------- | --------------------------- |
 | 沙箱、真实文件工具        | M2。M1 用一个假工具验证 tool loop 就够 |
-| HTTP / SSE       | M3                          |
+| run 的 HTTP / SSE  | M3。模型目录的两条 GET 是例外，见 §7：它们只读配置，不准入 run |
 | 数据库 checkpointer | M4。但 Provider 接口现在就要定       |
 | 中间件体系            | M6。M1 只留 middleware 列表的组装位  |
 | 子代理、技能、MCP       | M7/M8。提示词里留 section 占位      |
@@ -44,7 +46,7 @@
 | 天    | 内容                                           |
 | ---- | -------------------------------------------- |
 | D1–2 | `ThreadState` + 全部 reducer + reducer 单测      |
-| D3   | agent 工厂骨架、`configurable` 契约、模型/工具解析         |
+| D3   | agent 工厂骨架、`configurable` 契约、模型/工具解析、模型目录两条 GET（§7） |
 | D4–5 | 系统提示词模块：模板、section 组装、信任边界                   |
 | D6   | Checkpointer Provider 抽象（memory 实现）+ 单例/重置语义 |
 | D7–8 | 嵌入式客户端 `chat()` / `stream()` + 流式去重不变量       |
@@ -83,13 +85,27 @@ agentkit/
 
 tests/
 ├── fakes/
-│   └── chat_model.py             ★  # FakeChatModel，后面每个阶段都要用（§8.1）
+│   └── chat_model.py             ★  # FakeChatModel，后面每个阶段都要用（§9.1）
 ├── test_thread_state.py
 ├── test_agent_factory.py
 ├── test_prompt.py
 ├── test_checkpointer_provider.py
 ├── test_custom_events.py
-└── test_client.py
+├── test_client.py
+└── test_models_router.py          # §7 的两条 GET、404、密钥不出现在响应里
+```
+
+模型目录是 M1 唯一的 HTTP 面，文件按[路由层](2026-09-16-router-layer-design.md)的归属放：
+
+```
+app/gateway/
+├── models/
+│   ├── request.py                   # M1 只加 ModelName；线程侧模型以后再追加
+│   └── response.py                  # M1 只加 ModelResponse / ModelsListResponse / model_to_wire
+├── errors.py                        # ModelNotFound；其余异常映射是路由层 §6
+├── deps.py                          # require_scope 的第一版（§7.4）
+└── routers/
+    └── models.py                 ★  # GET /models、GET /models/{model_name}
 ```
 
 `config.yaml` 新增两个 section：`checkpointer`（M1 只认 `type: memory`）和
@@ -571,7 +587,7 @@ Gateway 的白名单 import 这份常量，不再手写第二份。
 | `reasoning_effort` | `str \| None` | 不传 | 工厂第 3 步，仅当键存在时传给 `create_chat_model`。模型不支持则由模型工厂双向剔除（M0），这里不改值、不抛 |
 | `is_plan_mode` | `bool` | `False` | M6 的 TodoList。M6 的 `runtime_ctx.is_plan_mode` 从这里抄，不另起名字 |
 | `subagent_enabled` | `bool` | `False` | 提示词的 subagent section，以及 M8 的 `SubagentLimitMiddleware` |
-| `agent_name` | `str \| None` | `None` → 模板里的 `"MyFlow"` | 提示词。M1 恒为 `None`（§10） |
+| `agent_name` | `str \| None` | `None` → 模板里的 `"MyFlow"` | 提示词。M1 恒为 `None`（§11） |
 
 
 ```python
@@ -1130,7 +1146,7 @@ custom 事件会经 M3 的 SSE 到浏览器，子代理的 `task_*` 还会被 wo
 §6.2 翻译循环里的 `custom` 分支在转发前再校验一次：不是 dict、或者没有非空字符串 `type` 的 chunk，
 记 warning 后丢弃。M3 的 `translate_chunk` 同理。这样 M5 收到的每个 `custom` 事件都能按 `type` 分发。
 
-**M1 唯一的生产者是假工具。** 它在返回结果前发一条 `{"type": "fake_tool_progress"}`。这样 §8.2 里
+**M1 唯一的生产者是假工具。** 它在返回结果前发一条 `{"type": "fake_tool_progress"}`。这样 §9.2 里
 `stream()` 的四类事件在 M1 就能端到端测到 `custom`，出口函数也在真实的 ToolNode 上下文里跑过一次，
 不只在单测里被直接调用。
 
@@ -1151,7 +1167,7 @@ custom 事件会经 M3 的 SSE 到浏览器，子代理的 `task_*` 还会被 wo
 
 缓存的正确性只有一条规则，分两个方向：
 
-- **编进图的每一个输入都在键里。** 漏一项，这一项变了图却不重建：CLI 的 `/model` 切不过去（§7），
+- **编进图的每一个输入都在键里。** 漏一项，这一项变了图却不重建：CLI 的 `/model` 切不过去（§8），
   或者一个用户拿到另一个用户的图（M9）。
 - **键里没有的东西不能编进图。** `thread_id`、`run_id`、`trace_id`、tracing 回调每次调用都变，只能在调用时
   经 `config` / `context` 传入（§3.3、§3.6）。编进了图，就会被同一个键下的所有调用共用。
@@ -1309,7 +1325,7 @@ def reset_agent(self) -> None:
 （M7 §2.3）。给不出的，由修改它的入口负责调 `reset_agent()`：客户端上凡是改技能或 MCP 配置的方法（M7），
 改完自己调，不指望调用方记得。只有别的进程改了文件、客户端无从得知时，才轮到调用方手动调。
 
-CLI 的 `/model <name>` 只改下一次调用的 `model_name`；`/reset`（§7）清的是 thread 的对话状态（最简单是换
+CLI 的 `/model <name>` 只改下一次调用的 `model_name`；`/reset`（§8）清的是 thread 的对话状态（最简单是换
 一个新 `thread_id`），和图无关。两者都不调 `reset_agent()`。
 
 **后面阶段往键里加分量，在引入该输入的同一个 PR 里加。** 已知的一项是 M9 的授权过滤：工具列表随角色和属性
@@ -1331,7 +1347,178 @@ M9 只改解析、不改键）。最后一条守键的完整性：用一个记�
 
 
 
-## 7. CLI（D9）
+## 7. 模型目录路由（D3）
+
+路由层 §3.2 把 `GET /api/models` 和 `GET /api/models/{model_name}` 划给 M1。
+本节是这两条路由的定义。错误体、`extra` 约定、能力门的写法、注册方式沿用路由层，不在这里再发明一套。
+
+它们**不是** run 路由。不调用 `start_run`，不读 checkpoint，不创建 thread。
+数据源只有 `get_app_config().models`（M0 §5.3）。`create_app` 里的 `include_router` 在路由层 §7.1，M1 不重写装配。
+
+### 7.1 路由表
+
+
+| Method | Path | 请求 | 成功响应 | 能力 | 所属文件 |
+| --- | --- | --- | --- | --- | --- |
+| GET | `/api/models` | 无 body、无 query | `ModelsListResponse`（200） | `models:read` | `app/gateway/routers/models.py` |
+| GET | `/api/models/{model_name}` | 路径参数 `ModelName` | `ModelResponse`（200） | `models:read` | 同上 |
+
+
+能力是 `models:read`，不是 `admin`。清单是模型选择器的数据（M5），不是运维写接口。
+`admin` 留给以后的 mcp / skills 变更。M1 到 M8 没有认证，`RunCaller.scopes is None`，`allows` 恒为真（路由层 §8.3）；门仍然写在 `Depends` 上，M9 只改 `caller_from_request` 的取值。
+
+不分页。模型来自一份 yaml，顺序就是文件顺序，第一条是默认模型（M0 §7.3）。
+套 `Page` 会让客户端以为后面还有一页。
+
+### 7.2 参数与响应
+
+```python
+# app/gateway/models/request.py
+ModelName = Annotated[str, Path(pattern=r"^[A-Za-z0-9._-]{1,128}$")]
+```
+
+| 参数 | 类型 / 约束 | 谁给 | 失败 |
+| --- | --- | --- | --- |
+| `model_name` | `ModelName` | 路径 | 含 `/`、空格、空串、超 128 → 422 `invalid_request`。这是请求不合法，不是模型不存在 |
+| `caller` | `Depends(require_scope("models:read"))` | `app/gateway/deps.py` | M9 起缺 scope → 403 `permission_denied` |
+
+`config.yaml` 里的 `models[].name` 用同一条正则。对不上的名字列表里放得出来，路径上却 422，客户端无法按名字再取一次。校验放在 M0 的 `ModelConfig.name` 上（`Field(pattern=...)`），和这里是同一份模式，不要各写各的。
+
+```python
+# app/gateway/models/response.py
+class ModelResponse(BaseModel):
+    name: str
+    model: str
+    display_name: str | None = None
+    description: str | None = None
+    supports_thinking: bool
+    supports_reasoning_effort: bool
+    supports_vision: bool
+    context_window: int | None = None
+
+
+class ModelsListResponse(BaseModel):
+    models: list[ModelResponse]
+
+
+_WIRE_FIELDS = (
+    "name", "model", "display_name", "description",
+    "supports_thinking", "supports_reasoning_effort",
+    "supports_vision", "context_window",
+)
+
+
+def model_to_wire(cfg: ModelConfig) -> ModelResponse:
+    """显式拷贝白名单。禁止 ModelConfig.model_dump()：extra="allow" 会把 api_key、base_url、when_thinking_* 带出来。"""
+    return ModelResponse.model_validate({key: getattr(cfg, key) for key in _WIRE_FIELDS})
+```
+
+| 响应字段 | 来源 | 不在响应里的配置 |
+| --- | --- | --- |
+| `name` | `ModelConfig.name` | `api_key`、`base_url`、`headers`、任何 `$ENV` 展开后的秘密 |
+| `model` | provider 侧模型 ID | `use`（类路径，客户端用不上） |
+| `display_name` / `description` | 给人看的文案，可空 | `when_thinking_enabled` / `when_thinking_disabled` / `thinking` |
+| `supports_thinking` / `supports_reasoning_effort` / `supports_vision` | 能力位，M5 用来画开关 | `stream_chunk_timeout`、`max_tokens`（调用参数，不是选择器要的） |
+| `context_window` | 可空整数 | 未设置就是 `null`，不要填 0 |
+
+
+### 7.3 handler
+
+```python
+# app/gateway/routers/models.py
+router = APIRouter(prefix="/models", tags=["models"])
+
+
+@router.get("", response_model=ModelsListResponse)
+async def list_models(
+    caller: Annotated[RunCaller, Depends(require_scope("models:read"))],
+) -> ModelsListResponse:
+    del caller  # 门在依赖里。M1 不按调用方裁清单；M9 若要裁，改下面这一行的数据源，不新开路由
+    config = get_app_config()                                 # agentkit/config/app_config.py，每次请求读，不缓存到 app.state
+    seen: set[str] = set()
+    models: list[ModelResponse] = []
+    for cfg in config.models:                                 # 文件顺序。索引是首个获胜（M0 §5.9），列表跟它一致
+        if cfg.name in seen:
+            continue
+        seen.add(cfg.name)
+        models.append(model_to_wire(cfg))                      # app/gateway/models/response.py
+    return ModelsListResponse(models=models)
+
+
+@router.get("/{model_name}", response_model=ModelResponse)
+async def get_model(
+    model_name: ModelName,                                     # app/gateway/models/request.py
+    caller: Annotated[RunCaller, Depends(require_scope("models:read"))],
+) -> ModelResponse:
+    del caller
+    cfg = get_app_config().get_model_config(model_name)        # 首个同名；没有则 None
+    if cfg is None:
+        raise ModelNotFound(f"Model {model_name} not found")   # app/gateway/errors.py
+    return model_to_wire(cfg)
+```
+
+| 步骤 | `list_models` | `get_model` | 失败 |
+| --- | --- | --- | --- |
+| 1 | `require_scope("models:read")` 在进函数体之前 | 同左 | 403，函数体不跑 |
+| 2 | `get_app_config()` | 同左，再 `get_model_config` | 配置文件坏了是启动/热重载的错，不是这条路由的 404 |
+| 3 | 按 `name` 去重，保留第一次出现 | 索引未命中 | 404 `model_not_found` |
+| 4 | `model_to_wire` 后放进 `ModelsListResponse` | `model_to_wire` | —— |
+
+空配置返回 `{"models": []}`，HTTP 200。没有模型是合法的新安装（M0 对空列表只 warning），不是 404。
+
+`GET /models` 必须写在 `GET /models/{model_name}` 前面。反了之后没有名为空路径的冲突，但下一次有人加 `GET /models/default` 时会被参数段吃掉。静态段先声明，和路由层 §7.1 同一条规则。
+
+详情不存在是 404，不是 400。`model_not_allowed`（400）是 `start_run` 第 4 步的事：客户端在一次 run 里点名了一个不在白名单里的模型。两条 code 不要合并——一个是「目录里没有这一项」，一个是「这次 run 不许用它」。
+
+### 7.4 错误与依赖的第一版
+
+`ModelNotFound` 不继承 `StartRunError`。模型路由不该 import 执行栈；`StartRunError` 要到 M3 的 `services.py` 才有。形状对齐路由层 §6.2：类上带 `status_code` 和 `code`，处理器只读这两个属性。
+
+```python
+# app/gateway/errors.py
+class ModelNotFound(Exception):
+    status_code: ClassVar[int] = 404
+    code: ClassVar[str] = "model_not_found"
+```
+
+`install_error_handlers` 给它登记一条和 `_handle_domain_error` 相同的出口（读 `exc.status_code` / `exc.code`，体是 `{detail, code, trace_id}`）。M3 把 `StartRunError` 接上同一出口，不另写一种错误体。
+
+```python
+# app/gateway/deps.py
+def require_scope(scope: str) -> Callable[[Request], RunCaller]:
+    """M1 的第一版。M9 之前 caller.scopes 恒为 None，allows 恒真。门的位置从第一条路由就固定。"""
+
+    def _dep(request: Request) -> RunCaller:
+        caller = caller_from_request(request)
+        if not caller.allows(scope):
+            raise RunPermissionDenied(f"missing scope: {scope}")
+        return caller
+
+    return _dep
+
+
+def caller_from_request(request: Request) -> RunCaller:
+    """M1 没有认证中间件。M3 仍返回匿名 HTTP；M9 改为读 request.state.auth（路由层 §4.1）。"""
+    return RunCaller(kind=CallerKind.HTTP, user_id=None)
+```
+
+`RunPermissionDenied` 在 M3 才和 `StartRunError` 放一起。M1 的 `require_scope` 在 scopes 恒为 `None` 时到不了那一行；M9 补上认证之后，抛出的必须是路由层 §6.1 那一个类，不要在 `deps.py` 里 `HTTPException(403)`。
+
+### 7.5 这条路由不做什么
+
+| 不做 | 理由 |
+| --- | --- |
+| 按用户过滤模型 | M9 的授权。M1 的清单等于配置文件 |
+| `POST` / `PATCH` 改 `config.yaml` | 模型表是运维配置，不是运行时 API |
+| 在响应里带 `api_key` 哪怕打码 | 打码后的密钥仍是一个客户端会依赖的字段。白名单里没有它 |
+| 用 `Page` 或 `?limit=` | 全量就是一份配置；截断会让选择器漏模型 |
+
+
+---
+
+
+
+## 8. CLI（D9）
 
 一个最小的 REPL：读一行 → `client.stream()` → 流式打印 → 循环。支持 `--thread-id` 续跑、
 `/reset` 清状态、`/model <name>` 切模型。
@@ -1348,11 +1535,11 @@ M9 只改解析、不改键）。最后一条守键的完整性：用一个记�
 
 
 
-## 8. 测试策略（D10）
+## 9. 测试策略（D10）
 
 
 
-### 8.1 FakeChatModel 是 M1 最重要的测试基础设施
+### 9.1 FakeChatModel 是 M1 最重要的测试基础设施
 
 有了它，M1 之后的**每一个阶段**都能离线测：中间件（M6）、子代理（M8）、
 run 生命周期（M3）全都不需要真实 provider。这个类的投入产出比极高，值得一开始就写完整。
@@ -1415,7 +1602,7 @@ class FakeChatModel(BaseChatModel):
 | -------------------- | -------------------------------------- |
 | 多轮脚本（`responses` 列表） | tool loop——模型要先发 tool_call，拿到结果后再发最终答案 |
 | 发起 tool_calls        | M2 的工具、M8 的子代理委托                       |
-| 按 chunk 流式           | §6.2 的 delta 拼接、§8.3 的差分测试             |
+| 按 chunk 流式           | §6.2 的 delta 拼接、§9.3 的差分测试             |
 | 模拟 usage 元数据         | token 统计的正确性                           |
 
 
@@ -1426,7 +1613,7 @@ class FakeChatModel(BaseChatModel):
 同理，脚本耗尽时要**抛** `AssertionError` **而不是返回空响应**。返回空响应会让"agent 多调了一次
 模型"这种 bug 表现为一条空消息，排查时得先怀疑三个地方；直接抛异常，栈顶就是答案。
 
-### 8.2 测试清单
+### 9.2 测试清单
 
 
 | 文件                              | 覆盖                                                                                                                                                                                                                    |
@@ -1436,12 +1623,13 @@ class FakeChatModel(BaseChatModel):
 | `test_prompt.py`                | 提示词渲染结果不含任何随时间/用户变化的内容（prefix cache 不变量）；未启用的 section 渲染成空串；用户输入被边界标记包裹                                                                                                                                               |
 | `test_checkpointer_provider.py` | 单例复用；`reset` 后重建；未知 backend 报错；缺失 provider 包给安装提示                                                                                                                                                                     |
 | `test_custom_events.py`         | §6.3：一次发送在 `custom` 模式和 `astream_events` 里各恰好一次；回调失败不影响 writer；writer 失败时不分发；`GraphBubbleUp` 和 `CancelledError` 不被吞；缺 `type` 抛 `ValueError` |
+| `test_models_router.py`         | `GET /api/models` 空配置是 `{"models": []}`；重名只留第一条；`api_key` / `when_thinking_enabled` 不在 JSON 里；未知名字 404 `model_not_found`；`/api/models/a/b` 与超长名字 422 `invalid_request` |
 | `test_client.py`                | 多轮对话；`stream()` 的四类事件；**AI 文本不重复投递**；token 按 id 只计一次（用 `usage_on_every_chunk=True` 跑）；`summary_text` 每个快照都在；**十轮对话后** `messages-tuple` **事件数不随快照数增长**（守 `seen_ids`）；纯元数据事件 `content=""` 能被识别；只订阅单个 stream mode 时的退化解包；无 `type` 的 custom chunk 被丢弃（§6.3）；图按键复用和重建、`reset_agent()`、`runtime.context` 里的 `user_id` 与键一致（§6.4） |
 
 
 
 
-### 8.3 流式去重用差分测试
+### 9.3 流式去重用差分测试
 
 把 `messages` 模式收到的 delta 按 id 拼接出的完整文本，和 `chat()` 返回的最终文本对比，
 必须完全一致。同时断言 `values` 快照里的 AI 文本没有产生额外投递。
@@ -1452,7 +1640,7 @@ class FakeChatModel(BaseChatModel):
 
 
 
-## 9. 验收清单
+## 10. 验收清单
 
 - [ ] CLI 里完成一次带工具调用的多轮对话
 - [ ] 重启进程后对话丢失（内存 checkpointer，符合预期）
@@ -1464,12 +1652,14 @@ class FakeChatModel(BaseChatModel):
 - [ ] 系统提示词渲染两次（不同用户、不同时间）结果完全相同
 - [ ] 全部测试离线跑通，不需要任何 provider 凭据
 - [ ] `import agentkit.agents` 不会拉起工具图（用 `sys.modules` 断言）
+- [ ] `GET /api/models` 与 `GET /api/models/{name}` 的响应字段等于 §7.2 的白名单，配置里的 `api_key` 不出现
+- [ ] 未知模型名 → 404 `model_not_found`；名字含 `/` → 422 `invalid_request`
 
 ---
 
 
 
-## 10. 刻意不做的事
+## 11. 刻意不做的事
 
 
 | 不做                         | 理由                                                 |
@@ -1486,9 +1676,9 @@ class FakeChatModel(BaseChatModel):
 
 
 
-## 11. 一句话总结
+## 12. 一句话总结
 
 M1 的代码量不大，但它定死了 checkpoint 里存什么、运行时参数叫什么、流式事件长什么样、
-agent 怎么被装配出来。
+agent 怎么被装配出来，以及模型目录的两条 GET 长什么样。
 
-后面所有阶段都是在这四份契约上加东西。契约本身改一次，前后端和数据都要跟着动。
+后面所有阶段都是在这些契约上加东西。契约本身改一次，前后端和数据都要跟着动。

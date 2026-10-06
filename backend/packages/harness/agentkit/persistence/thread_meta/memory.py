@@ -86,6 +86,46 @@ class MemoryThreadMetaStore(ThreadMetaStore):
         matched.sort(key=lambda row: (row["updated_at"], row["thread_id"]), reverse=True)
         return [deepcopy(row) for row in matched[offset : offset + limit]]
 
+    async def search_page(
+        self,
+        *,
+        user_id: str | None,
+        metadata=None,
+        status: str | None = None,
+        limit: int = 51,
+        cursor: str | None = None,
+        order: str = "desc",
+    ) -> list[dict]:
+        from agentkit.persistence.base import decode_keyset_cursor, encode_keyset_cursor
+
+        owner = resolve_thread_user(user_id, "search_page")
+        filters = metadata or {}
+        for key, expected in filters.items():
+            validate_metadata_filter(key, expected)
+        matched = []
+        for row in self._rows.values():
+            if owner is not None and row["user_id"] != owner:
+                continue
+            if status is not None and row["status"] != status:
+                continue
+            if not _metadata_matches(row["metadata"], filters):
+                continue
+            matched.append(row)
+        reverse = order != "asc"
+        matched.sort(key=lambda row: (row["updated_at"], row["thread_id"]), reverse=reverse)
+        if cursor is not None:
+            updated_at, thread_id = decode_keyset_cursor(cursor, order=order)
+            if order == "desc":
+                matched = [row for row in matched if (row["updated_at"], row["thread_id"]) < (updated_at, thread_id)]
+            else:
+                matched = [row for row in matched if (row["updated_at"], row["thread_id"]) > (updated_at, thread_id)]
+        page = []
+        for row in matched[:limit]:
+            copied = deepcopy(row)
+            copied["cursor"] = encode_keyset_cursor(order, row["updated_at"], row["thread_id"])
+            page.append(copied)
+        return page
+
     async def update_display_name(self, thread_id, display_name, *, user_id=AUTO) -> None:
         row = self._owned(thread_id, resolve_thread_user(user_id, "update_display_name"))
         if row is None:

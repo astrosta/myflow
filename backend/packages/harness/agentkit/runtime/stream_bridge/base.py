@@ -48,6 +48,11 @@ class StreamBridge(abc.ABC):
         omitted. Yields :data:`END_SENTINEL` once the producer calls
         :meth:`publish_end`. Yields :class:`StreamGap` and stops when the
         subscriber has fallen behind retained history.
+
+        Never raises for an unknown *run_id*: the buffer is created on demand and
+        the subscription waits for the first frame. Existence is the caller's
+        call (M3 §7.4) — "no buffer yet" is the normal state between admission
+        and the first publish. An already reclaimed run answers with END at once.
         """ 
 
     @abc.abstractmethod
@@ -56,5 +61,7 @@ class StreamBridge(abc.ABC):
 
         If *delay* > 0 the implementation should wait before releasing,
         giving late subscribers a chance to drain remaining events.
+        Reclaiming drops the payload but leaves a tombstone, so a later
+        subscriber gets an immediate END instead of falling back to "unknown run".
         """
 

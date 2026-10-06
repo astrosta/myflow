@@ -1,0 +1,11 @@
+{
+  "events": [
+    {"event_type": "run.start", "category": "trace"},
+    {"event_type": "run.end", "category": "outputs"},
+    {"event_type": "run.error", "category": "error"},
+    {"event_type": "llm.human.input", "category": "message"},
+    {"event_type": "llm.ai.response", "category": "message"},
+    {"event_type": "llm.tool.result", "category": "message"},
+    {"event_type": "llm.error", "category": "trace"}
+  ]
+}

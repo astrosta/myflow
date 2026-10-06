@@ -57,11 +57,22 @@ run_events:
   max_trace_content: 10240 # 仅 db：category=trace 超此字节截断
   track_token_usage: true  # RunJournal 是否把 usage 累到 RunRow
 
+# 直播帧的桥：进程级单例，lifespan 里建一次（backend 是 startup-only）。
+stream_bridge:
+  backend: memory                  # memory | redis（M9）    startup-only
+  queue_maxsize: 256               # 每 run 保留的数据事件数，决定"能重放多久"
+  heartbeat_interval_seconds: 15   # 0 = 关掉心跳（只给嵌入式用）
+
+# 本地沙箱是路径映射，不是隔离。宿主 bash 默认关闭。
+# sandbox.use 是 startup-only：改了要重启。
+sandbox:
+  use: agentkit.sandbox.local:LocalSandboxProvider
+  allow_host_bash: false   # 仅在完全可信的本地环境设为 true
+  bash_command_timeout: 600
+  mounts: []
+
 # ------------------------------------------------------------
-# 以下 section M0 还不读，留着是为了让文件形状从一开始就稳定。
+# 以下 section 留着是为了让文件形状从一开始就稳定。
 # 整段注释掉会被 YAML 解析成 null，加载器当作"缺失"走默认值（见 §5.7）。
 # ------------------------------------------------------------
-# sandbox:         # M2
-# database:        # M4   startup-only
-# summarization:   # M6
 # plugins:         # M10  startup-only，且会导致代码被 import

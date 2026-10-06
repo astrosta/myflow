@@ -4,7 +4,11 @@ from pydantic import BaseModel, ConfigDict, Field
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    name: str = Field(default="default", description="Logical model name used by the factory")
+    name: str = Field(
+        default="default",
+        pattern=r"^[A-Za-z0-9._-]{1,128}$",
+        description="Logical model name used by the factory",
+    )
     display_name: str | None = Field(default=None, description="Human-readable model name")
     description: str | None = Field(default=None, description="Model description")
   #  provider_type: str = Field(default="deepseek", description="The type of the model provider")

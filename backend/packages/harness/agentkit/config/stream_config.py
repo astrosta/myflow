@@ -2,8 +2,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from agentkit.config.reload_boundary import format_field_description
+
 
 class StreamBridgeConfig(BaseModel):
-    backend: Literal["memory", "redis"] = "memory"
+    backend: Literal["memory", "redis"] = Field(
+        default="memory",
+        description=format_field_description("stream_bridge.backend"),
+    )
     queue_maxsize: int = Field(default=256, gt=0)                    # 每 run 保留的数据事件数
     heartbeat_interval_seconds: float = Field(default=15.0, ge=0)    # 0 = 关掉心跳（只给嵌入式用）

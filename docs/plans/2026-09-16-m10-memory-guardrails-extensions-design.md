@@ -5,7 +5,8 @@
 > [M2 工具与沙箱](2026-09-16-m2-tools-sandbox-design.md) · [M3 Gateway 与流式](2026-09-16-m3-gateway-streaming-design.md) ·
 > [M4 持久化](2026-09-16-m4-persistence-design.md) · [M5 前端](2026-09-16-m5-frontend-design.md) ·
 > [M6 中间件体系](2026-09-16-m6-middleware-design.md) · [M7 MCP 与技能](2026-09-16-m7-mcp-skills-design.md) ·
-> [M8 子代理委托](2026-09-16-m8-subagents-design.md) · [M9 生产化](2026-09-16-m9-production-design.md)
+> [M8 子代理委托](2026-09-16-m8-subagents-design.md) · [M9 生产化](2026-09-16-m9-production-design.md) ·
+> [路由层详细设计](2026-09-16-router-layer-design.md)
 >
 > 本文细化 M10（3–4 周，四条线内部可并行）。沿用包名：框架层 `agentkit.*`，应用层 `app.*`。
 > 读完应能按文件树、接口、陷阱、测试清单直接开工。
@@ -91,6 +92,9 @@ agentkit/
 │   ├── factory.py                   ★  # build_tracing_callbacks；无全局副作用
 │   └── metadata.py                  ★  # session/user/trace_name
 └── runtime/events/catalog.py        # 加 context:memory、workspace.changes
+
+app/gateway/routers/memory.py         # prefix=/memory，§2.13
+# goal 三条写在已有的 app/gateway/routers/threads.py，不新建文件
 
 scripts/benchmark/
 └── memory_eviction/                 ★  # import 生产 eviction.py，不复制
@@ -597,26 +601,200 @@ JSON `{"error": "..."}` ，不要把异常冒成 Graph 失败。
 注册：`should_use_memory_tools(cfg)` 为真时，M2 工具目录把它四件加进 lead 工具表。
 本地后端 `requires_passive_writes_in_tool_mode=True`，所以 tool 模式仍挂 MemoryMiddleware。
 
-### 2.13 Gateway HTTP（`app/gateway/routers/memory.py`）
+### 2.13 路由
 
-前缀 `/api`。身份 `_resolve_memory_user_id(request)`：
-可信内部头（AuthMiddleware 验过）→ `make_safe_user_id(raw_owner)`，
-否则 `get_effective_user_id()`。浏览器调用方永远不是 internal。
+路由层把 `/api/memory/**` 和 thread 的 `goal` 子资源划给 M10。
+错误体、`extra="forbid"`、能力门沿用路由层。贡献路由的挂载规则仍是 §4.6，不在这张表里。
 
-| 方法 | 路径 | 行为 |
-|---|---|---|
-| GET | `/memory` | `get_memory`；不支持 → 501 |
-| POST | `/memory/reload` | 进程外改了 markdown 之后强制重载 |
-| DELETE | `/memory` | `clear_memory`；成功后 `cancel_by_agent` |
-| POST | `/memory/facts` | `create_fact`；ValueError → 422 |
-| PATCH | `/memory/facts/{fact_id}` | `update_fact`；冲突 409 |
-| DELETE | `/memory/facts/{fact_id}` | `delete_fact` |
-| GET | `/memory/export` | 走 `get_memory`，**不要**调死契约 `export_memory` |
-| POST | `/memory/import` | `import_memory`，随后触发淘汰 |
+身份不在路由里读 `X-DeerFlow-Owner-User-Id`。AuthMiddleware 已经把它写进 `request.state.auth`，`caller_from_request` 给出 `caller.user_id`（M9 §2.12）。存储桶用 `make_safe_user_id(caller.user_id)`。浏览器调用方的 `kind` 不是 internal。
 
-`MemoryConflictError` → 409；`MemoryCorruptionError` → 500（稳定文案，不带路径）。
-删除自定义 agent 时必须 `cancel_by_agent(name, user_id=...)`，否则 debounce 晚到会把已删 agent 复活。
-所有存储 I/O `asyncio.to_thread`。
+存储 I/O 在 `asyncio.to_thread` 里。路由不打开 `memory.json`。
+
+#### 记忆 `app/gateway/routers/memory.py`
+
+`prefix="/memory"`。`/reload`、`/export`、`/import`、`/facts` 都是静态段，写在 `/facts/{fact_id}` 前面。
+
+| Method | Path | 能力 | 成功 | 调什么 |
+| --- | --- | --- | --- | --- |
+| GET | `/api/memory` | `memory:read` | `MemoryResponse` | `get_memory`。后端没有该方法 → 501 `memory_not_supported` |
+| GET | `/api/memory/export` | `memory:read` | `MemoryResponse` | 同样 `get_memory`。不调用契约里没有的 `export_memory` |
+| POST | `/api/memory/reload` | `memory:write` | `MemoryResponse` | `reload`。给进程外改过 markdown 用 |
+| DELETE | `/api/memory` | `memory:write` | `{"cleared": true}` | `clear_memory`，成功后 `cancel_by_agent(user_id=...)` |
+| POST | `/api/memory/facts` | `memory:write` | 201 `FactResponse` | `create_fact` |
+| PATCH | `/api/memory/facts/{fact_id}` | `memory:write` | `FactResponse` | `update_fact` |
+| DELETE | `/api/memory/facts/{fact_id}` | `memory:write` | `{"deleted": fact_id}` | `delete_fact` |
+| POST | `/api/memory/import` | `memory:write` | `MemoryResponse` | `import_memory`，然后跑容量淘汰（§2.6） |
+
+```python
+# app/gateway/models/request.py
+FactId = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+
+class FactCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=4000)
+    category: str = Field(default="context", pattern=r"^[a-z0-9_-]{1,32}$")
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+class FactPatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    content: str | None = Field(default=None, min_length=1, max_length=4000)
+    category: str | None = Field(default=None, pattern=r"^[a-z0-9_-]{1,32}$")
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    revision: int = Field(ge=0)          # 必填。和存储里的 revision 不一致 → 409
+
+class MemoryImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    memory: dict[str, Any]
+```
+
+`FactPatchRequest` 至少要改一个字段。三个都是 `null` → 422 `invalid_memory_fact`。
+
+```python
+# app/gateway/models/response.py
+class FactResponse(BaseModel):
+    id: str
+    content: str
+    category: str
+    confidence: float
+    revision: int
+    created_at: str                      # ISO-8601 Z
+    updated_at: str | None = None
+    source: str                          # "conversation" 或 thread_id，不是文件路径
+
+class MemoryResponse(BaseModel):
+    version: str
+    revision: int | None = None
+    last_updated: str
+    facts: list[FactResponse]
+```
+
+wire 用 `snake_case`。不返回 `memory.json` 的路径、不返回别的用户的 `user_id`。摘要块（work context 一类）若后端放在 `get_memory` 的 dict 里，由 `memory_to_wire` 收成可选字段 `summaries: dict[str, str]`，键是固定的 `work` / `personal` / `top_of_mind`。未知键丢掉。
+
+```python
+# app/gateway/routers/memory.py
+router = APIRouter(prefix="/memory", tags=["memory"])
+
+@router.get("/export", response_model=MemoryResponse)
+@router.get("", response_model=MemoryResponse)
+async def get_memory_route(
+    caller: Annotated[RunCaller, Depends(require_scope("memory:read"))],
+) -> MemoryResponse:
+    return await asyncio.to_thread(read_memory_for, caller.user_id)
+
+@router.post("/facts", status_code=201, response_model=FactResponse)
+async def create_fact_route(
+    body: FactCreateRequest,
+    caller: Annotated[RunCaller, Depends(require_scope("memory:write"))],
+) -> FactResponse:
+    return await asyncio.to_thread(create_fact_for, caller.user_id, body)
+```
+
+其余写路由同样只有这三步：能力门、`to_thread`、`*_to_wire`。`read_memory_for` 这些函数在 `app/gateway/memory_api.py`，里面拿 `get_memory_manager()`。
+
+| 后端抛出 | 路由看到的异常 | HTTP | `code` |
+| --- | --- | --- | --- |
+| 没有 `get_memory` / `create_fact` 等 | `MemoryNotSupported` | 501 | `memory_not_supported` |
+| `ValueError`（内容、类目） | `InvalidMemoryFact` | 422 | `invalid_memory_fact` |
+| `MemoryConflictError` | 原样登记 | 409 | `memory_conflict` |
+| `MemoryCorruptionError` | `MemoryCorrupted`，detail 固定 `"Memory storage is unreadable"` | 500 | `memory_corrupted` |
+| fact 不存在 | `FactNotFound` | 404 | `fact_not_found` |
+
+`MemoryConflictError` 定义在 `agentkit`，不能继承 Gateway 的异常。和 `InvalidCursor` 一样放进路由层的 `_PERSISTENCE` 表。`MemoryCorruptionError` 的消息可能含路径，所以 `memory_api.py` 接住它再抛 `MemoryCorrupted`，路由仍不写 `try/except`。
+
+`DELETE /memory` 在 `clear_memory` 成功之后调用 `cancel_by_agent(user_id=storage_id)`。顺序反了，debounce 里的抽取会把刚删掉的事实写回来。删自定义 agent 时同样要调，那条不在本路由里，在 agent 删除路径上。
+
+`POST /import` 写完必须跑 §2.6 的淘汰。导入本身不绕过容量上限。
+
+#### goal `app/gateway/routers/threads.py`
+
+`/{thread_id}/goal` 是静态段，和 `state` / `compact` 一起声明，写在任何 `/{thread_id}/{param}` 之前。
+
+| Method | Path | 能力 | 成功 |
+| --- | --- | --- | --- |
+| GET | `/api/threads/{thread_id}/goal` | `threads:read` | `{"goal": GoalState \| null}` |
+| PUT | `/api/threads/{thread_id}/goal` | `threads:write` | 200，同一个形状 |
+| DELETE | `/api/threads/{thread_id}/goal` | `threads:write` | 200 `{"goal": null}` |
+
+```python
+# app/gateway/models/request.py
+class GoalPutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    objective: str = Field(min_length=1, max_length=4000)
+    max_continuations: int = Field(default=8, ge=0, le=8)
+
+class GoalState(BaseModel):
+    objective: str
+    max_continuations: int
+    continuation_count: int = 0
+
+class GoalResponse(BaseModel):
+    goal: GoalState | None
+```
+
+```python
+# app/gateway/routers/threads.py
+@router.get("/{thread_id}/goal", response_model=GoalResponse)
+async def get_goal(
+    thread_id: ThreadId,
+    caller: Annotated[RunCaller, Depends(require_scope("threads:read"))],
+    services: Annotated[RunServices, Depends(get_run_services)],
+) -> GoalResponse:
+    await require_visible_thread(services, thread_id, caller)
+    return GoalResponse(goal=await read_goal(services, thread_id))
+
+@router.put("/{thread_id}/goal", response_model=GoalResponse)
+async def put_goal(
+    thread_id: ThreadId,
+    body: GoalPutRequest,
+    caller: Annotated[RunCaller, Depends(require_scope("threads:write"))],
+    services: Annotated[RunServices, Depends(get_run_services)],
+) -> GoalResponse:
+    await ensure_goal_thread(services, thread_id, caller)   # 见下
+    async with reserve_checkpoint_write(services, thread_id, user_id=caller.user_id):
+        goal = await write_goal(services, thread_id, body.objective, body.max_continuations)
+    return GoalResponse(goal=goal)
+
+@router.delete("/{thread_id}/goal", response_model=GoalResponse)
+async def delete_goal(
+    thread_id: ThreadId,
+    caller: Annotated[RunCaller, Depends(require_scope("threads:write"))],
+    services: Annotated[RunServices, Depends(get_run_services)],
+) -> GoalResponse:
+    await require_visible_thread(services, thread_id, caller)
+    async with reserve_checkpoint_write(services, thread_id, user_id=caller.user_id):
+        await write_goal(services, thread_id, None, 0)
+    return GoalResponse(goal=None)
+```
+
+`read_goal` / `write_goal` 在 `agentkit/runtime/goal.py`。写走 checkpointer，`as_node` 固定 `"goal"`，不从 body 读。
+
+`ensure_goal_thread`：本用户还没有这行时，用 `ThreadMetaStore.create` 建行并写一个空 checkpoint。新对话页会先拿到 `thread_id`、再设 goal、然后才发第一条消息。别人已经占用这个 id → `ThreadOwnershipConflictError`（409 `thread_ownership_conflict`）。`GET` 和 `DELETE` 不建行，没有行就是 404 `thread_not_found`。
+
+有活跃 run 时 `reserve_checkpoint_write` 抛 `ThreadBusy`（409 `thread_busy`）。不在路由里接 `ConflictError`。
+
+没有 goal 的 GET 是 200、`goal: null`，不是 404。
+
+#### 错误
+
+| 异常 | HTTP | `code` | 所属文件 |
+| --- | --- | --- | --- |
+| `MemoryNotSupported` | 501 | `memory_not_supported` | `app/gateway/errors.py` |
+| `InvalidMemoryFact` | 422 | `invalid_memory_fact` | 同上 |
+| `MemoryConflictError` | 409 | `memory_conflict` | `agentkit/agents/memory/manager.py` |
+| `MemoryCorrupted` | 500 | `memory_corrupted` | `app/gateway/errors.py`。detail 固定，无路径 |
+| `FactNotFound` | 404 | `fact_not_found` | 同上 |
+| `ThreadBusy` | 409 | `thread_busy` | 已有。goal 的写和活跃 run 冲突 |
+
+#### 不做
+
+| 不做 | 理由 |
+| --- | --- |
+| `GET /api/memory/config` 把 `backend_config` 整份吐出去 | 里面可以有模型密钥。配置面不在这组路由里 |
+| 路由读 `X-DeerFlow-Owner-User-Id` | 只有 AuthMiddleware 读这只头（M9 §2.9） |
+| camelCase 字段（`lastUpdated`、`createdAt`） | 路由层的 wire 是 `snake_case` |
+| 在 goal 路由里 `start_run` | goal 是 checkpoint 上的一个通道。继续跑是下一次 run 自己的事 |
+| 把贡献路由算进这张表 | 它们最后挂、不能遮蔽宿主、不能 opt out 认证（§4.6） |
+
 
 ---
 
@@ -1267,6 +1445,8 @@ WORKSPACE_CHANGES_EVENT = RunEventDefinition("workspace.changes", "workspace")
 | `test_extension_isolation.py` | 贡献者抛异常 fail open 且 handler 只调一次；**真实取消传播、内部 CancelledError 被包住** |
 | `test_extension_ordering.py` | 语义锚点；组装在最后一步；AST 检查 `extensions/` 无模块级反向 import |
 | `test_extension_router.py` | 宿主优先；可证明的遮蔽原子拒绝；认证不可 opt out；WS 贡献被拒 |
+| `test_memory_routes.py` | `GET /memory/export` 不被当成 fact id；响应是 snake_case 且无文件路径；`revision` 不一致 409 `memory_conflict`；损坏存储 500 `memory_corrupted` 的 detail 无路径；`DELETE /memory` 之后才 `cancel_by_agent` |
+| `test_goal_routes.py` | 无 goal 的 GET 是 `{"goal": null}`；`max_continuations` 大于 8 → 422；活跃 run 时 PUT 409 `thread_busy`；别人的 thread id 409 `thread_ownership_conflict` 或 404，不写成自己的 goal；路由不调用 `start_run` |
 | `test_plugins_startup_only.py` | `plugins` 在 `STARTUP_ONLY_FIELDS`；API 写 JSON 不能改 plugins |
 | `test_tracing_no_import_side_effect.py` | **import 框架不启动追踪** |
 | `test_tracing_graph_root.py` | 图内 `attach_tracing=False`；子代理 metadata 带父 thread_id |
