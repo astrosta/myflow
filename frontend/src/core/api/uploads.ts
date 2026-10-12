@@ -1,4 +1,4 @@
-import { apiUrl } from "./base";
+import { apiFetch, apiUrl } from "./base";
 
 /**
  * 文件上传。
@@ -55,7 +55,7 @@ export async function uploadFiles(
   options: UploadOptions = {},
 ): Promise<UploadedFileRef[]> {
   if (!files.length) return [];
-  const { signal, fetchImpl = fetch } = options;
+  const { signal, fetchImpl = apiFetch } = options;
 
   const form = new FormData();
   for (const file of files) form.append("files", file, file.name);

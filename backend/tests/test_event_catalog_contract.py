@@ -13,7 +13,7 @@ from agentkit.runtime.events.constants import (
     RUN_EVENT_ID_MAX_LENGTH,
     RUN_EVENT_TYPE_MAX_LENGTH,
 )
-from agentkit.runtime.events.store.codec import normalize_event
+from agentkit.persistence.events.codec import normalize_event
 
 _CONTRACT = Path(__file__).resolve().parents[2] / "contracts" / "run_event_stream_contract.json"
 

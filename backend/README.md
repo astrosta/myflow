@@ -15,6 +15,11 @@ uv run --env-file .env --with uvicorn \
 - `--env-file` 是 **uv** 的参数，必须写在 `uvicorn` 之前。代码不会自己读 `.env`。
 - 依赖里没有 uvicorn，所以用 `--with uvicorn`。要热重载再加 `--reload`。
 - 本机绑 `127.0.0.1`。容器里才绑 `0.0.0.0`。
+- **Windows + Postgres checkpointer**：uvicorn 默认 `ProactorEventLoop`，psycopg 异步连不上。
+  启动时加上
+  `--loop backend.app.gateway.selector_loop:selector_loop_factory`
+  （这里的 attr 必须是零参可调用对象 / loop 类，不是 `(use_subprocess)->class`）。
+  只改 `asyncio.set_event_loop_policy` **无效**（uvicorn 会绕过 policy）。
 
 起来之后：`http://127.0.0.1:8001/docs`。
 
@@ -23,6 +28,14 @@ uv run --env-file .env --with uvicorn \
 ```bash
 uv run --env-file .env --with uvicorn \
   uvicorn backend.app.gateway.app:app --reload --host 127.0.0.1 --port 8001
+```
+
+Windows（Postgres）示例：
+
+```bash
+uv run --env-file .env --with uvicorn \
+  uvicorn backend.app.gateway.app:app --host 127.0.0.1 --port 8001 \
+  --loop backend.app.gateway.selector_loop:selector_loop_factory
 ```
 
 `--workers` **保持 1**。当前 `StreamBridge` 是进程内内存实现，多 worker 时创建 run 和订阅 SSE 可能不在同一进程。环境变量 `GATEWAY_WORKERS` 必须和真实进程数一致，否则启动回收会把别人的 inflight run 标成 error。
@@ -41,6 +54,185 @@ uv run --env-file .env --with uvicorn \
 
 沙箱段见 `config.yaml` 的 `sandbox`。本机 Local provider 默认不开宿主 bash；可信环境可设 `allow_host_bash: true`。
 
+**MCP 与技能走第二份文件**：`extensions_config.json`（模板 `extensions_config.example.json`，已 gitignored）。
+它**由 API 读写**，所以整份 `config.yaml` 不能变成 API 可写。路径优先级和 `config.yaml` 一样，环境变量是
+`MYFLOW_EXTENSIONS_CONFIG_PATH`（也认 `DEER_FLOW_EXTENSIONS_CONFIG_PATH`）：显式路径或环境变量指向的文件不存在会直接报错，
+只有"项目根下搜不到"才算没配扩展。所有读-改-写走 `agentkit.config.update_extensions_config()`：
+进程内 `threading.Lock` + 跨进程文件咨询锁 + 原子写，技能路由和 MCP 路由共用同一把锁。
+
+### MCP 服务器
+
+`extensions_config.json` 的 `mcpServers` 是 M2 工具列表的**第三源**（配置工具 → 内置 → MCP，按 `tool.name` 去重）。
+适配器是可选依赖：`uv sync --extra mcp`（或 `uv pip install langchain-mcp-adapters`），没装时 MCP 一台都不加载，
+其余功能照常。工具**懒加载**：第一次 `collect_tools` 时连一次，之后按 `extensions_config.json` 的
+内容签名失效；`POST /api/mcp/cache/reset` 可以强制本进程重来。
+
+| 配置键 | 作用 |
+|---|---|
+| `type` / `transport` | `stdio`（默认）· `sse` · `http`；两个都写时 `type` 赢 |
+| `command` / `args` / `env` | stdio 用。**API 启停时只接受 `{npx, uvx}` 这样的裸可执行名**（§5.7，纵深防御） |
+| `url` / `headers` | sse / http 用。静态 header 出现两种拼写会被拒 |
+| `tool_name_prefix` | 默认 true：工具名加上 `<server>_`，源路由仍然只看 metadata |
+| `session_init_timeout` / `tool_call_timeout` | 默认 60s；`session_init_timeout: null` = 不限 |
+
+凭据四层（**先注册的在外层，后注册的赢**）：静态 `headers` < `oauth` < `user_auth` < `headers_from_context`
+（`context.secrets` 里的键 → header）。**fail-closed 是默认**：映射里没有当前用户就报错，只点名缺失的键；
+想放行缺值要显式写 `on_missing: passthrough`。stdio 上这三层跳过（用 `env`）。
+`mcpInterceptors`（运维文件专属，会 import 代码）永远最靠近传输层。
+
+stdio 服务器是**有状态子进程**：会话按 `(server, user_id:thread_id)` 池化，池满 LRU 驱逐；
+明确的 `Connection closed` 只驱逐那一个会话，**失败绝不自动重放**。停止/启用某台服务器后，
+打一次 `POST /api/mcp/cache/reset` 让本进程立刻换掉旧会话。
+
+技能目录默认是项目根下的 `skills/{public,custom}/<name>/SKILL.md`（`config.yaml` 的 `skills.path` 可改）。
+模型看到的是系统提示词尾部的 `<available_skills>` 索引（每技能一行，描述截断到 `index_description_max_chars`），
+正文一律按需 `read_file` 或 `/skill-name` 注入 —— 没有"全量注入"模式开关。
+技能是**两层开关**：全局 `extensions_config.json` 的 `skills.<name>.enabled`（admin）与个人
+`skills_prefs.json` 的 `{user_id: {name: bool}}`（任何登录用户），有效状态 = 两者相与。
+
+## 认证（M9 §2）
+
+身份只有一个权威来源：**AuthMiddleware 写的 `request.state.auth`**。
+客户端在 body 里塞的 `user_id` / `owner_id` / `auth_user` / `auth_user_id`
+在 `start_run()` 里被**删掉**（不是"校验后使用"），下游一律用
+`agentkit.runtime.user_context` 的优先级链解析存储桶。
+
+### 两种模式
+
+| 模式 | 配置 | 行为 |
+|---|---|---|
+| 单人演示 | `auth.enabled: false` | 固定用户 `default`、全能力，数据继续进 `users/default/`。`GATEWAY_WORKERS>1` 时**拒绝启动** |
+| 多用户 | `auth.enabled: true` + `auth.jwt_secret`（≥32 字节） | 白名单外一律 401；缺密钥或缺 admin 时启动/接口会明确报错 |
+
+Demo 模式**故意**沿用 `default` 这个桶名（而不是 `auth-disabled`）：
+M4 时代的数据都在 `users/default/`，换名字等于让老用户"数据突然没了"。
+
+### 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `AUTH_JWT_SECRET` | HS256 密钥。**改它 = 所有会话立刻失效**（有意为之） |
+| `DEER_FLOW_INTERNAL_AUTH_TOKEN` | 通道 / 调度器代表用户的共享密钥，与 `auth.internal_tokens` 合并；写 `[new, old]` 即可不停机轮换 |
+| `GATEWAY_CORS_ORIGINS` | 逗号分隔。`CORSMiddleware` 与 `CSRFMiddleware` **读同一个变量** |
+| `GATEWAY_ENABLE_DOCS=false` | 把 `/docs`、`/redoc`、`/openapi.json` 从公开白名单拿掉（生产默认关） |
+| `AUTH_TRUSTED_PROXIES` | 只有 peer 落在这里时才信 `X-Real-IP`；**永远不看 `X-Forwarded-For`** |
+| `GATEWAY_WORKERS` | 必须等于真实进程数；`>1` 且认证关闭 → 拒绝启动 |
+
+### 错误码：能照着做，而不是"错了"
+
+默认 `auth.local.specific_errors: true`。每个失败都有自己的 `code`，detail 说清**下一步做什么**：
+
+| 情形 | HTTP | `code` | detail 里有什么 |
+|---|---|---|---|
+| 邮箱形状不对 | 422 | `invalid_email` | 哪条规则没过（缺 @、域名没有点、有空格…），并回显你刚敲的值 |
+| 用户名形状不对 | 422 | `invalid_username` | 是哪一条（3-32 位 / 字符集 / 首尾 / 保留字） |
+| 用户名被占 | 409 | `username_taken` | 是哪个用户名，让你换一个 |
+| 口令太短 | 422 | `password_too_short` | 最少 8 字符 + 实际几位 |
+| 口令太长 | 422 | `password_too_long` | 上限 72 **字节**（UTF-8）+ 实际字节数 |
+| 邮箱已注册 | 409 | `user_already_exists` | 是哪个邮箱，并提示直接登录 |
+| 自助注册关闭 | 403 | `registration_closed` | 让管理员建号 |
+| 已有 admin 再走 setup | 409 | `admin_already_exists` | 提示去登录（**不点名**现有 admin，这条路由公开） |
+| 没这个账号 | 401 | `account_not_found` | 回显你敲的**标识**（邮箱或用户名），提示先注册。不说是哪一种没注册 |
+| 密码不对 | 401 | `wrong_password` | 只说不对，**永不回显口令** |
+| 账号被禁用 / 在回收期 | 403 | `account_disabled` / `account_deleted` | 找管理员恢复。**只在口令正确时才给这个答案** |
+| 失败次数超限 | 429 | `login_rate_limited` | 剩余秒数 + 响应头 `Retry-After` |
+| 改密时当前密码错 | 401 | `invalid_credentials` | 明确指出是 current password 的问题 |
+| **服务端**读不出认证配置 | 503 | `auth_unavailable` | 让用户找管理员。**不是**"你没登录"——用户重登一百次也还是这个错 |
+
+两条不变量：**明文口令永不回显**（也不进日志、不进库）；
+**账号状态（禁用 / 回收期）只在口令正确之后才透露**——不知道口令的人不该读到"这个账号存在且被禁用了"。
+
+想要"不透露某个邮箱（或用户名）是否注册"就把 `auth.local.specific_errors` 设成 `false`：
+登录的四种失败（没这个账号 / 密码错 / 被禁用 / 回收期）会收敛成同一个 401 `invalid_credentials`
+和同一句 detail。代价是用户不知道为什么失败。
+
+### 用户名：第二个登录标识
+
+`users.username` 不是"显示名"，它是一个**登录标识**（§2.4）：
+
+- **形状**：3-32 字符，小写字母/数字/下划线/点/连字符，首尾必须是字母或数字；
+  `default` / `anonymous` / `auth-disabled` / `system` / `internal` 是保留字。
+- **大小写不敏感**：`Alice` 存成 `alice`，登录时敲 `ADMIN` 也进得去。
+- **两个标识各自唯一**：邮箱撞车 409 `user_already_exists`，用户名撞车 409
+  `username_taken`——要改的字段不同，code 也不同。
+- **改用户名不换桶**：桶名只来自 `users.id`（§2.2）。这条比改邮箱更容易写错，
+  因为用户名看起来"本来就是 id"。
+- **旧库自动回填**：`0003_users_username` 从邮箱 local part 派生（撞名加 `-2`），
+  再建唯一索引、置 NOT NULL。升级前不用手工准备数据。
+
+改名的入口是 **`PATCH /api/v1/auth/me`**：body `{"username": "..."}` → `UserResponse`。
+仅会话（PAT → 403 `session_required`）、**不动令牌**（别的设备不用重新登录）、
+**只改用户名**（多给一个字段就是 422 `invalid_request`）。
+`needs_setup` 的用户会被 403 `setup_required` 拦下——他该先去改密码。
+
+**401 ≠ 会话失效。** 登录 / 注册 / 初始化 / 改密上的 401、403 是"这次提交不对"，
+前端不该把它们当成"会话过期"去跳登录页（见 `frontend/README.md`）；
+"服务端自己读不出配置"则走 503 `auth_unavailable`，不冒充未认证。
+
+**浏览器里剩一枚旧 cookie**（换过 `jwt_secret`、`token_version` 变了、库重建过）时，
+公开路由照常工作、受保护路由照常 401 —— 用户不会被永久锁在登录页外面。
+这条有回归测试（`test_a_stale_cookie_cannot_lock_the_auth_pages`），改动认证门时别弄丢它。
+
+### 会话与令牌
+
+- JWT 只在 HttpOnly cookie `access_token` 里，**响应体里永远没有 token 字符串**。
+  登录响应只有 `expires_in` 与 `needs_setup`。
+- 撤销只有两个机制：`users.token_version`（改密 / 重置 / 软删 +1）与
+  `disabled` / `deleted_at`（每次鉴权都查库）。**没有 refresh token，登出不是全局登出**——
+  它只清当前浏览器，旧 token 重放仍然有效。
+- PAT 与 session 共享 `token_version`：改密会把 PAT 一起废掉。
+- cookie 只在 HTTPS / 本机 localhost / 显式 `auth.persist_cookies_over_http` 时持久化；
+  公网 HTTP 下降级成 session cookie。CSRF cookie 与 access cookie 的 `max_age` 成对更新。
+
+### 内部调用（通道 / 调度器）
+
+```
+X-DeerFlow-Internal-Token: <共享密钥>
+X-DeerFlow-Owner-User-Id:  <owner 的存储 ID>
+```
+
+三关：令牌相等 → owner 存在且启用 → 该 owner 绑定过这个通道（绑定表属 9D，
+未注册时只打一次 warning）。**只有 AuthMiddleware 会读这只 owner 头**，
+其它代码路径读到都必须当普通不可信输入丢掉。
+
+> **已知边界**：把 `DEER_FLOW_INTERNAL_AUTH_TOKEN` 下发到终端（移动 App、浏览器）
+> 等于允许伪造"代表某用户"。密钥只应放在 Gateway 本机 / 通道 worker / 调度器。
+
+### 首次初始化与救援
+
+- 没有 admin 时服务**不**自动建号，只提示访问 `/setup`（`GET /api/v1/auth/setup-status`）。
+- `POST /api/v1/auth/initialize` 只在零 admin 时可用，并发输家拿 409 `admin_already_exists`。
+- 忘记密码：`uv run python -m backend.app.gateway.auth.reset_admin [--email ...] [--credentials-file ...]`
+  → 随机口令、`token_version += 1`、`needs_setup=true`，凭据写进 `0600` 文件，
+  **stdout 只打路径不打明文**。
+
+### 存储分桶迁移
+
+```bash
+# 先看一眼 N 条 thread 归入谁（默认就是 dry-run）
+uv run python -m backend.scripts.migrate_user_buckets
+# 真跑（要求：Gateway 已停 / 没有活跃 run / 库里已有 admin）
+uv run python -m backend.scripts.migrate_user_buckets --apply
+```
+
+旧扁平布局 `{base}/threads/{tid}/...` 全部归**第一个 admin**；目标已存在就跳过、
+**绝不覆盖**；跨盘时先校验条目数与总字节数再删源。旧共享 `{base}/agents/` 只报告不搬。
+
+### PAT 的现状
+
+PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 scope 菜单、
+永不带 admin、到期即 401、`last_used_at` 按分钟节流、与 `token_version` 联动），
+但**签发 / 列表 / 吊销的 HTTP 路由按设计推到 W4**（M9 §2.12"不做"）：
+打这些路径是 404。服务层的 `AuthService.create_pat / list_pats / revoke_pat` 已经可用。
+
+### 与设计文档的两处偏差
+
+1. `users.system_role` **没有**唯一索引。设计里提过"admin 部分唯一索引"，
+   但 `UNIQUE(system_role)` 会禁止第二个 admin，而 §2.13 又要求"不能把最后一个 admin 降级"。
+   并发初始化改用条件插入（`WHERE NOT EXISTS (admin)`），降级/删除用条件写。
+2. `X-DeerFlow-Owner-User-Id` 的第三关（通道绑定）留了
+   `register_owner_binding_check()` 这个接缝给 9D，未注册时只打一次 warning。
+
 ## 主要路由
 
 都挂在 `/api`：
@@ -56,14 +248,32 @@ uv run --env-file .env --with uvicorn \
 | `POST` | `/api/threads/{id}/runs/{run_id}/cancel` | 取消 |
 | `POST` | `/api/threads/{id}/uploads` | 上传 |
 | `GET` | `/api/threads/{id}/artifacts/...` | 产物 |
+| `GET`/`PATCH` | `/api/mcp/config` | 读 MCP 配置（打码成 `****`）/ 启停一台已有服务器（`admin`） |
+| `POST` | `/api/mcp/cache/reset` | 清本进程的 MCP 工具缓存（`admin`） |
+| `GET` | `/api/skills` | 技能目录，`enabled` 是**有效状态**（`skills:read`；`?scope=global` 仅 `admin`） |
+| `PUT` | `/api/skills/{name}/preference` | 开关"我用不用"（任何登录用户，只写 `skills_prefs.json`） |
+| `PATCH` | `/api/skills/{name}` | 全局开关（`admin`，写 `extensions_config.json`） |
+| `POST` | `/api/skills/reload` | 清本进程的技能 prompt 缓存（`admin`） |
+| `GET` | `/api/v1/auth/setup-status` | 库里有没有 admin（公开） |
+| `POST` | `/api/v1/auth/initialize` | 建第一个 admin（公开，且只在零 admin 时；要 email + username + password） |
+| `POST` | `/api/v1/auth/login/local` | 本地登录（公开，响应体不含 token）。`identifier` = **邮箱或用户名**，旧的 `email` 字段名仍接受 |
+| `POST` | `/api/v1/auth/register` | 自助注册（公开，受 `auth.allow_registration` 控制；同样要 username） |
+| `POST` | `/api/v1/auth/logout` | 清 cookie（公开，幂等） |
+| `GET` | `/api/v1/auth/providers` | 有哪些登录方式（公开；OIDC 不在 M9） |
+| `GET` | `/api/v1/auth/me` | 当前用户（含 `username`；**仅会话**，PAT → 403 `session_required`） |
+| `PATCH` | `/api/v1/auth/me` | 改**自己**的用户名（body `{"username": ...}` → `UserResponse`；**仅会话**）。不动令牌、不换桶 |
+| `POST` | `/api/v1/auth/change-password` | 改密 = 撤销所有会话（**仅会话**） |
+
+M7 **没有创建类路由**：`PUT /api/mcp/config`（整份替换 = 新建 + 删除）和 `POST /api/skills`（新建/上传技能）
+都返回 404/405 —— 创建能力留给后续阶段 + 业务管理员，路由不存在比 403 更诚实。
 
 浏览器应走前端同源 `/api`，不要直接跨源打 8001（开发时 Next rewrite，生产时 nginx）。
 
 ## 测试
 
 ```bash
-cd backend
-uv run pytest
+# 必须在仓库根跑：测试 import backend.* 和 agentkit.*
+uv run python -m pytest backend/tests
 ```
 
 ## 排障
@@ -74,4 +284,5 @@ uv run pytest
 | `No config file found` | `--env-file .env`，或设置 `MYFLOW_CONFIG_PATH` |
 | `$DEEPSEEK_API_KEY is not set` | `.env` 里补上，并用 `--env-file` |
 | `address already in use` | 换 `--port` 或杀掉占用 8001 的进程 |
+| 登录页一直说"登录状态已失效" | 先确认网关进程不是旧的：**改完代码要重启 uvicorn**（README 里的 `--reload` 只在开发时开）。旧 cookie 从 9A 起不会再锁死登录页 |
 | SSE 只有一帧 `event: end` | 订阅早于 worker 第一帧 `publish`；见 `MemoryStreamBridge.subscribe` 在 buffer 为 None 时直接 END |

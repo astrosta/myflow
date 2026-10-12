@@ -9,9 +9,11 @@ from fastapi.testclient import TestClient
 
 from agentkit.config.paths import Paths
 from agentkit.persistence.thread_meta.memory import MemoryThreadMetaStore
-from agentkit.runtime.runs.store.memory import MemoryRunStore
+from agentkit.persistence.run.memory import MemoryRunStore
 from agentkit.sandbox.security import _REJECT_HINT
 from backend.app.gateway.app import install_error_handlers, install_middleware
+from backend.app.gateway.auth import AuthSettings
+from backend.app.gateway.auth_middleware import PUBLIC_EXACT_PATHS, PUBLIC_PATH_PREFIXES
 from backend.app.gateway.routers import artifacts, threads
 
 
@@ -25,7 +27,9 @@ def _client(tmp_path, monkeypatch) -> TestClient:
         event_store=SimpleNamespace(),
     )
     application = FastAPI(redirect_slashes=False)
-    install_middleware(application)
+    # M9 §2.11：这些用例测的是业务路由，不是认证门；显式钉住"认证关闭"，
+    # 免得结果取决于仓库里有没有 config.yaml。
+    install_middleware(application, auth_settings=AuthSettings.disabled())
     install_error_handlers(application)
     application.include_router(threads.router, prefix="/api")
     application.include_router(artifacts.router, prefix="/api")

@@ -53,7 +53,7 @@ agentkit/persistence/
 ├── recovery.py                   # recover_inflight_runs：启动时把孤儿活跃行收成 error
 ├── models/
 │   ├── __init__.py               # 必须 import 所有模型，autogenerate 才看得见
-│   └── run_event.py              # RunEventRow（实现在 runtime/events/store/db.py）
+│   └── run_event.py              # RunEventRow（实现在 persistence/events/db.py）
 ├── thread_meta/
 │   ├── model.py                  # ThreadMetaRow
 │   ├── base.py                   # ThreadMetaStore ABC
@@ -73,25 +73,33 @@ agentkit/runtime/user_context.py       # AUTO 哨兵；persistence 读、gateway
 agentkit/runtime/checkpointer/
 └── async_provider.py          ★  # make_checkpointer()：独立连接池，不是 ORM 引擎
 agentkit/runtime/checkpoint_state.py   # CheckpointStateAccessor
-agentkit/runtime/runs/store/           # ABC + Memory 在 M3；M4 只加工厂分叉
+agentkit/persistence/run/                # 与 thread_meta 同一个形状
+├── base.py                            # RunStore ABC + ACTIVE_STATUSES
+├── memory.py                          # MemoryRunStore
+├── model.py                           # RunRow
+├── sql.py                             # SqlRunStore
 └── __init__.py                        # make_run_store(session_factory)
+
+agentkit/persistence/events/
+├── base.py                            # RunEventStore ABC
+├── codec.py                           # 信封校验 + content 的 JSON 编码（唯一编码器）
+├── memory.py / db.py / jsonl.py       # 三份实现
+└── __init__.py                        # make_run_event_store()
 
 agentkit/runtime/events/
 ├── catalog.py                 ★  # event_type / category 权威名单
-├── journal.py                 ★  # RunJournal：callback → put_batch
-└── store/
-    ├── base.py
-    ├── memory.py
-    ├── db.py
-    ├── jsonl.py
-    └── __init__.py               # make_run_event_store()
+└── journal.py                 ★  # RunJournal：callback → put_batch
 ```
 
-**ABC 跟调用方走，SQL 跟 ORM 走。** `RunStore` 的接口在 M3 已经定在
-`runtime/runs/store/base.py`，因为 `RunManager` 依赖它；SQL 实现放
-`persistence/run/sql.py`。`RunEventStore` 反过来：接口在 runtime，因为账本是运行时
-概念，ORM 行只是 db 后端的物理落地。不要把两套 ABC 都塞进 persistence——
-那样 M1 客户端为了调 `list_messages` 还得 import 持久化包。
+**两套 ABC 都住在 `persistence/`，和 `thread_meta` 一样。** 仓储的接口属于持久化
+这一层：`RunManager` 与 `RunJournal` 依赖的是 ABC，不是某一份实现；
+"哪份实现"由工厂按 `database.backend` / `run_events.backend` 决定。
+runtime 那边只留**跑的时候才存在**的东西（catalog、journal、manager、worker）。
+
+早先的写法把 `RunEventStore` 放在 runtime，理由是"账本是运行时概念"——
+实际用下来那条理由站不住：`persistence/` 里已经同时住着`thread_meta` 与
+`run` 两套仓储和它们的 ORM 行，再让第三套按"概念上属于谁"分家，只会让
+"接口在哪、实现在哪、工厂在哪"变成三个要分别记的事实。
 
 **每个仓库都是「同一份 ABC、两份实现」。** `database.backend=memory` 时
 `get_session_factory()` 返回 `None`，工厂函数必须退化到 memory 实现，
@@ -112,7 +120,7 @@ agentkit/runtime/events/
 ```
 ┌─ SQL：自己的 alembic 链 ────────────────────────┐
 │  threads_meta    runs    run_events             │  ← M4 要建的
-│  （后面会长出 users / feedback / scheduled_* …） │
+│  （后面会长出 users / scheduled_* / channel_* …） │
 └─────────────────────────────────────────────────┘
 ┌─ SQL：LangGraph 自有（alembic 明确排除）────────┐
 │  checkpoints  checkpoint_blobs                  │  ← 不碰 DDL
@@ -1369,7 +1377,7 @@ LangChain 回调 ──► RunJournal ──put_batch──► RunEventStore ─
 ### 5.1 接口保证
 
 ```python
-# agentkit/runtime/events/store/base.py
+# agentkit/persistence/events/base.py
 class RunEventStore(abc.ABC):
     async def put(self, ...) -> None: ...                  # 单条，低频路径
     async def put_batch(self, events: list[...]) -> None: ...   # 常规路径
@@ -1462,7 +1470,7 @@ M8 的深层子代理一步一个事件，能把 Postgres 的锁打满。
 #### `seq` 分配的双层保护
 
 ```python
-# agentkit/runtime/events/store/db.py
+# agentkit/persistence/events/db.py
 async def _next_seq(self, thread_id: str) -> int:
     async with self._locks[thread_id]:          # 进程内：避免每次都撞唯一索引
         async with self._sf() as session:
@@ -1484,7 +1492,7 @@ SQLite 没有真正的 `FOR UPDATE`，靠 `BEGIN IMMEDIATE` + 唯一约束。
 #### `db` 后端的写入路径：一批一个事务，seq 连续分配
 
 ```python
-# agentkit/runtime/events/store/db.py
+# agentkit/persistence/events/db.py
 SEQ_RETRIES = 3
 
 
@@ -1584,7 +1592,7 @@ jsonl **没有** `put_if_absent` 的真正原子性。实现是：读该 run 文
 #### jsonl 后端的参数与冷启动
 
 ```python
-# agentkit/runtime/events/store/jsonl.py
+# agentkit/persistence/events/jsonl.py
 SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+$")      # thread_id / run_id 都会进文件路径
 
 
@@ -1661,7 +1669,7 @@ class JsonlRunEventStore(RunEventStore):
 #### 截断只切 `trace`
 
 ```python
-# agentkit/runtime/events/store/db.py（memory / jsonl 可以不实施，见 §5.2）
+# agentkit/persistence/events/db.py（memory / jsonl 可以不实施，见 §5.2）
 if event["category"] == "trace" and len(text) > self._max_trace_content:
     event["content"] = text[: self._max_trace_content]
     event["metadata"] = {**event["metadata"], "content_truncated": True}
@@ -2840,7 +2848,7 @@ class RunJournal(AsyncCallbackHandler):
 
 回调映射（哪个回调写哪条事件）与参数表只在 §5.7 定义一次，这里不重复。
 
-`put_batch` 里每条事件的 `seq` 由 `agentkit/runtime/events/store/db.py` 的 `_next_seq(thread_id)` 分配：进程内锁加上 `SELECT max(seq) ... FOR UPDATE`，冲突重试最多 3 次（§5.3）。调用方不传 `seq`，也不传 `created_at`。
+`put_batch` 里每条事件的 `seq` 由 `agentkit/persistence/events/db.py` 的 `_next_seq(thread_id)` 分配：进程内锁加上 `SELECT max(seq) ... FOR UPDATE`，冲突重试最多 3 次（§5.3）。调用方不传 `seq`，也不传 `created_at`。
 
 进度这一路：
 

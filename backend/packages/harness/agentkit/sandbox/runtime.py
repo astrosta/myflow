@@ -8,12 +8,28 @@ from typing import Any
 
 from langchain.tools import ToolRuntime
 
-from agentkit.sandbox.exceptions import SandboxNotFoundError, SandboxRuntimeError
+from agentkit.authz import (
+    DEFAULT_ROLE,
+    AuthzDeniedError,
+    build_principal_from_context,
+    check_authorization,
+)
+from agentkit.runtime.user_context import (
+    DEFAULT_USER_ID,
+    resolve_runtime_user_id as resolve_request_user_id,
+)
+from agentkit.sandbox.exceptions import (
+    SandboxAuthorizationError,
+    SandboxNotFoundError,
+    SandboxRuntimeError,
+)
 from agentkit.sandbox.sandbox import Sandbox
 from agentkit.sandbox.sandbox_provider import get_sandbox_provider
 from agentkit.sandbox.security import safe_app_config
 
-_DEFAULT_USER_ID = "default"
+#: 沙箱动作名。M10 的策略按它分支，M9 的 AllowAll 不看。
+SANDBOX_EXECUTE_ACTION = "sandbox.execute"
+
 _AUTHORIZATION_CHECKED: ContextVar[bool] = ContextVar("sandbox_authorization_checked", default=False)
 
 
@@ -22,15 +38,33 @@ def reset_authorization_checked() -> None:
 
 
 def authorize_sandbox_execution(*, context: dict[str, Any], app_config: Any) -> None:
-    """M9 fills this in. The call site stays on both the reuse and acquire paths."""
-    del context, app_config
+    """沙箱 acquire 与 reuse **两条路径**共用的一次授权检查（M9 §2.10）。
+
+    M9 的 provider 是 AllowAll：接口在，策略全放行。M10 换成工具级 deny 时
+    这里一行都不用改。provider 抛异常 = 拒绝（fail-closed），不是放行。
+    """
+    del app_config
+    principal = build_principal_from_context(context, default_role=DEFAULT_ROLE)
+    resource = {
+        key: value
+        for key, value in (("thread_id", context.get("thread_id")), ("run_id", context.get("run_id")))
+        if isinstance(value, str)
+    }
+    try:
+        check_authorization(principal, SANDBOX_EXECUTE_ACTION, resource=resource or None)
+    except AuthzDeniedError as exc:
+        raise SandboxAuthorizationError(str(exc)) from exc
 
 
-def resolve_runtime_user_id(runtime: ToolRuntime) -> str:
-    context = runtime.context or {}
-    if isinstance(context, dict) and (user_id := context.get("user_id")):
-        return str(user_id)
-    return _DEFAULT_USER_ID
+def runtime_user_bucket(runtime: ToolRuntime) -> str:
+    """这一轮工具调用属于哪个存储桶（M9 §2.1）。链在 `agentkit.runtime.user_context`。
+
+    工具运行时是"无 HTTP 路径"，所以允许落到 `DEFAULT_USER_ID` 桶：
+    `config["context"]["user_id"]`（服务端注入）→ 请求 ContextVar → default。
+    客户端塞的 `user_id` 到不了这里（`start_run` 已剥掉，M9 §2.1）。
+    """
+    context = runtime.context if isinstance(runtime.context, dict) else None
+    return resolve_request_user_id(context, allow_default=True) or DEFAULT_USER_ID
 
 
 def _resolve_runtime_thread_id(runtime: ToolRuntime) -> str | None:
@@ -81,7 +115,7 @@ def ensure_sandbox_initialized(runtime: ToolRuntime | None = None) -> Sandbox:
         raise SandboxRuntimeError("Thread ID not available in runtime context")
 
     provider = get_sandbox_provider()
-    sandbox_id = provider.acquire(thread_id, user_id=resolve_runtime_user_id(runtime))
+    sandbox_id = provider.acquire(thread_id, user_id=runtime_user_bucket(runtime))
     sandbox = provider.get(sandbox_id)
     if sandbox is None:
         _rollback_failed_acquire(provider, sandbox_id)
@@ -111,7 +145,7 @@ async def ensure_sandbox_initialized_async(runtime: ToolRuntime | None = None) -
         raise SandboxRuntimeError("Thread ID not available in runtime context")
 
     provider = get_sandbox_provider()
-    sandbox_id = await provider.acquire_async(thread_id, user_id=resolve_runtime_user_id(runtime))
+    sandbox_id = await provider.acquire_async(thread_id, user_id=runtime_user_bucket(runtime))
     sandbox = provider.get(sandbox_id)
     if sandbox is None:
         _rollback_failed_acquire(provider, sandbox_id)

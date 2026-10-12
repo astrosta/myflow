@@ -18,7 +18,7 @@ from langgraph.runtime import Runtime
 from agentkit.agents.middlewares.input_sanitization_middleware import neutralize_untrusted_tags
 from agentkit.agents.middlewares.thread_data_middleware import resolve_thread_id
 from agentkit.config.paths import Paths, get_paths
-from agentkit.sandbox.runtime import resolve_runtime_user_id
+from agentkit.sandbox.runtime import runtime_user_bucket
 from agentkit.utils.messages import record_original_user_content
 
 logger = logging.getLogger(__name__)
@@ -161,7 +161,7 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
 
         last_message = messages[-1]
         thread_id = resolve_thread_id(runtime)
-        user_id = resolve_runtime_user_id(runtime)
+        user_id = runtime_user_bucket(runtime)
         uploads_dir = self._paths.sandbox_uploads_dir(thread_id, user_id=user_id)
         new_files = self._files_from_message(last_message, uploads_dir)
         if not new_files:

@@ -18,24 +18,28 @@
 前面八个里程碑做出来的东西，**在你自己的机器上、你一个人用、只开一个进程**时是完整的。
 M9 把这三个前提逐个拆掉。
 
-| 线 | 拆掉的前提 | 核心难点 | 不可恢复错误 |
-|---|---|---|---|
-| **9A 多用户与鉴权** | "只有你一个人用" | 身份的唯一权威来源 | 图构建和中间件落进不同用户桶 |
-| **9B 多 Gateway 实例** | "只开一个进程" | 谁有权写终态 | **丢租约的进程继续写终态** |
-| **9C 定时任务调度** | "只有人类会发起对话" | 调度状态机 ≠ run 状态机 | 平行执行栈（两套生命周期） |
-| **9D IM 通道** | "只从浏览器进来" | 什么能发出去 | **黑名单外发 → 记忆泄漏到群里** |
-| **9E MCP 长时任务**（可选） | "工具调用几秒就返回" | 数据库是真相源 | 句柄丢了远端还在跑 |
+
+| 线                   | 拆掉的前提       | 核心难点            | 不可恢复错误              |
+| ------------------- | ----------- | --------------- | ------------------- |
+| **9A 多用户与鉴权**       | "只有你一个人用"   | 身份的唯一权威来源       | 图构建和中间件落进不同用户桶      |
+| **9B 多 Gateway 实例** | "只开一个进程"    | 谁有权写终态          | **丢租约的进程继续写终态**     |
+| **9C 定时任务调度**       | "只有人类会发起对话" | 调度状态机 ≠ run 状态机 | 平行执行栈（两套生命周期）       |
+| **9D IM 通道**        | "只从浏览器进来"   | 什么能发出去          | **黑名单外发 → 记忆泄漏到群里** |
+| **9E MCP 长时任务**（可选） | "工具调用几秒就返回" | 数据库是真相源         | 句柄丢了远端还在跑           |
+
 
 9B 和 9D 各对应一个**修不了数据也撤不回**的故障。评审压在这两条上。
 
 ### 1.1 依赖：9A 必须先做
 
-| 周 | 内容 |
-|---|---|
-| W1 | **9A 身份边界 + 认证门 + 存储分桶迁移**。没有这一周，后面四条线会各实现一遍身份 |
-| W2 | 9B 租约 / 孤儿回收 / Redis StreamBridge（并行：9D 通道骨架 + 出站白名单） |
-| W3 | 9C 调度器（并行：9D 两个平台适配：一个 wait、一个 stream） |
-| W4 | 跨线收口：kill -9 接管、IM 开记忆不泄漏、调度走同一条 `start_run`。9E **默认跳过** |
+
+| 周   | 内容                                                       |
+| --- | -------------------------------------------------------- |
+| W1  | **9A 身份边界 + 认证门 + 存储分桶迁移**。没有这一周，后面四条线会各实现一遍身份           |
+| W2  | 9B 租约 / 孤儿回收 / Redis StreamBridge（并行：9D 通道骨架 + 出站白名单）    |
+| W3  | 9C 调度器（并行：9D 两个平台适配：一个 wait、一个 stream）                   |
+| W4  | 跨线收口：kill -9 接管、IM 开记忆不泄漏、调度走同一条 `start_run`。9E **默认跳过** |
+
 
 OIDC/SSO、PAT、第三个 IM 平台、细粒度工具 RBAC，都是 W4 有余量再加的增量，不是 W1 阻塞项。
 
@@ -79,14 +83,12 @@ app/
 │   │   └── routers.py               ★  # prefix=/v1/auth，§2.12
 │   └── routers/
 │       ├── scheduled_tasks.py       ★  # prefix=/scheduled-tasks
-│       ├── channels.py              ★  # prefix=/channels；表在 persistence/channel_connections
-│       └── feedback.py              ★  # prefix=/runs，/ {run_id}/feedback
+│       └── channels.py              ★  # prefix=/channels；表在 persistence/channel_connections
 ├── scheduler/
 │   └── service.py                   ★  # 只决定何时；dispatch 调 start_run
 └── channels/
     ├── base.py / manager.py / message_bus.py / service.py
-    ├── slack.py                     ★  # wait 策略
-    └── telegram.py                  ★  # stream 改卡片策略
+    └── feishu.py                    ★  # 本阶段唯一的平台：卡片 patch 策略
 ```
 
 用户表放在 `app.gateway.auth`，**不要**放进 `agentkit.persistence`。
@@ -133,10 +135,13 @@ def strip_client_identity(body) -> None:
 认证系统允许身份是邮箱之类的任意非空字符串。直接拿去拼目录会出问题
 （`/`、`..`、大小写、超长）。
 
-| ID | 谁用 | 形状 |
-|---|---|---|
-| **原始 identity** | 授权过滤、JWT `sub`、users 表主键（本地账号用自己的 uuid/email 策略） | 任意非空 |
-| **存储 ID** | 文件系统分桶、sandbox 路径、memory 路径 | `make_safe_user_id(raw)` → `[A-Za-z0-9_-]+` |
+
+| ID                     | 谁用                                          | 形状                                          |
+| ---------------------- | ------------------------------------------- | ------------------------------------------- |
+| **原始 identity**        | 授权过滤、JWT `sub`、`users.id`（本地账号是 uuid）      | 任意非空                                        |
+| **登录标识**（email / username） | 登录、找回、给人看的名字；`users` 上的两个 unique 列          | 任意非空（各自有形状校验，见 §2.4）                        |
+| **存储 ID**              | 文件系统分桶、sandbox 路径、memory 路径                 | `make_safe_user_id(raw)` → `[A-Za-z0-9_-]+` |
+
 
 ```python
 _UNSAFE = re.compile(r"[^A-Za-z0-9_\-]")
@@ -154,10 +159,49 @@ def make_safe_user_id(raw: str) -> str:
 已经安全的 id 原样通过，避免无谓改桶。碰撞靠 digest 后缀，不要靠截断。
 M2 的 `SandboxProvider.acquire(..., user_id=)` 收的是**存储 ID**。
 
+**邮箱和用户名都不能当存储 ID。** 两个都是"用户随时可能想改"的字段，而且都不保证
+字符安全。存储 ID 只有一个来源：`users.id`（§2.2 下面那条规则）。用户名比邮箱更危险——
+它看起来"本来就是 id"，很容易被顺手拿去拼路径，于是"改个用户名"就变成了"数据消失"。
+
+#### 存储 ID 必须不可变：用 `users.id`，不要用 identity
+
+上面那张表里"存储 ID"的来源要说死：**它来自 `users.id`，不是来自用户的邮箱/用户名。**
+
+```python
+# agentkit/runtime/user_context.py
+def storage_user_id(user: UserRecord | None, *, raw_identity: str | None) -> str:
+    """有 users 行就用它的**不可变**主键；没有（嵌入模式 / 认证关闭）才退化到 identity。
+
+    退化路径必须打一次 warning：那意味着这份数据没有可迁移的账号归属。
+    """
+    if user is not None:
+        return make_safe_user_id(user.id)          # uuid → 原样通过
+    if raw_identity:
+        logger.warning("Falling back to identity-derived storage bucket for %r", raw_identity)
+        return make_safe_user_id(raw_identity)
+    return DEFAULT_USER_ID
+```
+
+
+| 用谁做存储 ID         | 用户改了邮箱之后           | 结论      |
+| ---------------- | ------------------ | ------- |
+| identity（邮箱）     | 桶名跟着变 → **数据"消失"** | ✗ 不可用   |
+| `users.id`（uuid） | 桶名不变               | ✓ 唯一正确解 |
+
+
+**这是本阶段最容易埋进去的一颗雷**：本地账号用邮箱当 identity 很自然，
+而"改邮箱"在用户管理里就是个普通操作。一旦桶名派生自 identity，
+改完邮箱用户会看到自己的对话全没了，而数据库里的行都还在——
+排查方向会先指向仓储而不是路径。
+
+**同一身份在两个桶里**是这条规则的反面：OIDC 首次登录、本地注册、
+内部通道代表用户，三条路径必须解析到同一个 `users.id`。
+账号合并（同邮箱的本地账号 + OIDC 身份）**M9 不做**，只保证同一 `users.id` 一致。
+
 ### 2.3 仓储层的三态 `user_id`
 
 M4 已经把默认值定成 `AUTO`。M9 把语义钉死，**所有**仓库（thread_meta / runs /
-run_events / scheduled_tasks / channel_connections / feedback）同一套：
+run_events / scheduled_tasks / channel_connections）同一套：
 
 ```python
 # AUTO：从 ContextVar 解析；没有用户 → RuntimeError，绝不退化成全局查询
@@ -178,14 +222,37 @@ async def get(self, thread_id: str, *, user_id: str | None | _AutoSentinel = AUT
 ```python
 class User(Base):
     __tablename__ = "users"
-    id: Mapped[str]                    # JWT sub
-    email: Mapped[str]                 # unique
+    id: Mapped[str]                    # JWT sub；存储桶的唯一来源（§2.2）
+    email: Mapped[str]                 # unique（小写归一）
+    username: Mapped[str]              # unique（小写归一）；登录标识之一，见下表
     password_hash: Mapped[str | None]  # bcrypt；OIDC 用户可空
     system_role: Mapped[str]           # "admin" | "user"
     needs_setup: Mapped[bool]          # reset 后强制改密
-    token_version: Mapped[int]         # 改密 / reset 时 +1
+    disabled: Mapped[bool]             # 停用（不是删除，可恢复）
+    deleted_at: Mapped[datetime | None]# 软删 + 回收期（§2.13 不变量 4）
+    token_version: Mapped[int]         # 改密 / reset / 软删时 +1
     created_at / updated_at
 ```
+
+**用户名（`username`）的四条规则**：
+
+
+| 规则        | 具体                                                                                       |
+| --------- | ---------------------------------------------------------------------------------------- |
+| 形状        | `^[a-z0-9](?:[a-z0-9_.-]{1,30}[a-z0-9])$`——3..32 字符，小写字母/数字/下划线/点/连字符，首尾必须是字母或数字           |
+| 大小写       | 写入时统一小写（`Alice` → `alice`），比较按小写；**邮箱同理**                                                 |
+| 唯一        | 独立 unique 索引，与 email 各管各的——两个字段可以互相不冲突，但都不允许重名                                             |
+| 保留字       | `default` / `anonymous` / `auth-disabled` / `system` / `internal` 不可注册（它们在日志与桶名里有特殊含义） |
+| **不是存储 ID** | 改用户名**不换桶**：桶名派生自 `users.id`。这条和"改邮箱不换桶"是同一条规则，必须有测试                                       |
+
+
+- **登录标识 = email 或 username。** `POST /api/v1/auth/login/local` 收的是
+  `identifier`：先按邮箱查，查不到再按用户名查（两条都是唯一索引，命中即定）。
+  `email` 作为旧字段名仍然接受（`AliasChoices`），但新客户端只发 `identifier`。
+- **注册 / 初始化必须同时给 `username`**：M9 没有"显示名"这个概念，
+  用户名就是给人看的那个名字，也是除邮箱之外的第二个登录入口。
+- 用户名只在**本地账号**上必填。将来 OIDC 首次登录时由 provider 的
+  `preferred_username` 派生（撞名加后缀），或者第一次登录时要求补填——M9 不做（§12）。
 
 角色 M9 只承认这两个。细粒度 RBAC 见 §12。
 未知 role 在 `build_principal_from_context` 里**不**被改写成 default——缺/空才用 default；
@@ -196,7 +263,7 @@ JWT 声明：`sub`、`tv`（token_version）、`exp`。校验：
 1. 签名 + exp
 2. 用户存在
 3. `tv == user.token_version`——不匹配必须 401。这是改密码后让所有旧 session
-   立刻失效的**唯一**机制。不要靠缩短 exp 假装能踢人。
+  立刻失效的**唯一**机制。不要靠缩短 exp 假装能踢人。
 
 **JWT 只在 HttpOnly cookie `access_token` 里传输，不出现在响应 JSON。**
 登录响应体只有 `expires_in` 和 `needs_setup`。测试钉死：响应 body / 响应头
@@ -310,6 +377,49 @@ M2 已定虚拟路径 `/mnt/user-data/{workspace,uploads,outputs}`。
 创建 thread 时客户端 `metadata.user_id` / `owner_id` 已在 §2.1 被剥掉，
 仓储 `create(..., user_id=AUTO)` 从 ContextVar 写入。
 
+#### 迁移的业务规则
+
+迁移不是"挪文件"，它同时改的是**谁能看见什么**。四条规则：
+
+1. **先建 `users` 行，再迁桶。** 桶名派生自 `users.id`（§2.2），
+  没有账号行就没有目标路径。迁移脚本因此要两步：建号（email → uuid）→ 移目录。
+2. **旧布局 `{base}/threads/{tid}/...` 全部归 admin 桶。** 认证启用之前的数据没有属主，
+  唯一诚实的处置是"归第一个 admin"，而不是猜一个用户。迁移日志要记下
+   "N 条 thread 归入 "，让运维能事后手工改归属。
+3. **迁移期间只读。** 脚本跑的时候 Gateway 必须停（或至少不接写入），
+  否则新写入会落到旧路径、被下一次迁移漏掉。脚本第一步检查"有没有活跃 run"，
+   有就拒绝启动迁移。
+4. **旧路径只读兼容一个版本。** `{base}/threads/`、`{base}/agents/` 在迁移后
+  仍可读（运维可能还有脚本引用），但**任何写/删之前必须先迁**——
+   否则会出现"一半新桶一半旧目录"的会话。
+
+```python
+# scripts/migrate_user_buckets.py
+def migrate(*, base: Path, dry_run: bool) -> int:
+    """返回失败数。单个用户失败继续，最后非零退出（§2.8）。"""
+    failures = 0
+    for legacy_dir in sorted((base / "threads").iterdir()):        # 认证前的扁平布局
+        owner = resolve_legacy_owner(legacy_dir) or first_admin_id()   # 规则 2
+        target = base / "users" / make_safe_user_id(owner) / "threads" / legacy_dir.name
+        if dry_run:
+            print(f"[dry-run] {legacy_dir} -> {target}")
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy_dir), str(target))              # 同盘：rename；跨盘：拷贝+校验+删
+            _verify_moved(legacy_dir, target)                      # 大小/条目数对不上就回滚这一次
+        except OSError:
+            logger.exception("Failed to migrate %s", legacy_dir)
+            failures += 1
+    return failures
+```
+
+- **每一步都要可重入**：`shutil.move` 的目标已存在时要么跳过（幂等）要么报错，
+**不要覆盖**——覆盖是把新桶里的数据换成旧的。
+- **校验再删**：跨文件系统时 `move` 退化成"拷贝 + 删"，中途崩溃会留下半个目录。
+先校验条目数与总字节数，再删源。
+- `**--dry-run` 是默认建议**：先让运维看一眼"N 条 thread 归属是谁"，再真跑。
+
 ### 2.9 内部认证：谁能代表某用户
 
 IM 通道和调度器不是浏览器。它们走进程内 HTTP 调自己的 Gateway，
@@ -335,11 +445,33 @@ X-DeerFlow-Owner-User-Id:  <storage user id>
 `runtime.context.is_internal = True` 由这条路径写入。下面这些键
 **只接受 is_internal 调用方**，客户端塞的一律丢：
 
-| 键 | 谁用 |
-|---|---|
-| `non_interactive` | 9C：去掉 `ask_clarification` |
-| `channel_user_id` | 9D：群里的原始发送者，只进 runtime.context，**不进 configurable** |
-| `github_token` 一类请求级密钥 | 不进 checkpoint（M7 §6） |
+
+| 键                      | 谁用                                                 |
+| ---------------------- | -------------------------------------------------- |
+| `non_interactive`      | 9C：去掉 `ask_clarification`                          |
+| `channel_user_id`      | 9D：群里的原始发送者，只进 runtime.context，**不进 configurable** |
+| `github_token` 一类请求级密钥 | 不进 checkpoint（M7 §6）                               |
+
+
+#### 内部通道能代表谁：三条业务规则
+
+`X-DeerFlow-Owner-User-Id` 不是"随便一个 id"，AuthMiddleware 授权它之前要过三关：
+
+
+| 关        | 规则                                                    | 失败                                                    |
+| -------- | ----------------------------------------------------- | ----------------------------------------------------- |
+| 令牌       | `X-DeerFlow-Internal-Token` 与配置常量 `compare_digest` 相等 | 401 `unauthenticated`（**不要**降级成匿名，否则通道静默写进 default 桶） |
+| owner 存在 | owner 必须是**存在且启用**的用户的存储 id                           | 401 `unknown_owner`；不允许"先发消息再建号"                      |
+| 通道允许     | 该 owner 确实绑定过这个通道（M9 §5.3 的 `channel_connections`）    | 403 `channel_not_bound`                               |
+
+
+- **第二条是业务逻辑，不是安全洁癖**：通道 worker 手里是"平台侧用户 id"，
+它必须先在 Gateway 侧映射成一个真实账号（绑定流程），否则会出现
+"群里某人发的消息写进了一个没人拥有的桶"。
+- **轮换内部 token 要能不停机**：`auth.internal_tokens: [new, old]` 接受列表，
+新值先上线、旧值下一版删掉。单值配置意味着轮换 = 所有通道同时重启。
+- **内部 token 不是用户令牌**：它不能换成 cookie、不能被 PAT 逻辑复用、
+也不该出现在任何面向用户的响应或日志里（共享密钥泄漏 = 可以代表任意用户）。
 
 ### 2.10 Principal：构造入口只有一个
 
@@ -386,9 +518,9 @@ M9 的内置 provider 是 AllowAll（接口在，策略全放行）。工具级 
 
 ### 2.12 路由
 
-路由层 §3.2 把四组划给 M9：`/api/v1/auth/**`、`/api/scheduled-tasks/**`、`/api/channels/**`、`/api/runs/{run_id}/feedback`。
+路由层 §3.2 把三组划给 M9：`/api/v1/auth/**`、`/api/scheduled-tasks/**`、`/api/channels/**`。
 错误体仍是 `{detail, code, trace_id}`。业务路由不 `try/except` 拼状态码。
-`create_app` 给这四个 router 加 `/api`；各自的 `prefix` 写在文件里。
+`create_app` 给这三个 router 加 `/api`；各自的 `prefix` 写在文件里。
 
 白名单是 §2.5 那份。白名单以外先过 AuthMiddleware，再过下面的 `require_scope`。
 未登录是 401 `unauthenticated`，函数体不跑。缺 scope 是已有的 403 `permission_denied`。
@@ -411,41 +543,52 @@ def caller_from_request(request: Request) -> RunCaller:
 
 `prefix="/v1/auth"`。这些路由在白名单上的，不再套 `require_scope`。
 
-| Method | Path | 请求 | 成功 | 谁能打 |
-| --- | --- | --- | --- | --- |
-| GET | `/api/v1/auth/setup-status` | 无 | `{"needs_setup": bool}` | 公开 |
-| POST | `/api/v1/auth/initialize` | `InitializeRequest` | 201，`UserResponse`，并设 cookie | 公开，且库里还没有 admin |
-| POST | `/api/v1/auth/login/local` | `LoginRequest` | 200，`LoginResponse`，并设 cookie | 公开 |
-| POST | `/api/v1/auth/register` | `RegisterRequest` | 201，`UserResponse`，并设 cookie | 公开；`auth.allow_registration` 为假则 403 `registration_closed` |
-| POST | `/api/v1/auth/logout` | 无 | 200 `{"ok": true}`，清 cookie | 公开。有会话就作废，没有也 200 |
-| GET | `/api/v1/auth/providers` | 无 | `{"local": true}` | 公开。OIDC 不在本阶段（§12） |
-| GET | `/api/v1/auth/me` | 无 | `UserResponse` | 已登录 |
-| POST | `/api/v1/auth/change-password` | `ChangePasswordRequest` | 200 `{"ok": true}`，`token_version += 1`，重签 cookie | **仅会话**。PAT 打这条 → 403 `session_required` |
+
+| Method | Path                           | 请求                      | 成功                                                | 谁能打                                                        |
+| ------ | ------------------------------ | ----------------------- | ------------------------------------------------- | ---------------------------------------------------------- |
+| GET    | `/api/v1/auth/setup-status`    | 无                       | `{"needs_setup": bool}`                           | 公开                                                         |
+| POST   | `/api/v1/auth/initialize`      | `InitializeRequest`（email + **username** + password） | 201，`UserResponse`，并设 cookie                      | 公开，且库里还没有 admin                                            |
+| POST   | `/api/v1/auth/login/local`     | `LoginRequest`（`identifier` = 邮箱或用户名） | 200，`LoginResponse`，并设 cookie                     | 公开                                                         |
+| POST   | `/api/v1/auth/register`        | `RegisterRequest`       | 201，`UserResponse`，并设 cookie                      | 公开；`auth.allow_registration` 为假则 403 `registration_closed` |
+| POST   | `/api/v1/auth/logout`          | 无                       | 200 `{"ok": true}`，清 cookie                       | 公开。有会话就作废，没有也 200                                          |
+| GET    | `/api/v1/auth/providers`       | 无                       | `{"local": true}`                                 | 公开。OIDC 不在本阶段（§12）                                         |
+| GET    | `/api/v1/auth/me`              | 无                       | `UserResponse`                                    | 已登录                                                        |
+| PATCH  | `/api/v1/auth/me`              | `UsernameUpdateRequest` | 200，`UserResponse`                                | **仅会话**。改**自己**的用户名；路径里没有 user_id，所以没有 IDOR 的余地          |
+| POST   | `/api/v1/auth/change-password` | `ChangePasswordRequest` | 200 `{"ok": true}`，`token_version += 1`，重签 cookie | **仅会话**。PAT 打这条 → 403 `session_required`                   |
+
 
 ```python
 # app/gateway/auth/models.py  （请求模型 extra="forbid"，放在 auth 包里，不进 run 的 request.py）
 class LoginRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    email: str = Field(min_length=3, max_length=254)
-    password: str = Field(min_length=1, max_length=128)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    # 邮箱**或**用户名；旧的 email 字段名仍然接受（AliasChoices）
+    identifier: str = Field(max_length=254, validation_alias=AliasChoices("identifier", "email"))
+    password: str = Field(max_length=256)
     remember_me: bool = False
 
 class InitializeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    email: str = Field(min_length=3, max_length=254)
-    password: str = Field(min_length=8, max_length=128)
+    email: str = Field(max_length=254)
+    username: str = Field(max_length=32)
+    password: str = Field(max_length=256)
 
 class RegisterRequest(InitializeRequest):
     pass
 
+class UsernameUpdateRequest(BaseModel):
+    """PATCH /api/v1/auth/me 的请求体。**只允许改用户名**。"""
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(max_length=512)      # 上界只是防超大 body；规则在领域层
+
 class ChangePasswordRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    current_password: str = Field(min_length=1, max_length=128)
-    new_password: str = Field(min_length=8, max_length=128)
+    current_password: str = Field(max_length=256)
+    new_password: str = Field(max_length=256)
 
 class UserResponse(BaseModel):
     id: str
     email: str
+    username: str
     system_role: Literal["admin", "user"]
 
 class LoginResponse(BaseModel):
@@ -453,134 +596,281 @@ class LoginResponse(BaseModel):
     needs_setup: bool
 ```
 
+形状校验（长度、邮箱规则、用户名规则）**不在模型层做**：模型层的 `min_length` 会先抛
+pydantic 的 `Request validation failed`，用户只知道"错了"、不知道"错在哪"。
+细则放在领域层，抛带 `code` 的 422（见下面的错误表）。
+
 `UserResponse` 没有 `password_hash`，没有 `token_version`。`LoginResponse` 没有 token 字符串（§2.4）。Set-Cookie 由 `session_cookie.py` 写，路由只调用它。
 
-| 情形 | HTTP | `code` |
-| --- | --- | --- |
-| 邮箱不存在或密码错 | 401 | `invalid_credentials`。两种情况同一个 detail，不透露哪个错了 |
-| 同一 peer IP 超过 `max_login_attempts` | 429 | `login_rate_limited` |
-| 已有 admin 再 initialize | 409 | `admin_already_exists` |
-| 改密时当前密码错 | 401 | `invalid_credentials` |
-| change-password 的调用方是 PAT | 403 | `session_required` |
+**PATCH `/me` 只改用户名，而且只改自己。** 三条刻意的约定：
+
+- **路径里没有 user_id**：目标就是会话里那个人。带 user_id 的 `PATCH /users/{id}` 是
+  管理接口的形状——它需要 `admin` 能力、需要审计日志、还要处理"不能改自己"之类的约束。
+  M9 不混这两件事：admin 改**别人**的用户名走服务层（§2.13），对应的路由留到 W4。
+- **不动令牌**：改用户名不是撤销事件。§2.13 的失效矩阵里"改角色 / 改邮箱 / 改用户名"
+  都是"令牌有效、数据不变"。改名顺手把所有设备踢下线，是最容易被写进去、
+  也最难向用户解释的行为。
+- **邮箱、角色、密码不许在这里顺手一起改**：请求体 `extra="forbid"`，
+  多给一个字段就是 422 `invalid_request`，而且错误里会点名那个字段。
+
+
+认证错误**默认具体到能照着做**（`auth.local.specific_errors=true`）：
+
+
+| 情形                            | HTTP | `code`                                              |
+| ----------------------------- | ---- | --------------------------------------------------- |
+| 邮箱形状不对                        | 422  | `invalid_email`——detail 说清哪条规则没过，并回显调用方刚敲的值         |
+| 用户名形状不对 / 撞保留字                | 422  | `invalid_username`——detail 说清是哪条（长度 / 字符集 / 首尾 / 保留字） |
+| 用户名被占                         | 409  | `username_taken`——点名那个用户名，让用户换一个                   |
+| 口令短于 8 字符                     | 422  | `password_too_short`——detail 带"最少 8 位"和实际位数         |
+| 口令超过 72 字节                    | 422  | `password_too_long`——按 **UTF-8 字节**算，detail 带实际字节数   |
+| 邮箱已注册                         | 409  | `user_already_exists`——点名那个邮箱，并提示去登录               |
+| 自助注册关闭                        | 403  | `registration_closed`                              |
+| 已有 admin 再 initialize          | 409  | `admin_already_exists`（**不点名**现有 admin 的邮箱：公开路由）     |
+| 登录标识没有账号（邮箱或用户名）              | 401  | `account_not_found`——detail 回显用户输入的那个标识，提示去注册     |
+| 密码不对                          | 401  | `wrong_password`                                   |
+| 账号被禁用 / 在回收期（**口令正确**才说）       | 403  | `account_disabled` / `account_deleted`             |
+| 同一 peer IP 超过 `max_login_attempts` | 429  | `login_rate_limited`，响应头带 `Retry-After`，detail 带剩余秒数 |
+| 改密时当前密码错                      | 401  | `invalid_credentials`——detail 说 `current password` |
+| change-password 的调用方是 PAT      | 403  | `session_required`                                 |
+
+
+两条不变量：
+
+- **明文口令永不回显**（也不进日志、不进库）。错误 detail 只说规则与**长度**。
+- **账号状态（禁用 / 回收期）只在口令正确之后才透露**：不知道口令的人不该从响应里读出
+  "这个账号存在且被禁用了"。
+
+把 `auth.local.specific_errors` 设成 **false** 会退回老行为：登录的四种失败
+（没这个账号 / 密码错 / 被禁用 / 回收期）全部收敛成 401 `invalid_credentials`、同一个 detail。
+代价是用户不知道为什么失败，收益是别人无法用登录接口探测某个邮箱（或用户名）有没有注册。
+这是**部署选择**，不是实现细节——默认给用户可操作的答案。
+
+> `email_not_registered` 这个名字在引入用户名之后就不准了（用户敲的可能是用户名），
+> 因此改名为 `account_not_found`。**登录标识不存在时报的是"没这个账号"，不说是邮箱还是用户名**：
+> 说了等于把两个命名空间都交给对方探测。
+
 
 登录计数用 TCP peer IP。只有 peer 落在 `AUTH_TRUSTED_PROXIES` 里才读 `X-Real-IP`（§2.5）。
 
 `logout` 清 access cookie 和 CSRF cookie，并且这个响应上不再签发新的 CSRF（§2.4）。
 
-#### 定时任务 `app/gateway/routers/scheduled_tasks.py`
-
-`prefix="/scheduled-tasks"`。每条都要同时有 `threads:write` 和 `runs:create`（§4.9）。缺一即 403。
-
-```python
-# app/gateway/deps.py
-def require_all_scopes(*scopes: str) -> Callable[[Request], RunCaller]:
-    def _dep(request: Request) -> RunCaller:
-        caller = caller_from_request(request)
-        missing = [scope for scope in scopes if not caller.allows(scope)]
-        if missing:
-            raise RunPermissionDenied(f"missing scope: {', '.join(missing)}")
-        return caller
-    return _dep
-```
-
-| Method | Path | 请求 | 成功 | 说明 |
-| --- | --- | --- | --- | --- |
-| GET | `/api/scheduled-tasks` | `limit` 1..200，默认 50 | `Page[ScheduledTaskResponse]` | 只列 `user_id=caller.user_id` |
-| POST | `/api/scheduled-tasks` | `ScheduledTaskCreateRequest` | 201，`ScheduledTaskResponse` | 非法时区或 cron → 422 `invalid_schedule` |
-| GET | `/api/scheduled-tasks/{task_id}` | `TaskId` | `ScheduledTaskResponse` | 不是自己的 → 404 `scheduled_task_not_found` |
-| PATCH | `/api/scheduled-tasks/{task_id}` | `ScheduledTaskPatchRequest` | 200 | 有 queued/launching/running 的 occurrence → 409 `task_active`（§4.7） |
-| POST | `.../{task_id}/pause` | 无 | 200 | 把 queued 标 cancelled；launching/running 拒绝，409 `task_active` |
-| POST | `.../{task_id}/resume` | 无 | 200 | 同样：有活跃 occurrence 则 409 |
-| POST | `.../{task_id}/trigger` | 无 | 202 `{"occurrence_id": ...}` | 允许在 paused 上手动跑。已有非终态 occurrence 则复用那一行，不另开 |
-| DELETE | `.../{task_id}` | 无 | `{"deleted": task_id}` | 规则同 pause |
-| GET | `.../{task_id}/runs` | `limit` | `Page[OccurrenceResponse]` | occurrence，不是 Gateway run |
-
-```python
-# app/gateway/models/request.py
-TaskId = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
-
-class ScheduledTaskCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    title: str = Field(min_length=1, max_length=200)
-    prompt: str = Field(min_length=1, max_length=8000)
-    schedule_type: Literal["cron", "once"]
-    schedule_spec: dict[str, str]          # cron: {"cron": "0 * * * *"}；once: {"run_at": ISO}
-    timezone: str = Field(min_length=1, max_length=64)
-    context_mode: Literal["fresh_thread_per_run", "reuse_thread"] = "fresh_thread_per_run"
-    thread_id: str | None = None           # 仅 reuse_thread；必须是 caller 自己的 thread
-```
-
-`thread_id` 若给出，先 `require_visible_thread`。看不见是 404 `thread_not_found`，不是 403。
-`overlap_policy` 不在请求里。服务端固定写 `enqueue`（§4.4）。客户端传这个字段 → 422 `invalid_request`。
-
-路由调用 `app/scheduler/service.py` 的仓储方法，不自己 `create_task`，也不调用 `start_run`。手动 trigger 只插入或复用 occurrence。真正开跑仍是 poller 的 `launching` 状态（§4.3）。
-
-`ScheduledTaskResponse` 含 `id`、`title`、`status`、`schedule_type`、`schedule_spec`、`timezone`、`context_mode`、`thread_id`、`next_run_at`、`last_run_id`、`last_error`。时间是 ISO-8601、`Z` 结尾。没有 `lease_owner`。
-
-#### 通道 `app/gateway/routers/channels.py`
-
-`prefix="/channels"`。`{name}` 只允许本阶段的两个平台：`slack`、`telegram`。其它 → 422 `invalid_request`。
-
-| Method | Path | 能力 | 成功 | 说明 |
-| --- | --- | --- | --- | --- |
-| GET | `/api/channels` | `channels:read` | `{"channels": [ChannelStatus]}` | 平台是否启用、自己有没有绑定。没有 bot token |
-| POST | `/api/channels/{name}/bind` | `channels:write` | 201 `{"code": ..., "expires_in": 600}` | 码只出现在这个响应里（§5.4） |
-| DELETE | `/api/channels/{name}/bind` | `channels:write` | `{"deleted": name}` | 删的是这个 caller 的绑定 |
-| POST | `/api/channels/{name}/restart` | `admin` | `{"restarted": name}` | 重启本进程里的那个平台连接，不是用户绑定 |
-
-`ChannelStatus` 的字段：`name`、`enabled`、`bound`、`external_account_id`（已绑定才有，是平台账号 id，不是 token）。
-
-消费绑定码发生在通道的入站消息里，不另开 HTTP。码错、过期、用过，入站都当无效，聊天里不回显码。HTTP 这边没有「提交码」的路由。
-
-#### 反馈 `app/gateway/routers/feedback.py`
-
-`prefix="/runs"`。路径是 `/api/runs/{run_id}/feedback`，不把 `thread_id` 再放进 URL。thread 从 run 行读。
-
-| Method | Path | 能力 | 成功 |
-| --- | --- | --- | --- |
-| PUT | `/api/runs/{run_id}/feedback` | `runs:read` | 200 `FeedbackResponse`。同一 caller + run + `message_id` 再 PUT 是覆盖 |
-| GET | `/api/runs/{run_id}/feedback` | `runs:read` | `{"feedback": FeedbackResponse \| null}` |
-
-```python
-# app/gateway/models/request.py
-class FeedbackPutRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    rating: Literal[-1, 1]
-    comment: str | None = Field(default=None, max_length=2000)
-    message_id: str | None = Field(default=None, max_length=64)
-```
-
-`message_id` 缺省表示对整次 run。先 `run_manager.get(run_id, user_id=caller.user_id)`，没有或不属于 caller → 404 `run_not_found`。不单开 `feedback_not_found`：GET 没有记录时 `feedback` 是 `null`，不是 404。
-
-`FeedbackResponse` 有 `feedback_id`、`run_id`、`thread_id`、`message_id`、`rating`、`comment`、`created_at`。没有 `user_id`。评论原样返回，不进系统提示词。
+> 各功能自己的路由表在**各自的小节**里：定时任务见 §4.10，IM 通道见 §5.9。
+> 本节只放**认证**（9A 自己的路由）与 M9 全局的**错误表 / 不做清单**。
 
 #### 错误
 
-| 异常 | HTTP | `code` | 所属文件 |
-| --- | --- | --- | --- |
-| `Unauthenticated` | 401 | `unauthenticated` | `app/gateway/auth_middleware.py`。白名单外没有有效会话、PAT 或内部 token |
-| `InvalidCredentials` | 401 | `invalid_credentials` | `app/gateway/auth/routers.py` |
-| `LoginRateLimited` | 429 | `login_rate_limited` | 同上 |
-| `AdminAlreadyExists` | 409 | `admin_already_exists` | 同上 |
-| `RegistrationClosed` | 403 | `registration_closed` | 同上 |
-| `SessionRequired` | 403 | `session_required` | 同上。PAT 打了只允许会话的路由 |
-| `InvalidSchedule` | 422 | `invalid_schedule` | `app/gateway/routers/scheduled_tasks.py` |
-| `ScheduledTaskNotFound` | 404 | `scheduled_task_not_found` | 同上 |
-| `TaskActive` | 409 | `task_active` | 同上 |
-| `RunNotFound` | 404 | `run_not_found` | 已有。反馈和别人的 run 都用它 |
+
+| 异常                      | HTTP | `code`                     | 所属文件                                                      |
+| ----------------------- | ---- | -------------------------- | --------------------------------------------------------- |
+| `Unauthenticated`       | 401  | `unauthenticated`          | `app/gateway/auth_middleware.py`。白名单外没有有效会话、PAT 或内部 token |
+| `InvalidCredentials`    | 401  | `invalid_credentials`      | `app/gateway/auth/routers.py`                             |
+| `LoginRateLimited`      | 429  | `login_rate_limited`       | 同上                                                        |
+| `AdminAlreadyExists`    | 409  | `admin_already_exists`     | 同上                                                        |
+| `RegistrationClosed`    | 403  | `registration_closed`      | 同上                                                        |
+| `SessionRequired`       | 403  | `session_required`         | 同上。PAT 打了只允许会话的路由                                         |
+| `InvalidSchedule`       | 422  | `invalid_schedule`         | `app/gateway/routers/scheduled_tasks.py`                  |
+| `ScheduledTaskNotFound` | 404  | `scheduled_task_not_found` | 同上                                                        |
+| `TaskActive`            | 409  | `task_active`              | 同上                                                        |
+| `RunNotFound`           | 404  | `run_not_found`            | 已有。别人的 run 用 404 而不是 403（run id 可枚举）                      |
+
 
 这些类带 `status_code` 和 `code`，登记进路由层的 `_handle_domain_error`。`detail` 不含密码、绑定码、bot token、内部 token。
 
 #### 不做
 
-| 不做 | 理由 |
-| --- | --- |
-| OIDC 的 `/oauth`、`/callback` | §12。白名单前缀先留着，路由不注册，所以打过去是 404 不是 401 |
-| PAT 的签发路由 | 同上，W4 可选。`caller_from_request` 已经能读 PAT 的 scopes |
-| `POST /api/channels/{name}/bind` 的码从聊天回读 | §5.4。没有第二条 HTTP 把码再取出来 |
-| 反馈路由放在 `/api/threads/{id}/runs/{id}/feedback` | 路由层的路径是 `/api/runs/{run_id}/feedback`。thread 从 run 行取，避免两个 id 不一致还得再判一次 |
-| 调度路由里 `start_run` | poller 才是唯一会进入 `launching` 的地方（§4.3） |
 
+| 不做                                            | 理由                                                                      |
+| --------------------------------------------- | ----------------------------------------------------------------------- |
+| OIDC 的 `/oauth`、`/callback`                   | §12。白名单前缀先留着，路由不注册，所以打过去是 404 不是 401                                    |
+| PAT 的签发路由                                     | 同上，W4 可选。`caller_from_request` 已经能读 PAT 的 scopes                        |
+| `POST /api/channels/{name}/bind` 的码从聊天回读      | §5.4。没有第二条 HTTP 把码再取出来                                                  |
+| **反馈（rating / comment）** | 见 §12：反馈是产品层能力，不是运行时必需。将来要做时它是**独立的 analytics 域**（自己的表、自己的读路径），不要塞回 run 路由 |
+| 调度路由里 `start_run`                             | poller 才是唯一会进入 `launching` 的地方（§4.3）                                    |
+
+
+---
+
+### 2.13 用户生命周期：谁能建、谁能停、删了之后数据怎么办
+
+**账号的每一次状态变化都要回答两个问题：令牌还有效吗？数据还看得见吗？**
+下面这张表就是答案，实现和测试都对着它写。
+
+
+| 动作                    | 谁可以做                                   | 令牌                             | 数据             | 备注                                                 |
+| --------------------- | -------------------------------------- | ------------------------------ | -------------- | -------------------------------------------------- |
+| 自助注册                  | 任何人（`auth.allow_self_register=true` 时） | 立刻签发                           | 空              | 关掉开关时 `POST /register` → 403 `registration_closed` |
+| 首次初始化（第一个 admin）      | 任何人（**只在零 admin 时**）                   | 立刻签发                           | 空              | 并发靠部分唯一索引，输家 409（§2.7）                             |
+| 改密码                   | 本人 / admin 重置                          | **全部失效**（`token_version += 1`） | 不变             | 唯一的"踢掉所有旧会话"机制                                     |
+| admin 重置密码            | admin                                  | 同上，且 `needs_setup=true`        | 不变             | 用户下次登录只能改密                                         |
+| 禁用账号（`disabled=true`） | admin                                  | 立即失效（每次鉴权查 `disabled`）         | 保留，且用户自己看不到    | 不是删除：可恢复                                           |
+| 用户删自己                 | 本人                                     | 全部失效                           | 进入回收期（默认 30 天） | 二次确认；回收期内 admin 可恢复                                |
+| admin 删除用户            | admin                                  | 同上                             | 同上             | 不能删最后一个 admin                                      |
+| 改角色 user ↔ admin      | admin                                  | 不变（role 每次从库里读）                | 不变             | 不能把最后一个 admin 降级                                   |
+| 改邮箱                   | 本人 / admin                             | 不变（`sub` 是 uuid，不是邮箱）          | 不变             | **桶名也不变**（§2.2）——这条要专门有测试                          |
+| 改用户名                  | 本人 / admin                             | 不变（`sub` 是 uuid，不是用户名）         | 不变             | 同上：**桶名也不变**；撞名 409 `username_taken`                 |
+
+
+四条不变量（都要有测试，而且都属于"最后一步才发现"的那类 bug）：
+
+1. **至少一个 admin。** 降级/删除最后一个 admin 一律 409 `last_admin`。
+  并发降级两个 admin 要靠条件写（`UPDATE ... WHERE (SELECT count(*) FROM users WHERE system_role='admin') > 1`）
+   或对 admin 行加锁——**不能先查再写**：TOCTOU 之后系统没有 admin，只能靠 CLI 救。
+2. **不能禁用/删除自己。** 409 `cannot_modify_self`。防的不是恶意，是手滑把自己锁在外面，
+  而恢复要动 CLI。
+3. `**needs_setup=true` 的用户只能改密。** 中间件放行**改密、logout，以及
+  `GET /me`**（前端得能问出"我是谁、为什么被拦"），其余业务路由 403 `setup_required`。
+  **这条按 `(method, path)` 判，不是只看 path**：`/me` 同时有 GET 和 PATCH，
+  而 PATCH 是改用户名——正事是改密码的人不该先去改用户名，
+  那只会把"旧口令还能用"的窗口拖长。
+  **不要只在前端拦**：管理员重置密码之后，用户在拿到新密码之前不该能用旧会话做任何事。
+4. **删除是软删 + 回收期。** 行保留（`deleted_at` 非空）、令牌全失效、桶先标记后删；
+  回收期内 admin 能恢复，到期由保留策略任务真删（与 M4 §10 同一套扫描）。
+   **注意 `AUTO` 语义**：软删用户的行还在，所以"按 user_id 查"仍然查得到——
+   挡住它的是鉴权层（登录失败），不是让仓储去猜。
+
+```python
+# app/gateway/routers/auth.py
+@router.post("/password", response_model=OkResponse)
+async def change_password(
+    body: PasswordChangeRequest,
+    caller: Annotated[RunCaller, Depends(require_authenticated)],
+    auth: AuthService = Depends(get_auth_service),
+) -> OkResponse:
+    """改密 = 撤销**所有**会话。不需要旧密码的路径（admin reset）走另一个路由。"""
+    await auth.change_password(
+        user_id=caller.user_id,
+        current=body.current_password,       # 本人改密必填
+        new=body.new_password,
+    )                                        # 内部：校验策略 → 写 hash → token_version += 1
+    response = OkResponse()
+    clear_auth_cookies(response)             # 自己这枚也失效，让用户重新登录一次
+    return response
+```
+
+### 2.14 令牌失效矩阵
+
+"改密码之后旧 token 还能用吗"必须有唯一答案。M9 只有两个撤销机制：
+`**token_version`（服务端计数）** 与 `**disabled` / `deleted_at`（服务端状态）**。
+没有 token 黑名单、没有 Redis——**登出不是全局登出**，这一点要写进用户文档。
+
+
+| 事件             | 浏览器 session cookie   | PAT                | 内部 token      |
+| -------------- | -------------------- | ------------------ | ------------- |
+| 登出             | 只清当前浏览器              | 不受影响               | 不受影响          |
+| 改密码 / admin 重置 | 立即失效（`tv` 不匹配 → 401） | **全部失效**（同一个 `tv`） | 不受影响          |
+| 禁用账号           | 立即失效                 | 立即失效               | 不受影响          |
+| 删除账号（软删）       | 立即失效                 | 立即失效               | 不受影响          |
+| 改角色 / 改邮箱      | 有效                   | 有效                 | 不受影响          |
+| 轮换内部 token     | 不受影响                 | 不受影响               | 旧值立即失效（需重启进程） |
+
+
+- **PAT 与 session 共享 `token_version`。** 这是刻意的：改密码时"顺手废掉那些 PAT"是用户的
+合理预期；反过来"PAT 在改密后还能用"才需要额外解释和 UI。
+- `**disabled` 每次鉴权都查库**，不是只在签发时查：否则禁用要等 token 过期才生效，
+而那个窗口在事故处置时不可接受。代价是每请求一次主键查询——M9 接受；
+要优化就上短 TTL 缓存 + 失效通知，**不要**退回"只在签发时查"。
+- **没有 refresh token。** 过期就重新登录，`remember_me` 只延长 `max_age`（§2.4）。
+加刷新令牌等于再加一套撤销语义，M9 不值得。
+
+### 2.15 PAT：业务规则
+
+PAT 是"给脚本用的长期凭据"。下面每条规则都在防止**一次性密钥变成永久后门**。
+
+
+| 规则            | 具体                                                                                     |
+| ------------- | -------------------------------------------------------------------------------------- |
+| 明文只回显一次       | 创建响应里有 `token`，之后任何接口都不再返回；库里存 `sha256(token)` + 前 8 位前缀，列表显示 `dfp_ab12…`              |
+| 有效期           | 必填，最长 `auth.pat_max_days`（默认 90）；到期即 401，不给宽限                                          |
+| scope         | 创建时从**固定菜单**里选（`runs:create` / `runs:read` / `runs:cancel` / `threads:read`…），不能自定义字符串 |
+| **永不带 admin** | PAT 走到管理类路由（用户管理、MCP 配置、技能写、缓存重置）一律 403；这条写死在 `require_scope` 里，"给 admin 发 PAT"不实现     |
+| 路由白名单         | 除 scope 外还有路由级 allowlist（路由层 §8.4）：没列进去的路由默认拒绝，新增路由要显式放行                               |
+| 归属            | 每个 PAT 属于一个 `users.id`；用户被禁用/删除/改密 → PAT 一起失效（§2.14）                                   |
+| 最后使用时间        | `last_used_at` 每次成功鉴权更新，但**节流到分钟**（每请求写库不值得）；列表里显示它，帮用户找出没用的 PAT                       |
+| 吊销            | `DELETE /api/v1/auth/pats/{id}` 立即生效（删行，不是标记）；只能吊销自己的                                  |
+| 审计            | 创建 / 吊销写一条 log（**不记明文**）；使用不逐次记，靠 `last_used_at` + 请求日志                                |
+| 数量上限          | 每用户 `auth.max_pats`（默认 20），超出 409 `too_many_pats`，逼用户清理旧的                              |
+
+
+**PAT 请求绝不回退到 cookie。** 带了 `Authorization` 但无效 → 硬 401（§2.6）。
+这不是洁癖：CSRF 中间件对 Bearer 跳过 double-submit，一旦允许回退，
+攻击页面写一个坏 header 就能把请求降级成"带 cookie 的跨站请求"。
+
+### 2.16 admin 的能力边界：管理员不是数据超级用户
+
+`system_role=admin` 能管理**平台**，不能读**别人的对话**。这条要写成规则，
+因为它决定了每个查询的写法，而不是靠"我们不会那么做"。
+
+
+| admin 能做                       | admin **不能**做                                  |
+| ------------------------------ | ---------------------------------------------- |
+| 用户管理：列表 / 禁用 / 重置密码 / 改角色 / 删号 | 读别人的 thread 内容、run 事件、上传的产物                    |
+| 全局配置：MCP 配置、技能全局开关、缓存重置、reload | 替别人跑 run（没有"以某用户身份开 run"的内部路由）                 |
+| 看审计与用量（计数、状态、时间戳）              | 看 `context.secrets` / MCP 凭据（GET 一律打码，§2.7 M7） |
+| 迁移与恢复：认领无主数据（`claim_unowned`）  | 通过管理接口下载别人的文件                                  |
+
+
+实现上的三条约束：
+
+1. **仓储查询永远带 `user_id`。** admin 视角的"全局查询"只出现在**迁移脚本与 CLI**里，
+  走显式的 `user_id=None`（§2.3），并且那些调用点要能一眼看出来。
+2. **管理类响应不含内容。** 用户列表返回计数与时间戳，不返回 last message；
+  需要"这个用户有多少 thread"就给数字，不给标题。
+3. **越权尝试记日志。** 用 admin 会话请求别人的 `/threads/{id}` 得到 404（与普通用户一样），
+  但日志里记一条 `admin_cross_user_access_denied`——它是合规审计要看的东西，
+   而普通用户的 404 不需要记（thread id 可枚举，记了就是噪音）。
+
+将来真要"客服可以看用户对话"，那是一个**新的、可审计的、需要二次授权的角色**
+（`support`），不是把 admin 放宽——这条界线现在画下来最便宜。
+
+---
+
+### 2.17 实现补充与偏差（写代码时定下来的，回填本文）
+
+代码与本文有出入的地方，都是这里明确过的；没有列在这里的，就当实现写错了。
+
+1. **`users.system_role` 没有唯一索引。** §2.7 提过"admin 部分唯一索引"，但
+   `UNIQUE(system_role)` 会禁止第二个 admin，而 §2.13 明确要求"不能把最后一个 admin 降级"
+   ——那前提就是可以有多个 admin。并发初始化改成**条件插入**
+   （`INSERT ... SELECT ... WHERE NOT EXISTS (admin)`），降级/删除用**条件写**
+   （`UPDATE ... WHERE (SELECT count(*) ...) > 1`），语义与 §2.13 不变量 1 完全一致。
+2. **PAT 行增加 `token_version` 列。** §2.14 要求"改密后 PAT 全部失效"，只靠
+   `users.token_version` 无法判断一枚 PAT 是改密前还是改密后签发的。
+   签发时快照，鉴权时对比。
+3. **`auth.enabled=false` 的桶名仍是 `default`**，不是 `auth-disabled`：
+   M4 时代的数据都在 `users/default/`，换名字等于让老用户"数据消失"——正是 §2.2 那颗雷。
+4. **公开路由上的陈旧 cookie 降级成匿名**（受保护路由仍是 401）。
+   严格按"cookie 存在但无效 → 401"执行，会让带着过期 cookie 的浏览器**永远进不了登录页**。
+5. **PAT 只落地校验链路**：Bearer 校验、固定 scope 菜单、永不带 admin、到期即 401、
+   `last_used_at` 分钟节流、与 `token_version` 联动、服务层 `create/list/revoke`。
+   签发 / 列表 / 吊销的 HTTP 路由按 §2.12 推到 W4。
+6. **内部认证第三关（通道绑定）留了接缝** `register_owner_binding_check()`：
+   绑定表属 9D §5.3，未注册时只打一次 warning，不静默放行也不误杀。
+7. **404 审计只有一个出口**：`admin_cross_user_access_denied` 写在错误处理器里
+   （`errors.py`），不写在每个路由的 `raise` 旁边——漏一处的表现是"审计日志缺行"，
+   没有报错也没有指标。
+8. **`AgentClient`（嵌入路径）补了 `config["context"]`**：原来图装配拿不到 `user_id`，
+   而运行期那一侧是 `default`，两侧落进不同桶——§2.1 说的就是这个 bug。
+9. **认证错误默认"具体"**（`auth.local.specific_errors=true`）：§2.12 原本要求
+   登录失败一律 401 `invalid_credentials`、同一个 detail；产品上要的是"用户点一次就知道
+   下一步做什么"，所以默认改成逐条说清（邮箱没注册 / 密码错 / 被禁用 / 回收期），
+   并保留把开关关掉退回防枚举形态的能力。**账号状态只在口令正确之后才透露**，
+   明文口令永不回显。
+10. **公开路由上的 401 ≠ 会话失效（两端各改一处）。**
+    后端：陈旧 cookie 在公开路由下降级成匿名（受保护路由仍是 401），
+    否则带着旧 cookie 的浏览器**永远进不了登录页**；
+    前端：`isAuthEndpoint()` 把登录 / 注册 / 初始化 / 改密排除在
+    `notifyUnauthorized()` 的广播之外——那里的 401/403 是"这次提交不对"，
+    广播出去的表现是点一次登录就被弹成"登录状态已失效，请重新登录"，真正的原因被顶掉。
+11. **用户名（`username`）是后加的第二个登录标识**（§2.4 / §2.12）。
+    落地方式：`users.username` 独立 unique 索引、写入时小写归一、
+    注册与初始化必填、登录接受 `identifier`（邮箱或用户名，旧的 `email` 字段名仍然接受）。
+    `email_not_registered` 随之改名为 `account_not_found`——用户敲的是哪个命名空间，
+    响应里**不区分**，否则等于把两个命名空间都交出去探测。已有数据由
+    `0003_users_username` 从邮箱 local part 回填（撞名加后缀）。
+12. **服务端读不出认证配置报 503 `auth_unavailable`**，不再伪装成 401 `unauthenticated`。
+    伪装的两个后果：用户被送去重新登录（而再登一次还是同一个错），
+    以及健康检查跟着变红。健康检查路径（`/health`、`/health/ready`）在配置坏掉时仍然放行。
 
 ---
 
@@ -623,6 +913,34 @@ worker `finally`、journal `update_run_progress` / `update_run_completion`、
 
 `journal.close(flush=not ownership_lost)`：丢租约时连最后一次 flush 都不要。
 
+#### 被接管之后：用户看到什么，钱算谁的
+
+丢租约的进程**静默退出**，接管者负责把这件事**告诉用户**。这条分工决定了三个可见结果：
+
+
+| 维度        | 结果                                                                     | 谁写                                       |
+| --------- | ---------------------------------------------------------------------- | ---------------------------------------- |
+| run 终态    | `error` + `stop_reason='orphan_recovered'`                            | **接管者**（旧 owner 一个字节都不许写）                 |
+| SSE       | 接管者补 `publish_end`：客户端看到 `end`，而不是永远转圈                              | 接管者（§3.6）                                |
+| thread 投影 | `threads_meta.status = 'error'`                                        | 接管者                                      |
+| token     | **保留 store 里已有的累计值**（旧 owner 最后一次 `update_run_progress` 的快照），接管者只补终态 | 接管者：写终态时**不要**传 `totals`，否则会把已有计数清零 |
+
+
+**为什么 token 是"保留"而不是"重算"**：接管者没有旧 owner 的内存计数器，
+它能拿到的只有那 5 秒节流的快照。重算 = 把用户已经产生的消耗抹掉；
+保留 = 少算最后几秒。**宁可少算，也不要清零**——账单上少几秒是误差，清零是账目对不上。
+
+还有一条必须写进文档的**已知边界**：旧 owner 如果没有真正死掉（比如事件循环被一个
+长同步调用阻塞，心跳迟到了），它可能已经执行过一部分工具。**副作用工具因此可能在两次
+执行之间重复**。缓解手段只有三条，都不是银弹：
+
+1. `grace_seconds`（默认 10）让"心跳迟到"不至于立刻变成接管；
+2. M2 的 blocking-IO 检测不让同步调用堵住事件循环；
+3. 有副作用的工具自己幂等（写文件用临时名 + rename、创建资源用幂等键）。
+
+**"丢租约后不准再写"这条规则保护的是账本一致性，不是副作用。** 把它当成
+"exactly-once 执行"是错的——多点部署下没有 exactly-once，只有"最终可见状态一致"。
+
 ### 3.2 租约的时间语义
 
 ```
@@ -643,7 +961,7 @@ RENEW_EVERY = LEASE_SECONDS / 3    # 允许连续失败两次而不丢
 2. 成功 → 用**返回的** `lease_expires_at` 更新内存（不要自己算）
 3. 失败但 `now < record.lease_expires_at` → 记 warning，下次再试
 4. 失败且 `now >= record.lease_expires_at` → `_mark_ownership_lost(record)`：
-   设标志、`abort_event.set()`、`task.cancel()`、**不写 store**
+  设标志、`abort_event.set()`、`task.cancel()`、**不写 store**
 
 `renew_lease` 的 WHERE：`run_id=? AND owner_worker_id=? AND status IN ('pending','running')`。
 0 行更新 = 不是你的了（被 takeover 或已终态）。
@@ -653,6 +971,31 @@ RENEW_EVERY = LEASE_SECONDS / 3    # 允许连续失败两次而不丢
 **本进程自己的 ownership_lost 判断不加 grace**——那会让你在已经没租约时还继续跑。
 
 `owner_worker_id = f"{hostname}:{uuid4().hex}"`，进程启动时生成一次，关机即废。
+
+#### 租约的参数与业务后果
+
+
+| 参数                | 默认     | 含义                                        | 调大 / 调小的后果                                                     |
+| ----------------- | ------ | ----------------------------------------- | ------------------------------------------------------------- |
+| `runs.lease_seconds` | 30     | 租约时长（STARTUP_ONLY）                        | 调大 → 崩溃后用户等更久才看到 error；调小 → 心跳抖动就容易误接管                        |
+| `RENEW_EVERY`     | lease/3 | 续约周期                                      | 固定按 1/3 取：**允许连续失败两次仍持有**，这是"网络抖一下就被接管"与"死太久没人管"之间的折中          |
+| `grace_seconds`   | 10     | **别人**判断我过期时的宽限（§3.2）                    | 调大 → 接管更慢但更安全；调小 → 时钟偏移会误接管                                   |
+| 心跳扫描节流            | 每 3 次续约 | 顺带做孤儿回收（§3.3）                             | 调密 → 争抢变多；调疏 → 孤儿停留更久                                         |
+
+
+业务后果表（写文档时要照抄这几行）：
+
+- **最坏情况下，一个死掉的实例上的 run 要 `lease_seconds + grace + 扫描周期` 才被收掉**（默认约 50–60 秒）。
+  这段时间里用户看到的是"还在跑"——所以取消/接管相关的 UI 文案要写"可能需要一分钟"，
+  而不是"立即停止"。
+- **心跳必须跑在事件循环上，且不能被饿死。** 一个堵住事件循环的同步调用（大文件哈希、
+  同步 HTTP、CPU 密集循环）会让续约迟到；迟到超过租约就是被接管。M2 的 blocking-IO 检测
+  是这条的前置防线，多实例部署下从"代码风格问题"升级为"正确性问题"。
+- **`lease_expires_at` 只认 store 返回的值**（§3.2 已写）。心跳里绝不能
+  `record.lease_expires_at = now + lease_seconds` 自己推——那样续约失败时你仍然以为持有。
+- **pending 的 run 也有租约。** 准入之后、`try_start` 之前同样会被回收；
+  没有租约的 pending 行会被别人的启动扫描当成孤儿立刻收掉（而这正是 M4 单实例
+  `recover_inflight_runs` 的行为，多实例下必须禁用它）。
 
 ### 3.3 孤儿回收
 
@@ -684,20 +1027,94 @@ RENEW_EVERY = LEASE_SECONDS / 3    # 允许连续失败两次而不丢
 
 store 重试有次数/backoff 上限。单条 SQL 仍依赖驱动/池超时，不要在心跳里无限等。
 
+#### 回收的业务规则
+
+孤儿不是"跑得久的 run"，是"**没有任何活着的进程在续约的租约**"。三种来源：
+实例进程崩溃、实例被 kill（OOM / 滚动发布）、网络分区导致续约持续失败。
+
+
+| 规则                     | 具体                                                                              | 为什么                                                   |
+| ---------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| **认领即终态**              | `claim_for_takeover` 在同一条 UPDATE 里写 `status='error'` + `stop_reason='orphan_recovered'` | 只改 owner 不写终态 = 一个谁都不负责的 running 行                     |
+| **扫描不是权限**             | 扫描结果只是候选；仲裁是那条带 `lease_expires_at + grace < now` 的条件更新                        | 两个实例会同时扫到同一行（§3.3）                                    |
+| **一次最多回收 N 条**（默认 50）  | 启动扫描分批，每批之间给心跳让路                                                                | 一次收几百条会把启动拖住，也会在 store 上打出一串锁                          |
+| **扫描加抖动**              | 周期扫描的间隔取 `[1x, 1.5x]` 随机                                                       | 否则所有实例在同一秒争抢同一批行，白白放大 CAS 冲突                          |
+| **不自动重跑**              | 回收只把 run 标成 error，**不会**重开一次 run                                                | 工具可能已经执行过（g1 的已知边界）；要不要重试是**用户/调度器**的决定，不是回收器的        |
+| **不删数据**               | checkpoint、run_events、thread 全部保留                                               | 用户要能回看"那次为什么失败"；清理归 M4 §10 的保留策略                       |
+| **调度 occurrence 单列一类失败** | `orphan_recovered` 是**独立**的失败分类，不并进"工具报错"                                        | 调度策略对两者的反应不同：基础设施问题可以重试，工具报错往往不能（§4.6）                 |
+
+
+```python
+# agentkit/runtime/runs/recovery.py（多实例版）
+ORPHAN_RECLAIM_BATCH = 50
+
+
+async def reclaim_expired_leases(
+    store: RunStore, *, owner_worker_id: str, grace_seconds: float, now: datetime | None = None
+) -> int:
+    """返回真正被本进程认领的行数。**single-flight + 抖动**由调用方（心跳循环）保证。"""
+    cutoff = (now or datetime.now(UTC)) - timedelta(seconds=grace_seconds)
+    claimed = 0
+    for row in await store.list_inflight_with_expired_lease(before=cutoff, limit=ORPHAN_RECLAIM_BATCH):
+        won = await store.claim_for_takeover(
+            row["run_id"], owner_worker_id=owner_worker_id,
+            status="error", stop_reason="orphan_recovered",
+            error="interrupted: owner stopped renewing its lease",
+        )
+        if not won:
+            continue                      # 别人先认领了，或者原 owner 又续上了 → 跳过
+        claimed += 1
+        await on_reclaimed(row)           # 补 publish_end + 投影 thread 状态（§3.6）
+    return claimed
+```
+
+- `list_inflight_with_expired_lease` **只是候选查询**：它读的是快照，行在被认领前可能已经被续上。
+  所以 `claim_for_takeover` 的 WHERE 必须**再判一次**过期条件（这正是"扫描不是权限"的落地）。
+- `on_reclaimed` 里**先发 END 再投影**：用户最关心的是"别再转圈"，thread 侧栏慢一拍无所谓。
+- **启动扫一次、之后每 3 次续约扫一次**（§3.3）：启动那次是为了尽快收掉上一个实例留下的孤儿，
+  之后那次纯粹是安全网——正常情况下孤儿由"别的实例启动"或"租约过期后的第一次扫描"收掉。
+
 ### 3.4 取消在多实例下有三种结果
 
-| 情况 | 结果 | HTTP |
-|---|---|---|
-| 本进程持有这个 run | 直接 `abort_event` + cancel task | 200 |
-| 别的进程持有，租约有效 | `request_cancel(run_id, action)` 写库，等 owner 心跳读到后执行 | 202 |
-| 别的进程持有，租约已过期 | `claim_for_takeover` 后按本地取消处理 | 200 |
-| 存储层不支持取消请求（memory RunStore） | 拒绝 | 409 + `Retry-After` |
+
+| 情况                          | 结果                                                  | HTTP                |
+| --------------------------- | --------------------------------------------------- | ------------------- |
+| 本进程持有这个 run                 | 直接 `abort_event` + cancel task                      | 200                 |
+| 别的进程持有，租约有效                 | `request_cancel(run_id, action)` 写库，等 owner 心跳读到后执行 | 202                 |
+| 别的进程持有，租约已过期                | `claim_for_takeover` 后按本地取消处理                       | 200                 |
+| 存储层不支持取消请求（memory RunStore） | 拒绝                                                  | 409 + `Retry-After` |
+
 
 第二种**不转移租约**。转移租约会让两个进程都以为自己在跑。
 owner 心跳在续约成功后读 `cancel_action`，对本进程 task 发 abort；
 status 写入和 rollback 仍走 worker finalization，心跳自己不写终态。
 
 取消和完成抢同一行：CAS，先到的赢。已经 `success` 的行，取消请求是 no-op。
+
+#### 202 的业务含义：受理 ≠ 已停止
+
+别的实例持有这个 run 时，取消只能变成一条**持久化的请求**（§3.4 第二种）。这条路径决定了
+前端行为，必须写进接口文档：
+
+
+| 客户端看到      | 含义                              | 该做什么                                        |
+| ---------- | ------------------------------- | ------------------------------------------- |
+| 200        | 本进程执行了取消（或接管后取消）                | 继续读流：END 马上就来                              |
+| **202**    | **已经受理**，等 owner 的心跳读走它         | **不要**把 UI 切成"已停止"；继续等 `end`，最坏一个心跳周期（默认 ≤10s） |
+| 409        | 存储层不支持跨进程取消（memory RunStore）     | 单实例才有这种情况；多实例预检已经禁掉它（§3.5）                  |
+
+
+- **时效**：`cancel_requested_at` 落库之后，owner 在**下一次续约成功后**读到它
+  （§3.2 的步骤 1 → 读 `cancel_action`），所以最坏延迟是 `RENEW_EVERY`（默认 10 秒）。
+  UI 上的"正在停止…"要允许 10 秒以上。
+- **请求与动作分开存**：`cancel_requested_at`（什么时候请求的）+ `cancel_action`（interrupt / rollback）。
+  只存一个布尔会让"用户先点停止、又点了一次回滚"变成说不清的状态。
+- **终态之后请求作废**：run 已经是终态时，`request_cancel` 不要再写任何东西
+  （CAS 自然挡住）；已经写进去的 `cancel_action` 对终态行没有意义，**不需要清理**——
+  它只是一列状态，读的人会先看 status。
+- **重复点停止是幂等的**：第一次 200/202，第二次要么 409 `not_cancellable`（已终态）
+  要么再次 202（请求已存在，直接返回同一个结果）。**不要**产生第二行审计，
+  否则"用户点了三次停止"在账本里看起来像三次操作。
 
 ### 3.5 多 worker 的硬前提要在启动时强制
 
@@ -731,6 +1148,32 @@ STARTUP_ONLY_FIELDS["scheduler.multi_instance"] = "同上。"
 `scheduler.recursion_limit` **不是** STARTUP_ONLY：每次 dispatch 现读，
 YAML 热重载对下一次调度 run 生效，不必重启 poller（根 AGENTS.md 已定）。
 
+#### 多实例下的三个全局约束
+
+"能水平扩容"不等于"复制一份就完事"。下面三条是**跨实例的全局预算**，
+每实例各自算一遍就是 N 倍超发。
+
+
+| 约束          | 单实例的做法                | 多实例必须改成                                                     | 不改的后果                              |
+| ----------- | --------------------- | ----------------------------------------------------------- | ---------------------------------- |
+| **调度并发预算**  | 进程内计数                 | 全局计数：`SELECT count(*) FROM scheduled_task_runs WHERE status IN ('launching','running')` + 条件插入/认领 | 2 个实例 = 2 倍并发，4 个 = 4 倍；用户配的"最多同时跑 3 个"失效 |
+| **库迁移兼容性**  | 迁移随便写                 | 只允许**加**：加可空列 / 带 `server_default` 的列 / 加表 / 加索引；删列与改名要跨两个版本 | 滚动发布期间旧实例读到新 schema，缺列直接 500        |
+| **数据库连接数**  | `pool_size=5` 就够     | `实例数 × (ORM pool + checkpointer pool + 心跳连接) < max_connections` | 第 N 个实例起不来，报错还是"连接被拒"，看起来像网络问题      |
+
+
+**第一条最容易漏**：M9 §4 的 `scheduler.max_concurrent_runs` 在进程内的实现（信号量）
+在单实例下完全正确，而多实例下它是"每实例"的。要在 `assert_multi_worker_preflight` 里
+把这条从"建议"升级成**检查**：`multi_instance=true` 且调度器仍用进程内信号量 → 拒绝启动。
+
+**第二条是 M4 §3.2 那条 fail-closed 的镜像**：M4 拒绝未知 revision 是为了防"旧代码读新库"，
+但**已经在跑的旧实例不会重新检查**。所以滚动发布的顺序必须是
+"先迁库（兼容迁移）→ 再逐个替换实例"，而兼容迁移的定义就是上面那一列允许的动作。
+
+**第三条要有数字**：默认 `pool_size=5`、checkpointer 池 5、心跳复用 ORM 连接，
+一个实例约占 12–15 条连接。Postgres 默认 `max_connections=100` →
+**生产实例数上限大约是 6**。要更多实例就调 `max_connections` 或上 pgbouncer，
+并在部署文档里把这条算式写出来——它比"记得改连接池"这种叮嘱有效。
+
 ### 3.6 StreamBridge 换 Redis
 
 M3 §7 的接口一字不改。`supports_cross_process = True`。
@@ -742,7 +1185,7 @@ M3 §7 的接口一字不改。`supports_cross_process = True`。
 - `publish_end` 的保证不变（M3 最重要的不变量）：嵌套 finally，END 一定发出
 - heartbeat / END 的 Redis 消息 **不要当续传 id**（空 id）
 - retained key 的 TTL（`stream_bridge.stream_ttl_seconds`）在每次 `publish` /
-  `publish_end` 刷新——这是泄漏安全网，**不是** run 超时
+`publish_end` 刷新——这是泄漏安全网，**不是** run 超时
 - 孤儿回收标 `orphan_recovered` 之后，Gateway **补** `publish_end` 并延迟 cleanup
 
 store-only SSE 与 `/wait` 消费者：普通 durable 终态 **不能**当成流已完成
@@ -769,6 +1212,34 @@ M3 §6.3 + M4 §9 的关机顺序在多实例下多两步：
 peer 再接管一次——用户看到一次正常对话变成 orphan error。
 
 ---
+
+#### 发布与关机的业务取舍
+
+滚动发布**一定会**打断一部分正在跑的 run，问题只是"打断多少、用户看到什么"。
+
+
+| 取舍                       | 做法                                        | 用户看到                                             |
+| ------------------------ | ----------------------------------------- | ------------------------------------------------ |
+| **让 run 跑完**（推荐给长对话）      | `terminationGracePeriodSeconds` > 最长 run 时长 | 无感；代价是发布变慢，且必须大于 `runs.timeout_seconds` 的上限      |
+| **快点发**（推荐给高频小发布）         | 排空 `shutdown_timeout_seconds`（默认 10s）后强制 | 被中断的 run 变 `orphan_recovered` error，SSE 收到 `end` |
+| **两阶段**（大规模）              | 先摘流量（不再接新 run）→ 等在跑的 run 收尾 → 再退出         | 无感，且不需要长 grace；代价是要一个"只排空不接新"的状态（M9 不做，写进已知边界）     |
+
+
+**"排空"在 M9 的实现**（§3.7 的第 1 步）：给 inflight task 设 abort + `task.cancel()`，
+在 `shutdown_timeout_seconds` 内等它们写完终态。**这段等待期间进程不再接新 run**
+（`RunManager._closing` 拒新准入，M3 §5.9），但**仍要能响应已经在跑的那些请求**。
+
+两条容易搞反的细节：
+
+- **先停心跳再收 run 是错的**（§3.7 已写）：本进程的 run 会在收尾期间因为租约过期
+  被自己判成 `ownership_lost`，于是收尾被跳过、还被 peer 接管一次。顺序必须是
+  "收 run → 停心跳 → 抽干回收"。
+- **回收任务在关机时要立刻收掉**：还在等 `stream_cleanup` 延迟的任务改成立即删除，
+  否则进程会为了几个已经没人订阅的缓冲多活 60 秒（M3 §7 的 `STREAM_RETENTION_SECONDS`）。
+
+**发布期间的用户可见性**：被中断的 run 会变成 `error`，而**不是**自动重试。
+要"发布不丢对话"，正确做法是把上面第一行或第三行做掉，而不是让回收器自动重跑
+（§3.3：不自动重跑）。
 
 ## 4. 9C 定时任务调度器（W3）
 
@@ -864,11 +1335,13 @@ queued  ──────→  launching  ──────→  running  ──
 (持久,重启存活)   (短租约声明)        (已绑定 Gateway run)
 ```
 
-| 状态 | 含义 | 关键性质 |
-|---|---|---|
-| `queued` | 该跑了，但还没能启动 | **持久化，重启后存活** |
-| `launching` | 某个实例声明了启动权 | 短租约；**唯一可以调用 `start_run()` 的状态** |
-| `running` | 已经绑定到一个 Gateway `run_id` | 之后跟随 run 的生命周期 |
+
+| 状态          | 含义                       | 关键性质                             |
+| ----------- | ------------------------ | -------------------------------- |
+| `queued`    | 该跑了，但还没能启动               | **持久化，重启后存活**                    |
+| `launching` | 某个实例声明了启动权               | 短租约；**唯一可以调用 `start_run()` 的状态** |
+| `running`   | 已经绑定到一个 Gateway `run_id` | 之后跟随 run 的生命周期                   |
+
 
 为什么需要 `launching`：从"决定要启动"到"run 真的创建出来"之间有一个窗口，
 进程在这个窗口里崩溃的话，没有这个状态就无法区分"还没启动"和"可能已经启动了"。
@@ -908,10 +1381,12 @@ paused 任务抑制自动 occurrence，但允许手动 trigger；手动跑完后
 
 ### 4.6 失败分类
 
-| 启动失败的原因 | occurrence 去向 |
-|---|---|
+
+| 启动失败的原因                         | occurrence 去向    |
+| ------------------------------- | ---------------- |
 | 线程忙（`ConflictError` / HTTP 409） | 退回 `queued`，稍后重试 |
-| 其它错误（配置坏、模型没有、权限） | 终态 `failed` |
+| 其它错误（配置坏、模型没有、权限）               | 终态 `failed`      |
+
 
 把所有错误都退回 `queued` 会让一个配置错误的任务永远重试。
 
@@ -939,7 +1414,7 @@ API：修改 enabled 且无活跃 occurrence 的任务可以立刻改 `next_run_
 
 - 5 段 cron，`croniter`，在任务 timezone 的墙上时间取 next，再存 UTC
 - `once.run_at` 无 tzinfo = 任务 timezone 的墙上时间；持久化前转到 UTC
-  （SQLite 列丢 tzinfo 时，带着 offset 存会把触发时刻平移整个 offset）
+（SQLite 列丢 tzinfo 时，带着 offset 存会把触发时刻平移整个 offset）
 - 未知 IANA timezone → `ValueError`，创建任务时 400，不要静默用 UTC
 
 poll 间隔建议 5–10s。`claim_due_tasks(now, lease_owner, lease_seconds, limit)`
@@ -956,18 +1431,76 @@ M5 加一页 `/workspace/scheduled-tasks`：列表、cron 编辑、暂停、手�
 
 ---
 
-## 5. 9D IM 通道（W2 骨架，W3 两个平台）
+### 4.10 路由 `app/gateway/routers/scheduled_tasks.py`
 
-M9 实现通道**架构** + **两种投递策略各一个平台**，不要六个平台一起上。
+`prefix="/scheduled-tasks"`。每条都要同时有 `threads:write` 和 `runs:create`（§4.9）。缺一即 403。
 
-| 策略 | M9 平台 | 调用 |
-|---|---|---|
-| 等最终回复 | Slack（或 Discord） | `runs.wait()` |
-| 流式改卡片 | Telegram（或飞书） | `runs.stream()`，原地 edit |
-| 发射后不管 | **不做**（GitHub 那种） | 需要忙时缓冲，多 worker 有已知缺口 |
+```python
+# app/gateway/deps.py
+def require_all_scopes(*scopes: str) -> Callable[[Request], RunCaller]:
+    def _dep(request: Request) -> RunCaller:
+        caller = caller_from_request(request)
+        missing = [scope for scope in scopes if not caller.allows(scope)]
+        if missing:
+            raise RunPermissionDenied(f"missing scope: {', '.join(missing)}")
+        return caller
+    return _dep
+```
 
-Feishu / DingTalk / Buzz / GitHub / WeChat 列为后续增量。架构要让加一个
-`Channel` 子类不必改 manager。
+
+| Method | Path                             | 请求                           | 成功                            | 说明                                                                |
+| ------ | -------------------------------- | ---------------------------- | ----------------------------- | ----------------------------------------------------------------- |
+| GET    | `/api/scheduled-tasks`           | `limit` 1..200，默认 50         | `Page[ScheduledTaskResponse]` | 只列 `user_id=caller.user_id`                                       |
+| POST   | `/api/scheduled-tasks`           | `ScheduledTaskCreateRequest` | 201，`ScheduledTaskResponse`   | 非法时区或 cron → 422 `invalid_schedule`                               |
+| GET    | `/api/scheduled-tasks/{task_id}` | `TaskId`                     | `ScheduledTaskResponse`       | 不是自己的 → 404 `scheduled_task_not_found`                            |
+| PATCH  | `/api/scheduled-tasks/{task_id}` | `ScheduledTaskPatchRequest`  | 200                           | 有 queued/launching/running 的 occurrence → 409 `task_active`（§4.7） |
+| POST   | `.../{task_id}/pause`            | 无                            | 200                           | 把 queued 标 cancelled；launching/running 拒绝，409 `task_active`       |
+| POST   | `.../{task_id}/resume`           | 无                            | 200                           | 同样：有活跃 occurrence 则 409                                           |
+| POST   | `.../{task_id}/trigger`          | 无                            | 202 `{"occurrence_id": ...}`  | 允许在 paused 上手动跑。已有非终态 occurrence 则复用那一行，不另开                       |
+| DELETE | `.../{task_id}`                  | 无                            | `{"deleted": task_id}`        | 规则同 pause                                                         |
+| GET    | `.../{task_id}/runs`             | `limit`                      | `Page[OccurrenceResponse]`    | occurrence，不是 Gateway run                                         |
+
+
+```python
+# app/gateway/models/request.py
+TaskId = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+
+class ScheduledTaskCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=200)
+    prompt: str = Field(min_length=1, max_length=8000)
+    schedule_type: Literal["cron", "once"]
+    schedule_spec: dict[str, str]          # cron: {"cron": "0 * * * *"}；once: {"run_at": ISO}
+    timezone: str = Field(min_length=1, max_length=64)
+    context_mode: Literal["fresh_thread_per_run", "reuse_thread"] = "fresh_thread_per_run"
+    thread_id: str | None = None           # 仅 reuse_thread；必须是 caller 自己的 thread
+```
+
+`thread_id` 若给出，先 `require_visible_thread`。看不见是 404 `thread_not_found`，不是 403。
+`overlap_policy` 不在请求里。服务端固定写 `enqueue`（§4.4）。客户端传这个字段 → 422 `invalid_request`。
+
+路由调用 `app/scheduler/service.py` 的仓储方法，不自己 `create_task`，也不调用 `start_run`。手动 trigger 只插入或复用 occurrence。真正开跑仍是 poller 的 `launching` 状态（§4.3）。
+
+`ScheduledTaskResponse` 含 `id`、`title`、`status`、`schedule_type`、`schedule_spec`、`timezone`、`context_mode`、`thread_id`、`next_run_at`、`last_run_id`、`last_error`。时间是 ISO-8601、`Z` 结尾。没有 `lease_owner`。
+
+## 5. 9D IM 通道（W2 骨架，W3 飞书）
+
+M9 实现通道**架构** + **一个平台：飞书（Feishu / Lark）**。
+
+
+| 策略    | M9 平台              | 调用                                                    |
+| ----- | ------------------ | ----------------------------------------------------- |
+| 流式改卡片 | **飞书**（唯一）          | `runs.stream()` → 先发 running 卡片，再 patch 同一 `message_id` |
+| 等最终回复 | 不做（Slack / Discord 那种） | 它要的是 `runs.wait()`；架构上留着，本阶段不实现                      |
+| 发射后不管 | 不做                 | 需要忙时缓冲，多 worker 下有已知缺口（§5.7）                           |
+
+
+**为什么只做一个平台**：通道的成本不在 adapter，而在**与平台无关的那一半**——
+绑定码的消费顺序、一个外部身份只能有一个活跃 owner、节流与终态保证、白名单过滤、
+用户身份穿透到沙箱。这些写对了，加第二个平台只是"新增一个 adapter 文件 + 一个工厂分支 +
+一份配置"；反过来，一次上三个平台，会把每个平台的怪癖写进 manager，之后再拆很贵。
+
+Slack / Telegram / Discord / DingTalk / Buzz / GitHub / WeChat 全部列为后续增量。
 
 ### 5.1 一开始就要定的：能发出去的东西是**白名单**
 
@@ -1027,11 +1560,13 @@ SDK 客户端注入 §2.9 的内部 token + CSRF 对。`langgraph_url` 在 Compo
 
 一条入站消息带三样东西：
 
-| 字段 | 含义 |
-|---|---|
-| `connection_id` | 用户绑定 |
-| `owner_user_id` | DeerFlow 存储 ID，**这次 run 的 user_id** |
-| `channel_user_id` | 平台上的原始发送者 ID（群里每人不同） |
+
+| 字段                | 含义                                  |
+| ----------------- | ----------------------------------- |
+| `connection_id`   | 用户绑定                                |
+| `owner_user_id`   | DeerFlow 存储 ID，**这次 run 的 user_id** |
+| `channel_user_id` | 平台上的原始发送者 ID（群里每人不同）                |
+
 
 **owner 必须通过显式的 `user_id=` 一路穿透**：`receive_file`、`ensure_uploads_dir`、
 产物投递、记忆桶、`start_run(user_id=)`。通道 worker 跑在自己的 task 里，
@@ -1041,7 +1576,7 @@ SDK 客户端注入 §2.9 的内部 token + CSRF 对。`langgraph_url` 在 Compo
 
 - **只从内部认证调用方的顶层 `body.context` 接受**，从自由形式 `body.config` 一律清除
 - **只写进 runtime.context，绝不写进 `configurable`**——后者会进 checkpoint，
-  等于把群里某个人的平台 ID 永久写进对话历史
+等于把群里某个人的平台 ID 永久写进对话历史
 
 sandbox `bash` 若要暴露这个 id，用命令串前缀 `export DEERFLOW_CHANNEL_USER_ID=...;`
 （无效/超长则 `unset`），**不要**走 `execute_command(env=)`——那会把 AIO 切到
@@ -1050,13 +1585,13 @@ M8 `task` 已要求把 dispatch 当时的 `channel_user_id` 拷进子代理。
 
 ### 5.4 绑定码的安全模型
 
-用户在浏览器点"绑定 Telegram"，拿到一次性码，在聊天里发 `/start <code>`
-（Telegram）或 `/connect <code>`（其它）。
+用户在浏览器点"绑定飞书"，拿到一次性码，在飞书里给 bot 发 `/connect <code>`。
+（绑定命令的语法放在 adapter 里：换平台时改的是那一个常量，不是这段流程。）
 
 **绑定码的消费必须发生在 `allowed_users` 过滤之前**，否则一个刚被加进白名单
 但还没绑定的用户永远没法完成第一次绑定。
 
-推论：**`allowed_users` 不是绑定期的防御**。任何持有有效码的人都能消费它。
+推论：`**allowed_users` 不是绑定期的防御**。任何持有有效码的人都能消费它。
 绑定的安全性完全建立在码的机密性上：
 
 - `secrets.token_urlsafe(16)`
@@ -1064,8 +1599,9 @@ M8 `task` 已要求把 dispatch 当时的 `channel_user_id` 拷进子代理。
 - 一次性 `consume`
 - **只在发起绑定的那个浏览器里显示，绝不回显到聊天里**
 
-`allowed_users` 仍然守着普通消息。空 allowlist 的语义按平台写清：
-运营 bot 默认空=全放行；若做 Buzz 那种空=拒，`start()` 要 WARNING。
+`allowed_users` 仍然守着普通消息。**飞书的空 allowlist 按运营 bot 处理：空 = 全放行**，
+`start()` 打一条 WARNING 说明当前谁都能用。将来接企业内 bot 类平台（空 = 拒）时，
+这条语义要按平台配置，而不是改全局默认。
 
 ### 5.5 一个外部身份只能有一个活跃 owner
 
@@ -1084,11 +1620,22 @@ CREATE UNIQUE INDEX uq_channel_connection_active_identity
 
 ### 5.6 流式投递的限流与终态
 
-Telegram 群 20 条/分钟。通道侧节流：私聊 1s、群 3s；超长截断（4096）后最终再 split。
-被限流丢掉的中间更新可以接受，**最终那一次必须成功**。
+飞书的限流按**群 / 单聊**分别配置（`channels.feishu.rate_limit.{chat,direct}`，默认群 3s、单聊 1s），
+并且**发消息与 patch 卡片共享同一个令牌桶**——只给"发"限流、让"改"无限打，一样会撞平台侧限流。
+超长文本按飞书单条上限截断，最终那一次再 split 成多条。
 
-Feishu 同类：先发一张 running 卡片，随后 patch 同一 `message_id`。
-M9 若只做 Telegram，把"同一 target 上 edit"做成 `Channel` 的能力，而不是写死在 Telegram 里。
+投递顺序（`stream` 策略）：
+
+1. run 开始 → 发一张 **running 卡片**，记住返回的 `message_id`；
+2. 流式期间 → **patch 同一 `message_id`**，节流到上面那个令牌桶；
+3. 终态 → 最后一次 patch（成功 / 失败 / 被取消三种卡片）。**这一步必须成功**：
+   重试到上限仍失败，就退回"发一条纯文本终态"——用户不能只看到一张永远转圈的卡片。
+
+**中间更新可以丢，终态不能丢。** 这是通道侧唯一的硬保证，测试要单独覆盖它。
+
+"在同一 target 上编辑"做成 `Channel` 的能力（`supports_edit = True` + `edit(target, text)`），
+不是飞书专属代码路径：能编辑的平台走 patch；不能编辑的（未来的 Slack / Discord）
+退回"发一条新消息，旧的追加一句已结束"。
 
 同一 thread 上快速跟进：`ChannelRunPolicy.serialize_thread_runs=True` 时
 manager 内排队，而不是回一条 THREAD_BUSY 让用户以为丢了。
@@ -1112,6 +1659,28 @@ Gateway 超时取消 shutdown 时，service 保留 channel 单例以便重试 cl
 
 ---
 
+### 5.9 路由 `app/gateway/routers/channels.py`
+
+`prefix="/channels"`。`{name}` 本阶段**只允许 `feishu`**；其它 → 422 `invalid_request`。
+
+**只做一个平台，但不要把它写死**：`Channel` 抽象（`base.py`）与工厂分支保持通用，
+加 Slack / Telegram 是"新增一个 adapter 文件 + 一个工厂分支 + 一份配置"，
+不是回头改 manager、绑定流程或 message bus。路由、绑定码、节流、审计这些**与平台无关**的部分
+现在就要写对——它们才是加平台时最容易返工的地方。
+
+
+| Method | Path                           | 能力               | 成功                                     | 说明                          |
+| ------ | ------------------------------ | ---------------- | -------------------------------------- | --------------------------- |
+| GET    | `/api/channels`                | `channels:read`  | `{"channels": [ChannelStatus]}`        | 平台是否启用、自己有没有绑定。没有 bot token |
+| POST   | `/api/channels/{name}/bind`    | `channels:write` | 201 `{"code": ..., "expires_in": 600}` | 码只出现在这个响应里（§5.4）            |
+| DELETE | `/api/channels/{name}/bind`    | `channels:write` | `{"deleted": name}`                    | 删的是这个 caller 的绑定            |
+| POST   | `/api/channels/{name}/restart` | `admin`          | `{"restarted": name}`                  | 重启本进程里的那个平台连接，不是用户绑定        |
+
+
+`ChannelStatus` 的字段：`name`、`enabled`、`bound`、`external_account_id`（已绑定才有，是平台账号 id，不是 token）。
+
+消费绑定码发生在通道的入站消息里，不另开 HTTP。码错、过期、用过，入站都当无效，聊天里不回显码。HTTP 这边没有「提交码」的路由。
+
 ## 6. 9E MCP 长时任务（默认跳过）
 
 M7 已把它列为不做。只有确实存在跑几十分钟的远端工具时才开工。形状：
@@ -1121,7 +1690,7 @@ M7 已把它列为不做。只有确实存在跑几十分钟的远端工具时�
 - 数据库是真相源；租约轮询在 Agent/LLM 循环之外
 - `ThreadState` 只收到有界的当前线程投影
 - 远端完成后 Gateway 开一次**通知 run** 把结果说回对话；投递指令放在用户输入边界之外，
-  序列化的远端事件当不可信数据 framing
+序列化的远端事件当不可信数据 framing
 - 任务比聊天活得长：thread 已删则 dead-letter，不要为通知重建 thread
 
 三条容易错的（真做时测试钉住）：
@@ -1164,8 +1733,12 @@ scheduler:
 
 channels:
   langgraph_url: http://127.0.0.1:8001/api
-  slack: { enabled: false, bot_token: $SLACK_BOT_TOKEN, app_token: $SLACK_APP_TOKEN }
-  telegram: { enabled: false, bot_token: $TELEGRAM_BOT_TOKEN }
+  feishu:
+    enabled: false
+    app_id: $FEISHU_APP_ID
+    app_secret: $FEISHU_APP_SECRET
+    verification_token: $FEISHU_VERIFICATION_TOKEN   # 事件回调校验
+    rate_limit: { direct: 1.0, chat: 3.0 }
 
 channel_connections:
   enabled: false                   # 用户绑定层；不替代 bot 凭据
@@ -1181,13 +1754,27 @@ channel_connections:
 
 M4 的混合 bootstrap 仍然适用。M9 新增 revision（不要改已 stamp 的旧 revision）：
 
-| revision | 内容 |
-|---|---|
-| `00xx_users` | `users` 表 + admin 部分唯一索引 |
-| `00xx_run_lease_live` | 若 M4 已有租约列则空；补 `cancel_action` / `cancel_requested_at` / `stop_reason` |
-| `00xx_scheduled_tasks` | 两张表 + `uq_scheduled_task_run_active` |
-| `00xx_channel_connections` | connections + conversations + `uq_channel_connection_active_identity` |
-| `00xx_pat` | W4 可选；只存 SHA-256 digest |
+
+| revision                   | 内容                                                                     |
+| -------------------------- | ---------------------------------------------------------------------- |
+| `0002_users_pat`           | `users` 表（id / email / **username** / password_hash / …）+ `personal_access_tokens` |
+| `0003_users_username`      | 已有的 `users` 补 `username` 列：加可空列 → 回填 → 唯一索引 → 置 NOT NULL                |
+| `00xx_run_lease_live`      | 若 M4 已有租约列则空；补 `cancel_action` / `cancel_requested_at` / `stop_reason` |
+| `00xx_scheduled_tasks`     | 两张表 + `uq_scheduled_task_run_active`                                   |
+| `00xx_channel_connections` | connections + conversations + `uq_channel_connection_active_identity`  |
+| `00xx_pat`                 | W4 可选；只存 SHA-256 digest                                                |
+
+
+**`username` 的回填规则**（`0003_users_username`，跑在滚动发布之前）：
+
+1. 从邮箱的 local part 派生（`alice@example.com` → `alice`），按 §2.4 的字符集清洗；
+2. 撞名加数字后缀（`alice-2`、`alice-3`…），仍然撞就退回 `user-<id 前 8 位>`；
+3. 清洗后不足 3 字符的同样走第 2 条；
+4. 回填完再建 unique 索引、再置 `NOT NULL`——**顺序不能反**，反了在有数据的库上会直接失败。
+
+**admin 部分唯一索引**在实现时改成了条件写（见 §2.17 第 1 条），
+所以这条 revision 里没有它。
+
 
 `create_all` + stamp 路径必须在 ORM `__table_args__` 里带上那两个 partial unique index。
 
@@ -1195,31 +1782,38 @@ M4 的混合 bootstrap 仍然适用。M9 新增 revision（不要改已 stamp �
 
 ## 9. 测试清单
 
-| 文件 | 覆盖 |
-|---|---|
-| `test_identity_strip.py` | 客户端 `user_id` / `owner_id` 在 metadata/configurable/context 三处都被剥；internal 头未经 AuthMiddleware 当不可信 |
-| `test_identity_boundary.py` | 优先级链；**图构建和中间件落在同一个桶**（两个用户交错请求） |
-| `test_make_safe_user_id.py` | 邮箱 → 稳定目录安全 id；已安全则原样；不同输入不共桶 |
-| `test_repository_auto_scope.py` | `AUTO` 无上下文抛错不退化全局；显式 `None` 才全局；跨用户 get 返回 None |
-| `test_auth_gate.py` | OpenAPI 里非白名单默认 401 `unauthenticated`；cookie 存在但 tv 不匹配 401；JWT 不出现在响应体；PAT 打 change-password → 403 `session_required` |
-| `test_m9_routes.py` | initialize 第二次 409 `admin_already_exists`；登录失败不区分邮箱和密码；调度 PATCH 在活跃 occurrence 上 409 `task_active`；trigger 不调用 `start_run`；别人的 task/run 是 404；反馈 PUT 后再 GET 是覆盖；绑定响应含码，GET /channels 不含码和 token |
-| `test_csrf.py` | POST 缺 header 拒；bootstrap 不要求 token 但拒 hostile Origin；坏 Bearer 不回退 cookie |
-| `test_token_version.py` | 改密后旧 cookie 立刻 401；新 cookie 可用 |
-| `test_owner_404.py` | 访问别人的 thread/run/artifact 一律 404 |
-| `test_ownership_lost.py` | **丢租约后不写终态、不发业务 SSE、不 flush journal**；终态守卫挡住迟到的 success |
-| `test_orphan_recovery.py` | 两个进程同时认领只有一个成功；扫描不是权限；single-flight 慢轮跳过 |
-| `test_cancel_cross_worker.py` | 有效租约 → 202 + request_cancel 不转移 owner；过期 → claim 后本地取消 |
-| `test_multi_worker_preflight.py` | 缺 Postgres / 缺 DB 事件存储 / 心跳关 / auth 关 → 拒绝启动 |
-| `test_redis_stream_bridge.py` | Last-Event-ID、GAP、publish_end、heartbeat 无 id、TTL 刷新；与 memory 实现同一套协议测试 |
-| `test_shutdown_order.py` | 先收 run 再停心跳；倒过来的负例会把本进程 run 标 ownership_lost |
-| `test_occurrence_state_machine.py` | 唯一非终态约束；launching 过期回 queued；忙时排队不跳过；queued 不占预算；once 手动失败不毁未来 |
-| `test_scheduled_idempotency.py` | 恢复重试复用同一条 Gateway run；`start_run` 被调用而不是内部 astream |
-| `test_non_interactive.py` | 内部调用去掉 ask_clarification；客户端塞的键被丢 |
-| `test_task_definition_freeze.py` | 活跃 occurrence 期间 PATCH 409 |
-| `test_channel_outbound_allowlist.py` | **隐藏 HumanMessage 不外发**；裸字符串拒绝；前缀匹配不误伤 `domain`；`<memory>` 在 send() 被拒 |
-| `test_channel_identity.py` | owner 显式穿透到上传/产物；`channel_user_id` 不进 checkpoint / configurable |
-| `test_connect_code.py` | 绑定码在 allowed_users 之前消费；不回显聊天；并发绑定只有一个活跃；TTL / 一次性 |
-| `test_cron_timezone.py` | naive run_at 按任务 tz 解释后存 UTC；非法 tz 400 |
+
+| 文件                                   | 覆盖                                                                                                                                                                                              |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_identity_strip.py`             | 客户端 `user_id` / `owner_id` 在 metadata/configurable/context 三处都被剥；internal 头未经 AuthMiddleware 当不可信                                                                                               |
+| `test_identity_boundary.py`          | 优先级链；**图构建和中间件落在同一个桶**（两个用户交错请求）                                                                                                                                                                |
+| `test_make_safe_user_id.py`          | 邮箱 → 稳定目录安全 id；已安全则原样；不同输入不共桶                                                                                                                                                                   |
+| `test_repository_auto_scope.py`      | `AUTO` 无上下文抛错不退化全局；显式 `None` 才全局；跨用户 get 返回 None                                                                                                                                                |
+| `test_auth_gate.py`                  | OpenAPI 里非白名单默认 401 `unauthenticated`；cookie 存在但 tv 不匹配 401；JWT 不出现在响应体；PAT 打 change-password → 403 `session_required`                                                                          |
+| `test_m9_routes.py`                  | initialize 第二次 409 `admin_already_exists`；登录失败不区分邮箱和密码；调度 PATCH 在活跃 occurrence 上 409 `task_active`；trigger 不调用 `start_run`；别人的 task/run 是 404；绑定响应含码，GET /channels 不含码和 bot token；**没有 feedback 路由**（404） |
+| `test_csrf.py`                       | POST 缺 header 拒；bootstrap 不要求 token 但拒 hostile Origin；坏 Bearer 不回退 cookie                                                                                                                       |
+| `test_token_version.py`              | 改密后旧 cookie 立刻 401；新 cookie 可用                                                                                                                                                                  |
+| `test_owner_404.py`                  | 访问别人的 thread/run/artifact 一律 404                                                                                                                                                                |
+| `test_ownership_lost.py`             | **丢租约后不写终态、不发业务 SSE、不 flush journal**；终态守卫挡住迟到的 success                                                                                                                                         |
+| `test_orphan_recovery.py`            | 两个进程同时认领只有一个成功；扫描不是权限；single-flight 慢轮跳过；**一次最多回收 `ORPHAN_RECLAIM_BATCH` 条**；扫描间隔带抖动；**不自动重跑**（只标 error）；调度 occurrence 记 `orphan_recovered` 独立分类
+| `test_lease_renewal.py`              | 续约连续失败两次仍持有（`RENEW_EVERY = lease/3`）；`lease_expires_at` 只取 store 返回值；peer 判过期加 `grace`、**本进程自己不加**；`renew_lease` 的 WHERE 0 行 → `ownership_lost` 且不写 store
+| `test_takeover_visibility.py`        | 接管后 `status=error` + `stop_reason=orphan_recovered`、补 `publish_end`、thread 投影为 error；**token 不被清零**（接管者写终态不传 `totals`）；旧 owner 之后的写入全被跳过
+| `test_cancel_cross_worker_ui.py`     | 非 owner 取消 → 202 且 `cancel_requested_at` + `cancel_action` 落库；owner 下一次续约后 abort（≤ `RENEW_EVERY`）；重复点停止不产生第二行审计；终态 run 的取消请求是 no-op
+| `test_multi_worker_global_budget.py` | 两个实例的调度并发预算**全局**（合计不超过配置值）；`multi_instance=true` 且调度器仍是进程内信号量 → 拒绝启动；连接数算式在预检里给出可读的失败信息
+| `test_rolling_deploy_compat.py`      | 兼容迁移（加可空列 / 带默认列）后旧实例仍能读写；非兼容迁移（删列 / 改名）被预检拒绝；滚动发布期间新实例的迁移不会让旧实例 500                                                                                                                                                        |
+| `test_cancel_cross_worker.py`        | 有效租约 → 202 + request_cancel 不转移 owner；过期 → claim 后本地取消                                                                                                                                          |
+| `test_multi_worker_preflight.py`     | 缺 Postgres / 缺 DB 事件存储 / 心跳关 / auth 关 → 拒绝启动                                                                                                                                                    |
+| `test_redis_stream_bridge.py`        | Last-Event-ID、GAP、publish_end、heartbeat 无 id、TTL 刷新；与 memory 实现同一套协议测试                                                                                                                          |
+| `test_shutdown_order.py`             | 先收 run 再停心跳；倒过来的负例会把本进程 run 标 ownership_lost                                                                                                                                                    |
+| `test_occurrence_state_machine.py`   | 唯一非终态约束；launching 过期回 queued；忙时排队不跳过；queued 不占预算；once 手动失败不毁未来                                                                                                                                  |
+| `test_scheduled_idempotency.py`      | 恢复重试复用同一条 Gateway run；`start_run` 被调用而不是内部 astream                                                                                                                                              |
+| `test_non_interactive.py`            | 内部调用去掉 ask_clarification；客户端塞的键被丢                                                                                                                                                               |
+| `test_task_definition_freeze.py`     | 活跃 occurrence 期间 PATCH 409                                                                                                                                                                      |
+| `test_channel_outbound_allowlist.py` | **隐藏 HumanMessage 不外发**；裸字符串拒绝；前缀匹配不误伤 `domain`；`<memory>` 在 send() 被拒                                                                                                                          |
+| `test_channel_identity.py`           | owner 显式穿透到上传/产物；`channel_user_id` 不进 checkpoint / configurable                                                                                                                                 |
+| `test_connect_code.py`               | 绑定码在 allowed_users 之前消费；不回显聊天；并发绑定只有一个活跃；TTL / 一次性                                                                                                                                              |
+| `test_cron_timezone.py`              | naive run_at 按任务 tz 解释后存 UTC；非法 tz 400                                                                                                                                                          |
+
 
 `test_ownership_lost.py` 和 `test_channel_outbound_allowlist.py` 是这一阶段
 最值得写的两个——它们各自对应一个会造成**不可恢复后果**的错误。
@@ -1235,8 +1829,15 @@ TDD：W1 先写身份剥离和 AUTO fail-closed；W2 先写 ownership_lost 负�
 - [ ] 两个用户各自的 thread、文件、记忆完全隔离；访问对方的 thread 返回 404
 - [ ] 改密码后，旧浏览器标签页的请求立刻被拒；响应 JSON 里看不到 JWT
 - [ ] **两个 Gateway 实例并行，`kill -9` 掉持有某个 run 的那个，
-      另一个在租约过期后接管、标 `error`、给客户端补 `end`**
+  ```
+  另一个在租约过期后接管、标 `error`、给客户端补 `end`**
+  ```
 - [ ] 被 kill 的那个进程如果恢复，不会再写任何终态（即使 agent 协程还跑完了）
+- [ ] 被接管的 run：SSE 收到 `end`（不是一直转圈）、`threads_meta.status=error`、**token 计数没有被清零**
+- [ ] 在**非 owner** 实例上取消一个 run → 202，且 `RENEW_EVERY`（默认 10 秒）内真的被停止；前端在 202 时不把 UI 切成"已停止"
+- [ ] 两个实例的**调度并发合计**不超过配置值（全局预算，不是每实例）
+- [ ] 滚动发布：只做兼容迁移（加可空列）时，旧实例在迁移后仍能正常读写；
+      非兼容迁移（删列 / 改名）被预检拒绝
 - [ ] 一个每分钟触发、单次跑 3 分钟的定时任务：后续触发排队而不是跳过，重启后队列存活
 - [ ] 定时任务跑起来的 run 走的是和网页完全相同的 run 路径（同一套事件、同一套取消、同一套 token 账本）
 - [ ] 调度 run 的工具集没有 `ask_clarification`；网页 run 塞 `non_interactive` 无效
@@ -1244,7 +1845,7 @@ TDD：W1 先写身份剥离和 AUTO fail-closed；W2 先写 ownership_lost 负�
 - [ ] **开启记忆后在 IM 里对话，群里看不到任何 `<memory>` / `<durable_context_data>` 内容**
 - [ ] 新加一条 `/api/foo` 路由，不改白名单，未登录访问是 401 `unauthenticated`
 - [ ] `POST /api/v1/auth/login/local` 的响应体和 `Authorization` 头都没有 token；cookie 里有
-- [ ] `PUT /api/runs/{id}/feedback` 对别人的 run 是 404 `run_not_found`
+- [ ] `/api/runs/{id}/feedback` 不存在（404）——反馈不在本阶段范围里
 
 第三条要真的用 `kill -9` 做，不要用优雅关闭——优雅关闭走的是完全不同的代码路径。
 最后第二条建议每个已实现的通道都跑一遍。
@@ -1253,37 +1854,43 @@ TDD：W1 先写身份剥离和 AUTO fail-closed；W2 先写 ownership_lost 负�
 
 ## 11. 与已有里程碑的接口对照
 
-| 已有槽 | M9 填什么 |
-|---|---|
-| M0 `STARTUP_ONLY_FIELDS` | `runs.lease_seconds`、`stream_bridge.backend`、`scheduler.max_concurrent_runs` 等 |
-| M0 `make_safe_user_id` | 全链路强制；原始 identity 与存储 ID 分离 |
-| M2 虚拟路径 / `acquire(user_id=)` | 宿主机改 `users/{uid}/threads/{tid}/...`；agent 仍看 `/mnt/user-data` |
-| M3 `RunRecord.ownership_lost` 等 | 心跳真正写租约；丢了就跳过 finally 持久化 |
-| M3 `start_run` / 幂等键 | 调度器唯一派发入口；occurrence 键复用 |
-| M3 StreamBridge 接口 | Redis 实现；`publish_end` / GAP / Last-Event-ID 不变 |
-| M4 租约列、终态守卫、`AUTO` | `claim_for_takeover` 替换单 worker 的一锅 orphan 回收 |
-| M4 `recover_inflight_runs` | 多实例下禁止；会误杀 peer 的 inflight |
-| M5 `/workspace/scheduled-tasks` | 接本阶段 API |
-| M6 Clarification / DurableContext 隐藏块 | `non_interactive` 去工具；通道出站白名单防泄漏 |
-| M7 请求级密钥不进 checkpoint | `channel_user_id` 同纪律 |
-| M8 `channel_user_id` 拷进子代理 | 9D 群聊身份不断档 |
+
+| 已有槽                                   | M9 填什么                                                                         |
+| ------------------------------------- | ------------------------------------------------------------------------------ |
+| M0 `STARTUP_ONLY_FIELDS`              | `runs.lease_seconds`、`stream_bridge.backend`、`scheduler.max_concurrent_runs` 等 |
+| M0 `make_safe_user_id`                | 全链路强制；原始 identity 与存储 ID 分离                                                    |
+| M2 虚拟路径 / `acquire(user_id=)`         | 宿主机改 `users/{uid}/threads/{tid}/...`；agent 仍看 `/mnt/user-data`                 |
+| M3 `RunRecord.ownership_lost` 等       | 心跳真正写租约；丢了就跳过 finally 持久化                                                      |
+| M3 `start_run` / 幂等键                  | 调度器唯一派发入口；occurrence 键复用                                                       |
+| M3 StreamBridge 接口                    | Redis 实现；`publish_end` / GAP / Last-Event-ID 不变                                |
+| M4 租约列、终态守卫、`AUTO`                    | `claim_for_takeover` 替换单 worker 的一锅 orphan 回收                                  |
+| M4 `recover_inflight_runs`            | 多实例下禁止；会误杀 peer 的 inflight                                                     |
+| M5 `/workspace/scheduled-tasks`       | 接本阶段 API                                                                       |
+| M6 Clarification / DurableContext 隐藏块 | `non_interactive` 去工具；通道出站白名单防泄漏                                               |
+| M7 请求级密钥不进 checkpoint                 | `channel_user_id` 同纪律                                                          |
+| M8 `channel_user_id` 拷进子代理            | 9D 群聊身份不断档                                                                     |
+
 
 ---
 
 ## 12. 刻意不做的事
 
-| 不做 | 理由 |
-|---|---|
-| 细粒度 RBAC / 工具级 deny | 先只有 `admin` / `user`。`authz.provider` 接口留下，内置 AllowAll |
-| OIDC/SSO | W1 阻塞项是本地账号。OIDC 是同一套 cookie + users 表的增量 |
-| 跨进程的 IM 忙时缓冲 | 需要共享缓冲或通道 leader 选举。单进程没有正确性问题，写进已知边界 |
-| 分布式登录限速 | 进程内计数在单 worker 精确、多 worker 近似 |
-| Kubernetes / 微服务化 | 路线图岔路第 3 条。Gateway 仍是单体，只是可以水平加副本 |
-| 9E MCP 长时任务 | 整套租约 + 轮询 + 通知 run。除非真有几十分钟的远端工具 |
-| IM 双向富交互（按钮、表单） | 每个平台一套 API |
-| 六个 IM 平台一次上齐 | M9 两种投递策略各一个平台；其余按相同 Channel 接口后加 |
-| GitHub fire-and-forget 通道 | 依赖忙时缓冲，多 worker 缺口与上一条同类 |
-| 调度 `overlap_policy=skip` | 已证明对用户是错的；配置枚举里不要出现这个值 |
+
+| 不做                        | 理由                                                     |
+| ------------------------- | ------------------------------------------------------ |
+| 细粒度 RBAC / 工具级 deny       | 先只有 `admin` / `user`。`authz.provider` 接口留下，内置 AllowAll |
+| OIDC/SSO                  | W1 阻塞项是本地账号。OIDC 是同一套 cookie + users 表的增量              |
+| 跨进程的 IM 忙时缓冲              | 需要共享缓冲或通道 leader 选举。单进程没有正确性问题，写进已知边界                  |
+| 分布式登录限速                   | 进程内计数在单 worker 精确、多 worker 近似                          |
+| Kubernetes / 微服务化         | 路线图岔路第 3 条。Gateway 仍是单体，只是可以水平加副本                      |
+| 9E MCP 长时任务               | 整套租约 + 轮询 + 通知 run。除非真有几十分钟的远端工具                       |
+| IM 双向富交互（按钮、表单）           | 每个平台一套 API                                             |
+| 飞书以外的 IM 平台               | Slack / Telegram / Discord / DingTalk 等按相同 `Channel` 接口后加；M9 只做飞书 |
+| GitHub fire-and-forget 通道 | 依赖忙时缓冲，多 worker 缺口与上一条同类                               |
+| 调度 `overlap_policy=skip`  | 已证明对用户是错的；配置枚举里不要出现这个值                                 |
+| **反馈 / 评分**               | 产品层能力，不是运行时必需。真要做时是独立的 analytics 域（自己的表与读路径），不塞回 run 路由  |
+| 等最终回复式投递（`runs.wait()` 平台） | 架构上留着（`Channel` 的能力位），M9 只实现飞书的卡片 patch 路径             |
+
 
 ---
 
@@ -1293,7 +1900,7 @@ M9 四条主线各有难点，但只有两个错误是**不可恢复**的：
 
 1. **丢租约的进程继续写终态** → 数据库和客户端永久不一致，没有任何机制能修
 2. **通道用黑名单决定什么能外发** → 用户的记忆和隐藏上下文泄漏到外部平台，
-   在不可撤回的平台上永久留存
+  在不可撤回的平台上永久留存
 
 W1 把身份权威来源定死，W2 把这两条不可恢复错误用测试钉死，
 W3 让调度器和通道都只当 `start_run()` 的 caller。其余的（身份桶错了、

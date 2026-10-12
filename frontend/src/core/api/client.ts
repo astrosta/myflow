@@ -1,6 +1,7 @@
 import { Client } from "@langchain/langgraph-sdk";
 
 import { API_BASE_URL } from "./base";
+import { withCsrf } from "./csrf";
 import { createGapRecoveringFetch } from "./fetch-with-gap";
 import { isRunCreateRequest, sanitizeRunCreateBody } from "./run-request";
 import { isStreamingRunRequest, rewriteStreamModes } from "./stream-mode";
@@ -51,17 +52,30 @@ export function createApiClient(): Client {
       fetch: createGapRecoveringFetch(),
     },
     onRequest: (url, init) => {
-      if (typeof init.body !== "string") return init;
+      /**
+       * M9 §2：SDK 发的每一条请求也要带上会话 cookie 和 CSRF 头。
+       *
+       * - JWT 只在 HttpOnly cookie `access_token` 里（§2.4），不带 cookie 全 401
+       * - 非 GET 要带 `X-CSRF-Token`（§2.6），否则 403
+       *
+       * 这两件事不能只在自己那几个 fetch 上做：真正的业务请求（建 thread、
+       * 起 run、取消）全是 SDK 发的，漏了它整个应用在开启认证后就是一片 401。
+       */
+      const headers = new Headers(init.headers);
+      withCsrf(headers, init.method);
+      const withAuth = { ...init, headers, credentials: "same-origin" as RequestCredentials };
+
+      if (typeof init.body !== "string") return withAuth;
       const path = url.pathname;
       if (isRunCreateRequest(path)) {
         const sanitized = sanitizeRunCreateBody(init.body);
-        return sanitized === init.body ? init : { ...init, body: sanitized };
+        return sanitized === init.body ? withAuth : { ...withAuth, body: sanitized };
       }
       if (isStreamingRunRequest(path)) {
         const rewritten = rewriteStreamModes(init.body);
-        return rewritten === init.body ? init : { ...init, body: rewritten };
+        return rewritten === init.body ? withAuth : { ...withAuth, body: rewritten };
       }
-      return init;
+      return withAuth;
     },
   });
 }

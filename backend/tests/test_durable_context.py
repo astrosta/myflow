@@ -3,7 +3,7 @@
 import asyncio
 
 from langchain.agents.middleware.types import ModelRequest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agentkit.agents.middlewares.durable_context_middleware import DurableContextMiddleware
 from agentkit.agents.middlewares.message_utils import insert_after_leading_system_messages
@@ -205,3 +205,98 @@ def test_insert_after_leading_system_messages_does_not_mutate_inputs() -> None:
     assert result[2] is human
     assert messages == [system, human]
     assert len(injected) == 1
+
+def _tool_pair(tool_name: str, path: str, content: str, *, call_id: str = "call-1"):
+    """一次 read_file 的 AI tool_call + ToolMessage 对。"""
+    call = AIMessage(
+        content="",
+        id=f"ai-{call_id}",
+        tool_calls=[{"name": tool_name, "id": call_id, "args": {"path": path}}],
+    )
+    result = ToolMessage(content=content, tool_call_id=call_id, name=tool_name)
+    return [call, result]
+
+
+def test_a_skill_md_read_is_captured_without_the_body() -> None:
+    from agentkit.agents.middlewares.durable_context_middleware import extract_skills
+
+    body = "# 说明\n" + "x" * 400
+    skills = extract_skills(
+        _tool_pair("read_file", "/mnt/skills/public/pdf-processing/SKILL.md", _skill_text(body)),
+        skills_root="/mnt/skills",
+        tool_names={"read_file"},
+    )
+
+    assert len(skills) == 1
+    entry = skills[0]
+    assert entry["name"] == "pdf-processing"
+    assert entry["path"] == "/mnt/skills/public/pdf-processing/SKILL.md"
+    assert entry["description"] == "处理 PDF 文档"
+    assert len(entry["description"]) <= 240
+    assert "说明" not in entry["description"]  # 正文不进 state
+    assert "x" * 400 not in str(entry)
+
+
+def test_only_configured_tools_and_the_skills_root_are_captured() -> None:
+    from agentkit.agents.middlewares.durable_context_middleware import extract_skills
+
+    outside = _tool_pair("read_file", "/mnt/user-data/workspace/SKILL.md", _skill_text(""))
+    other_tool = _tool_pair("web_fetch", "/mnt/skills/public/x/SKILL.md", _skill_text(""))
+    not_a_skill = _tool_pair("read_file", "/mnt/skills/public/x/README.md", "hello")
+
+    assert extract_skills(outside, skills_root="/mnt/skills", tool_names={"read_file"}) == []
+    assert extract_skills(other_tool, skills_root="/mnt/skills", tool_names={"read_file"}) == []
+    assert extract_skills(not_a_skill, skills_root="/mnt/skills", tool_names={"read_file"}) == []
+
+
+def test_a_skill_md_without_frontmatter_falls_back_to_the_directory_name() -> None:
+    from agentkit.agents.middlewares.durable_context_middleware import extract_skills
+
+    skills = extract_skills(
+        _tool_pair("read", "/mnt/skills/custom/csv-tools/SKILL.md", "# 没有 frontmatter\n"),
+        skills_root="/mnt/skills",
+        tool_names={"read"},
+    )
+
+    assert skills == [
+        {"name": "csv-tools", "path": "/mnt/skills/custom/csv-tools/SKILL.md", "description": ""}
+    ]
+
+
+def _skill_text(body: str) -> str:
+    return f"---\nname: pdf-processing\ndescription: 处理 PDF 文档\n---\n{body}"
+
+
+def test_the_capture_hook_writes_skill_context_into_state() -> None:
+    middleware = DurableContextMiddleware(skills_container_path="/mnt/skills")
+    state = {
+        "messages": _tool_pair(
+            "read_file", "/mnt/skills/public/pdf-processing/SKILL.md", _skill_text("# 正文\n")
+        )
+    }
+
+    update = middleware.before_model(state, object())
+
+    assert update is not None
+    assert update["skill_context"][0]["name"] == "pdf-processing"
+
+
+def test_the_projection_renders_skill_refs_escaped() -> None:
+    middleware = DurableContextMiddleware()
+    state = {
+        "skill_context": [
+            {"name": "pdf", "path": "/mnt/skills/public/pdf/SKILL.md", "description": "<b>x</b>"}
+        ]
+    }
+    seen: dict = {}
+
+    def handler(request: ModelRequest) -> str:
+        seen["request"] = request
+        return "ok"
+
+    middleware.wrap_model_call(_request(HumanMessage(content="hi", id="u1"), **state), handler)
+
+    rendered = seen["request"].messages[1].content  # [contract, data, human]
+    assert "## Skills read so far" in rendered
+    assert "&lt;b&gt;x&lt;/b&gt;" in rendered
+    assert "<b>x</b>" not in rendered

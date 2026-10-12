@@ -18,6 +18,7 @@ from agentkit.sandbox.tools import (
     str_replace,
     write_file,
 )
+from agentkit.tools.builtin.describe_skill import describe_skill
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,8 @@ _HOST_BASH_DISABLED = (
 
 # (group, tool). Config entries with the same .name win because they are added first.
 _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
+    # L1 技能元数据：框架工具，任何策略下都可用（M7 §3.8）
+    ("skills", describe_skill),
     ("sandbox", read_file),
     ("sandbox", write_file),
     ("sandbox", str_replace),
@@ -105,9 +108,15 @@ def _configured_tools(app_config: AppConfig) -> list[ToolConfig]:
 
 
 def _load_mcp_tools(app_config: AppConfig) -> list[BaseTool]:
-    """M7 fills this in. M2 has no MCP source."""
-    del app_config
-    return []
+    """第三源：MCP（配置工具 → 内置 → MCP，按 tool.name 去重，先到先得）。"""
+    del app_config  # MCP 服务器列表在 extensions_config.json，不在 AppConfig 里
+    from agentkit.mcp.cache import get_cached_mcp_tools
+
+    try:
+        return list(get_cached_mcp_tools())
+    except Exception:
+        logger.exception("MCP tools are unavailable; continuing without them")
+        return []
 
 
 def _add_tool(tools: list[BaseTool], seen: set[str], tool: BaseTool) -> None:

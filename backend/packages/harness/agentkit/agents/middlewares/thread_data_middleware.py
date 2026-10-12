@@ -10,7 +10,7 @@ from langgraph.runtime import Runtime
 
 from agentkit.agents.thread_state import ThreadDataState
 from agentkit.config.paths import Paths, get_paths
-from agentkit.sandbox.runtime import resolve_runtime_user_id
+from agentkit.sandbox.runtime import runtime_user_bucket
 
 
 class ThreadDataMiddlewareState(AgentState):
@@ -55,7 +55,7 @@ class ThreadDataMiddleware(AgentMiddleware[ThreadDataMiddlewareState]):
     def before_agent(self, state: ThreadDataMiddlewareState, runtime: Runtime) -> dict:
         del state
         thread_id = resolve_thread_id(runtime)
-        user_id = resolve_runtime_user_id(runtime)
+        user_id = runtime_user_bucket(runtime)
         if not self._lazy_init:
             self._paths.ensure_thread_dirs(thread_id, user_id=user_id)
         return {"thread_data": self._thread_paths(thread_id, user_id)}

@@ -19,7 +19,7 @@ from agentkit.runtime.events.catalog import (
     RUN_START_EVENT,
 )
 from agentkit.runtime.events.journal import RunJournal
-from agentkit.runtime.events.store import MemoryRunEventStore
+from agentkit.persistence.events import MemoryRunEventStore
 
 MIDDLEWARE_TAGS = ["middleware:summarize", "langgraph_node"]
 

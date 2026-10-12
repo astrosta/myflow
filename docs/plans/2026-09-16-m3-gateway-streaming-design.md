@@ -1289,7 +1289,7 @@ class RunRecord:
 #### `RunStore` 接口：M3 要实现的十个方法
 
 ```python
-# agentkit/runtime/runs/store/base.py
+# agentkit/persistence/run/base.py
 ACTIVE_STATUSES = frozenset({"pending", "running"})
 
 
@@ -1405,7 +1405,7 @@ def _record_from_row(row: dict) -> RunRecord:
 #### 内存实现：原子性来自"没有 await"
 
 ```python
-# agentkit/runtime/runs/store/memory.py
+# agentkit/persistence/run/memory.py
 class MemoryRunStore(RunStore):
     def __init__(self) -> None:
         self._rows: dict[str, dict] = {}

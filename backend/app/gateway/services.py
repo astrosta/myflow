@@ -25,6 +25,7 @@ from agentkit.agents.middlewares.provenance import PROVENANCE_KEYS
 from agentkit.utils.messages import ORIGINAL_USER_CONTENT_KEY
 from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.context import RunContext
+from agentkit.runtime.secret_context import REDACTED_CONTEXT_KEYS, REQUEST_SECRETS_KEY
 from agentkit.runtime.runs import (
     DisconnectMode,
     RunManager,
@@ -55,7 +56,6 @@ from .run_models import RunCaller, RunCreateRequest, RunLaunch
 logger = logging.getLogger(__name__)
 _CLIENT_INPUT_CHANNELS = frozenset({"messages"})
 _CLIENT_MESSAGE_TYPES = frozenset({"human"})
-REQUEST_SECRETS_KEY = "secrets" 
 
 # user_role / authz_attributes：M9 的 Principal 从 runtime.context 读它们，客户端不能预置
 _DROPPED_KEYS = (
@@ -64,6 +64,9 @@ _DROPPED_KEYS = (
 )
 
 _CREDDENTIAL_METADATA_KEYS = frozenset({"auth_token"})
+
+#: 客户端可以塞进来的身份别名（§2.1 的 `_CLIENT_IDENTITY_KEYS`）。
+_CLIENT_IDENTITY_KEYS = ("user_id", "owner_id", "auth_user", "auth_user_id")
 
 # 客户端不能伪造的 additional_kwargs 键。internal 请求只保留 original_user_content。
 _SERVER_OWNED_MESSAGE_KEYS = PROVENANCE_KEYS | {
@@ -114,6 +117,9 @@ async def start_run(
     """
     app_config = get_app_config()
     ctx = services.run_context
+
+    # 客户端声明的身份一律**删掉**（不是校验后使用）：所有入口共用这一处（§2.1）
+    strip_client_identity(body)
 
     # 判断如果要取消旧run，是否有权限
     _require_cancel_capability(caller, body.multitask_strategy) 
@@ -197,6 +203,23 @@ async def start_run(
         await _abandon_unattached_run(services, record, exc)
         raise
     return RunLaunch(record=record, reused=False)
+
+def strip_client_identity(body: RunCreateRequest) -> None:
+    """就地删掉客户端声明的身份（M9 §2.1）。
+
+    `metadata` / `config.configurable` / `config.context` / `context` 四处同一条规则。
+    **不是"校验后使用"，是删掉**：唯一权威来源是服务端认证注入的
+    `runtime.context.user_id`（`inject_server_owned` 写），
+    所以这里删得越干净，下游就越不可能从 body 里再读一次。
+
+    HTTP、IM、调度、嵌入四条入口都走 `start_run`，剥身份只有这一处。
+    """
+    config = body.config if isinstance(body.config, dict) else {}
+    for bag in (body.metadata, config.get("configurable"), config.get("context"), body.context):
+        if isinstance(bag, dict):
+            for key in _CLIENT_IDENTITY_KEYS:
+                bag.pop(key, None)
+
 
 def _require_cancel_capability(caller: RunCaller, strategy: str) -> None:
     if strategy != "reject" and not caller.allows("runs:cancel"):
@@ -388,7 +411,13 @@ def _redact_secrets(value: Any) -> Any:
 def _is_redacted_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False
-    return key == REQUEST_SECRETS_KEY or key == "trace_id" or key == TRACE_METADATA_KEY or key.startswith("__")
+    return (
+        key == REQUEST_SECRETS_KEY
+        or key == "trace_id"
+        or key == TRACE_METADATA_KEY
+        or key in REDACTED_CONTEXT_KEYS  # slash 源路径 / 技能策略决策 / 激活台账（M7 §3.6）
+        or key.startswith("__")
+    )
 
 
 def _persisted_kwargs(body: RunCreateRequest) -> dict:

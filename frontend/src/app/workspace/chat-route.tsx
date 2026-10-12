@@ -1,10 +1,10 @@
 "use client";
 
-import { useRouter } from "next/navigation";
-import { useCallback } from "react";
+import { useEffect } from "react";
 
 import { useChat } from "@/core/threads/use-chat";
 
+import { useChatSession } from "./chat-session";
 import { ChatPage } from "./chat-page";
 
 /**
@@ -13,34 +13,43 @@ import { ChatPage } from "./chat-page";
  * 分开的理由是 ChatPage 只认 ChatController 这个接口，所以它可以被
  * 塞一个假的 controller 做渲染测试，而不需要跑起 SDK 和网络。
  *
- * `threadId` 为 `null` 表示"这是一个还没落地的新会话"（`/workspace`）。
- * 第一次发送时 SDK 会自己建 thread，然后走下面的 `onThreadCreated`。
+ * threadId 为 null 表示"这是一个还没落地的新会话"（/workspace）。
+ * 第一次发送时 SDK 会自己建 thread，然后回调 reportThreadCreated。
+ *
+ * **重挂载的 key 挂在 ChatSession 上，不是 ChatRoute 上**：useChat 必须待在被
+ * 重挂载的那一层里。挂在 ChatRoute 上只会重建 ChatPage，controller 里的
+ * 乐观消息、历史窗口、流状态全都原地不动 —— 看起来像重置了，其实没有。
+ *
+ * key 由两部分拼成，各自负责一件事：
+ *
+ * - epoch：**在 /workspace 上再点一次"新对话"**。地址没变、路由段没变，
+ *   只能靠它把会话清干净。
+ * - threadId：**在会话之间切换**。/workspace/chats/[thread_id] 是同一个路由段，
+ *   A → B 只是换参数，React 会复用实例——只按 epoch 做 key 的话，
+ *   A 的乐观消息和已经翻过的历史页会漏到 B 里。
+ *
+ * 新会话第一次发送时这两个都不变（地址是 replaceState 换的，threadId 恒为
+ * null、epoch 不动），所以首轮不会重挂载 —— 这正是这个模块存在的理由。
  */
 export function ChatRoute({ threadId }: { threadId: string | null }) {
-  const router = useRouter();
+  const { epoch } = useChatSession();
+  return <ChatSession key={epoch + ":" + (threadId ?? "new")} threadId={threadId} />;
+}
+
+function ChatSession({ threadId }: { threadId: string | null }) {
+  const { reportThreadCreated, setActiveThreadId } = useChatSession();
 
   /**
-   * thread 建好之后把地址换成 `/workspace/chats/{id}`。
+   * 把"当前在看哪个会话"同步给侧栏。
    *
-   * **必须走 `router.replace`，不能用 `history.replaceState`。**
-   *
-   * 我一开始用 replaceState，图的是"不重新挂载、不打断正在流的这一轮"。
-   * 但那样会造成一个**内外不一致**的状态：地址栏是 `/workspace/chats/{id}`，
-   * 而 Next 内部的路由树还停在 `/workspace`。于是侧栏那个
-   * `<a href="/workspace">新对话</a>` 点下去时，Next 一比"我已经在 /workspace 了"，
-   * 直接 no-op —— 按钮看起来完全失灵。
-   *
-   * 换成 router.replace 之后两边一致，"新对话"能正常导航。
-   * 代价是这个组件会重新挂载一次，但 `reconnectOnMount` 会重新 join
-   * 正在跑的 run（M5 §5.1 就是为这个场景设计的），所以流不会丢。
+   * 只有路由段变化（进入某个既有会话、或回到 /workspace）才会重跑 ——
+   * threadId 是这个实例的定值。会话刚建好时**不会**跑到这里把它清成 null，
+   * 因为那条路径不发导航、本实例不重挂载。
    */
-  const handleThreadCreated = useCallback(
-    (createdThreadId: string) => {
-      router.replace(`/workspace/chats/${createdThreadId}`, { scroll: false });
-    },
-    [router],
-  );
+  useEffect(() => {
+    setActiveThreadId(threadId);
+  }, [threadId, setActiveThreadId]);
 
-  const controller = useChat({ threadId, onThreadCreated: handleThreadCreated });
+  const controller = useChat({ threadId, onThreadCreated: reportThreadCreated });
   return <ChatPage controller={controller} />;
 }

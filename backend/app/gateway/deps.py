@@ -7,25 +7,67 @@ from uuid import uuid4
 
 from fastapi import Request
 
+from agentkit.persistence.engine import get_session_factory
 from agentkit.runtime.run_services import RunServices
+from backend.app.gateway.auth.errors import Unauthenticated
+from backend.app.gateway.auth.result import AuthKind, AuthResult
+from backend.app.gateway.auth.service import AuthService
+from backend.app.gateway.auth.store import make_user_store
+from backend.app.gateway.auth_middleware import require_session
 from backend.app.gateway.run_models import CallerKind, RunCaller
 
 __all__ = [
     "RunServices",
     "caller_from_request",
+    "get_auth_service",
     "get_checkpointer",
     "get_event_store",
     "get_request_id",
     "get_run_services",
     "get_run_store",
+    "get_session_auth",
     "get_thread_store",
+    "require_all_scopes",
+    "require_authenticated",
     "require_scope",
 ]
 
 
 def caller_from_request(request: Request) -> RunCaller:
-    """M3 has no auth: every HTTP caller is anonymous. M9 reads request.state.auth here."""
-    return RunCaller(kind=CallerKind.HTTP, user_id=None)
+    """M3 的匿名实现到这里换成读中间件（M9 §2.12）。**body 里的身份仍然不看。**
+
+    `auth.scopes is None` 表示会话用户或内部调用方（不按 scope 裁）；
+    PAT 带具体集合。内部调用是 `CallerKind.INTERNAL`，`user_id` 来自
+    `X-DeerFlow-Owner-User-Id`，而且那只头**只有** AuthMiddleware 读（§2.9）。
+    """
+    auth: AuthResult | None = getattr(request.state, "auth", None)
+    if auth is None:
+        return RunCaller(kind=CallerKind.HTTP, user_id=None)
+    kind = CallerKind.INTERNAL if auth.kind is AuthKind.internal else CallerKind.HTTP
+    return RunCaller(kind=kind, user_id=auth.user_id, scopes=auth.scopes, user_role=auth.role)
+
+
+def get_auth_service(request: Request) -> AuthService:
+    """进程级单例。`database.backend=memory` 时账号只活在进程内，构建一次就够。"""
+    service = getattr(request.app.state, "auth_service", None)
+    if isinstance(service, AuthService):
+        return service
+    service = AuthService(make_user_store(get_session_factory()))
+    request.app.state.auth_service = service
+    return service
+
+
+def get_session_auth(request: Request) -> AuthResult:
+    """只允许会话的路由用它（`/me`、`change-password`）。PAT → 403 `session_required`。"""
+    return require_session(getattr(request.state, "auth", None))
+
+
+def require_authenticated(request: Request) -> AuthResult:
+    """认证门的**函数版**：装在依赖里，函数体第一行不再自己判断。"""
+    auth: AuthResult | None = getattr(request.state, "auth", None)
+    if auth is None or not auth.is_authenticated:
+        raise Unauthenticated("authentication required")
+    return auth
 
 
 def get_run_services(request: Request) -> RunServices:
@@ -69,3 +111,17 @@ def require_scope(scope: str) -> Callable[[Request], RunCaller]:
 
     return _dep
 
+
+def require_all_scopes(*scopes: str) -> Callable[[Request], RunCaller]:
+    """**全部**满足才放行（M9 §2.12：定时任务路由要同时有 `threads:write` 和 `runs:create`）。"""
+
+    def _dep(request: Request) -> RunCaller:
+        from backend.app.gateway.services import RunPermissionDenied
+
+        caller = caller_from_request(request)
+        missing = [scope for scope in scopes if not caller.allows(scope)]
+        if missing:
+            raise RunPermissionDenied(f"missing scope: {', '.join(missing)}")
+        return caller
+
+    return _dep

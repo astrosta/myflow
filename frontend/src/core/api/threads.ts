@@ -1,4 +1,4 @@
-import { apiUrl } from "./base";
+import { apiFetch, apiUrl } from "./base";
 
 /**
  * Thread 的读写。
@@ -59,7 +59,7 @@ export interface ListThreadsOptions {
 }
 
 export async function listThreads(options: ListThreadsOptions = {}): Promise<Page<ThreadRow>> {
-  const { limit = 50, cursor = null, order = "desc", signal, fetchImpl = fetch } = options;
+  const { limit = 50, cursor = null, order = "desc", signal, fetchImpl = apiFetch } = options;
   const params = new URLSearchParams({ limit: String(limit), order });
   if (cursor) params.set("cursor", cursor);
 
@@ -80,7 +80,7 @@ export interface CreateThreadOptions {
 }
 
 export async function createThread(options: CreateThreadOptions = {}): Promise<ThreadRow> {
-  const { threadId = null, assistantId = null, metadata = null, signal, fetchImpl = fetch } = options;
+  const { threadId = null, assistantId = null, metadata = null, signal, fetchImpl = apiFetch } = options;
   const body: Record<string, unknown> = {};
   if (threadId) body.thread_id = threadId;
   if (assistantId) body.assistant_id = assistantId;
@@ -115,7 +115,7 @@ export async function getThreadState(
   threadId: string,
   options: { signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
 ): Promise<ThreadStateSnapshot> {
-  const { signal, fetchImpl = fetch } = options;
+  const { signal, fetchImpl = apiFetch } = options;
   const response = await fetchImpl(
     apiUrl("/threads/" + encodeURIComponent(threadId) + "/state"),
     { signal },

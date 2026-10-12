@@ -9,11 +9,11 @@ from agentkit.persistence.engine import close_engine, get_session_factory, init_
 from agentkit.persistence.recovery import RESTART_ERROR, recover_inflight_runs
 from agentkit.persistence.thread_meta import make_thread_meta_store
 from agentkit.runtime.events.catalog import LLM_HUMAN_INPUT
-from agentkit.runtime.events.store.db import DbRunEventStore
-from agentkit.runtime.events.store.memory import MemoryRunEventStore
+from agentkit.persistence.events.db import DbRunEventStore
+from agentkit.persistence.events.memory import MemoryRunEventStore
 from agentkit.runtime.runs.manager import RunManager
 from agentkit.runtime.runs.schemas import ThreadOperationKind
-from agentkit.runtime.runs.store import make_run_store
+from agentkit.persistence.run import make_run_store
 
 
 def _run(scenario) -> None:

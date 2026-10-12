@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
+from agentkit.authz import ADMIN_ROLE
 from agentkit.runtime.runs import RunRecord
 from backend.app.gateway.models.request import _THREAD_ID_PATTERN
 from backend.app.gateway.models.response import run_to_wire
@@ -133,6 +134,17 @@ class RunCaller:
         return self.kind is CallerKind.INTERNAL
     
     def allows(self,  permission: str) -> bool:
+        """能力门。
+
+        `admin` 有两个合法来源：会话用户的 `system_role`，或显式带 `admin` 的 scope 集合。
+        **PAT 永远拿不到它**——`AuthService.authenticate_pat` 会把 `admin` 从 scope 里减掉，
+        而 `PAT_SCOPE_MENU` 里根本没有这个值（§2.15"永不带 admin"）。
+        其余能力按 scope 判，`scopes=None`（会话 / 内部调用方）表示不裁。
+        """
+        if permission == ADMIN_ROLE:
+            return self.user_role == ADMIN_ROLE or (
+                self.scopes is not None and ADMIN_ROLE in self.scopes
+            )
         return self.scopes is None or permission in self.scopes
 
     @classmethod

@@ -15,7 +15,7 @@ from agentkit.runtime.checkpoint_state import (
     messages_to_events,
 )
 from agentkit.runtime.events.catalog import LLM_AI_RESPONSE, LLM_HUMAN_INPUT
-from agentkit.runtime.events.store import JsonlRunEventStore, MemoryRunEventStore
+from agentkit.persistence.events import JsonlRunEventStore, MemoryRunEventStore
 
 
 class _Snapshot:

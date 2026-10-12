@@ -17,6 +17,7 @@ STARTUP_ONLY_FIELDS: dict[str,str] = {
     "run_events.backend": "make_run_event_store() 在 lifespan 里构造一次",
     "stream_bridge.backend": "create_stream_bridge() 在 lifespan 里构造一次；换后端要重建单例",
     "sandbox.use": "get_sandbox_provider() 首次调用时按 use 创建单例；重载后的 AppConfig 不会重建它",
+    "skills.container_path": "它被编译进系统提示词的技能索引和沙箱 mount；换路径要重建沙箱视图",
 }
 
 def format_field_description(field_path: str, *, field_doc: str|None=None) -> str:

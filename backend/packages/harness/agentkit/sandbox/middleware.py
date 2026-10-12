@@ -9,7 +9,7 @@ from langgraph.runtime import Runtime
 
 from agentkit.sandbox.runtime import (
     reset_authorization_checked,
-    resolve_runtime_user_id,
+    runtime_user_bucket,
 )
 from agentkit.sandbox.sandbox_provider import get_sandbox_provider
 
@@ -51,13 +51,8 @@ def _thread_id(state: Any, runtime: Runtime) -> str | None:
 
 
 def _user_id(runtime: Runtime) -> str:
-    context = getattr(runtime, "context", None)
-    if isinstance(context, dict) and context.get("user_id"):
-        return str(context["user_id"])
-    try:
-        return resolve_runtime_user_id(runtime)  # type: ignore[arg-type]
-    except Exception:
-        return "default"
+    """与工具路径同一个解析函数（M9 §2.1）：context.user_id → ContextVar → default 桶。"""
+    return runtime_user_bucket(runtime)  # type: ignore[arg-type]
 
 
 def _existing_id(state: Any) -> str | None:

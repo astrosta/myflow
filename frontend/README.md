@@ -50,6 +50,50 @@ compose 里网关只 `expose: 8001`，不要给它加 `ports`。发布端口必�
 
 `NEXT_PUBLIC_*` 构建时内联，改了要重新 build。
 
+## 登录标识
+
+登录页那个输入框收的是 **`identifier`：邮箱或用户名**（M9 §2.4 的两个登录标识）。
+后端按"有没有 `@"分派到不同的 unique 索引——用户名不允许 `@，所以永远不歧义。
+输入框因此是 `type="text"` 而不是 `type="email"`。
+
+- 注册 / 初始化要**同时**给邮箱和用户名（用户名 3-32 位，字母/数字/下划线/点/连字符）。
+- 登录失败且后端说"这个账号还没注册"时，登录页会按输入内容给出"用这个邮箱注册"或
+  "注册这个用户名"，并把刚敲的内容带进注册页预填。
+- **改用户名**在设置面板的「账号」栏（`settings-dialog.tsx` → `updateUsername()`）：
+  发 `PATCH /api/v1/auth/me`，body 只有 `{"username": "..."}`，拿回完整的
+  `UserResponse` 直接更新本地状态（不必再拉一次 `/me`）。
+  形状校验在 `core/auth/username.ts`，规则与后端 `normalize_username` **逐条对齐**——
+  "前端说没问题、后端 422"是最难自查的一类不一致。
+  这个请求前后端各有一条**协议**测试：`auth.contract.test.ts`（发出去的形状）与
+  `test_auth_username_change.py`（收到的行为）。
+- 顶栏用户菜单显示**用户名**（`title` 里带邮箱），因为用户名才是给人看的那个名字。
+
+## 登录 / 注册的错误怎么显示
+
+后端的错误体是 `{detail, code, trace_id}`，**`code` 才是给程序看的**（M9 §2.12）。
+翻译集中在 `src/core/auth/error-messages.ts`，按 `code` 分支：
+
+- 有稳定语义的 code → 固定的中文文案（`wrong_password`、`account_disabled`……）。
+- **只有服务端才知道的细节**（邮箱是哪条规则没过、口令差几位 / 超几个字节）→ 直接展示
+  `detail`。前端算不出这些数，硬编一句"格式不对"反而更难修。
+- 认不出的 code → 显示服务端原话，不吞成一句笼统的失败。
+- `login_rate_limited` → 用响应头 `Retry-After` 说出"还有 N 秒"。
+
+登录页在 `email_not_registered` 时会多给一个「用这个邮箱注册」的入口（带 `?email=` 预填）。
+`auth.local.specific_errors=false` 的部署拿不到这个 code，入口自然不出现——
+UI 不会替用户断言"你没注册过"。
+
+### 401 不等于"会话失效"
+
+`src/core/api/unauthorized.ts` 里的 `isAuthEndpoint()` 把认证端点排除在
+`notifyUnauthorized()` 的广播之外：登录 / 注册 / 初始化 / 改密上的 401、403 是
+**"这次提交不对"**（密码错、邮箱没注册、当前密码错、注册关闭……），不是"会话没了"。
+
+不排除的表现很具体：用户在登录页点一次登录，被 AuthGuard 当成会话过期弹走，
+红框里写的是"登录状态已失效，请重新登录"——真正的原因被顶掉了。
+
+`/v1/auth/me` **不在**排除名单里：它是探活，401 就是"会话没了"，该跳登录页。
+
 ## 发送时的请求
 
 新会话会先建 thread，再开 SSE：

@@ -6,6 +6,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from agentkit.config.agents_config import AgentsConfig
+from agentkit.config.auth_config import AuthConfig
 from agentkit.config.checkpointer_config import CheckpointerConfig
 from agentkit.config.database_config import DatabaseConfig
 from agentkit.config.file_signature import ConfigSignature, get_config_signature
@@ -16,6 +17,7 @@ from agentkit.config.run_events_config import RunEventsConfig
 from agentkit.config.runs_config import RunsConfig
 from agentkit.config.runtime_paths import existing_project_file
 from agentkit.config.sandbox_config import SandboxConfig
+from agentkit.config.skills_config import SkillsConfig
 from agentkit.config.stream_config import StreamBridgeConfig
 from agentkit.config.summarization_config import SummarizationConfig
 from agentkit.config.title_config import TitleConfig
@@ -31,8 +33,10 @@ class AppConfig(BaseModel):
         ge=1,
         description="Hard server-side ceiling for a client-supplied run recursion_limit. Client values above this are clamped; prevents runaway LangGraph super-steps (LLM cost / DoS).",
     )
+    auth: AuthConfig = Field(default_factory=AuthConfig)
     checkpointer: CheckpointerConfig = Field(default_factory=CheckpointerConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
     run_events: RunEventsConfig = Field(default_factory=RunEventsConfig)

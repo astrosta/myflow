@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any, Literal
 
 from agentkit.runtime.events.catalog import LLM_AI_RESPONSE, LLM_HUMAN_INPUT, LLM_TOOL_RESULT
-from agentkit.runtime.events.store.base import RunEventStore
+from agentkit.persistence.events.base import RunEventStore
 
 CHECKPOINT_SEED_RUN_ID = "checkpoint-seed"
 ChannelMode = Literal["full", "delta"]

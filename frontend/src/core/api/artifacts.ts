@@ -1,5 +1,5 @@
 import { ARTIFACT_PREVIEW_MAX_BYTES } from "../types";
-import { apiUrl } from "./base";
+import { apiFetch, apiUrl } from "./base";
 
 /**
  * Artifact 预览（M5 §6.5）。
@@ -56,7 +56,7 @@ export async function fetchArtifactPreview(
   path: string,
   options: FetchArtifactOptions = {},
 ): Promise<ArtifactPreview> {
-  const { limitBytes = ARTIFACT_PREVIEW_MAX_BYTES, signal, fetchImpl = fetch } = options;
+  const { limitBytes = ARTIFACT_PREVIEW_MAX_BYTES, signal, fetchImpl = apiFetch } = options;
   const headers: Record<string, string> = {};
   if (limitBytes !== null) headers.Range = `bytes=0-${limitBytes - 1}`;
 

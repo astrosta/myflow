@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from agentkit.config.model_config import ModelConfig
 from agentkit.persistence.base import iso_utc
@@ -213,3 +213,41 @@ def _wire_time(value: Any) -> str | None:
     if value in (None, ""):
         return None
     return str(value)
+
+# ---------------------------------------------------------------------------
+# M7 §2.4：MCP 配置与技能目录
+# ---------------------------------------------------------------------------
+
+
+class SkillResponse(BaseModel):
+    """category 是 public / custom，不是磁盘路径。
+
+    enabled 是**有效状态** = 全局启用 and 个人偏好；global_enabled 只在
+    admin 传 ?scope=global 时回填（§2.4 的两层开关）。
+    """
+
+    name: str
+    description: str
+    category: Literal["public", "custom"]
+    enabled: bool
+    global_enabled: bool | None = None
+
+
+class SkillsListResponse(BaseModel):
+    skills: list[SkillResponse]
+
+
+class SkillReloadResponse(BaseModel):
+    reloaded: bool = True  # 只表示这个 worker
+
+
+class McpCacheResetResponse(BaseModel):
+    reset: bool = True  # 只表示这个 worker
+
+
+class McpConfigResponse(BaseModel):
+    """GET/PUT/PATCH /api/mcp/config 的形状。值已经打码，函数里没有原始凭据。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    mcp_servers: dict[str, dict[str, Any]] = Field(alias="mcpServers")

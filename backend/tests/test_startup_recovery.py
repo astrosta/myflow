@@ -10,12 +10,13 @@ from types import SimpleNamespace
 import pytest
 
 from agentkit.config.app_config import AppConfig
+from agentkit.config.auth_config import AuthConfig
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine
 from agentkit.persistence.recovery import RESTART_ERROR, recover_inflight_runs
 from agentkit.persistence.thread_meta import make_thread_meta_store
-from agentkit.runtime.events.store.memory import MemoryRunEventStore
+from agentkit.persistence.events.memory import MemoryRunEventStore
 from agentkit.runtime.runs.schemas import RunStatus, ThreadOperationKind
-from agentkit.runtime.runs.store import make_run_store
+from agentkit.persistence.run import make_run_store
 from agentkit.runtime.runs.worker import _finalize
 from backend.app.gateway import app as gateway_app
 
@@ -128,7 +129,10 @@ def test_rejected_completion_does_not_mark_the_thread() -> None:
 
 def test_lifespan_closes_the_engine_after_the_checkpointer(monkeypatch: pytest.MonkeyPatch) -> None:
     order: list[str] = []
-    monkeypatch.setattr(gateway_app, "get_app_config", lambda: AppConfig())
+    # 这两个用例测的是引擎 / checkpointer 的关闭顺序；把认证显式关掉（§2.11）。
+    monkeypatch.setattr(
+        gateway_app, "get_app_config", lambda: AppConfig(auth=AuthConfig(enabled=False))
+    )
 
     real_init = gateway_app.init_engine_from_config
     real_make = gateway_app.make_checkpointer
@@ -173,7 +177,10 @@ def test_lifespan_closes_the_engine_after_the_checkpointer(monkeypatch: pytest.M
 
 def test_recovery_error_fails_startup_and_still_closes_the_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     closed = []
-    monkeypatch.setattr(gateway_app, "get_app_config", lambda: AppConfig())
+    # 这两个用例测的是引擎 / checkpointer 的关闭顺序；把认证显式关掉（§2.11）。
+    monkeypatch.setattr(
+        gateway_app, "get_app_config", lambda: AppConfig(auth=AuthConfig(enabled=False))
+    )
 
     async def recover(run_store, thread_meta, *, gateway_workers=1) -> int:
         raise RuntimeError("orphan")

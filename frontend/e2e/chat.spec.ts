@@ -193,6 +193,21 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Expose-Headers": "Content-Location,Content-Type",
 };
 
+/**
+ * 认证探活的固定返回（M9 §2.5）。
+ *
+ * SessionGate / AuthGuard / UserMenu **各自持有一份 useSession()**，进工作区时
+ * 会各发一次 GET /v1/auth/me。这几条不 mock 的话，用例末尾那句
+ * expect(backend.unhandled).toEqual([]) 会红，而且红得很难看懂 ——
+ * 报错是一串 auth 路径，和被测的聊天行为毫无关系。
+ */
+const AUTH_USER = {
+  id: "u-e2e-1",
+  email: "e2e@local.test",
+  username: "e2e",
+  system_role: "user",
+};
+
 class MockGateway {
   readonly threadId = THREAD_ID;
   readonly runId = RUN_ID;
@@ -411,6 +426,17 @@ class MockGateway {
         },
       };
     }
+    // ---- 认证（工作区外壳进入时必发，见 AUTH_USER 的注释）----
+    if (pathname === "/api/v1/auth/me") {
+      return { status: 200, body: AUTH_USER };
+    }
+    if (pathname === "/api/v1/auth/providers") {
+      return { status: 200, body: { local: true } };
+    }
+    if (pathname === "/api/v1/auth/logout") {
+      return { status: 200, body: { ok: true } };
+    }
+
     if (pathname === "/api/info") return { status: 200, body: {} };
     if (pathname === "/api/assistants" || pathname === "/api/assistants/search") {
       return { status: 200, body: [] };

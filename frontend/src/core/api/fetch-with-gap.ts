@@ -1,4 +1,5 @@
 import type { StreamGapFrame } from "../types";
+import { notifyUnauthorized, shouldBroadcastUnauthorized } from "./unauthorized";
 import {
   DEFAULT_MAX_RECOVERIES,
   StreamRecoveryExhaustedError,
@@ -114,6 +115,8 @@ export function createGapRecoveringFetch(options: GapRecoveringFetchOptions = {}
 
   const wrapped = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const response = await baseFetch(input, init);
+    // SDK 发的请求走这里而不是 apiFetch，未授权广播也要接一下
+    if (shouldBroadcastUnauthorized(response.status, String(input))) notifyUnauthorized();
     if (!isEventStream(response)) return response;
 
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;

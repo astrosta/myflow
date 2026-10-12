@@ -9,6 +9,9 @@ dependencies = [
     "agentkit",
     "fastapi>=0.141.1",
     "python-multipart>=0.0.20",
+    # M9 §2：密码哈希与 JWT。都是 app 层依赖——harness 不认识账号表。
+    "bcrypt>=4.1",
+    "PyJWT>=2.8",
 ]
 
 [project.optional-dependencies]

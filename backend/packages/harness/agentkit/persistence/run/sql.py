@@ -12,7 +12,7 @@ from agentkit.persistence.base import decode_keyset_cursor, encode_keyset_cursor
 from agentkit.persistence.json_compat import json_value_matches
 from agentkit.persistence.run.model import RunRow
 from agentkit.runtime.runs.schemas import RunStatus
-from agentkit.runtime.runs.store.base import ACTIVE_STATUSES, RunStore
+from agentkit.persistence.run.base import ACTIVE_STATUSES, RunStore
 from agentkit.runtime.user_context import AUTO, resolve_user_id
 
 TERMINAL_STATUSES = ("success", "error", "timeout", "interrupted")

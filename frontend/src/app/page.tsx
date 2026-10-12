@@ -54,12 +54,6 @@ export default function LandingPage() {
             >
               进入工作区
             </Link>
-            <Link
-              className="inline-flex h-10 items-center rounded-md border border-neutral-300 px-5 text-sm font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900"
-              href="/login"
-            >
-              查看登录页
-            </Link>
           </div>
         </section>
 

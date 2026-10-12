@@ -13,7 +13,7 @@ from agentkit.agents.middlewares.summarization_middleware import (
 )
 from agentkit.agents.thread_state import get_thread_state_schema
 from agentkit.runtime.runs.manager import RunManager
-from agentkit.runtime.runs.store.memory import MemoryRunStore
+from agentkit.persistence.run.memory import MemoryRunStore
 from agentkit.runtime.runs.worker import build_state_mutation_graph
 
 

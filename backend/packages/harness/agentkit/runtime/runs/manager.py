@@ -20,7 +20,7 @@ from agentkit.runtime.runs.schemas import (
     CancelOutcome,
     InvalidRunTransition,
 )
-from agentkit.runtime.runs.store import RunStore
+from agentkit.persistence.run import RunStore
 from agentkit.runtime.runs.totals import RunTotals
 from agentkit.utils.ids import new_run_id
 

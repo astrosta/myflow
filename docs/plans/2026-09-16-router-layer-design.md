@@ -411,7 +411,7 @@ async def list_messages(
     services: Annotated[RunServices, Depends(get_run_services)],
 ) -> Page[MessageResponse]:
     await _require_visible_thread(services, thread_id, caller)
-    rows = await services.event_store.list_messages(          # agentkit/runtime/events/store/base.py
+    rows = await services.event_store.list_messages(          # agentkit/persistence/events/base.py
         thread_id,
         limit=params.limit + 1,
         before_seq=params.before_seq,
@@ -1658,7 +1658,7 @@ async def search_page(
 # 前面再加 order 的一个字符（"d" / "a"），这样客户端中途改 order 会在 _parse_cursor 里变成 InvalidCursor，而不是漏行。
 ```
 
-`RunStore.list_by_thread` 的所属文件是 `agentkit/persistence/run/sql.py`（接口声明在 `agentkit/runtime/runs/store/base.py`）。游标解析失败抛 `InvalidCursor`（`agentkit/persistence/base.py`），路由不 `except`。
+`RunStore.list_by_thread` 的所属文件是 `agentkit/persistence/run/sql.py`（接口声明在 `agentkit/persistence/run/base.py`）。游标解析失败抛 `InvalidCursor`（`agentkit/persistence/base.py`），路由不 `except`。
 
 ---
 

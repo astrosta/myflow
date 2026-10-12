@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from agentkit.config import AppConfig, ModelConfig
 from backend.app.gateway.app import install_error_handlers, install_middleware
+from backend.app.gateway.auth import AuthSettings
 from backend.app.gateway.routers import models
 
 
@@ -27,7 +28,9 @@ def _model(name: str, **overrides) -> ModelConfig:
 
 def _client(configs: list[ModelConfig]) -> TestClient:
     application = FastAPI(redirect_slashes=False)
-    install_middleware(application)
+    # M9 §2.11：这些用例测的是业务路由，不是认证门；显式钉住"认证关闭"，
+    # 免得结果取决于仓库里有没有 config.yaml。
+    install_middleware(application, auth_settings=AuthSettings.disabled())
     install_error_handlers(application)
     application.include_router(models.router, prefix="/api")
     application.dependency_overrides.clear()

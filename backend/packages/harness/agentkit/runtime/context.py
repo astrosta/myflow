@@ -13,8 +13,8 @@ from agentkit.config import AppConfig
 
 if TYPE_CHECKING:
     from agentkit.persistence.thread_meta.base import ThreadMetaStore
-    from agentkit.runtime.events.store.base import RunEventStore
-    from agentkit.runtime.runs.store.base import RunStore
+    from agentkit.persistence.events.base import RunEventStore
+    from agentkit.persistence.run.base import RunStore
     from agentkit.runtime.runs.worker import AgentFactory
 
 _PER_RUN_FIELDS = frozenset({

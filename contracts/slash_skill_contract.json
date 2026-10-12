@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "name_pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+  "command_pattern": "^/([a-z0-9]+(?:-[a-z0-9]+)*)(?:\\s+|$)",
+  "reserved_names": [
+    "agent",
+    "bootstrap",
+    "goal",
+    "help",
+    "memory",
+    "models",
+    "new",
+    "status"
+  ],
+  "notes": [
+    "只认行首：前导空白不是斜杠激活",
+    "名字之后必须是空白或输入结束；/pdf-processingX 不是斜杠激活",
+    "保留名是频道命令，永远不当技能"
+  ]
+}

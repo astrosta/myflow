@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 
 from agentkit.runtime.events.catalog import LLM_HUMAN_INPUT
-from agentkit.runtime.events.store import JsonlRunEventStore
+from agentkit.persistence.events import JsonlRunEventStore
 
 
 def _event(run_id: str, content: str) -> dict:

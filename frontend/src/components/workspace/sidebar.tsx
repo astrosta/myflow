@@ -10,12 +10,23 @@ import { cn, formatTimestamp } from "@/lib/utils";
  * 侧栏不自己取数，是因为"列表怎么来的"（分页、失效、乐观插入）属于
  * 服务端状态，应该由 TanStack Query 在容器里管；这里只负责画出来。
  */
+const NEW_CHAT_CLASS =
+  "flex h-9 w-full items-center justify-center rounded-md border border-neutral-300 bg-white text-xs font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900";
+
 export interface SidebarProps {
   threads: readonly ThreadSummary[];
   activeThreadId?: string | null;
   loading?: boolean;
   error?: string | null;
   onRefresh?: () => void;
+  /**
+   * "新对话"。传了才渲染成按钮。
+   *
+   * 不传就退回 <Link href="/workspace">：地址是 history.replaceState 换的，
+   * Next 的路由树仍停在 /workspace，那个 Link 在新会话里会被判定成
+   * "已经在这儿"而空转 —— 所以真实调用点必须走这个回调。
+   */
+  onNewChat?: () => void;
   className?: string;
 }
 
@@ -25,6 +36,7 @@ export function Sidebar({
   loading = false,
   error = null,
   onRefresh,
+  onNewChat,
   className,
 }: SidebarProps) {
   return (
@@ -48,12 +60,15 @@ export function Sidebar({
       </div>
 
       <div className="px-3 pb-3">
-        <Link
-          className="flex h-9 w-full items-center justify-center rounded-md border border-neutral-300 bg-white text-xs font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900"
-          href="/workspace"
-        >
-          ＋ 新对话
-        </Link>
+        {onNewChat ? (
+          <button className={NEW_CHAT_CLASS} onClick={onNewChat} type="button">
+            ＋ 新对话
+          </button>
+        ) : (
+          <Link className={NEW_CHAT_CLASS} href="/workspace">
+            ＋ 新对话
+          </Link>
+        )}
       </div>
 
       <nav className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">

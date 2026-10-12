@@ -2,7 +2,7 @@
 
 import { useStream } from "@langchain/langgraph-sdk/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { toChatMessages } from "../api/adapt";
 import { getApiClient } from "../api/client";
@@ -81,6 +81,13 @@ export function useChat({
    * （见 chat-route），组件不会重建，所以只能在这里接住。
    */
   const [createdThreadId, setCreatedThreadId] = useState<string | null>(null);
+
+  /**
+   * 地址只落地一次。`onCreated` 每起一个 run 都会回调，而"把新会话的地址写进 URL"
+   * 只在第一个 run 需要——后续 run 的地址已经是它了。
+   */
+  const navigatedRef = useRef(false);
+
   const effectiveThreadId = threadId ?? createdThreadId;
   const hasThread = effectiveThreadId !== null;
   const client = useMemo(() => getApiClient(), []);
@@ -143,7 +150,35 @@ export function useChat({
     onThreadId: (newThreadId) => {
       setCreatedThreadId(newThreadId);
       queryClient.invalidateQueries({ queryKey: ["threads"] });
-      onThreadCreated?.(newThreadId);
+      // 这里**不发导航**，原因见下面 onCreated 的注释
+    },
+    /**
+     * §5.1：**改地址必须等到 run 真正建立**，不能放在 `onThreadId`。
+     *
+     * 新会话第一次发送时 `/workspace` → `/workspace/chats/{id}` 是跨路由段的
+     * 导航，ChatRoute 整棵子树会重新挂载。重挂载本身没问题——SDK 的
+     * `reconnectOnMount` 就是为它设计的：新实例从 sessionStorage 读
+     * `lg:stream:{threadId}` 拿到 run_id，再 `joinStream` 把流接回来。
+     *
+     * 问题出在**读的时机**。`reconnectKey` 是个 `useMemo`，依赖只有
+     * `runMetadataStorage` / `stream.isLoading` / `threadId`——它在 mount 时求值
+     * 一次，之后 storage 再变化**不会让它重算**。而那个键是在 `runs/stream`
+     * 建立之后才写进去的（SDK 内部先写 storage、再回调 `onCreated`）。
+     *
+     * 所以只要在 `onThreadId` 那一刻导航（它由 `threads.create()` 返回触发，
+     * 早于 run 的建立），新实例 mount 时 storage 还是空的 → `reconnectKey`
+     * 求值成 undefined → **join 永远不会发生**。表现就是：乐观消息随旧实例
+     * 一起没了，历史页又是空的，界面退回欢迎页；要等旧实例（虽然已卸载，
+     * 但 fetch 没被 abort）的 `onFinish` 失效 `["messages"]`、把账本重拉回来
+     * 才恢复——实测约 2.6 秒的空窗。
+     *
+     * 放到 `onCreated` 就对齐了：这个回调点就在 storage 写入之后。
+     */
+    onCreated: (run) => {
+      // 已存在的会话不需要改地址（threadId 就是当前路由段）；新会话只写一次
+      if (threadId !== null || navigatedRef.current) return;
+      navigatedRef.current = true;
+      onThreadCreated?.(run.thread_id);
     },
     onUpdateEvent: (data, { mutate }) => {
       // §3.2：无关的帧要在调用 SDK 的状态改写器**之前**就拒掉

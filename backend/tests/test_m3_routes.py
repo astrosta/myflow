@@ -13,6 +13,7 @@ from agentkit.persistence.thread_meta.memory import MemoryThreadMetaStore
 from agentkit.runtime.runs import CancelOutcome, DisconnectMode, RunRecord, RunStatus
 from backend.app.gateway.app import app as gateway
 from backend.app.gateway.app import create_app, install_error_handlers, install_middleware
+from backend.app.gateway.auth import AuthSettings
 from backend.app.gateway.routers import thread_runs, threads
 from backend.app.gateway.run_models import RunCaller, RunLaunch
 
@@ -46,6 +47,24 @@ EXPECTED_ROUTES = {
     ("POST", "/api/threads/{thread_id}/uploads"),
     ("DELETE", "/api/threads/{thread_id}/uploads/{filename}"),
     ("GET", "/api/threads/{thread_id}/artifacts/{path:path}"),
+    # M7 §2.4：MCP 配置与技能目录（没有 PUT /config：整份替换属"创建"，M7 不注册）
+    ("GET", "/api/mcp/config"),
+    ("PATCH", "/api/mcp/config"),
+    ("POST", "/api/mcp/cache/reset"),
+    ("GET", "/api/skills"),
+    ("POST", "/api/skills/reload"),
+    ("PUT", "/api/skills/{name}/preference"),
+    ("PATCH", "/api/skills/{name}"),
+    # M9 §2.12：认证（prefix=/v1/auth，/api 由 create_app 加）
+    ("GET", "/api/v1/auth/setup-status"),
+    ("POST", "/api/v1/auth/initialize"),
+    ("POST", "/api/v1/auth/login/local"),
+    ("POST", "/api/v1/auth/register"),
+    ("POST", "/api/v1/auth/logout"),
+    ("GET", "/api/v1/auth/providers"),
+    ("GET", "/api/v1/auth/me"),
+    ("PATCH", "/api/v1/auth/me"),
+    ("POST", "/api/v1/auth/change-password"),
 }
 
 STREAMING_PATHS = {
@@ -199,7 +218,9 @@ def _services() -> SimpleNamespace:
 
 def _client(services: SimpleNamespace) -> TestClient:
     application = FastAPI(redirect_slashes=False)
-    install_middleware(application)
+    # M9 §2.11：这些用例测的是业务路由，不是认证门；显式钉住"认证关闭"，
+    # 免得结果取决于仓库里有没有 config.yaml。
+    install_middleware(application, auth_settings=AuthSettings.disabled())
     install_error_handlers(application)
     application.include_router(threads.router, prefix="/api")
     application.include_router(thread_runs.router, prefix="/api")

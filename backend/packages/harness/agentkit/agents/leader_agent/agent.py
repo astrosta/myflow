@@ -17,6 +17,7 @@ from agentkit.agents.leader_agent.runtime_keys import (
 from agentkit.agents.thread_state import ThreadState
 from agentkit.config import AppConfig, get_app_config
 from agentkit.models import create_chat_model
+from agentkit.runtime.user_context import resolve_runtime_user_id
 from agentkit.tools import get_available_tools
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ def assemble_agent(
     cfg = (config or {}).get("configurable", {})
     resolved_config = app_config or get_app_config()
 
+    user_id = _resolve_user_id(config)
     requested_model  = _resolve_runtime_option(cfg, "model_name", None, resolved_config.agents.default_model)
     thinking_enabled = _resolve_runtime_option(cfg, "thinking_enabled", None, False)
 
@@ -96,14 +98,15 @@ def assemble_agent(
         cfg=cfg,
     )
 
-    # 组中间件
-    middleware = build_middlewares(config, app_config=resolved_config)
+    # 组中间件（M6 §3.2 的顺序；M7 §3.9 的技能槽位在 assembly 里）
+    middleware = build_middlewares(config, app_config=resolved_config, user_id=user_id)
 
     # 渲染系统提示词
     system_prompt = apply_prompt_template(
         agent_name=_resolve_runtime_option(cfg, "agent_name", None, None),
         subagent_enabled=_resolve_runtime_option(cfg, "subagent_enabled", None, False),
         app_config=resolved_config,
+        user_id=user_id,
     )
 
     graph = _compile_agent(model=model, tools=tools, middleware=middleware, system_prompt=system_prompt, state_schema=ThreadState, checkpointer=checkpointer)
@@ -156,8 +159,30 @@ def _negotiate_thinking(model_name: str, thinking_enabled: bool, app_config: App
 def apply_tool_filter(tools: list, cfg: dict) -> list:
     return list(tools)
 
-def build_middlewares(config: RunnableConfig, *, app_config: AppConfig | None = None) -> list:
-    return []
+def build_middlewares(
+    config: RunnableConfig,
+    *,
+    app_config: AppConfig | None = None,
+    user_id: str | None = None,
+) -> list:
+    """lead 的完整中间件链。顺序与槽位注释都在 middlewares/assembly.py。"""
+    from agentkit.agents.middlewares.assembly import build_middlewares as _assemble
+
+    resolved = app_config or get_app_config()
+    cfg = (config or {}).get("configurable", {})
+    model_name = _resolve_runtime_option(cfg, "model_name", None, resolved.agents.default_model)
+    return _assemble(config, model_name, app_config=resolved, user_id=user_id)
+
+
+def _resolve_user_id(config: RunnableConfig) -> str | None:
+    """user_id 是服务端注入的：只从 context 读，不从 configurable 读（M6 §4.1）。
+
+    走 M9 §2.1 的**同一条**优先级链（context → 请求 ContextVar），
+    否则会出现"图构建和中间件落进不同用户桶"——多用户下才现形的那类 bug。
+    都没有时返回 None：M7 的 skills_prefs 用 None 表示 `__default__` 桶。
+    """
+    context = (config or {}).get("context")
+    return resolve_runtime_user_id(context if isinstance(context, Mapping) else None)
 
 def _compile_agent(*, model, tools, middleware, system_prompt, state_schema, checkpointer):
     kwargs = dict(

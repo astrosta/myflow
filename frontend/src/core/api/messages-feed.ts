@@ -1,6 +1,6 @@
 import type { ChatMessage, MessageType } from "../types";
 import type { MessagePage } from "../messages/history";
-import { apiUrl } from "./base";
+import { apiFetch, apiUrl } from "./base";
 
 /**
  * 分页拉取的消息 feed（M5 §4.1 的"持久化历史"那一列）。
@@ -38,6 +38,24 @@ export interface FeedMessage {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * 用户消息的**原文**。
+ *
+ * M6 的输入净化中间件会把用户输入包进 `--- BEGIN USER INPUT ---` 防护框再喂给模型
+ * （`input_sanitization_middleware.py`），而账本里记的正是喂给模型的那一份。
+ * 那层框是给模型看的，不该出现在界面上——原文存在
+ * `additional_kwargs.original_user_content`（first-writer-wins）。
+ */
+export const ORIGINAL_USER_CONTENT_KEY = "original_user_content";
+
+function originalUserContent(value: unknown): string | null {
+  if (!isRecord(value)) return null;
+  const kwargs = value.additional_kwargs;
+  if (!isRecord(kwargs)) return null;
+  const original = kwargs[ORIGINAL_USER_CONTENT_KEY];
+  return typeof original === "string" && original ? original : null;
+}
 
 /** content 是 str | dict（journal 的 _message_content 保证），但再兜一层 */
 function normalizeContent(value: unknown): ChatMessage["content"] {
@@ -80,7 +98,8 @@ export function feedMessageToChatMessage(row: FeedMessage): ChatMessage | null {
   const message: ChatMessage = {
     id: innerId ?? "evt-" + String(row.seq),
     type,
-    content: normalizeContent(row.content),
+    // 人类消息优先显示原文，别把给模型看的防护框渲染出来
+    content: (type === "human" ? originalUserContent(row.content) : null) ?? normalizeContent(row.content),
     seq: typeof row.seq === "number" ? row.seq : null,
     run_id: row.run_id ?? null,
     created_at: row.created_at ?? null,
@@ -136,7 +155,7 @@ export async function fetchMessagePage(
   threadId: string,
   options: FetchMessagePageOptions = {},
 ): Promise<MessagePage> {
-  const { limit = DEFAULT_PAGE_SIZE, beforeSeq = null, afterSeq = null, signal, fetchImpl = fetch } = options;
+  const { limit = DEFAULT_PAGE_SIZE, beforeSeq = null, afterSeq = null, signal, fetchImpl = apiFetch } = options;
   const params = new URLSearchParams({ limit: String(limit) });
   if (beforeSeq !== null) params.set("before_seq", String(beforeSeq));
   if (afterSeq !== null) params.set("after_seq", String(afterSeq));

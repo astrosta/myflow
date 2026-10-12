@@ -12,10 +12,10 @@ from sqlalchemy.exc import IntegrityError
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine
 from agentkit.persistence.models.run_event import RunEventRow
 from agentkit.runtime.events.catalog import LLM_HUMAN_INPUT
-from agentkit.runtime.events.store import JsonlRunEventStore, MemoryRunEventStore
-from agentkit.runtime.events.store.base import RunEventSeqConflict
-from agentkit.runtime.events.store.db import DbRunEventStore
-from agentkit.runtime.events.store.jsonl import os as jsonl_os
+from agentkit.persistence.events import JsonlRunEventStore, MemoryRunEventStore
+from agentkit.persistence.events.base import RunEventSeqConflict
+from agentkit.persistence.events.db import DbRunEventStore
+from agentkit.persistence.events.jsonl import os as jsonl_os
 
 
 def _run(scenario) -> None:

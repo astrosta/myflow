@@ -11,7 +11,7 @@ import pytest
 from agentkit.config.run_events_config import RunEventsConfig
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine
 from agentkit.runtime.events.catalog import LLM_HUMAN_INPUT, RUN_START_EVENT
-from agentkit.runtime.events.store import (
+from agentkit.persistence.events import (
     DbRunEventStore,
     JsonlRunEventStore,
     MemoryRunEventStore,

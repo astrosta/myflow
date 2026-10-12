@@ -390,6 +390,11 @@ class AgentClient:
         configurable["thread_id"] = thread_id
         configurable["checkpoint_ns"] = overrides.get("checkpoint_ns", "")
         config: dict[str, Any] = {"configurable": configurable}
+        # 身份也要进 config：工具/中间件读 `config["context"]`，图装配读的是**同一处**
+        # （M9 §2.1）。少了这一行，装配侧只能落到 ContextVar → None（skills prefs 变成
+        # `__default__` 桶），而运行期那一侧是 `default`——"图构建和中间件落进不同用户桶"
+        # 正是这条线上最典型的 bug，而且单用户测试完全看不出来。
+        config["context"] = {"thread_id": thread_id, "user_id": self._resolve_user_id()}
         if "recursion_limit" in overrides:
             config["recursion_limit"] = overrides["recursion_limit"]
         return config

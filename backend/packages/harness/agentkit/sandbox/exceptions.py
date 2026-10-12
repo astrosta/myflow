@@ -19,3 +19,7 @@ class SandboxNotFoundError(SandboxError):
 
 class SandboxTimeoutError(SandboxError):
     """A command exceeded its wall-clock timeout and its process tree was killed."""
+
+
+class SandboxAuthorizationError(SandboxError):
+    """AuthzProvider 拒绝了这次 acquire / reuse（M9 §2.10）。fail-closed。"""

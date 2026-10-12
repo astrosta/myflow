@@ -28,8 +28,8 @@ from agentkit.runtime.events.catalog import (
     RUN_START_EVENT,
     RunEventDefinition,
 )
-from agentkit.runtime.events.store.base import RunEventStore
-from agentkit.runtime.events.store.codec import limit_trace
+from agentkit.persistence.events.base import RunEventStore
+from agentkit.persistence.events.codec import limit_trace
 
 MIDDLEWARE_TAG_PREFIX = "middleware:"
 LEAD_CALLER = "lead"

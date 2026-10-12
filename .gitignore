@@ -218,3 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 .myflow
+
+# M7：API 可写的运行时配置（含凭据）。模板见 extensions_config.example.json。
+extensions_config.json
+.extensions_config.json.lock
+skills_prefs.json
+.skills_prefs.json.lock

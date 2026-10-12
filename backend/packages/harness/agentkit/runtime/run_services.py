@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from agentkit.runtime.context import RunContext
-from agentkit.runtime.events.store.base import RunEventStore
+from agentkit.persistence.events.base import RunEventStore
 from agentkit.runtime.runs.manager import RunManager
-from agentkit.runtime.runs.store.base import RunStore
+from agentkit.persistence.run.base import RunStore
 from agentkit.runtime.stream_bridge.base import StreamBridge
 from agentkit.runtime.stream_bridge.provider import create_stream_bridge
 
