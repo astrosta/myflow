@@ -5,11 +5,14 @@
 export interface UserSettings {
   /** `config.yaml` 里 `models[].name` 之一；null = 用服务端默认 */
   modelName: string | null;
+  /** 推理等级 id（`models[].reasoning_efforts[].id`）；null = 不指定，交给 provider */
+  reasoningEffort: string | null;
   thinkingEnabled: boolean;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
   modelName: null,
+  reasoningEffort: null,
   thinkingEnabled: true,
 };
 
@@ -38,6 +41,8 @@ export function parseSettings(raw: string | null): UserSettings {
     const parsed = JSON.parse(raw) as Partial<UserSettings>;
     return {
       modelName: typeof parsed.modelName === "string" ? parsed.modelName : null,
+      reasoningEffort:
+        typeof parsed.reasoningEffort === "string" ? parsed.reasoningEffort : null,
       thinkingEnabled:
         typeof parsed.thinkingEnabled === "boolean"
           ? parsed.thinkingEnabled

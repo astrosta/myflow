@@ -108,6 +108,30 @@ def test_metadata_fields_are_not_passed_to_constructor(install_model_class):
         assert key not in kwargs
 
 
+def test_reasoning_effort_is_passed_only_when_the_model_publishes_levels(install_model_class):
+    build_model(
+        install_model_class,
+        app_config=make_app_config(
+            supports_reasoning_effort=True, reasoning_efforts=["low", "high"]
+        ),
+        reasoning_effort="high",
+    )
+    assert RecordingChatModel.last_init_kwargs["reasoning_effort"] == "high"
+
+    build_model(install_model_class, reasoning_effort="high")
+    assert "reasoning_effort" not in RecordingChatModel.last_init_kwargs
+
+
+def test_reasoning_efforts_stay_metadata_only(install_model_class):
+    build_model(
+        install_model_class,
+        app_config=make_app_config(reasoning_efforts=["low", {"id": "high", "label": "高"}]),
+    )
+    kwargs = RecordingChatModel.last_init_kwargs
+    assert "reasoning_efforts" not in kwargs
+    assert "reasoning_effort" not in kwargs
+
+
 def test_model_overrides_ignore_none_then_later_step_can_drop_them(install_model_class, monkeypatch):
     snapshots: list[dict[str, Any]] = []
     original = factory_mod._apply_stream_chunk_timeout_default

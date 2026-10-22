@@ -86,14 +86,22 @@ def assemble_agent(
     user_id = _resolve_user_id(config)
     requested_model  = _resolve_runtime_option(cfg, "model_name", None, resolved_config.agents.default_model)
     thinking_enabled = _resolve_runtime_option(cfg, "thinking_enabled", None, False)
+    requested_effort = _resolve_runtime_option(cfg, "reasoning_effort", None, None)
     subagent_enabled = bool(_resolve_runtime_option(cfg, "subagent_enabled", None, False))
 
     # 能力协商
     model_name = _effective_model_name(requested_model, resolved_config)
     thinking_enabled = _negotiate_thinking(model_name, thinking_enabled, resolved_config)
+    reasoning_effort = _negotiate_reasoning_effort(model_name, requested_effort, resolved_config)
 
     # 建立模型
-    model = create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_config, attach_tracing=False)
+    model = create_chat_model(
+        name=model_name,
+        thinking_enabled=thinking_enabled,
+        reasoning_effort=reasoning_effort,
+        app_config=resolved_config,
+        attach_tracing=False,
+    )
 
     # M8 §10.1：进程级共享的容量控制器。**同一个实例**要喂给 task 闭包、Limit 中间件、执行器，
     # 否则每个 run 一套各 3 槽的控制器，上限形同虚设。
@@ -221,10 +229,34 @@ def _effective_model_name(requested: str | None, app_config: AppConfig) -> str:
 
 
 def _negotiate_thinking(model_name: str, thinking_enabled: bool, app_config: AppConfig) -> bool:
-    if thinking_enabled and not app_config.models.get(model_name).supports_thinking:
+    if not thinking_enabled:
+        return False
+    model_config = app_config.get_model_config(model_name)
+    if model_config is None or not model_config.supports_thinking:
         logger.warning(f"Model {model_name} does not support thinking, setting thinking_enabled to False")
         return False
     return thinking_enabled
+
+
+def _negotiate_reasoning_effort(
+    model_name: str, reasoning_effort: str | None, app_config: AppConfig
+) -> str | None:
+    """配置里公布的等级才允许下发；旧客户端带着过期等级来时回退到模型默认。"""
+
+    if reasoning_effort is None:
+        return None
+    model_config = app_config.get_model_config(model_name)
+    if model_config is None or not model_config.supports_reasoning_effort:
+        logger.warning(f"Model {model_name} does not support reasoning effort, ignoring {reasoning_effort!r}")
+        return None
+    published = model_config.reasoning_effort_ids()
+    if published and reasoning_effort not in published:
+        logger.warning(
+            f"Model {model_name} does not publish reasoning effort {reasoning_effort!r}; "
+            f"published: {published}; using the provider default"
+        )
+        return None
+    return reasoning_effort
 
 
 def apply_tool_filter(tools: list, cfg: dict) -> list:

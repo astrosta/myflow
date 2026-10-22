@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 _METADATA_FIELDS = frozenset({
     "use", "name", "display_name", "description",
-    "supports_thinking", "supports_reasoning_effort",
+    "supports_thinking", "supports_reasoning_effort", "reasoning_efforts",
     "when_thinking_enabled", "when_thinking_disabled", "thinking",
     "supports_vision", "context_window", "pricing",
 })
@@ -93,6 +93,7 @@ def create_chat_model(
     app_config: AppConfig | None = None,
     attach_tracing: bool = True,
     model_overrides: dict | None = None,
+    reasoning_effort: str | None = None,
     **kwargs,
 ) -> BaseChatModel:
 
@@ -152,9 +153,12 @@ def create_chat_model(
         elif has_thinking_settings and effective_wte.get("thinking", {}).get("type"):
             model_settings["thinking"] = {"type": "disabled"}
 
+    # 用户在下拉里选的等级优先于 thinking 分支写进去的默认值；模型不支持就整体丢掉。
     if not model_config.supports_reasoning_effort:
         kwargs.pop("reasoning_effort", None)
         model_settings.pop("reasoning_effort", None)
+    elif reasoning_effort is not None:
+        model_settings["reasoning_effort"] = reasoning_effort
 
     # 若支持stream chunk超时，设置stream chunk默认超时
     _apply_stream_chunk_timeout_default(model_class, model_settings)

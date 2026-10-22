@@ -2,6 +2,8 @@
 
 import { useEffect } from "react";
 
+import type { ModelControlProps } from "@/components/workspace/composer";
+import { useModelSelection } from "@/core/models/use-model-selection";
 import { useChat } from "@/core/threads/use-chat";
 
 import { useChatSession } from "./chat-session";
@@ -33,10 +35,41 @@ import { ChatPage } from "./chat-page";
  */
 export function ChatRoute({ threadId }: { threadId: string | null }) {
   const { epoch } = useChatSession();
-  return <ChatSession key={epoch + ":" + (threadId ?? "new")} threadId={threadId} />;
+  /**
+   * 模型 / 推理等级的选择放在**重挂载层之上**：换会话不该把用户刚选好的模型清掉。
+   * 目录本身来自 `/api/models`（config.yaml），这里只负责把它变成 composer 的 props。
+   */
+  const modelSelection = useModelSelection();
+  const modelControl: ModelControlProps = {
+    models: modelSelection.models,
+    current: modelSelection.current,
+    effortOptions: modelSelection.effortOptions,
+    effortId: modelSelection.effortId,
+    effortLabel: modelSelection.effortLabel,
+    loading: modelSelection.loading,
+    error: modelSelection.error,
+    onSelectModel: modelSelection.selectModel,
+    onSelectEffort: modelSelection.selectEffort,
+  };
+  return (
+    <ChatSession
+      key={epoch + ":" + (threadId ?? "new")}
+      modelControl={modelControl}
+      runContext={modelSelection.runContext}
+      threadId={threadId}
+    />
+  );
 }
 
-function ChatSession({ threadId }: { threadId: string | null }) {
+function ChatSession({
+  threadId,
+  modelControl,
+  runContext,
+}: {
+  threadId: string | null;
+  modelControl: ModelControlProps;
+  runContext: Record<string, string>;
+}) {
   const { reportThreadCreated, setActiveThreadId } = useChatSession();
 
   /**
@@ -50,6 +83,10 @@ function ChatSession({ threadId }: { threadId: string | null }) {
     setActiveThreadId(threadId);
   }, [threadId, setActiveThreadId]);
 
-  const controller = useChat({ threadId, onThreadCreated: reportThreadCreated });
-  return <ChatPage controller={controller} />;
+  const controller = useChat({
+    threadId,
+    onThreadCreated: reportThreadCreated,
+    runContext,
+  });
+  return <ChatPage controller={controller} modelControl={modelControl} />;
 }

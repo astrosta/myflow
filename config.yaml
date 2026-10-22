@@ -33,6 +33,18 @@ models:
     when_thinking_enabled:
       extra_body:
         thinking: { type: enabled }
+    # 推理等级：composer 的“推理等级”下拉只显示这里公布的候选，id 会原样发给 provider。
+    # 不写 default 就是“默认（不指定）”，不选不下发，行为和没配一样。
+    reasoning_efforts:
+      - id: low
+        label: 低
+        description: 快速响应，适合闲聊、改写与简单问答
+      - id: medium
+        label: 中
+        description: 常规任务，速度与质量平衡
+      - id: high
+        label: 高
+        description: 复杂推理与长链路排障，更慢也更贵
 
   # - name: gpt-4o                       # 唯一标识，API 和前端用这个名字选模型
   #   display_name: GPT-4o               # 给人看的，不会传给 provider
@@ -88,7 +100,7 @@ auth:
 database:
   backend: postgres          # memory | sqlite | postgres   startup-only
   sqlite_dir: .myflow
-  url: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/myflow   # 仅 postgres
+  url: postgresql+asyncpg://postgres:postgres@192.168.154.141:5432/myflow   # 仅 postgres
   checkpoint_channel_mode: full   # full | delta，启动时冻结
   postgres_schema: ""             # 非空时钉 search_path
 
@@ -144,8 +156,11 @@ knowledge_base:
       ocr_mode: txt
       timeout_seconds: 600
     cloud:
-      base_url: ""              # 必填：例如 https://mineru.net
-      api_key: ""               # 必填；建议写 $MINERU_API_KEY
+      base_url: "https://mineru.net"              # 必填：例如 https://mineru.net（只写主机，不写接口路径）
+      api_key: $MINERU_API_KEY               # 必填；建议写 $MINERU_API_KEY
+      # 云端接口路径全部在这里配置，代码里没有默认端点：换网关/代理只改这两行。
+      file_urls_path: /api/v4/file-urls/batch        # POST：申请上传 URL
+      extract_results_path: /api/v4/extract-results/batch/{batch_id}  # GET：轮询任务（必须含 {batch_id}）
       model_version: pipeline
       language: ch
       enable_formula: true
@@ -190,9 +205,9 @@ knowledge_base:
   embedding:
     provider: openai_compatible
     protocol: openai            # openai | tei
-    base_url: ""                # 必填：Qwen3-Embedding-8B 服务地址
+    base_url: $EMBEDDING_BASE_URL                # 必填：Qwen3-Embedding-8B 服务地址
     path: /embeddings
-    api_key: ""
+    api_key: $EMBEDDING_API_KEY
     model: Qwen/Qwen3-Embedding-8B
     dimensions: 4096
     max_input_tokens: 8192
@@ -233,9 +248,9 @@ knowledge_base:
     rerank:
       enabled: false                # 打开时下面的 base_url 与 model 必填
       protocol: cohere              # cohere | tei（vLLM/Jina/Cohere 走 cohere，TEI 走 tei）
-      base_url: ""                  # 精排服务地址，例如 http://127.0.0.1:8000/rerank 的 host
+      base_url: $RERANK_BASE_URL                  # 精排服务地址，例如 http://127.0.0.1:8000/rerank 的 host
       path: /rerank
-      api_key: ""                   # 可写 $RERANK_API_KEY
+      api_key: $RERANK_API_KEY                   # 可写 $RERANK_API_KEY
       model: Qwen/Qwen3-Reranker-8B
       max_document_chars: 4000
       timeout_seconds: 60

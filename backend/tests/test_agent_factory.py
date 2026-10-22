@@ -28,6 +28,25 @@ def test_missing_reasoning_effort_is_a_different_key_from_none() -> None:
     assert hash(missing) != hash(explicit_none)
 
 
+def test_reasoning_effort_negotiation_never_sends_unpublished_levels() -> None:
+    from agentkit.agents.leader_agent.agent import _negotiate_reasoning_effort
+
+    config = AppConfig(
+        models=[
+            ModelConfig.model_validate(
+                {"name": "flash", "use": "langchain_openai:ChatOpenAI", "reasoning_efforts": ["low", "high"]}
+            ),
+            ModelConfig.model_validate({"name": "plain", "use": "langchain_openai:ChatOpenAI"}),
+        ]
+    )
+
+    assert _negotiate_reasoning_effort("flash", None, config) is None
+    assert _negotiate_reasoning_effort("flash", "high", config) == "high"
+    # 过期等级（模型没公布）/ 模型不支持 → 不下发，回退 provider 默认
+    assert _negotiate_reasoning_effort("flash", "medium", config) is None
+    assert _negotiate_reasoning_effort("plain", "high", config) is None
+
+
 def test_app_config_and_checkpointer_compare_by_identity() -> None:
     left_config = AppConfig()
     right_config = AppConfig()

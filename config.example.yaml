@@ -33,6 +33,17 @@ models:
     when_thinking_enabled:
       extra_body:
         thinking: { type: enabled }
+    # 推理等级（可选）：值是发给 provider 的 id，label/description 只给前端看。
+    # 标 default: true 的那档会被 composer 预选；不标就默认“不指定”，不下发该参数。
+    reasoning_efforts:
+      - low
+      - id: medium
+        label: 中
+        description: 常规任务，速度与质量平衡
+        default: true
+      - id: high
+        label: 高
+        description: 复杂推理与长链路排障，更慢也更贵
 
   # - name: gpt-4o                       # 唯一标识，API 和前端用这个名字选模型
   #   display_name: GPT-4o               # 给人看的，不会传给 provider
@@ -235,8 +246,11 @@ knowledge_base:
       ocr_mode: txt
       timeout_seconds: 600
     cloud:
-      base_url: ""              # 必填：例如 https://mineru.net
+      base_url: ""              # 必填：例如 https://mineru.net（只写主机，不写接口路径）
       api_key: ""               # 必填；建议写 $MINERU_API_KEY
+      # 云端接口路径全部在这里配置，代码里没有默认端点：换网关/代理只改这两行。
+      file_urls_path: /api/v4/file-urls/batch        # POST：申请上传 URL
+      extract_results_path: /api/v4/extract-results/batch/{batch_id}  # GET：轮询任务（必须含 {batch_id}）
       model_version: pipeline
       language: ch
       enable_formula: true

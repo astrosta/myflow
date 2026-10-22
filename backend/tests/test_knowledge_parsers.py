@@ -113,6 +113,45 @@ async def test_cloud_mineru_full_upload_poll_download_cycle(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cloud_mineru_paths_come_from_config(tmp_path) -> None:
+    path = tmp_path / "manual.pdf"
+    path.write_bytes(b"pdf-bytes")
+    calls: list[str] = []
+    zip_payload = _zip({"full.md": "# 代理\n\n走网关".encode()})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/gateway/mineru/file-urls":
+            return httpx.Response(200, json={"code": 0, "data": {"batch_id": "b9", "file_urls": ["http://upload.local/f9"]}})
+        if request.url.host == "upload.local":
+            return httpx.Response(200)
+        if request.url.path == "/gateway/mineru/task/b9/result":
+            return httpx.Response(200, json={"code": 0, "data": {"extract_result": [{"state": "done", "full_zip_url": "http://download.local/r9.zip"}]}})
+        if request.url.host == "download.local":
+            return httpx.Response(200, content=zip_payload)
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    parser = MineruCloudParser(
+        CloudMinerUConfig(
+            base_url="http://cloud.test/",
+            api_key="cloud-key",
+            poll_interval_seconds=0.001,
+            file_urls_path="gateway/mineru/file-urls",
+            extract_results_path="/gateway/mineru/task/{batch_id}/result",
+        ),
+        client=client,
+    )
+    parsed = await parser.parse(path, filename="manual.pdf")
+    await parser.aclose()
+    await client.aclose()
+
+    assert "代理" in parsed.markdown
+    assert calls[0] == "POST /gateway/mineru/file-urls"
+    assert "GET /gateway/mineru/task/b9/result" in calls
+
+
+@pytest.mark.asyncio
 async def test_cloud_mineru_failure_is_sanitized(tmp_path) -> None:
     path = tmp_path / "x.pdf"
     path.write_bytes(b"x")

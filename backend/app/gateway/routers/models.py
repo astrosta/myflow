@@ -29,7 +29,9 @@ async def list_models(
             continue
         seen.add(cfg.name)
         models.append(model_to_wire(cfg))
-    return ModelsListResponse(models=models)
+    # 服务端默认模型：前端没有本地选择时显示它，而不是自己猜 models[0]
+    default_model = config.agents.default_model or (config.models[0].name if config.models else None)
+    return ModelsListResponse(models=models, default_model=default_model)
 
 
 @router.get("/{model_name}", response_model=ModelResponse)

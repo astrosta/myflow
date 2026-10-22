@@ -186,6 +186,12 @@ class MineruCloudParser:
             )
         return self._client
 
+    def _url(self, path: str, **params: str) -> str:
+        """Every cloud endpoint path comes from config; none is spelled out here."""
+
+        rendered = path.format(**params) if params else path
+        return self._config.base_url.rstrip("/") + "/" + rendered.lstrip("/")
+
     async def parse(self, path: Path, *, filename: str) -> ParsedDocument:
         http = self._http()
         headers = _auth(self._config.api_key)
@@ -198,7 +204,7 @@ class MineruCloudParser:
         }
         try:
             created = await http.post(
-                self._config.base_url.rstrip("/") + "/api/v4/file-urls/batch",
+                self._url(self._config.file_urls_path),
                 json=payload,
                 headers=headers,
             )
@@ -227,7 +233,7 @@ class MineruCloudParser:
             raise KnowledgeUnavailable(f"MinerU cloud request failed: {type(exc).__name__}") from exc
 
     async def _poll(self, batch_id: str, headers: dict[str, str]) -> dict[str, Any]:
-        url = self._config.base_url.rstrip("/") + f"/api/v4/extract-results/batch/{batch_id}"
+        url = self._url(self._config.extract_results_path, batch_id=batch_id)
         deadline = time.monotonic() + self._config.timeout_seconds
         while time.monotonic() < deadline:
             response = await self._http().get(url, headers=headers)

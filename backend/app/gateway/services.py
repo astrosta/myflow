@@ -159,6 +159,9 @@ async def start_run(
     # 检查模型白名单
     model_name = _check_model_allowed(switches.get("model_name"), app_config) 
 
+    # 推理等级必须是该模型在 config.yaml 里公布的候选之一（和前端下拉同源）
+    _check_reasoning_effort(switches.get("reasoning_effort"), model_name, app_config)
+
     # 判断是否有权限访问thread
     if not await _thread_access_allowed(ctx.thread_store, thread_id, caller, require_existing=require_existing_thread):
         raise ThreadNotFound(f"Thread {thread_id} not found") 
@@ -298,11 +301,50 @@ def _normalize_stream_modes(raw: str | list[str] | None) -> list[str]:
         raise RunRequestInvalid(str(exc)) from exc
 
 def _check_model_allowed(model_name: str | None, app_config: AppConfig) -> str| None:
+    """白名单就是 config.yaml 里的 `models[].name`。
+
+    以前这里读 `app_config.model_config.allowed_models`：那是 Pydantic 的配置字典，
+    根本没有这个属性——客户端一旦真传 `model_name` 就是 AttributeError 500。
+    """
     if model_name is None:
         return None
-    if model_name in app_config.model_config.allowed_models:
+    if app_config.get_model_config(model_name) is not None:
         return model_name
     raise ModelNotAllowed(f"Model {model_name} is not allowed")
+
+
+def _effective_model_name(model_name: str | None, app_config: AppConfig) -> str | None:
+    """和 agent 装配同一套回退：请求 → agents.default_model → models[0]。"""
+
+    if model_name is not None:
+        return model_name
+    if app_config.agents.default_model is not None:
+        return app_config.agents.default_model
+    return app_config.models[0].name if app_config.models else None
+
+
+def _check_reasoning_effort(
+    reasoning_effort: str | None, model_name: str | None, app_config: AppConfig
+) -> str | None:
+    """只接受目标模型在配置里公布的等级：前端下拉和这里读的是同一份配置。"""
+
+    if reasoning_effort is None:
+        return None
+    effective = _effective_model_name(model_name, app_config)
+    model_config = app_config.get_model_config(effective) if effective else None
+    if model_config is None:
+        raise RunRequestInvalid(f"Cannot resolve reasoning effort for model {effective!r}")
+    if not model_config.supports_reasoning_effort:
+        raise RunRequestInvalid(
+            f"Model {effective} does not support reasoning_effort"
+        )
+    published = model_config.reasoning_effort_ids()
+    if published and reasoning_effort not in published:
+        raise RunRequestInvalid(
+            f"reasoning_effort {reasoning_effort!r} is not published by model {effective}; "
+            f"allowed: {published}"
+        )
+    return reasoning_effort
 
 async def _thread_access_allowed(thread_store, thread_id: str, caller: RunCaller, *, require_existing: bool) -> bool:
     if caller.user_id is None: #检查thread id是否存在

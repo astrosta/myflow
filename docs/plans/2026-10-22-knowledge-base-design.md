@@ -221,8 +221,11 @@ knowledge_base:
       ocr_mode: txt                 # txt | ocr | auto（按服务支持）
       timeout_seconds: 600
     cloud:
-      base_url: ""                  # 必填；由部署方填写 mineru.net 或代理地址
+      base_url: ""                  # 必填；只填主机/前缀，不填接口路径
       api_key: ""                   # 云端必填，建议 $MINERU_API_KEY
+      # 云端接口路径也全部来自配置：代码里没有任何路径常量。
+      file_urls_path: /api/v4/file-urls/batch          # POST 申请上传 URL
+      extract_results_path: /api/v4/extract-results/batch/{batch_id}  # GET 轮询，必须含 {batch_id}
       model_version: pipeline       # pipeline | vlm（以云端文档为准）
       language: ch
       enable_formula: true
@@ -330,6 +333,12 @@ knowledge_base:
 - **所有服务地址只存在于配置文件**：`parse.local.endpoint`、`parse.cloud.base_url`、
   `embedding.base_url`、`vector_store.uri` 在代码和 Pydantic 默认值中都为空；
   启用时必须由用户填写，不能靠代码里的默认端点。
+- **接口路径同样来自配置**：`parse.local.file_parse_path`、`parse.cloud.file_urls_path`、
+  `parse.cloud.extract_results_path` 都是配置项，解析器里没有 `/api/v4/...` 这类路径常量，
+  换网关/代理/私有化部署只改配置。路径必须是相对路径（出现 `://` 直接报错，主机只能写在
+  `endpoint`/`base_url`），`extract_results_path` 必须含 `{batch_id}` 占位符，否则启动失败。
+- 云端返回的签名上传 URL 和 `full_zip_url` 是服务端给的临时地址，**不可配置**，也不做
+  host 白名单（首版按内网可信代理部署）；这与“接口路径可配置”并不冲突。
 - `enabled=true` 时启动预检：根据 `parse.mode` 校验对应端点，再校验 embedding 地址/
   协议/模型/维度、Milvus URI。缺失或非法直接拒绝启动，并列出具体配置键，避免运行时
   才报 500。
@@ -355,8 +364,9 @@ knowledge_base:
 ### 4.2 MinerU 双模式适配
 
 **接口版本**：以当前最新 MinerU 4.x 的 HTTP API 为准，不使用旧版 `/file_parse`。
-本地模式使用 V1 HTTP API；云端模式使用 mineru.net 最新批量任务 API。接口路径只作为
-默认值，服务地址必须来自配置。
+本地模式使用 V1 HTTP API；云端模式使用 mineru.net 最新批量任务 API。**服务地址与接口
+路径都来自配置**：`file_parse_path`、`file_urls_path`、`extract_results_path` 的默认值
+只是 Pydantic 默认值，解析器内部不出现任何路径字符串常量（见 §4.1）。
 
 **本地模式（`parse.mode=local`）**：
 
@@ -371,11 +381,13 @@ knowledge_base:
 
 **云端模式（`parse.mode=cloud`）**：
 
-1. `POST {cloud.base_url}/api/v4/file-urls/batch` 申请上传 URL；
-2. 将文件字节 PUT 到返回的签名 URL；
-3. 轮询 `GET /api/v4/extract-results/batch/{batch_id}` 直至 `done/failed`；
-4. 下载 `full_zip_url`，解压读取 `full.md` 与 `content_list.json`；
-5. `Authorization: Bearer {cloud.api_key}`，超时与轮询间隔可配。
+1. `POST {cloud.base_url}{cloud.file_urls_path}` 申请上传 URL；
+2. 将文件字节 PUT 到**响应里返回的**签名 URL（该地址由服务端给出，不配置）；
+3. 轮询 `GET {cloud.base_url}{cloud.extract_results_path}`（`{batch_id}` 用实际批次号
+   填充，例如默认值 `/api/v4/extract-results/batch/{batch_id}`）直至 `done/failed`；
+4. 下载响应里的 `full_zip_url`（同样是临时签名地址），解压读取 `full.md` 与
+   `content_list.json`；
+5. `Authorization: Bearer {cloud.api_key}`，超时、轮询间隔、单文档下载上限都可配。
 
 两套适配器输出同一个 `ParsedDocument(markdown, metadata)`，后续清洗、分片、
 embedding 完全复用。云端未配置 API Key 时启动预检失败；不会静默切换到本地。
@@ -1068,6 +1080,8 @@ keyword_query ───────────────────► Milvu
 - 切片大小与重叠按 token 计量，采用 512 token / 64 overlap 基线，FAQ/API 按结构边界
   不重叠；
 - MinerU 同时支持本地服务和云端服务，通过配置切换，使用最新版接口；
+- MinerU 的服务地址与接口路径全部来自配置（云端 `file_urls_path` /
+  `extract_results_path`，本地 `file_parse_path`），代码里没有路径常量；
 - 纯文本/Markdown/HTML 不走 MinerU，直接读取；
 - 所有服务地址（MinerU/embedding/Milvus）只来自配置文件，代码无默认端点；
 - embedding 模型 Qwen3-Embedding-8B，维度 4096；协议可配 OpenAI/TEI；
@@ -1130,6 +1144,9 @@ M3/M4 路由与配置测试失败不在本功能范围内，已在最终说明�
   `retrieval_mode`、`reranked`、每条结果的 `rrf_score`/`rerank_score`；
 - 前端：检索测试增加关键词输入与“混合检索/向量检索 · 已精排/融合排序”说明，
   分数标签统一为“相关度”；`/status` 增加 `retrieval` 段。
+- 配置收敛：MinerU 云端接口路径改为配置项 `parse.cloud.file_urls_path` /
+  `parse.cloud.extract_results_path`（默认值与 mineru.net 4.x 一致，必须含 `{batch_id}`），
+  本地 `file_parse_path` 一并加校验；解析器内的 `/api/v4/...` 常量全部删除。
 
 实现中踩到并修掉的坑：
 

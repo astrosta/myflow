@@ -3,12 +3,15 @@
 import { useCallback } from "react";
 
 import type { ArtifactPreviewLoader } from "@/components/workspace/artifact-panel";
+import type { ModelControlProps } from "@/components/workspace/composer";
 import { ChatView } from "@/components/workspace/chat-view";
 import { fetchArtifactPreview } from "@/core/api/artifacts";
 import type { ChatController } from "@/core/threads/chat-controller";
 
 export interface ChatPageProps {
   controller: ChatController;
+  /** 模型 / 推理等级选择条（目录来自 `/api/models`，由路由层取数） */
+  modelControl?: ModelControlProps;
 }
 
 /**
@@ -18,7 +21,7 @@ export interface ChatPageProps {
  * artifact 预览的取数函数在这一层构造（core 的 fetchArtifactPreview 只被
  * 应用层引用），下面的 components/workspace 因此保持"只接 props"的形状。
  */
-export function ChatPage({ controller }: ChatPageProps) {
+export function ChatPage({ controller, modelControl }: ChatPageProps) {
   const threadId = controller.threadId;
 
   const loadArtifactPreview = useCallback<ArtifactPreviewLoader>(
@@ -33,5 +36,11 @@ export function ChatPage({ controller }: ChatPageProps) {
     [threadId],
   );
 
-  return <ChatView controller={controller} loadArtifactPreview={loadArtifactPreview} />;
+  return (
+    <ChatView
+      controller={controller}
+      loadArtifactPreview={loadArtifactPreview}
+      modelControl={modelControl}
+    />
+  );
 }

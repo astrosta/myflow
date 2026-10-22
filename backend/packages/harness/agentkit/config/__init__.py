@@ -28,7 +28,7 @@ from agentkit.config.memory_config import (
     MemoryMaintenanceConfig,
     MemoryProfileConfig,
 )
-from agentkit.config.model_config import ModelConfig
+from agentkit.config.model_config import ModelConfig, ReasoningEffortOption
 from agentkit.config.pii_config import PIIConfig
 from agentkit.config.runs_config import RunsConfig
 from agentkit.config.sandbox_config import SandboxConfig
@@ -85,6 +85,7 @@ __all__ = [
     "MemoryProfileConfig",
     "ModelConfig",
     "PIIConfig",
+    "ReasoningEffortOption",
     "RunsConfig",
     "DEFAULT_USER_BUCKET",
     "SKILLS_PREFS_FILENAME",

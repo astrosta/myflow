@@ -66,6 +66,13 @@ class DeletedResponse(BaseModel):
     deleted: str
 
 
+class ReasoningEffortResponse(BaseModel):
+    id: str
+    label: str
+    description: str | None = None
+    default: bool = False
+
+
 class ModelResponse(BaseModel):
     name: str
     model: str
@@ -75,10 +82,13 @@ class ModelResponse(BaseModel):
     supports_reasoning_effort: bool
     supports_vision: bool
     context_window: int | None = None
+    reasoning_efforts: list[ReasoningEffortResponse] = []
+    default_reasoning_effort: str | None = None
 
 
 class ModelsListResponse(BaseModel):
     models: list[ModelResponse]
+    default_model: str | None = None
 
 
 class UploadedFileInfo(BaseModel):
@@ -112,6 +122,9 @@ _MODEL_WIRE_FIELDS = (
     "supports_vision",
     "context_window",
 )
+
+#: 由 ModelConfig 的属性算出来，而不是直接 getattr 拷贝
+#: （reasoning_efforts 是对象列表，default_reasoning_effort 是派生属性）。
 
 
 class ThreadCompactResponse(BaseModel):
@@ -204,7 +217,19 @@ def message_to_wire(event: Mapping[str, Any]) -> MessageResponse:
 
 def model_to_wire(cfg: ModelConfig) -> ModelResponse:
     """Copy the public whitelist. model_dump() would leak api_key and provider settings."""
-    return ModelResponse.model_validate({key: getattr(cfg, key) for key in _MODEL_WIRE_FIELDS})
+    data = {key: getattr(cfg, key) for key in _MODEL_WIRE_FIELDS}
+    # 推理等级来自配置，前端只展示、不回填：id 是发给 provider 的取值。
+    data["reasoning_efforts"] = [
+        {
+            "id": option.id,
+            "label": option.display,
+            "description": option.description,
+            "default": option.default,
+        }
+        for option in cfg.reasoning_efforts
+    ]
+    data["default_reasoning_effort"] = cfg.default_reasoning_effort
+    return ModelResponse.model_validate(data)
 
 
 def _wire_time(value: Any) -> str | None:

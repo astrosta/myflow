@@ -304,7 +304,27 @@ M3 §6 定义了一个 `gap` 控制帧：缓冲区已经滚过去了，客户端
 
 用渲染库自带的增量动画 API。
 
-### 6.5 Artifact 预览要有大小上限
+### 6.5 模型 / 推理等级是输入框的一部分
+
+输入框右下角、**发送按钮左侧**放模型与推理等级选择（`model-picker.tsx`）。
+取舍照 DeepSeek Harness 的 composer：一个紧凑触发器 + 两级菜单，而不是两个大下拉——
+工具行高度固定，两个 select 会把输入框撑高、把附件和发送按钮挤小；触发器一行就能读完
+当前选择（`模型 · 等级`）。
+
+- **候选全部来自 config.yaml**：`/api/models` 返回 `models[].name` 与每个模型自己公布的
+  `reasoning_efforts`（`{id,label,description,default}`）。前端不维护模型清单，
+  也不知道哪个模型有什么等级；模型没公布候选时"推理等级"整段不出现。
+- **选择只落在目录的行上**（`core/models/selection.ts`）：本地存过但已下线的模型名、
+  换了模型后失效的等级，都会回退到服务端默认／`默认（不指定）`，不会把过期的值发出去。
+- **"默认"= 不下发**：`context` 里只放非空值；空就由服务端用 `agents.default_model`
+  与 provider 默认等级。配置里标 `default: true` 的那档才会被预选。
+- 每次提交都带 `context.model_name` / `context.reasoning_effort`（走 `runs.create` 的
+  `context`，也就是网关的 client switches）；网关再按同一份配置校验一次，
+  过期值返回 422 而不是静默忽略。
+- 选择存 localStorage（`UserSettings.modelName` / `reasoningEffort`），换会话不清空；
+  目录用 TanStack Query 缓存，失败时菜单里显示原因，不阻塞发送。
+
+### 6.6 Artifact 预览要有大小上限
 
 - `ThreadState.artifacts` 是权威的清单
 - 文本内容通过 **HTTP byte range 只取前 1 MiB**，后端返回 206

@@ -4,9 +4,11 @@ import { useCallback, useState, type KeyboardEvent } from "react";
 
 import { ArrowUpIcon, StopIcon } from "@/components/ui/icons";
 import { Textarea } from "@/components/ui/textarea";
+import type { ModelInfo, ReasoningEffort } from "@/core/api/models";
 import { cn } from "@/lib/utils";
 
 import { FileUpload } from "./file-upload";
+import { ModelPicker } from "./model-picker";
 
 /**
  * 输入框 + 发送 + 停止。
@@ -46,6 +48,27 @@ export interface ComposerProps {
   variant?: "hero" | "docked";
   placeholder?: string;
   className?: string;
+  /**
+   * 模型 / 推理等级选择条（放在发送按钮左边）。
+   *
+   * 由容器层注入而不是在这里取数：Composer 是"只接 props"的展示组件，
+   * 目录来自 `/api/models`（也就是 config.yaml），只有容器层知道怎么拿。
+   * 不传就完全不渲染这块控件（老调用方、测试都不受影响）。
+   */
+  modelControl?: ModelControlProps;
+}
+
+export interface ModelControlProps {
+  models: ModelInfo[];
+  current: ModelInfo | null;
+  effortOptions: ReasoningEffort[];
+  effortId: string | null;
+  effortLabel: string;
+  loading?: boolean;
+  error?: string | null;
+  disabled?: boolean;
+  onSelectModel: (name: string) => void;
+  onSelectEffort: (id: string | null) => void;
 }
 
 export function Composer({
@@ -57,6 +80,7 @@ export function Composer({
   variant = "docked",
   placeholder = "输入消息，Enter 发送，Shift+Enter 换行",
   className,
+  modelControl,
 }: ComposerProps) {
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -158,6 +182,21 @@ export function Composer({
             />
 
             <div className="ml-auto flex items-center gap-2">
+              {/* 模型 / 推理等级：贴着发送按钮左侧，推理等级只在模型公布候选时出现 */}
+              {modelControl ? (
+                <ModelPicker
+                  current={modelControl.current}
+                  disabled={disabled || modelControl.disabled}
+                  effortId={modelControl.effortId}
+                  effortLabel={modelControl.effortLabel}
+                  effortOptions={modelControl.effortOptions}
+                  error={modelControl.error}
+                  loading={modelControl.loading}
+                  models={modelControl.models}
+                  onSelectEffort={modelControl.onSelectEffort}
+                  onSelectModel={modelControl.onSelectModel}
+                />
+              ) : null}
               {streaming ? (
                 <button
                   aria-label="停止"

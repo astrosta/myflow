@@ -54,6 +54,33 @@ uv run --env-file .env --with uvicorn \
 
 沙箱段见 `config.yaml` 的 `sandbox`。本机 Local provider 默认不开宿主 bash；可信环境可设 `allow_host_bash: true`。
 
+### 模型与推理等级（输入框里的两个选择）
+
+输入框右下角的模型 / 推理等级选择**只读 `models` 段**，没有第二份清单：
+
+```yaml
+models:
+  - name: deepseek-v4-flash        # 唯一标识：/api/models 的 name，也是 context.model_name
+    display_name: Flash            # 只给人看
+    supports_reasoning_effort: true
+    reasoning_efforts:             # id 原样发给 provider，label/description 只给前端
+      - id: low
+        label: 低
+        description: 快速响应
+      - id: medium
+        label: 中
+        default: true              # 标了才会被预选；不标 = “默认（不指定）”
+```
+
+- `GET /api/models` 返回 `models[]`（含每个模型自己的 `reasoning_efforts` 与
+  `default_reasoning_effort`）与 `default_model`（`agents.default_model`，缺省 `models[0]`）；
+- 前端把选择塞进 `runs.create` 的 `context.model_name` / `context.reasoning_effort`；
+- 网关按同一份配置校验：模型不在 `models[].name` 里 → 400 `model_not_allowed`；
+  等级不是该模型公布的候选 → 422 `invalid_run_request`（不会静默忽略）；
+- 装配时 `assemble_agent` 再做一次协商（等级过期的旧客户端回退 provider 默认），
+  最终由 `create_chat_model(..., reasoning_effort=…)` 传给模型；模型不支持就整体丢弃；
+- `reasoning_efforts` 是**元数据**：不会被当成模型构造参数转发出去。
+
 ### 持久记忆（M10 §2）
 
 `memory.enabled: true` 后，lifespan 按 `database.backend` 打开 LangGraph `BaseStore`
@@ -305,6 +332,13 @@ M7 **没有创建类路由**：`PUT /api/mcp/config`（整份替换 = 新建 + �
 `knowledge_base.enabled: true` 后，lifespan 建立知识库服务。**所有服务地址只来自
 config.yaml**，代码里没有默认端点；启用时缺 `parse.local.endpoint`（或云端
 `base_url` + `api_key`）、`embedding.base_url`、`vector_store.uri` 会拒绝启动。
+
+MinerU 的**接口路径也是配置**：本地 `parse.local.file_parse_path`（默认 `/v1/file_parse`）、
+云端 `parse.cloud.file_urls_path`（默认 `/api/v4/file-urls/batch`）与
+`parse.cloud.extract_results_path`（默认 `/api/v4/extract-results/batch/{batch_id}`，必须含
+`{batch_id}`）。解析器里没有路径常量，换网关/代理只改配置；路径必须相对（含 `://` 直接
+报错），主机写在 `endpoint`/`base_url`。云端响应里的签名上传 URL 和 `full_zip_url` 是
+服务端临时地址，不配置。
 
 ```bash
 # 只在启用知识库时需要；同时保留 postgres/mcp 等其它 extra

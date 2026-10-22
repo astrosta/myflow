@@ -31,6 +31,9 @@ import { createOptimisticHumanMessage, createTurnBaseline } from "./turn-baselin
 
 export const DEFAULT_ASSISTANT_ID = "lead_agent";
 
+/** 没有模型选择时的空装配上下文（常量引用，避免每次渲染都新建对象） */
+const EMPTY_RUN_CONTEXT: Record<string, string> = {};
+
 /**
  * 停止之后安排一次跟进刷新的延迟（§5.1）。
  *
@@ -53,6 +56,14 @@ export interface UseChatOptions {
   assistantId?: string;
   /** thread 建好之后的回调：用来把 URL 换成 `/workspace/chats/{id}` */
   onThreadCreated?: (threadId: string) => void;
+  /**
+   * 每一轮都要带上的装配上下文（`model_name` / `reasoning_effort`）。
+   *
+   * 走 `runs.create` 的 `context`，网关的 collect_client_switches 认的是这几个键，
+   * 并会按 config.yaml 的模型白名单与推理等级再校验一次。空对象就是"不选"，
+   * 服务端用 agents.default_model 与 provider 默认等级。
+   */
+  runContext?: Record<string, string>;
 }
 
 /**
@@ -65,6 +76,7 @@ export function useChat({
   threadId,
   assistantId = DEFAULT_ASSISTANT_ID,
   onThreadCreated,
+  runContext,
 }: UseChatOptions): ChatController {
   const queryClient = useQueryClient();
 
@@ -94,6 +106,9 @@ export function useChat({
 
   /** §3.1：主聊天流**强制**成增量模式。请求层还会再覆盖一次 body（见 client.ts） */
   const streamModes = useMemo(() => sanitizeChatStreamModes(null), []);
+
+  /** 提交时要带的装配上下文。上层已用 useMemo 固定引用，这里只补个空对象兜底 */
+  const runContextValue = runContext ?? EMPTY_RUN_CONTEXT;
 
   const [recovery, setRecovery] = useState<StreamRecoveryEvent | null>(null);
   const [optimistic, setOptimistic] = useState<ChatMessage[]>([]);
@@ -327,6 +342,8 @@ export function useChat({
           { messages: [{ type: "human", content: text, id: optimisticMessage.id }] } as never,
           {
             streamMode: streamModes as never,
+            /** model_name / reasoning_effort：空对象时网关按默认模型处理 */
+            context: runContextValue as never,
             /**
              * 显式写出来，哪怕它和默认值一样。
              *
@@ -344,7 +361,7 @@ export function useChat({
         throw error;
       }
     },
-    [stream, streamModes, effectiveThreadId, messages],
+    [stream, streamModes, effectiveThreadId, messages, runContextValue],
   );
 
   const stop = useCallback(async () => {

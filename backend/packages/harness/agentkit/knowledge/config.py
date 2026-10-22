@@ -121,6 +121,20 @@ class ChunkingConfig(BaseModel):
         return self
 
 
+BATCH_ID_PLACEHOLDER = "{batch_id}"
+
+
+def _api_path(value: str) -> str:
+    """API paths live in config, but they stay relative to the configured host."""
+
+    text = value.strip()
+    if not text:
+        raise ValueError("endpoint path must not be empty")
+    if "://" in text:
+        raise ValueError("endpoint path must be a path; the service address belongs in the base URL")
+    return "/" + text.lstrip("/")
+
+
 class LocalMinerUConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -133,12 +147,22 @@ class LocalMinerUConfig(BaseModel):
     timeout_seconds: float = Field(default=600.0, gt=0)
     max_download_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
 
+    @field_validator("file_parse_path")
+    @classmethod
+    def _parse_path_is_relative(cls, value: str) -> str:
+        return _api_path(value)
+
 
 class CloudMinerUConfig(BaseModel):
+    """Cloud batch endpoints are configurable paths; only the base URL is a host."""
+
     model_config = ConfigDict(extra="forbid")
 
     base_url: str = ""
     api_key: str = Field(default="", repr=False)
+    # POST asks for an upload URL, GET polls one batch by id.
+    file_urls_path: str = "/api/v4/file-urls/batch"
+    extract_results_path: str = "/api/v4/extract-results/batch/" + BATCH_ID_PLACEHOLDER
     model_version: str = "pipeline"
     language: str = "ch"
     enable_formula: bool = True
@@ -147,6 +171,26 @@ class CloudMinerUConfig(BaseModel):
     poll_interval_seconds: float = Field(default=2.0, gt=0, le=60)
     timeout_seconds: float = Field(default=900.0, gt=0)
     max_download_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
+
+    @field_validator("file_urls_path", "extract_results_path")
+    @classmethod
+    def _cloud_paths_are_relative(cls, value: str) -> str:
+        return _api_path(value)
+
+    @field_validator("extract_results_path")
+    @classmethod
+    def _poll_path_takes_a_batch_id(cls, value: str) -> str:
+        if BATCH_ID_PLACEHOLDER not in value:
+            raise ValueError(
+                "parse.cloud.extract_results_path must contain " + BATCH_ID_PLACEHOLDER
+            )
+        try:
+            value.format(batch_id="probe")
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                "parse.cloud.extract_results_path has an unsupported placeholder"
+            ) from exc
+        return value
 
 
 class ParserConfig(BaseModel):

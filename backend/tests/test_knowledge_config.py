@@ -99,6 +99,29 @@ def test_enabling_rerank_requires_an_address_and_a_model() -> None:
     assert ok.retrieval.keyword.enabled is False
 
 
+def test_mineru_endpoint_paths_are_configurable_and_relative() -> None:
+    from agentkit.knowledge.config import CloudMinerUConfig, LocalMinerUConfig
+
+    cloud = CloudMinerUConfig(
+        base_url="http://cloud.test",
+        file_urls_path="proxy/v4/file-urls",
+        extract_results_path="/proxy/v4/batch/{batch_id}",
+    )
+    assert cloud.file_urls_path == "/proxy/v4/file-urls"
+    assert cloud.extract_results_path == "/proxy/v4/batch/{batch_id}"
+
+    local = LocalMinerUConfig(endpoint="http://mineru:8000", file_parse_path="v1/parse")
+    assert local.file_parse_path == "/v1/parse"
+
+    with pytest.raises(ValidationError) as excinfo:
+        CloudMinerUConfig(extract_results_path="/api/v4/extract-results/batch")
+    assert "batch_id" in str(excinfo.value)
+
+    with pytest.raises(ValidationError) as excinfo:
+        CloudMinerUConfig(file_urls_path="https://other.host/api/v4/file-urls/batch")
+    assert "path" in str(excinfo.value)
+
+
 def test_full_local_config_uses_token_defaults() -> None:
     cfg = KnowledgeBaseConfig.model_validate(
         {

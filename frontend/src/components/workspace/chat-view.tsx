@@ -4,7 +4,7 @@ import type { ChatController } from "@/core/threads/chat-controller";
 import { cn } from "@/lib/utils";
 
 import { ArtifactPanel, type ArtifactPreviewLoader } from "./artifact-panel";
-import { Composer } from "./composer";
+import { Composer, type ModelControlProps } from "./composer";
 import { MessageList } from "./message-list";
 import { StreamStatus } from "./stream-status";
 import { TodoPanel } from "./todo-panel";
@@ -21,6 +21,8 @@ import { TodoPanel } from "./todo-panel";
 export interface ChatViewProps {
   controller: ChatController;
   loadArtifactPreview: ArtifactPreviewLoader;
+  /** 模型 / 推理等级选择条；由容器层从 `/api/models` 取数后注入 */
+  modelControl?: ModelControlProps;
   className?: string;
 }
 
@@ -43,7 +45,12 @@ function ChatHero() {
   );
 }
 
-export function ChatView({ controller, loadArtifactPreview, className }: ChatViewProps) {
+export function ChatView({
+  controller,
+  loadArtifactPreview,
+  modelControl,
+  className,
+}: ChatViewProps) {
   /**
    * 对话还没开始 —— 输入框要显示在页面中间，而不是贴底。
    *
@@ -102,6 +109,7 @@ export function ChatView({ controller, loadArtifactPreview, className }: ChatVie
           <Composer
             attachmentsDisabled={controller.threadId === null}
             disabled={controller.threadLoading}
+            modelControl={modelControl}
             onSubmit={controller.submit}
             onStop={() => {
               void controller.stop();

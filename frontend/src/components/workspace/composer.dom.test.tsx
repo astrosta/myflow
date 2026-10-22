@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { Composer } from "./composer";
+import { Composer, type ModelControlProps } from "./composer";
 
 /**
  * 发送按钮的"点亮"是**纯客户端**行为：空输入时禁用灰底，一打字就变实心深色。
@@ -76,6 +76,53 @@ describe("发送按钮的状态", () => {
     expect(view.queryByRole("button", { name: "发送" })).toBeNull();
     const stop = view.getByRole("button", { name: "停止" });
     expect(stop.querySelector("svg")).not.toBeNull();
+  });
+});
+
+describe("模型 / 推理等级选择条", () => {
+  const modelControl: ModelControlProps = {
+    models: [
+      {
+        name: "flash",
+        model: "deepseek-v4-flash",
+        display_name: "Flash",
+        description: null,
+        supports_thinking: true,
+        supports_reasoning_effort: true,
+        supports_vision: false,
+        context_window: null,
+        reasoning_efforts: [{ id: "low", label: "低", description: null, default: false }],
+        default_reasoning_effort: null,
+      },
+    ],
+    current: null,
+    effortOptions: [],
+    effortId: null,
+    effortLabel: "默认",
+    onSelectEffort: () => {},
+    onSelectModel: () => {},
+  };
+
+  it("不传就不渲染这块控件（老调用方不受影响）", () => {
+    const { view } = setup();
+    expect(view.queryByRole("button", { name: /选择模型/ })).toBeNull();
+  });
+
+  it("**在发送按钮左边**：同一个工具行里，pickerm 在前", () => {
+    const { view } = setup({ modelControl });
+    const picker = view.getByRole("button", { name: /选择模型/ });
+    const send = view.getByRole("button", { name: "发送" });
+
+    const row = send.parentElement!;
+    expect(row).toBe(picker.parentElement?.parentElement);
+    // DOM 顺序 = 视觉顺序（同一行、同一 flex 容器）
+    expect(row.compareDocumentPosition(picker) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("停止按钮也在选择条右边，不会把两个控件挤乱", () => {
+    const { view } = setup({ modelControl, streaming: true, onStop: () => {} });
+    const stop = view.getByRole("button", { name: "停止" });
+    expect(stop.parentElement).toBe(view.getByRole("button", { name: /选择模型/ }).parentElement?.parentElement);
   });
 });
 
