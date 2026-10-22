@@ -10,6 +10,7 @@ by the methods below. Do not re-derive that mapping anywhere else.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -30,6 +31,8 @@ from agentkit.runtime.events.catalog import (
 )
 from agentkit.persistence.events.base import RunEventStore
 from agentkit.persistence.events.codec import limit_trace
+
+logger = logging.getLogger(__name__)
 
 MIDDLEWARE_TAG_PREFIX = "middleware:"
 LEAD_CALLER = "lead"
@@ -65,10 +68,19 @@ class RunJournal(AsyncCallbackHandler):
         flush_interval: float = 5.0,
         track_token_usage: bool = True,
         max_trace_content: int = 10240,
+        usage_sink: Any | None = None,
     ) -> None:
         super().__init__()
+        # M8 §7.2：这个 handler 绑定在**父循环**上（持有父循环的任务和连接池），子代理跑在
+        # 隔离循环上，所以拷贝 ContextVar 进隔离循环时必须把它摘掉——否则子代理的 LLM/Tool
+        # 回调会被记进**父 run** 的消息账本，刷新页面后用户的主会话里就会冒出子代理的中间
+        # 消息。标记名与 ``subagents.executor.LOOP_BOUND_MARKER`` 是同一个字符串。
+        self.myflow_loop_bound = True
         self._store = store
         self._record = record
+        #: §15：子代理用量的**转发**目标（父 run 的 ``UsageCollector``）。本类仍然
+        #: "never accumulates usage"（模块 docstring）：累加只有一处，就是那个累加器。
+        self.usage_sink = usage_sink
         self._batch_size = batch_size
         self.flush_interval = flush_interval
         self.track_token_usage = track_token_usage
@@ -284,6 +296,27 @@ class RunJournal(AsyncCallbackHandler):
         except Exception:
             self._buf = batch + self._buf  # 放回队首：下一次 flush 重试
             raise
+
+    # ---- §15 子代理用量（本类只转发，不累加）----
+
+    def record_external_llm_usage_records(self, records: Sequence[Mapping[str, Any]]) -> None:
+        """把隔离循环报回来的**子代理**用量转给父 run 的累加器（M8 §15）。
+
+        ``task`` 工具在父循环里按**方法名**找"父 run 的用量记录器"（§9），而它手上最稳定的
+        把手就是账本，所以这个入口留在本类上。注意 worker 组装的 callback 顺序是
+        ``[..., usage, journal]``：正常路径解析到的是 ``UsageCollector`` 本身，走到这里的
+        是"只挂了 journal"的调用方（单测 / 嵌入）。两条路都汇到同一个累加器，**不会记两遍**
+        ——``SubagentResult.claim_usage_report`` 保证一次委派只交付一次（§7.5）。
+
+        本方法必须是**同步**且只在父循环上跑的：累加器的字段是无锁的读-改-写（§7.5）。
+        """
+        sink = self.usage_sink
+        if sink is None:
+            logger.debug(
+                "no usage sink attached; dropping %d subagent usage record(s)", len(records or ())
+            )
+            return
+        sink.record_external_llm_usage_records(records)
 
     async def _put(
         self,

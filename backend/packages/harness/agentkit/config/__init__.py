@@ -19,8 +19,17 @@ from agentkit.config.extensions_config import (
     update_extensions_config,
     writable_extensions_config_path,
 )
+from agentkit.config.knowledge_config import KnowledgeBaseConfig
 from agentkit.config.llm_call_config import LlmCallConfig
+from agentkit.config.memory_config import (
+    MemoryConfig,
+    MemoryFoldingConfig,
+    MemoryIngestConfig,
+    MemoryMaintenanceConfig,
+    MemoryProfileConfig,
+)
 from agentkit.config.model_config import ModelConfig
+from agentkit.config.pii_config import PIIConfig
 from agentkit.config.runs_config import RunsConfig
 from agentkit.config.sandbox_config import SandboxConfig
 from agentkit.config.skills_config import SkillsConfig
@@ -38,6 +47,17 @@ from agentkit.config.skills_prefs import (
     write_user_skill_pref,
 )
 from agentkit.config.stream_config import StreamBridgeConfig
+from agentkit.config.subagent_runtime_config import SubagentRuntimeConfig
+from agentkit.config.subagents_config import (
+    SUBAGENT_CONCURRENCY_CEILING,
+    CustomSubagentConfig,
+    SubagentOverrideConfig,
+    SubagentsConfig,
+    SubagentTokenBudgetConfig,
+    drop_null_config_entries,
+    effective_subagent_concurrency,
+    resolve_token_budget_max_tokens,
+)
 from agentkit.config.summarization_config import SummarizationConfig
 from agentkit.config.title_config import TitleConfig
 from agentkit.config.tool_config import ToolConfig
@@ -50,23 +70,38 @@ __all__ = [
     "AuthConfig",
     "LocalLoginConfig",
     "CheckpointerConfig",
+    "CustomSubagentConfig",
     "DatabaseConfig",
     "ExtensionsConfig",
+    "KnowledgeBaseConfig",
     "LlmCallConfig",
     "McpServerConfig",
     "McpUserAuthConfig",
     "SkillToggleConfig",
+    "MemoryConfig",
+    "MemoryFoldingConfig",
+    "MemoryIngestConfig",
+    "MemoryMaintenanceConfig",
+    "MemoryProfileConfig",
     "ModelConfig",
+    "PIIConfig",
     "RunsConfig",
     "DEFAULT_USER_BUCKET",
     "SKILLS_PREFS_FILENAME",
     "SandboxConfig",
     "SkillsConfig",
     "StreamBridgeConfig",
+    "SUBAGENT_CONCURRENCY_CEILING",
+    "SubagentOverrideConfig",
+    "SubagentRuntimeConfig",
+    "SubagentTokenBudgetConfig",
+    "SubagentsConfig",
     "SummarizationConfig",
     "TitleConfig",
     "ToolConfig",
     "atomic_write_extensions_config",
+    "drop_null_config_entries",
+    "effective_subagent_concurrency",
     "extensions_config_file_lock",
     "extensions_config_write_lock",
     "get_app_config",
@@ -77,6 +112,7 @@ __all__ = [
     "reset_extensions_config_cache",
     "resolve_skills_prefs_path",
     "resolve_extensions_config_path",
+    "resolve_token_budget_max_tokens",
     "set_app_config",
     "skills_prefs_file_lock",
     "skills_prefs_write_lock",

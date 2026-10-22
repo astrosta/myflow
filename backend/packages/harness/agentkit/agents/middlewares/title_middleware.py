@@ -20,7 +20,7 @@ from agentkit.utils.messages import get_original_user_content_text, message_cont
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TITLE = "New Conversation"
+_DEFAULT_TITLE = "新对话"
 _PROMPT_SIDE_LIMIT = 500
 _THINK_BLOCK = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 

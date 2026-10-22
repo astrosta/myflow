@@ -136,11 +136,10 @@ def strip_client_identity(body) -> None:
 （`/`、`..`、大小写、超长）。
 
 
-| ID                     | 谁用                                          | 形状                                          |
-| ---------------------- | ------------------------------------------- | ------------------------------------------- |
-| **原始 identity**        | 授权过滤、JWT `sub`、`users.id`（本地账号是 uuid）      | 任意非空                                        |
-| **登录标识**（email / username） | 登录、找回、给人看的名字；`users` 上的两个 unique 列          | 任意非空（各自有形状校验，见 §2.4）                        |
-| **存储 ID**              | 文件系统分桶、sandbox 路径、memory 路径                 | `make_safe_user_id(raw)` → `[A-Za-z0-9_-]+` |
+| ID              | 谁用                                               | 形状                                          |
+| --------------- | ------------------------------------------------ | ------------------------------------------- |
+| **原始 identity** | 授权过滤、JWT `sub`、users 表主键（本地账号用自己的 uuid/email 策略） | 任意非空                                        |
+| **存储 ID**       | 文件系统分桶、sandbox 路径、memory 路径                      | `make_safe_user_id(raw)` → `[A-Za-z0-9_-]+` |
 
 
 ```python
@@ -158,10 +157,6 @@ def make_safe_user_id(raw: str) -> str:
 
 已经安全的 id 原样通过，避免无谓改桶。碰撞靠 digest 后缀，不要靠截断。
 M2 的 `SandboxProvider.acquire(..., user_id=)` 收的是**存储 ID**。
-
-**邮箱和用户名都不能当存储 ID。** 两个都是"用户随时可能想改"的字段，而且都不保证
-字符安全。存储 ID 只有一个来源：`users.id`（§2.2 下面那条规则）。用户名比邮箱更危险——
-它看起来"本来就是 id"，很容易被顺手拿去拼路径，于是"改个用户名"就变成了"数据消失"。
 
 #### 存储 ID 必须不可变：用 `users.id`，不要用 identity
 
@@ -222,37 +217,14 @@ async def get(self, thread_id: str, *, user_id: str | None | _AutoSentinel = AUT
 ```python
 class User(Base):
     __tablename__ = "users"
-    id: Mapped[str]                    # JWT sub；存储桶的唯一来源（§2.2）
-    email: Mapped[str]                 # unique（小写归一）
-    username: Mapped[str]              # unique（小写归一）；登录标识之一，见下表
+    id: Mapped[str]                    # JWT sub
+    email: Mapped[str]                 # unique
     password_hash: Mapped[str | None]  # bcrypt；OIDC 用户可空
     system_role: Mapped[str]           # "admin" | "user"
     needs_setup: Mapped[bool]          # reset 后强制改密
-    disabled: Mapped[bool]             # 停用（不是删除，可恢复）
-    deleted_at: Mapped[datetime | None]# 软删 + 回收期（§2.13 不变量 4）
-    token_version: Mapped[int]         # 改密 / reset / 软删时 +1
+    token_version: Mapped[int]         # 改密 / reset 时 +1
     created_at / updated_at
 ```
-
-**用户名（`username`）的四条规则**：
-
-
-| 规则        | 具体                                                                                       |
-| --------- | ---------------------------------------------------------------------------------------- |
-| 形状        | `^[a-z0-9](?:[a-z0-9_.-]{1,30}[a-z0-9])$`——3..32 字符，小写字母/数字/下划线/点/连字符，首尾必须是字母或数字           |
-| 大小写       | 写入时统一小写（`Alice` → `alice`），比较按小写；**邮箱同理**                                                 |
-| 唯一        | 独立 unique 索引，与 email 各管各的——两个字段可以互相不冲突，但都不允许重名                                             |
-| 保留字       | `default` / `anonymous` / `auth-disabled` / `system` / `internal` 不可注册（它们在日志与桶名里有特殊含义） |
-| **不是存储 ID** | 改用户名**不换桶**：桶名派生自 `users.id`。这条和"改邮箱不换桶"是同一条规则，必须有测试                                       |
-
-
-- **登录标识 = email 或 username。** `POST /api/v1/auth/login/local` 收的是
-  `identifier`：先按邮箱查，查不到再按用户名查（两条都是唯一索引，命中即定）。
-  `email` 作为旧字段名仍然接受（`AliasChoices`），但新客户端只发 `identifier`。
-- **注册 / 初始化必须同时给 `username`**：M9 没有"显示名"这个概念，
-  用户名就是给人看的那个名字，也是除邮箱之外的第二个登录入口。
-- 用户名只在**本地账号**上必填。将来 OIDC 首次登录时由 provider 的
-  `preferred_username` 派生（撞名加后缀），或者第一次登录时要求补填——M9 不做（§12）。
 
 角色 M9 只承认这两个。细粒度 RBAC 见 §12。
 未知 role 在 `build_principal_from_context` 里**不**被改写成 default——缺/空才用 default；
@@ -358,7 +330,7 @@ M2 已定虚拟路径 `/mnt/user-data/{workspace,uploads,outputs}`。
 
 ```text
 {base}/users/{storage_user_id}/threads/{thread_id}/user-data/{workspace,uploads,outputs}
-{base}/users/{storage_user_id}/memory.json          # M10
+LangGraph BaseStore: users/{uid}/profile|records   # M10（不再用 memory.json）
 {base}/users/{storage_user_id}/agents/{name}/       # 自定义 agent
 ```
 
@@ -547,48 +519,39 @@ def caller_from_request(request: Request) -> RunCaller:
 | Method | Path                           | 请求                      | 成功                                                | 谁能打                                                        |
 | ------ | ------------------------------ | ----------------------- | ------------------------------------------------- | ---------------------------------------------------------- |
 | GET    | `/api/v1/auth/setup-status`    | 无                       | `{"needs_setup": bool}`                           | 公开                                                         |
-| POST   | `/api/v1/auth/initialize`      | `InitializeRequest`（email + **username** + password） | 201，`UserResponse`，并设 cookie                      | 公开，且库里还没有 admin                                            |
-| POST   | `/api/v1/auth/login/local`     | `LoginRequest`（`identifier` = 邮箱或用户名） | 200，`LoginResponse`，并设 cookie                     | 公开                                                         |
+| POST   | `/api/v1/auth/initialize`      | `InitializeRequest`     | 201，`UserResponse`，并设 cookie                      | 公开，且库里还没有 admin                                            |
+| POST   | `/api/v1/auth/login/local`     | `LoginRequest`          | 200，`LoginResponse`，并设 cookie                     | 公开                                                         |
 | POST   | `/api/v1/auth/register`        | `RegisterRequest`       | 201，`UserResponse`，并设 cookie                      | 公开；`auth.allow_registration` 为假则 403 `registration_closed` |
 | POST   | `/api/v1/auth/logout`          | 无                       | 200 `{"ok": true}`，清 cookie                       | 公开。有会话就作废，没有也 200                                          |
 | GET    | `/api/v1/auth/providers`       | 无                       | `{"local": true}`                                 | 公开。OIDC 不在本阶段（§12）                                         |
 | GET    | `/api/v1/auth/me`              | 无                       | `UserResponse`                                    | 已登录                                                        |
-| PATCH  | `/api/v1/auth/me`              | `UsernameUpdateRequest` | 200，`UserResponse`                                | **仅会话**。改**自己**的用户名；路径里没有 user_id，所以没有 IDOR 的余地          |
 | POST   | `/api/v1/auth/change-password` | `ChangePasswordRequest` | 200 `{"ok": true}`，`token_version += 1`，重签 cookie | **仅会话**。PAT 打这条 → 403 `session_required`                   |
 
 
 ```python
 # app/gateway/auth/models.py  （请求模型 extra="forbid"，放在 auth 包里，不进 run 的 request.py）
 class LoginRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    # 邮箱**或**用户名；旧的 email 字段名仍然接受（AliasChoices）
-    identifier: str = Field(max_length=254, validation_alias=AliasChoices("identifier", "email"))
-    password: str = Field(max_length=256)
+    model_config = ConfigDict(extra="forbid")
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
     remember_me: bool = False
 
 class InitializeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    email: str = Field(max_length=254)
-    username: str = Field(max_length=32)
-    password: str = Field(max_length=256)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
 
 class RegisterRequest(InitializeRequest):
     pass
 
-class UsernameUpdateRequest(BaseModel):
-    """PATCH /api/v1/auth/me 的请求体。**只允许改用户名**。"""
-    model_config = ConfigDict(extra="forbid")
-    username: str = Field(max_length=512)      # 上界只是防超大 body；规则在领域层
-
 class ChangePasswordRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    current_password: str = Field(max_length=256)
-    new_password: str = Field(max_length=256)
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
 
 class UserResponse(BaseModel):
     id: str
     email: str
-    username: str
     system_role: Literal["admin", "user"]
 
 class LoginResponse(BaseModel):
@@ -596,59 +559,16 @@ class LoginResponse(BaseModel):
     needs_setup: bool
 ```
 
-形状校验（长度、邮箱规则、用户名规则）**不在模型层做**：模型层的 `min_length` 会先抛
-pydantic 的 `Request validation failed`，用户只知道"错了"、不知道"错在哪"。
-细则放在领域层，抛带 `code` 的 422（见下面的错误表）。
-
 `UserResponse` 没有 `password_hash`，没有 `token_version`。`LoginResponse` 没有 token 字符串（§2.4）。Set-Cookie 由 `session_cookie.py` 写，路由只调用它。
 
-**PATCH `/me` 只改用户名，而且只改自己。** 三条刻意的约定：
 
-- **路径里没有 user_id**：目标就是会话里那个人。带 user_id 的 `PATCH /users/{id}` 是
-  管理接口的形状——它需要 `admin` 能力、需要审计日志、还要处理"不能改自己"之类的约束。
-  M9 不混这两件事：admin 改**别人**的用户名走服务层（§2.13），对应的路由留到 W4。
-- **不动令牌**：改用户名不是撤销事件。§2.13 的失效矩阵里"改角色 / 改邮箱 / 改用户名"
-  都是"令牌有效、数据不变"。改名顺手把所有设备踢下线，是最容易被写进去、
-  也最难向用户解释的行为。
-- **邮箱、角色、密码不许在这里顺手一起改**：请求体 `extra="forbid"`，
-  多给一个字段就是 422 `invalid_request`，而且错误里会点名那个字段。
-
-
-认证错误**默认具体到能照着做**（`auth.local.specific_errors=true`）：
-
-
-| 情形                            | HTTP | `code`                                              |
-| ----------------------------- | ---- | --------------------------------------------------- |
-| 邮箱形状不对                        | 422  | `invalid_email`——detail 说清哪条规则没过，并回显调用方刚敲的值         |
-| 用户名形状不对 / 撞保留字                | 422  | `invalid_username`——detail 说清是哪条（长度 / 字符集 / 首尾 / 保留字） |
-| 用户名被占                         | 409  | `username_taken`——点名那个用户名，让用户换一个                   |
-| 口令短于 8 字符                     | 422  | `password_too_short`——detail 带"最少 8 位"和实际位数         |
-| 口令超过 72 字节                    | 422  | `password_too_long`——按 **UTF-8 字节**算，detail 带实际字节数   |
-| 邮箱已注册                         | 409  | `user_already_exists`——点名那个邮箱，并提示去登录               |
-| 自助注册关闭                        | 403  | `registration_closed`                              |
-| 已有 admin 再 initialize          | 409  | `admin_already_exists`（**不点名**现有 admin 的邮箱：公开路由）     |
-| 登录标识没有账号（邮箱或用户名）              | 401  | `account_not_found`——detail 回显用户输入的那个标识，提示去注册     |
-| 密码不对                          | 401  | `wrong_password`                                   |
-| 账号被禁用 / 在回收期（**口令正确**才说）       | 403  | `account_disabled` / `account_deleted`             |
-| 同一 peer IP 超过 `max_login_attempts` | 429  | `login_rate_limited`，响应头带 `Retry-After`，detail 带剩余秒数 |
-| 改密时当前密码错                      | 401  | `invalid_credentials`——detail 说 `current password` |
-| change-password 的调用方是 PAT      | 403  | `session_required`                                 |
-
-
-两条不变量：
-
-- **明文口令永不回显**（也不进日志、不进库）。错误 detail 只说规则与**长度**。
-- **账号状态（禁用 / 回收期）只在口令正确之后才透露**：不知道口令的人不该从响应里读出
-  "这个账号存在且被禁用了"。
-
-把 `auth.local.specific_errors` 设成 **false** 会退回老行为：登录的四种失败
-（没这个账号 / 密码错 / 被禁用 / 回收期）全部收敛成 401 `invalid_credentials`、同一个 detail。
-代价是用户不知道为什么失败，收益是别人无法用登录接口探测某个邮箱（或用户名）有没有注册。
-这是**部署选择**，不是实现细节——默认给用户可操作的答案。
-
-> `email_not_registered` 这个名字在引入用户名之后就不准了（用户敲的可能是用户名），
-> 因此改名为 `account_not_found`。**登录标识不存在时报的是"没这个账号"，不说是邮箱还是用户名**：
-> 说了等于把两个命名空间都交给对方探测。
+| 情形                                 | HTTP | `code`                                       |
+| ---------------------------------- | ---- | -------------------------------------------- |
+| 邮箱不存在或密码错                          | 401  | `invalid_credentials`。两种情况同一个 detail，不透露哪个错了 |
+| 同一 peer IP 超过 `max_login_attempts` | 429  | `login_rate_limited`                         |
+| 已有 admin 再 initialize              | 409  | `admin_already_exists`                       |
+| 改密时当前密码错                           | 401  | `invalid_credentials`                        |
+| change-password 的调用方是 PAT          | 403  | `session_required`                           |
 
 
 登录计数用 TCP peer IP。只有 peer 落在 `AUTH_TRUSTED_PROXIES` 里才读 `X-Real-IP`（§2.5）。
@@ -708,7 +628,6 @@ pydantic 的 `Request validation failed`，用户只知道"错了"、不知道"�
 | admin 删除用户            | admin                                  | 同上                             | 同上             | 不能删最后一个 admin                                      |
 | 改角色 user ↔ admin      | admin                                  | 不变（role 每次从库里读）                | 不变             | 不能把最后一个 admin 降级                                   |
 | 改邮箱                   | 本人 / admin                             | 不变（`sub` 是 uuid，不是邮箱）          | 不变             | **桶名也不变**（§2.2）——这条要专门有测试                          |
-| 改用户名                  | 本人 / admin                             | 不变（`sub` 是 uuid，不是用户名）         | 不变             | 同上：**桶名也不变**；撞名 409 `username_taken`                 |
 
 
 四条不变量（都要有测试，而且都属于"最后一步才发现"的那类 bug）：
@@ -718,12 +637,9 @@ pydantic 的 `Request validation failed`，用户只知道"错了"、不知道"�
    或对 admin 行加锁——**不能先查再写**：TOCTOU 之后系统没有 admin，只能靠 CLI 救。
 2. **不能禁用/删除自己。** 409 `cannot_modify_self`。防的不是恶意，是手滑把自己锁在外面，
   而恢复要动 CLI。
-3. `**needs_setup=true` 的用户只能改密。** 中间件放行**改密、logout，以及
-  `GET /me`**（前端得能问出"我是谁、为什么被拦"），其余业务路由 403 `setup_required`。
-  **这条按 `(method, path)` 判，不是只看 path**：`/me` 同时有 GET 和 PATCH，
-  而 PATCH 是改用户名——正事是改密码的人不该先去改用户名，
-  那只会把"旧口令还能用"的窗口拖长。
-  **不要只在前端拦**：管理员重置密码之后，用户在拿到新密码之前不该能用旧会话做任何事。
+3. `**needs_setup=true` 的用户只能改密。** 中间件放行改密与 logout，其余业务路由
+  403 `setup_required`。**不要只在前端拦**：管理员重置密码之后，
+   用户在拿到新密码之前不该能用旧会话做任何事。
 4. **删除是软删 + 回收期。** 行保留（`deleted_at` 非空）、令牌全失效、桶先标记后删；
   回收期内 admin 能恢复，到期由保留策略任务真删（与 M4 §10 同一套扫描）。
    **注意 `AUTO` 语义**：软删用户的行还在，所以"按 user_id 查"仍然查得到——
@@ -851,26 +767,6 @@ PAT 是"给脚本用的长期凭据"。下面每条规则都在防止**一次性
    没有报错也没有指标。
 8. **`AgentClient`（嵌入路径）补了 `config["context"]`**：原来图装配拿不到 `user_id`，
    而运行期那一侧是 `default`，两侧落进不同桶——§2.1 说的就是这个 bug。
-9. **认证错误默认"具体"**（`auth.local.specific_errors=true`）：§2.12 原本要求
-   登录失败一律 401 `invalid_credentials`、同一个 detail；产品上要的是"用户点一次就知道
-   下一步做什么"，所以默认改成逐条说清（邮箱没注册 / 密码错 / 被禁用 / 回收期），
-   并保留把开关关掉退回防枚举形态的能力。**账号状态只在口令正确之后才透露**，
-   明文口令永不回显。
-10. **公开路由上的 401 ≠ 会话失效（两端各改一处）。**
-    后端：陈旧 cookie 在公开路由下降级成匿名（受保护路由仍是 401），
-    否则带着旧 cookie 的浏览器**永远进不了登录页**；
-    前端：`isAuthEndpoint()` 把登录 / 注册 / 初始化 / 改密排除在
-    `notifyUnauthorized()` 的广播之外——那里的 401/403 是"这次提交不对"，
-    广播出去的表现是点一次登录就被弹成"登录状态已失效，请重新登录"，真正的原因被顶掉。
-11. **用户名（`username`）是后加的第二个登录标识**（§2.4 / §2.12）。
-    落地方式：`users.username` 独立 unique 索引、写入时小写归一、
-    注册与初始化必填、登录接受 `identifier`（邮箱或用户名，旧的 `email` 字段名仍然接受）。
-    `email_not_registered` 随之改名为 `account_not_found`——用户敲的是哪个命名空间，
-    响应里**不区分**，否则等于把两个命名空间都交出去探测。已有数据由
-    `0003_users_username` 从邮箱 local part 回填（撞名加后缀）。
-12. **服务端读不出认证配置报 503 `auth_unavailable`**，不再伪装成 401 `unauthenticated`。
-    伪装的两个后果：用户被送去重新登录（而再登一次还是同一个错），
-    以及健康检查跟着变红。健康检查路径（`/health`、`/health/ready`）在配置坏掉时仍然放行。
 
 ---
 
@@ -1757,23 +1653,11 @@ M4 的混合 bootstrap 仍然适用。M9 新增 revision（不要改已 stamp �
 
 | revision                   | 内容                                                                     |
 | -------------------------- | ---------------------------------------------------------------------- |
-| `0002_users_pat`           | `users` 表（id / email / **username** / password_hash / …）+ `personal_access_tokens` |
-| `0003_users_username`      | 已有的 `users` 补 `username` 列：加可空列 → 回填 → 唯一索引 → 置 NOT NULL                |
+| `00xx_users`               | `users` 表 + admin 部分唯一索引                                               |
 | `00xx_run_lease_live`      | 若 M4 已有租约列则空；补 `cancel_action` / `cancel_requested_at` / `stop_reason` |
 | `00xx_scheduled_tasks`     | 两张表 + `uq_scheduled_task_run_active`                                   |
 | `00xx_channel_connections` | connections + conversations + `uq_channel_connection_active_identity`  |
 | `00xx_pat`                 | W4 可选；只存 SHA-256 digest                                                |
-
-
-**`username` 的回填规则**（`0003_users_username`，跑在滚动发布之前）：
-
-1. 从邮箱的 local part 派生（`alice@example.com` → `alice`），按 §2.4 的字符集清洗；
-2. 撞名加数字后缀（`alice-2`、`alice-3`…），仍然撞就退回 `user-<id 前 8 位>`；
-3. 清洗后不足 3 字符的同样走第 2 条；
-4. 回填完再建 unique 索引、再置 `NOT NULL`——**顺序不能反**，反了在有数据的库上会直接失败。
-
-**admin 部分唯一索引**在实现时改成了条件写（见 §2.17 第 1 条），
-所以这条 revision 里没有它。
 
 
 `create_all` + stamp 路径必须在 ORM `__table_args__` 里带上那两个 partial unique index。

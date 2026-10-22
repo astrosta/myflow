@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.runnables import RunnableConfig
 
@@ -18,8 +20,11 @@ from agentkit.agents.middlewares.durable_context_middleware import DurableContex
 from agentkit.agents.middlewares.dynamic_context_middleware import DynamicContextMiddleware
 from agentkit.agents.middlewares.input_sanitization_middleware import InputSanitizationMiddleware
 from agentkit.agents.middlewares.llm_error_handling_middleware import LLMErrorHandlingMiddleware
+from agentkit.agents.middlewares.memory_middleware import MemoryMiddleware
+from agentkit.agents.middlewares.pii_middleware import PIIMiddleware, PIIOutputMiddleware
 from agentkit.agents.middlewares.skill_activation_middleware import SkillActivationMiddleware
 from agentkit.agents.middlewares.skill_tool_policy_middleware import SkillToolPolicyMiddleware
+from agentkit.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
 from agentkit.agents.middlewares.summarization_middleware import create_summarization_middleware
 from agentkit.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
 from agentkit.agents.middlewares.title_middleware import TitleMiddleware
@@ -27,7 +32,10 @@ from agentkit.agents.middlewares.tool_error_handling_middleware import ToolError
 from agentkit.agents.middlewares.uploads_middleware import UploadsMiddleware
 from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.secret_context import new_owner_token
-from agentkit.sandbox.middleware import SandboxMiddleware
+from agentkit.agents.middlewares.sandbox_middleware import SandboxMiddleware
+from agentkit.subagents.policy import SubagentPolicy
+
+logger = logging.getLogger(__name__)
 
 
 def build_skill_middlewares(
@@ -83,6 +91,9 @@ def build_runtime_middlewares(
     # SLOT: ToolReceipt / Guardrail / SandboxAudit / ReadBeforeWrite / ToolProgress（M10/W3）
     # 错误处理放最内：外层看到的是盖好 myflow_tool_meta 的结果。
     chain.append(ToolErrorHandlingMiddleware(app_config=app_config))
+    # PII 工具参数还原必须在 ToolErrorHandling 之内：无法解析的 handle 会被
+    # 错误处理收成可恢复的 ToolMessage，而不是把整轮打崩。
+    chain.append(PIIMiddleware(app_config=app_config))
     return chain
 
 
@@ -94,9 +105,11 @@ def build_middlewares(
     custom_middlewares: list[AgentMiddleware] | None = None,
     user_id: str | None = None,
     available_skills: frozenset[str] | None = None,
+    subagent_policy: SubagentPolicy | None = None,
 ) -> list[AgentMiddleware]:
     """lead 的完整链：基础层 + 上下文投影 + 技能（Activation → Policy → DurableContext）。"""
     resolved = app_config or get_app_config()
+    subagent_enabled = bool((config or {}).get("configurable", {}).get("subagent_enabled"))
     chain = build_runtime_middlewares(resolved, include_uploads=True, lazy_init=True)
     chain.append(DynamicContextMiddleware(app_config=resolved))
 
@@ -116,11 +129,43 @@ def build_middlewares(
             app_config=resolved, run_model_name=model_name
         )
         if summarization is not None:
+            # M10 §2.6.1：压缩丢掉的消息在压缩前入队，而不是等下一轮。
+            from agentkit.agents.memory.manager import get_memory_manager
+            from agentkit.agents.memory.summarization_hook import MemorySummarizationHook
+
+            try:
+                manager = get_memory_manager(app_config=resolved)
+                if manager.ingestors:
+                    summarization.before_summarization.append(
+                        MemorySummarizationHook(
+                            manager,
+                            user_id=user_id,
+                            thread_id=(config or {}).get("configurable", {}).get("thread_id"),
+                        )
+                    )
+            except Exception:
+                logger.warning("Memory summarization hook was not attached", exc_info=True)
             chain.append(summarization)
     # SLOT: TodoList if is_plan_mode
     chain.append(TitleMiddleware(app_config=resolved))
-    # SLOT: Memory（M10）/ ViewImage / SystemMessageCoalescing / LoopDetection（W3）
-    # SLOT: SubagentLimitMiddleware if subagent_enabled（M8，lead-only）
+    # M10 §2.6.1 / §2.8.1：画像注入与轮次入队。after_model 反序，所以它在 Title 之后注册、
+    # 在 Title 之前跑——标题生成失败不影响记忆入队。
+    chain.append(MemoryMiddleware(config=resolved, user_id=user_id))
+    # 输出侧脱敏最后注册：after_model 反序，因此它在 Memory/Title 之前跑，模型
+    # 写回的 AI 文本和 tool_calls 参数先变成 handle，Memory 再看到脱敏/去 handle 视图。
+    chain.append(PIIOutputMiddleware(app_config=resolved))
+    # SLOT: ViewImage / SystemMessageCoalescing / LoopDetection（W3）
+    # M8 §10.3：槽位耗尽时剥调用（lead-only）。after_model 反序，所以它排在 DurableContext
+    # **之前**跑——prior 数的正是"这次模型调用之前"已经派出去的那些委派。
+    if subagent_enabled and subagent_policy is not None:
+        chain.append(
+            SubagentLimitMiddleware(
+                # §16：并发数读的是**同一份策略快照**（提示词里的数字也来自它）；
+                # 总量每 run 现读当前配置（这一条可热重载，§4.2）
+                max_concurrent=subagent_policy.max_concurrent,
+                max_total_per_run=resolved.subagents.max_total_per_run,
+            )
+        )
     # SLOT: TerminalResponse / SafetyFinishReason / Clarification（W3，必须最后注册）
     if custom_middlewares:
         chain.extend(custom_middlewares)
@@ -135,4 +180,6 @@ def build_subagent_runtime_middlewares(
 ) -> list[AgentMiddleware]:
     """子代理（M8）复用基础层：没有上传、没有标题、没有技能绑定。"""
     del model_name
-    return build_runtime_middlewares(app_config, include_uploads=False, lazy_init=lazy_init)
+    chain = build_runtime_middlewares(app_config, include_uploads=False, lazy_init=lazy_init)
+    chain.append(PIIOutputMiddleware(app_config=app_config))
+    return chain

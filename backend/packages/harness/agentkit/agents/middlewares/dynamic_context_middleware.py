@@ -21,11 +21,12 @@ from agentkit.utils.messages import INJECTED_USER_MESSAGE_ID_SUFFIX
 logger = logging.getLogger(__name__)
 
 _INJECT_TIMEOUT_SECONDS = 5.0
-_DATE_TIMEZONE_ENV = "DEER_FLOW_DATE_TIMEZONE"
+_DATE_TIMEZONE_ENV = "MYFLOW_DATE_TIMEZONE"
 _DYNAMIC_CONTEXT_REMINDER_KEY = "dynamic_context_reminder"
 _REMINDER_DATE_KEY = "reminder_date"
 _DATE_RE = re.compile(r"<current_date>([^<]+)</current_date>")
 _SUMMARY_MESSAGE_NAME = "summary"
+_PROFILE_MESSAGE_ID = "__user_profile__"
 
 
 def is_dynamic_context_reminder(message: object) -> bool:
@@ -58,7 +59,7 @@ def _date_timezone() -> ZoneInfo | None:
 def _format_current_date() -> str:
     tz = _date_timezone()
     now = datetime.now(tz) if tz is not None else datetime.now()
-    return now.strftime("%Y-%m-%d, %A")
+    return now.strftime("%Y-%m-%d") + " 星期" + "一二三四五六日"[now.weekday()]
 
 
 def _full_reminder(current_date: str) -> str:
@@ -99,6 +100,8 @@ def _is_user_injection_target(message: object) -> bool:
     if is_dynamic_context_reminder(message):
         return False
     if message.name == _SUMMARY_MESSAGE_NAME:
+        return False
+    if message.id == _PROFILE_MESSAGE_ID:
         return False
     if message.id and str(message.id).endswith(INJECTED_USER_MESSAGE_ID_SUFFIX):
         return False

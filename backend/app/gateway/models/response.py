@@ -251,3 +251,127 @@ class McpConfigResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     mcp_servers: dict[str, dict[str, Any]] = Field(alias="mcpServers")
+
+# ---------------------------------------------------------------------------
+# Knowledge base
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeTypeStatus(BaseModel):
+    value: str
+    strategy: str
+    chunk_size_tokens: int
+    chunk_overlap_tokens: int
+
+
+class KnowledgeStatusResponse(BaseModel):
+    enabled: bool
+    parser: str
+    parser_mode: str
+    embedding_model: str
+    embedding_dimensions: int
+    vector_store: str
+    collection: str
+    allowed_extensions: list[str]
+    text_extensions: list[str]
+    max_file_size_bytes: int
+    max_total_size_bytes: int
+    max_files_per_request: int
+    max_documents_per_base: int
+    types: list[KnowledgeTypeStatus]
+
+
+class KnowledgeBaseResponse(BaseModel):
+    id: str
+    name: str
+    type: str
+    description: str | None = None
+    document_count: int
+    chunk_count: int
+    created_at: str
+    updated_at: str
+
+
+class KnowledgeBaseListResponse(BaseModel):
+    bases: list[KnowledgeBaseResponse]
+    count: int
+
+
+class KnowledgeDocumentResponse(BaseModel):
+    id: str
+    knowledge_base_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    status: str
+    chunk_count: int
+    error_message: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class KnowledgeDocumentListResponse(BaseModel):
+    documents: list[KnowledgeDocumentResponse]
+    count: int
+
+
+class KnowledgeUploadResponse(BaseModel):
+    documents: list[KnowledgeDocumentResponse]
+    count: int
+
+
+class KnowledgeSearchHitResponse(BaseModel):
+    chunk_id: str
+    document_id: str
+    filename: str
+    section: str
+    page: int
+    chunk_index: int
+    score: float
+    knowledge_base_id: str
+    knowledge_base_name: str
+    knowledge_base_type: str
+    content: str
+    rrf_score: float | None = None
+    rerank_score: float | None = None
+
+
+class KnowledgeSearchResponse(BaseModel):
+    query: str
+    keyword_query: str = ""
+    retrieval_mode: str = "vector"
+    reranked: bool = False
+    results: list[KnowledgeSearchHitResponse]
+    truncated: bool = False
+
+
+class KnowledgeDeletedResponse(BaseModel):
+    deleted: str
+
+
+def knowledge_base_to_wire(item) -> KnowledgeBaseResponse:
+    return KnowledgeBaseResponse(
+        id=item.id,
+        name=item.name,
+        type=item.type,
+        description=item.description,
+        document_count=item.document_count,
+        chunk_count=item.chunk_count,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
+def knowledge_document_to_wire(item) -> KnowledgeDocumentResponse:
+    return KnowledgeDocumentResponse(
+        id=item.id,
+        knowledge_base_id=item.knowledge_base_id,
+        filename=item.filename,
+        mime_type=item.mime_type,
+        size_bytes=item.size_bytes,
+        status=item.status,
+        chunk_count=item.chunk_count,
+        error_message=item.error_message,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )

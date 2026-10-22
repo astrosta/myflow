@@ -23,6 +23,7 @@ from agentkit.sandbox.exceptions import (
     SandboxNotFoundError,
     SandboxRuntimeError,
 )
+from agentkit.sandbox.lease import lease_owner_from_context, shield_sandbox_work
 from agentkit.sandbox.sandbox import Sandbox
 from agentkit.sandbox.sandbox_provider import get_sandbox_provider
 from agentkit.sandbox.security import safe_app_config
@@ -156,6 +157,13 @@ async def ensure_sandbox_initialized_async(runtime: ToolRuntime | None = None) -
 
 
 async def run_sync_tool_after_async_init(func, runtime: ToolRuntime, *args: Any) -> Any:
-    """Async graphs initialize the sandbox first, then run the sync tool off-loop."""
+    """Async graphs initialize the sandbox first, then run the sync tool off-loop.
+
+    §11.3：子代理名下这次调用要**登记**在租约台账里再 await。``to_thread`` 取消不掉——
+    worker 被砍之后线程还在跑，执行器得先 ``drain_sandbox_work`` 排空它，才能释放租约。
+    """
     await ensure_sandbox_initialized_async(runtime)
-    return await asyncio.to_thread(func, runtime, *args)
+    owner_id = lease_owner_from_context(runtime.context)
+    if owner_id is None:
+        return await asyncio.to_thread(func, runtime, *args)
+    return await shield_sandbox_work(owner_id, asyncio.to_thread(func, runtime, *args))

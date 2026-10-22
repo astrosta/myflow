@@ -62,7 +62,7 @@ sandbox:
 #   enabled: true
 #   jwt_secret: $AUTH_JWT_SECRET   # ≥32 字节；读不到会直接报错。改了 = 所有会话立刻失效
 #   allow_registration: false      # 自助注册要显式打开
-#   internal_tokens: [$DEER_FLOW_INTERNAL_AUTH_TOKEN]   # 通道/调度器代表用户用；支持 [new, old] 轮换
+#   internal_tokens: [$MYFLOW_INTERNAL_AUTH_TOKEN]   # 通道/调度器代表用户用；支持 [new, old] 轮换
 # cookie 只在 HTTPS / 本机 localhost / 显式 opt-in 时持久化（§2.4）。
 # ------------------------------------------------------------
 auth:
@@ -113,3 +113,130 @@ skills:
   path: skills                  # 相对项目根
   container_path: /mnt/skills   # startup-only：编译进提示词索引与沙箱 mount
   index_description_max_chars: 120
+
+# ------------------------------------------------------------
+# 知识库（MinerU + Qwen3-Embedding-8B + Milvus）
+# enabled=false 时不需要装 pymilvus/transformers，也不会给 agent 挂检索工具。
+# 启用前必须填写所有服务地址：代码里没有默认端点。
+# 安装：uv sync --all-packages --all-extras（会同时装 postgres/mcp 等 extra）
+# ------------------------------------------------------------
+knowledge_base:
+  enabled: false
+  storage_dir: .myflow/knowledge
+  allowed_extensions: [pdf, doc, docx, ppt, pptx, xls, xlsx, md, markdown, txt, html, htm, csv, epub]
+  text_extensions: [md, markdown, txt, html, htm, csv]
+  max_file_size_bytes: 52428800
+  max_total_size_bytes: 209715200
+  max_files_per_request: 10
+  max_knowledge_bases_per_user: 50
+  max_documents_per_base: 200
+  max_ingest_concurrency: 2
+
+  parse:
+    provider: mineru
+    mode: local                 # local | cloud
+    local:
+      endpoint: ""              # 必填：本地 MinerU 地址，例如 http://127.0.0.1:8000
+      file_parse_path: /v1/file_parse
+      api_key: ""               # 可选；需要时写 $MINERU_API_KEY
+      response_format: zip
+      tier: flash
+      ocr_mode: txt
+      timeout_seconds: 600
+    cloud:
+      base_url: ""              # 必填：例如 https://mineru.net
+      api_key: ""               # 必填；建议写 $MINERU_API_KEY
+      model_version: pipeline
+      language: ch
+      enable_formula: true
+      enable_table: true
+      is_ocr: false
+      poll_interval_seconds: 2
+      timeout_seconds: 900
+      max_download_bytes: 536870912
+    max_download_bytes: 536870912
+
+  chunking:
+    tokenizer:
+      provider: qwen             # qwen | approximate
+      model: Qwen/Qwen3-Embedding-8B
+      path: ""                  # 可选：本地 tokenizer 目录
+      local_files_only: false
+    min_chunk_tokens: 32
+    max_chunk_tokens: 1024
+    separators: ["\n\n", "\n", "。", "！", "？", "；", ". ", "! ", "? ", "; ", "，", ", ", " "]
+    types:
+      technical:
+        strategy: heading_hierarchy
+        chunk_size_tokens: 512
+        chunk_overlap_tokens: 64
+      operations:
+        strategy: procedure
+        chunk_size_tokens: 512
+        chunk_overlap_tokens: 64
+      faq:
+        strategy: qa_pair
+        chunk_size_tokens: 384
+        chunk_overlap_tokens: 0
+      security:
+        strategy: clause
+        chunk_size_tokens: 512
+        chunk_overlap_tokens: 64
+      api:
+        strategy: api_reference
+        chunk_size_tokens: 768
+        chunk_overlap_tokens: 0
+
+  embedding:
+    provider: openai_compatible
+    protocol: openai            # openai | tei
+    base_url: ""                # 必填：Qwen3-Embedding-8B 服务地址
+    path: /embeddings
+    api_key: ""
+    model: Qwen/Qwen3-Embedding-8B
+    dimensions: 4096
+    max_input_tokens: 8192
+    batch_size: 8
+    timeout_seconds: 120
+    max_retries: 2
+    send_dimensions: false
+    query_instruction: "Given a question, retrieve passages from the user's knowledge base that answer it"
+    document_instruction: ""
+
+  vector_store:
+    provider: milvus
+    uri: "http://192.168.154.141:19530"   # 必填；当前环境已配置，无鉴权
+    token: ""
+    db_name: ""
+    collection: myflow_knowledge
+    metric_type: COSINE
+    index_type: AUTOINDEX
+    consistency_level: Session
+    flush: true
+    timeout_seconds: 30
+
+  retrieval:
+    top_k: 5
+    candidate_k: 20                 # 每个召回通道的候选数，也是交给精排的条数
+    rrf_k: 60                       # RRF 融合的 k（与 Milvus RRFRanker 同参数）
+    score_threshold: null           # 仅纯向量检索生效；COSINE 常用 0.2~0.4
+    max_context_chars: 8000
+
+    # 关键词通道：BM25 稀疏检索，由 Milvus 服务端完成分词与打分。
+    keyword:
+      enabled: true
+      analyzer: chinese             # chinese | english | standard；改后需重建 collection
+      bm25_k1: 1.2
+      bm25_b: 0.75
+
+    # 精排：开关关掉时直接用 RRF 融合顺序。
+    rerank:
+      enabled: false                # 打开时下面的 base_url 与 model 必填
+      protocol: cohere              # cohere | tei（vLLM/Jina/Cohere 走 cohere，TEI 走 tei）
+      base_url: ""                  # 精排服务地址，例如 http://127.0.0.1:8000/rerank 的 host
+      path: /rerank
+      api_key: ""                   # 可写 $RERANK_API_KEY
+      model: Qwen/Qwen3-Reranker-8B
+      max_document_chars: 4000
+      timeout_seconds: 60
+      max_retries: 1

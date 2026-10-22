@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-#: 设计文档里叫 deerflow_mcp；本仓库统一用 myflow_ 前缀（见 myflow_tool_meta）。
+#: MCP 工具的元数据键。本仓库统一 ``myflow_`` 前缀（见 myflow_tool_meta）。
 MCP_TOOL_META_KEY = "myflow_mcp"
 
 

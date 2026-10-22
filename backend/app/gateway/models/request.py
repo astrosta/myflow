@@ -159,3 +159,25 @@ class SkillPreferenceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool
+
+
+# ---------------------------------------------------------------------------
+# Knowledge base
+# ---------------------------------------------------------------------------
+
+KnowledgeTypeLiteral = Literal["technical", "operations", "faq", "security", "api"]
+
+
+class KnowledgeBaseCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    type: KnowledgeTypeLiteral
+    description: str | None = Field(default=None, max_length=2000)
+class KnowledgeBaseUpdateRequest(BaseModel):
+    """Type is intentionally absent: changing it would invalidate every chunk."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)

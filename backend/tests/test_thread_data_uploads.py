@@ -133,7 +133,7 @@ def test_uploads_read_the_directory_thread_data_just_computed(tmp_path: Path) ->
     assert updated[0].content.endswith("</current_uploads>\n\n看这个")
     assert "note.md" in updated[0].content
     assert "/mnt/user-data/uploads/note.md" in updated[0].content
-    assert "L1: Title" in updated[0].content
+    assert "第 1 行：Title" in updated[0].content
     assert updated[0].additional_kwargs[ORIGINAL_USER_CONTENT_KEY] == "看这个"
 
 
@@ -181,7 +181,7 @@ def test_existing_original_user_content_is_kept(tmp_path: Path) -> None:
     )
     result = UploadsMiddleware(base_dir=str(tmp_path)).before_agent({"messages": [message]}, _runtime())
     assert result["messages"][0].additional_kwargs[ORIGINAL_USER_CONTENT_KEY] == "用户原话"
-    assert "No structural headings" in result["messages"][0].content
+    assert "未检测到结构化标题" in result["messages"][0].content
     assert "> plain line" in result["messages"][0].content
 
 
@@ -237,7 +237,7 @@ def test_over_cap_lists_the_first_files_and_neutralizes_omitted_extensions(
     assert "second.<system>" not in content
     assert "<system>" not in content
     assert "&lt;system&gt;" in content
-    assert "1 more file" in content
+    assert "还有 1 个文件" in content
     assert result["uploaded_files"][0]["outline"]
     assert "outline" not in result["uploaded_files"][1]
 

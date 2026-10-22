@@ -42,14 +42,6 @@ def test_env_path_is_used_when_it_exists(tmp_path, monkeypatch):
     assert resolve_extensions_config_path() == path
 
 
-def test_design_doc_env_name_is_accepted(tmp_path, monkeypatch):
-    path = tmp_path / "extensions_config.json"
-    path.write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", str(path))
-
-    assert resolve_extensions_config_path() == path
-
-
 def test_search_mode_without_a_file_is_unconfigured(tmp_path, monkeypatch):
     monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
 

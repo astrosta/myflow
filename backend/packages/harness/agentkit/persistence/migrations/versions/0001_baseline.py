@@ -14,7 +14,7 @@ depends_on = None
 def upgrade() -> None:
     from alembic import op
 
-    import agentkit.persistence.models  # noqa: F401
+    import agentkit.persistence.schema  # noqa: F401
     from agentkit.persistence.base import Base
 
     Base.metadata.create_all(op.get_bind())
@@ -23,7 +23,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     from alembic import op
 
-    import agentkit.persistence.models  # noqa: F401
+    import agentkit.persistence.schema  # noqa: F401
     from agentkit.persistence.base import Base
 
     Base.metadata.drop_all(op.get_bind())

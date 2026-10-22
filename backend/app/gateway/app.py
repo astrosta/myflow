@@ -10,12 +10,21 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from agentkit.agents.memory.backends.langmem.store import make_memory_store
+from agentkit.agents.memory.maintenance.service import MemoryMaintenanceService
+from agentkit.agents.memory.manager import (
+    configure_memory_store,
+    get_memory_manager,
+    reset_memory_manager,
+)
 from agentkit.config import AppConfig, get_app_config
+from agentkit.knowledge.service import configure_knowledge_service, reset_knowledge_service
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine_from_config
 from agentkit.persistence.recovery import gateway_worker_count, recover_inflight_runs
 from agentkit.persistence.thread_meta import make_thread_meta_store
 from agentkit.runtime import cancel_detached
 from agentkit.runtime.checkpointer import make_checkpointer
+from agentkit.subagents.runtime import get_subagent_runtime
 from agentkit.persistence.events import make_run_event_store
 from agentkit.runtime.run_services import build_run_services
 from agentkit.persistence.run import make_run_store
@@ -29,7 +38,9 @@ from backend.app.gateway.errors import install_error_handlers
 from backend.app.gateway.middleware.trace import TraceMiddleware
 from backend.app.gateway.routers import (
     artifacts,
+    knowledge,
     mcp,
+    memory,
     models,
     skills,
     thread_runs,
@@ -72,27 +83,59 @@ async def lifespan(app: FastAPI):
         workers = gateway_worker_count()
         event_store = make_run_event_store(app_config.run_events, gateway_workers=workers)
         async with make_checkpointer(app_config) as checkpointer:
-            services = build_run_services(
-                app_config,
-                checkpointer,
-                thread_meta=thread_meta,
-                run_store=run_store,
-                event_store=event_store,
-            )
-            app.state.run_services = services
-            # 账号表在 app 层（§1.2）：harness 不认识 UserRecord，只认识 CurrentUser Protocol。
-            app.state.auth_service = AuthService(make_user_store(session_factory))
-            recovered = await recover_inflight_runs(
-                run_store, thread_meta, gateway_workers=workers
-            )
-            if recovered:
-                logger.warning("recovered %s inflight runs as error after restart", recovered)
-            try:
-                yield
-            finally:
-                timeout = app_config.runs.shutdown_timeout_seconds
-                await services.run_manager.shutdown(timeout=timeout if timeout is not None else 10.0)
-                cancel_detached()
+            with make_memory_store(
+                app_config.database,
+                app_config.memory.backend_config if app_config.memory.enabled else {},
+            ) as memory_store:
+                services = build_run_services(
+                    app_config,
+                    checkpointer,
+                    thread_meta=thread_meta,
+                    run_store=run_store,
+                    event_store=event_store,
+                )
+                app.state.run_services = services
+                # 账号表在 app 层（§1.2）：harness 不认识 UserRecord，只认识 CurrentUser Protocol。
+                app.state.auth_service = AuthService(make_user_store(session_factory))
+                # M10 §2.5.3 / §2.9.1：memory store 和 checkpointer 同一个 database 选择；
+                # maintenance 是独立服务，不复用定时任务服务（那个会创建 thread/run）。
+                configure_memory_store(memory_store)
+                memory_manager = get_memory_manager(
+                    store=memory_store, app_config=app_config
+                )
+                app.state.memory_manager = memory_manager
+                # Knowledge metadata shares the app database; providers are built once.
+                app.state.knowledge_config = app_config.knowledge_base
+                app.state.knowledge_service = await configure_knowledge_service(
+                    app_config.knowledge_base
+                )
+                maintenance = MemoryMaintenanceService(memory_manager)
+                app.state.memory_maintenance = maintenance
+                if app_config.memory.enabled and app_config.memory.maintenance.enabled:
+                    maintenance.start()
+                # M8 §10.1：进程级子代理容量控制器在这里冻结一次（subagent_runtime.* 是
+                # startup-only）。建在启动时而不是"第一个启用子代理的 run"，是为了让 YAML
+                # 里那个值在启动那一刻就定下来——热重载不能悄悄抬高已经宣告出去的容量。
+                get_subagent_runtime(app_config)
+                recovered = await recover_inflight_runs(
+                    run_store, thread_meta, gateway_workers=workers
+                )
+                if recovered:
+                    logger.warning("recovered %s inflight runs as error after restart", recovered)
+                try:
+                    yield
+                finally:
+                    maintenance.stop()
+                    if not memory_manager.flush(
+                        app_config.memory.ingest.shutdown_flush_timeout_seconds
+                    ):
+                        logger.warning("Memory extraction flush exceeded its shutdown budget")
+                    reset_memory_manager()
+                    await reset_knowledge_service()
+                    app.state.knowledge_service = None
+                    timeout = app_config.runs.shutdown_timeout_seconds
+                    await services.run_manager.shutdown(timeout=timeout if timeout is not None else 10.0)
+                    cancel_detached()
     finally:
         await close_engine()
 
@@ -140,6 +183,10 @@ def create_app() -> FastAPI:
     # M7 §2.4：两个 router 各自 prefix，/api 加在这里。
     application.include_router(mcp.router, prefix="/api")
     application.include_router(skills.router, prefix="/api")
+    # Human-facing knowledge base; same /api prefix as the rest of the browser API.
+    application.include_router(knowledge.router, prefix="/api")
+    # M10 §2.12：memory routes，/api 同样加在这里。
+    application.include_router(memory.router, prefix="/api")
     # M9 §2.12：认证路由 prefix=/v1/auth，/api 同样加在这里。
     application.include_router(auth_router, prefix="/api")
     return application

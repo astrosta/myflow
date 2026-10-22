@@ -51,17 +51,25 @@ agentkit/persistence/
 ├── json_compat.py             ★  # json_value_matches / JsonMatch（SQLite+PG）
 ├── postgres_schema.py            # search_path 钉住、schema 名白名单
 ├── recovery.py                   # recover_inflight_runs：启动时把孤儿活跃行收成 error
-├── models/
-│   ├── __init__.py               # 必须 import 所有模型，autogenerate 才看得见
-│   └── run_event.py              # RunEventRow（实现在 persistence/events/db.py）
-├── thread_meta/
-│   ├── model.py                  # ThreadMetaRow
+├── schema.py                     # ★ 唯一一处把**所有** ORM 类 import 一遍的地方
+├── thread_meta/                  # 三套仓储一个形状：ABC + 内存 + SQL + ORM 行
 │   ├── base.py                   # ThreadMetaStore ABC
+│   ├── memory.py
+│   ├── model.py                  # ThreadMetaRow
 │   ├── sql.py
-│   └── memory.py
+│   └── __init__.py               # make_thread_meta_store()
 ├── run/
+│   ├── base.py                   # RunStore ABC + ACTIVE_STATUSES（M3 定的接口）
+│   ├── memory.py                 # MemoryRunStore
 │   ├── model.py                  # RunRow
-│   └── sql.py                    # SqlRunStore，实现 M3 的 RunStore ABC
+│   ├── sql.py                    # SqlRunStore
+│   └── __init__.py               # make_run_store()
+├── events/
+│   ├── base.py                   # RunEventStore ABC
+│   ├── codec.py                  # 信封校验 + content 的 JSON 编码（唯一编码器）
+│   ├── memory.py / db.py / jsonl.py
+│   ├── model.py                  # RunEventRow（只有 db 后端用它）
+│   └── __init__.py               # make_run_event_store()
 └── migrations/
     ├── alembic.ini
     ├── env.py
@@ -91,6 +99,10 @@ agentkit/runtime/events/
 └── journal.py                 ★  # RunJournal：callback → put_batch
 ```
 
+**ORM 行跟着它的仓储走，不再单开 `models/` 目录。** 每张表只有一个仓储会碰它
+（`run_events` 只有 `events/db.py`），把行定义放在那个包里，"表 ↔ 仓储 ↔ 工厂"
+三者就在同一个目录下。`schema.py` 只承担一件事：**把所有行类 import 一遍**。
+
 **两套 ABC 都住在 `persistence/`，和 `thread_meta` 一样。** 仓储的接口属于持久化
 这一层：`RunManager` 与 `RunJournal` 依赖的是 ABC，不是某一份实现；
 "哪份实现"由工厂按 `database.backend` / `run_events.backend` 决定。
@@ -105,9 +117,10 @@ runtime 那边只留**跑的时候才存在**的东西（catalog、journal、man
 `get_session_factory()` 返回 `None`，工厂函数必须退化到 memory 实现，
 而不是让调用方自己 `if session_factory is None`。调用方只认 ABC。
 
-`models/__init__.py` 必须把所有 ORM 类 import 一遍。漏掉任何一个，
-`create_all` 建不出那张表，`autogenerate` 也看不见它——然后 CI 的
-「空 diff」测试会绿，上线才 500 `no such table`。
+`persistence/schema.py` 必须把所有 ORM 类 import 一遍（`create_all`、`env.py`、
+`0001_baseline` 都 import 它）。漏掉任何一个，`create_all` 建不出那张表，
+`autogenerate` 也看不见它——然后 CI 的「空 diff」测试会绿，
+上线才 500 `no such table`。**新加表时唯一要做的事就是往这个文件里加一行。**
 
 ---
 
@@ -1229,7 +1242,7 @@ M4 先把合同文件建出来，哪怕只有上面那 7 条：
 M4 的 ORM：
 
 ```python
-# agentkit/persistence/models/run_event.py
+# agentkit/persistence/events/model.py
 class RunEventRow(Base):
     __tablename__ = "run_events"
 
@@ -2397,7 +2410,7 @@ SQLite 连接上要打开 `render_as_batch`。旧版 SQLite 不能直接 `ALTER 
 
 ```python
 # agentkit/persistence/migrations/env.py
-import agentkit.persistence.models          # noqa: F401  ★ 少这一行，autogenerate 会生成"删掉所有表"
+import agentkit.persistence.schema          # noqa: F401  ★ 少这一行，autogenerate 会生成"删掉所有表"
 from agentkit.persistence.base import Base
 from agentkit.persistence.migrations._env_filters import include_object
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain.agents import create_agent
 from langchain_core.runnables import RunnableConfig
@@ -19,6 +19,11 @@ from agentkit.config import AppConfig, get_app_config
 from agentkit.models import create_chat_model
 from agentkit.runtime.user_context import resolve_runtime_user_id
 from agentkit.tools import get_available_tools
+
+from agentkit.subagents.policy import SubagentPolicy
+
+if TYPE_CHECKING:  # 运行时在 assemble_agent 里 import：subagents 那条链会绕回本模块
+    from agentkit.subagents.runtime import SubagentRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +77,7 @@ def assemble_agent(
     *,
     app_config: AppConfig | None = None, 
     checkpointer: Checkpointer | None = None,
+    subagent_runtime: SubagentRuntime | None = None,
 ) -> AgentAssembly:
 
     cfg = (config or {}).get("configurable", {})
@@ -80,6 +86,7 @@ def assemble_agent(
     user_id = _resolve_user_id(config)
     requested_model  = _resolve_runtime_option(cfg, "model_name", None, resolved_config.agents.default_model)
     thinking_enabled = _resolve_runtime_option(cfg, "thinking_enabled", None, False)
+    subagent_enabled = bool(_resolve_runtime_option(cfg, "subagent_enabled", None, False))
 
     # 能力协商
     model_name = _effective_model_name(requested_model, resolved_config)
@@ -88,25 +95,74 @@ def assemble_agent(
     # 建立模型
     model = create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_config, attach_tracing=False)
 
+    # M8 §10.1：进程级共享的容量控制器。**同一个实例**要喂给 task 闭包、Limit 中间件、执行器，
+    # 否则每个 run 一套各 3 槽的控制器，上限形同虚设。
+    runtime = subagent_runtime
+    if subagent_enabled and runtime is None:
+        from agentkit.subagents.runtime import get_subagent_runtime
+
+        runtime = get_subagent_runtime(resolved_config)
+
+    # M8 §16：委派策略在 run 开始时**快照一次**，写进 run config 的 context。
+    # task 工具（执行侧）与 Limit 中间件（剥调用）之后都读这一份，运行中改 YAML 不影响
+    # 本次 run——否则同一次 run 的前后两次委派会用两套策略。
+    policy = None
+    if subagent_enabled:
+        from agentkit.subagents.policy import snapshot_subagent_policy
+
+        policy = snapshot_subagent_policy(
+            resolved_config,
+            max_running=runtime.config.max_running if runtime is not None else None,
+        )
+        _stamp_subagent_policy(config, policy)
+
     # 组装工具
-    tools = apply_tool_filter(
-        get_available_tools(
-            model_name=model_name,
-            subagent_enabled=bool(_resolve_runtime_option(cfg, "subagent_enabled", None, False)),
-            app_config=resolved_config,
-        ),
-        cfg=cfg,
+    tools = get_available_tools(
+        model_name=model_name,
+        subagent_enabled=subagent_enabled,
+        app_config=resolved_config,
     )
+    if runtime is not None and policy is not None and policy.enabled:
+        # task 是**闭包**，不是内置工具表里的静态对象：它要绑到那个共享 runtime 上。
+        # §16：[]（硬拒绝）时连工具都不装——看不见也调不动。
+        from agentkit.tools.builtin.task_tool import make_task_tool
+
+        tools = [*tools, make_task_tool(dispatcher=runtime, app_config=resolved_config)]
+    if resolved_config.memory.enabled:
+        # M10 §2.8.2：read-only memory_search. Its closure is bound to the process manager
+        # so tests and embedded hosts can inject a manager without touching a global.
+        from agentkit.agents.memory.manager import get_memory_manager
+        from agentkit.agents.memory.tools import TOOL_NAME as MEMORY_TOOL_NAME
+        from agentkit.agents.memory.tools import make_memory_search_tool
+
+        try:
+            manager = get_memory_manager(app_config=resolved_config)
+            if MEMORY_TOOL_NAME not in {tool.name for tool in tools}:
+                tools = [*tools, make_memory_search_tool(manager)]
+        except Exception:
+            logger.warning("memory_search was not attached", exc_info=True)
+    if resolved_config.knowledge_base.enabled:
+        # Identity is read from runtime.context inside the tool, never from model args.
+        from agentkit.knowledge.tool import TOOL_NAME as KNOWLEDGE_TOOL_NAME
+        from agentkit.knowledge.tool import make_knowledge_search_tool
+
+        if KNOWLEDGE_TOOL_NAME not in {tool.name for tool in tools}:
+            tools = [*tools, make_knowledge_search_tool()]
+    # 过滤（将来 M9 的鉴权也在这里）必须看到**完整**的工具表，所以 task 在它之前就位
+    tools = apply_tool_filter(tools, cfg=cfg)
 
     # 组中间件（M6 §3.2 的顺序；M7 §3.9 的技能槽位在 assembly 里）
-    middleware = build_middlewares(config, app_config=resolved_config, user_id=user_id)
+    middleware = build_middlewares(
+        config, app_config=resolved_config, user_id=user_id, subagent_policy=policy
+    )
 
-    # 渲染系统提示词
+    # 渲染系统提示词（§16：委派段读的是同一份快照）
     system_prompt = apply_prompt_template(
         agent_name=_resolve_runtime_option(cfg, "agent_name", None, None),
-        subagent_enabled=_resolve_runtime_option(cfg, "subagent_enabled", None, False),
+        subagent_enabled=subagent_enabled,
         app_config=resolved_config,
         user_id=user_id,
+        subagent_policy=policy,
     )
 
     graph = _compile_agent(model=model, tools=tools, middleware=middleware, system_prompt=system_prompt, state_schema=ThreadState, checkpointer=checkpointer)
@@ -119,6 +175,21 @@ class AgentAssembly:
 
 def unwrap_agent_graph(result: Any) -> Any:
     return result.graph if isinstance(result, AgentAssembly) else result
+
+
+def _stamp_subagent_policy(config: RunnableConfig, policy: SubagentPolicy) -> None:
+    """把策略快照写进 run config 的 ``context``（worker 会把它变成 runtime.context）。
+
+    这两个键**客户端够不到**：``build_run_config`` 只从服务端塞 context，而
+    ``normalize_client_configurable`` 会删掉所有非装配键。所以这里写的是服务端权威值。
+    """
+    if not isinstance(config, dict):
+        return
+    context = config.get("context")
+    if not isinstance(context, dict):
+        context = {}
+        config["context"] = context
+    context.update(policy.to_context())
 
 def _resolve_runtime_option(cfg: dict, key: str, agent_value, default):
     """Resolve a runtime option with ``request > agent config > default`` precedence.
@@ -164,6 +235,7 @@ def build_middlewares(
     *,
     app_config: AppConfig | None = None,
     user_id: str | None = None,
+    subagent_policy: SubagentPolicy | None = None,
 ) -> list:
     """lead 的完整中间件链。顺序与槽位注释都在 middlewares/assembly.py。"""
     from agentkit.agents.middlewares.assembly import build_middlewares as _assemble
@@ -171,7 +243,13 @@ def build_middlewares(
     resolved = app_config or get_app_config()
     cfg = (config or {}).get("configurable", {})
     model_name = _resolve_runtime_option(cfg, "model_name", None, resolved.agents.default_model)
-    return _assemble(config, model_name, app_config=resolved, user_id=user_id)
+    return _assemble(
+        config,
+        model_name,
+        app_config=resolved,
+        user_id=user_id,
+        subagent_policy=subagent_policy,
+    )
 
 
 def _resolve_user_id(config: RunnableConfig) -> str | None:

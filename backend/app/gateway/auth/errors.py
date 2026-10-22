@@ -167,7 +167,7 @@ class SetupRequired(CodedError):
 
 
 class UnknownOwner(CodedError):
-    """`X-DeerFlow-Owner-User-Id` 不是存在且启用的账号（§2.9 关 2）。
+    """`X-MyFlow-Owner-User-Id` 不是存在且启用的账号（§2.9 关 2）。
 
     不允许"先发消息再建号"：那会写进一个没人拥有的桶。
     """

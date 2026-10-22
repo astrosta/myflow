@@ -5,10 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from uuid import uuid4
 
-from fastapi import Request
-
+from agentkit.agents.memory.manager import MemoryManager, get_memory_manager
+from agentkit.config import get_app_config
+from agentkit.config.knowledge_config import KnowledgeBaseConfig
+from agentkit.knowledge.errors import KnowledgeDisabled
+from agentkit.knowledge.service import KnowledgeService
 from agentkit.persistence.engine import get_session_factory
 from agentkit.runtime.run_services import RunServices
+from fastapi import Request
+
 from backend.app.gateway.auth.errors import Unauthenticated
 from backend.app.gateway.auth.result import AuthKind, AuthResult
 from backend.app.gateway.auth.service import AuthService
@@ -22,6 +27,10 @@ __all__ = [
     "get_auth_service",
     "get_checkpointer",
     "get_event_store",
+    "get_knowledge_config",
+    "get_knowledge_service",
+    "get_knowledge_service_optional",
+    "get_memory_manager_service",
     "get_request_id",
     "get_run_services",
     "get_run_store",
@@ -38,7 +47,7 @@ def caller_from_request(request: Request) -> RunCaller:
 
     `auth.scopes is None` 表示会话用户或内部调用方（不按 scope 裁）；
     PAT 带具体集合。内部调用是 `CallerKind.INTERNAL`，`user_id` 来自
-    `X-DeerFlow-Owner-User-Id`，而且那只头**只有** AuthMiddleware 读（§2.9）。
+    `X-MyFlow-Owner-User-Id`，而且那只头**只有** AuthMiddleware 读（§2.9）。
     """
     auth: AuthResult | None = getattr(request.state, "auth", None)
     if auth is None:
@@ -70,6 +79,16 @@ def require_authenticated(request: Request) -> AuthResult:
     return auth
 
 
+def get_memory_manager_service(request: Request) -> MemoryManager:
+    """Resolve the process manager (lifespan-owned when running the real app)."""
+    manager = getattr(request.app.state, "memory_manager", None)
+    if not isinstance(manager, MemoryManager):
+        manager = get_memory_manager()
+    request.state.memory_manager = manager
+    request.state.memory_maintenance = getattr(request.app.state, "memory_maintenance", None)
+    return manager
+
+
 def get_run_services(request: Request) -> RunServices:
     return request.app.state.run_services
 
@@ -88,6 +107,26 @@ def get_event_store(request: Request):
 
 def get_checkpointer(request: Request):
     return get_run_services(request).run_context.checkpointer
+
+
+def get_knowledge_service_optional(request: Request) -> KnowledgeService | None:
+    # app.state is process-owned; tests may inject a narrow fake implementing the service API.
+    service = getattr(request.app.state, "knowledge_service", None)
+    return service if service is not None else None
+
+
+def get_knowledge_service(request: Request) -> KnowledgeService:
+    service = get_knowledge_service_optional(request)
+    if service is None:
+        raise KnowledgeDisabled("Knowledge base is disabled or not initialized")
+    return service
+
+
+def get_knowledge_config(request: Request) -> KnowledgeBaseConfig:
+    config = getattr(request.app.state, "knowledge_config", None)
+    if isinstance(config, KnowledgeBaseConfig):
+        return config
+    return get_app_config().knowledge_base
 
 
 def get_request_id(request: Request) -> str:

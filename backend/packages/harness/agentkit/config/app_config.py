@@ -10,8 +10,11 @@ from agentkit.config.auth_config import AuthConfig
 from agentkit.config.checkpointer_config import CheckpointerConfig
 from agentkit.config.database_config import DatabaseConfig
 from agentkit.config.file_signature import ConfigSignature, get_config_signature
+from agentkit.config.knowledge_config import KnowledgeBaseConfig
 from agentkit.config.llm_call_config import LlmCallConfig
+from agentkit.config.memory_config import MemoryConfig
 from agentkit.config.model_config import ModelConfig
+from agentkit.config.pii_config import PIIConfig
 from agentkit.config.reload_boundary import format_field_description
 from agentkit.config.run_events_config import RunEventsConfig
 from agentkit.config.runs_config import RunsConfig
@@ -19,9 +22,12 @@ from agentkit.config.runtime_paths import existing_project_file
 from agentkit.config.sandbox_config import SandboxConfig
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.config.stream_config import StreamBridgeConfig
+from agentkit.config.subagent_runtime_config import SubagentRuntimeConfig
+from agentkit.config.subagents_config import SubagentsConfig, resolve_token_budget_max_tokens
 from agentkit.config.summarization_config import SummarizationConfig
 from agentkit.config.title_config import TitleConfig
 from agentkit.config.tool_config import ToolConfig
+from agentkit.subagents.config import INHERIT_MODEL
 
 
 class AppConfig(BaseModel):
@@ -44,6 +50,15 @@ class AppConfig(BaseModel):
     llm_call: LlmCallConfig = Field(default_factory=LlmCallConfig)
     title: TitleConfig = Field(default_factory=TitleConfig)
     summarization: SummarizationConfig = Field(default_factory=SummarizationConfig)
+    # Knowledge base: disabled by default; enabling requires configured service addresses.
+    knowledge_base: KnowledgeBaseConfig = Field(default_factory=KnowledgeBaseConfig)
+    # M10 §2.11：host-shared memory policy; backend-private knobs stay in backend_config.
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    # PII 只在 model/state 边界脱敏；工具结果由工具自身负责（见 PII 文档）。
+    pii: PIIConfig = Field(default_factory=PIIConfig)
+    # M8 §4：subagents 全部热重载；subagent_runtime 是进程级容量（startup-only）。
+    subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
+    subagent_runtime: SubagentRuntimeConfig = Field(default_factory=SubagentRuntimeConfig)
     models: list[ModelConfig] = Field(default_factory=list)
     tools: list[ToolConfig] = Field(default_factory=list)
     model_config = ConfigDict(extra="allow")
@@ -98,6 +113,29 @@ class AppConfig(BaseModel):
             raise ValueError(f"summarization.model_name {summary_model!r} is not one of models[].name")
         return self
 
+    @model_validator(mode="after")
+    def _validate_subagent_models(self) -> Self:
+        """§4.3：model 要么是 ``inherit``，要么必须落在 models[].name 里。
+
+        和 agents.default_model / title.model_name 同一条纪律：配置期就失败，
+        而不是等第一个子代理被派出去才在隔离循环里炸。
+        """
+        for name, definition in self.subagents.custom_agents.items():
+            if definition.model != INHERIT_MODEL and definition.model not in self._models_by_name:
+                raise ValueError(
+                    f"subagents.custom_agents.{name}.model {definition.model!r} is not one of "
+                    f"models[].name (or {INHERIT_MODEL!r})"
+                )
+        for name, override in self.subagents.agents.items():
+            if override.model is None or override.model == INHERIT_MODEL:
+                continue
+            if override.model not in self._models_by_name:
+                raise ValueError(
+                    f"subagents.agents.{name}.model {override.model!r} is not one of "
+                    f"models[].name (or {INHERIT_MODEL!r})"
+                )
+        return self
+
     @classmethod
     def resolve_config_path(cls, config_path: Path|None = None) -> Path:
         if config_path:
@@ -130,6 +168,13 @@ class AppConfig(BaseModel):
 
     def get_model_config(self, name: str) -> ModelConfig | None:
         return self._models_by_name.get(name)
+
+    def resolve_subagent_token_budget_max_tokens(self) -> int:
+        """子代理 token 预算上限（§4.1）：显式值永远优先，否则跟 summarization.enabled 耦合。"""
+        return resolve_token_budget_max_tokens(
+            self.subagents.token_budget,
+            summarization_enabled=self.summarization.enabled,
+        )
 
 
 _app_config: AppConfig | None = None

@@ -128,28 +128,28 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
     def _format_entry(self, file: dict, lines: list[str]) -> None:
         size_kb = file["size"] / 1024
         size_text = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024:.1f} MB"
-        lines.append(f"- {neutralize_untrusted_tags(file['filename'])} ({size_text})")
-        lines.append(f"  Path: {neutralize_untrusted_tags(file['path'])}")
+        lines.append(f"- {neutralize_untrusted_tags(file['filename'])}（{size_text}）")
+        lines.append(f"  路径：{neutralize_untrusted_tags(file['path'])}")
         outline = [entry for entry in file.get("outline") or [] if not entry.get("truncated")]
         if outline:
-            lines.append("  Document outline (use `read_file` with line ranges to read sections):")
+            lines.append("  文档大纲（可用 `read_file` 按行范围读取对应章节）：")
             for entry in outline:
-                lines.append(f"  L{entry['line']}: {neutralize_untrusted_tags(str(entry.get('title') or ''))}")
+                lines.append(f"  第 {entry['line']} 行：{neutralize_untrusted_tags(str(entry.get('title') or ''))}")
         else:
             preview = file.get("outline_preview") or []
             if preview:
-                lines.append("  No structural headings detected. Document begins with:")
+                lines.append("  未检测到结构化标题。文档开头如下：")
                 for text in preview:
                     lines.append(f"  > {neutralize_untrusted_tags(str(text))}")
         lines.append("")
 
     def _files_message(self, files: list[dict], omitted: list[dict]) -> str:
-        lines = ["<current_uploads>", "The following files were uploaded in this message:", ""]
+        lines = ["<current_uploads>", "本条消息上传了以下文件：", ""]
         for file in files:
             self._format_entry(file, lines)
         if omitted:
-            lines.append(f"... ({len(omitted)} more file(s) from this message omitted from this context.)")
-            lines.append(f"  Omitted file types: {_omitted_types(omitted)}")
+            lines.append(f"...（本条消息还有 {len(omitted)} 个文件未放入当前上下文。）")
+            lines.append(f"  未放入的文件类型：{_omitted_types(omitted)}")
             lines.append("")
         lines.append("</current_uploads>")
         return "\n".join(lines)

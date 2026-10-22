@@ -60,11 +60,13 @@ class MemoryRunEventStore(RunEventStore):
         run_id: str,
         event_types: Sequence[str] | None = None,
         after_seq: int | None = None,
+        task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         rows = [
             row
             for row in self._events.get(thread_id, [])
-            if row["run_id"] == run_id and _event_visible(row, event_types, after_seq)
+            if row["run_id"] == run_id
+            and _event_visible(row, event_types, after_seq, task_id)
         ]
         rows.sort(key=lambda row: row["seq"])
         return [_copy(row) for row in rows]
@@ -153,11 +155,22 @@ def _copy(row: dict[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(row)
 
 
-def _event_visible(row: dict[str, Any], event_types: Sequence[str] | None, after_seq: int | None) -> bool:
+def _event_visible(
+    row: dict[str, Any],
+    event_types: Sequence[str] | None,
+    after_seq: int | None,
+    task_id: str | None = None,
+) -> bool:
     if event_types is not None and row["event_type"] not in event_types:
         return False
     if after_seq is not None and row["seq"] <= after_seq:
         return False
+    if task_id is not None:
+        # M8 §14.3：展开一张卡片时只拉那一条委派的事件。metadata 里存的是 provider 的
+        # tool_call_id（对外相关键），不是 execution_id。
+        metadata = row.get("metadata")
+        if not isinstance(metadata, dict) or metadata.get("task_id") != task_id:
+            return False
     return True
 
 

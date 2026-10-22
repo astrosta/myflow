@@ -6,7 +6,7 @@ auth:
   jwt_secret: $AUTH_JWT_SECRET  # HS256 签名密钥
   jwt_ttl_seconds: 86400
   allow_registration: false     # §2.13：自助注册要显式打开
-  internal_tokens: []           # 与 DEER_FLOW_INTERNAL_AUTH_TOKEN 合并，支持 [new, old] 轮换
+  internal_tokens: []           # 与 MYFLOW_INTERNAL_AUTH_TOKEN 合并，支持 [new, old] 轮换
   local:
     max_login_attempts: 5       # 热重载；最小 2（单次失败不得锁 IP，§2.5）
     lockout_seconds: 300
@@ -21,7 +21,7 @@ from typing import Literal
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 #: 通道 / 调度器代表用户时带的那只头（§2.9）。轮换期允许新旧并存。
-INTERNAL_AUTH_TOKEN_ENV = "DEER_FLOW_INTERNAL_AUTH_TOKEN"
+INTERNAL_AUTH_TOKEN_ENV = "MYFLOW_INTERNAL_AUTH_TOKEN"
 
 
 class LocalLoginConfig(BaseModel):
@@ -101,7 +101,7 @@ class AuthConfig(BaseModel):
     local: LocalLoginConfig = Field(default_factory=LocalLoginConfig)
 
     def effective_internal_tokens(self) -> tuple[str, ...]:
-        """配置列表 + `DEER_FLOW_INTERNAL_AUTH_TOKEN`，去重且保持顺序。"""
+        """配置列表 + `MYFLOW_INTERNAL_AUTH_TOKEN`，去重且保持顺序。"""
         tokens: list[str] = []
         for token in (*self.internal_tokens, os.getenv(INTERNAL_AUTH_TOKEN_ENV, "")):
             if token and token not in tokens:

@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain.agents.middleware.summarization import (
-    DEFAULT_SUMMARY_PROMPT,
     ContextSize,
     SummarizationMiddleware,
 )
@@ -31,9 +30,58 @@ from agentkit.runtime.runs.worker import build_state_mutation_graph
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SUMMARY_PROMPT = """<role>
+上下文提取助手
+</role>
+
+<primary_objective>
+你的唯一目标是从下面的对话历史中提取质量最高、最相关的上下文。
+</primary_objective>
+
+<objective_information>
+你即将达到可接受的输入 token 上限，因此必须从对话历史中提取最重要、最相关的信息。
+这些上下文之后会替换下面的完整对话历史。请确保只保留继续完成总体目标所必需的信息。
+</objective_information>
+
+<instructions>
+下面的对话历史会被你提取的上下文替换。你要确保不会重复已经完成的操作，
+因此提取内容应聚焦于对总体目标最重要的信息。
+
+请按以下章节组织摘要。每个章节都像检查清单：有内容就填写，没有内容就明确写“无”。
+
+## 会话意图
+
+用户的主要目标或请求是什么？你正在完成什么总体任务？要简洁，但足以理解整个会话的目的。
+
+## 摘要
+
+提取并记录对话历史中最重要的上下文，包括对话中做出的重要选择、结论或策略，
+以及关键决策背后的理由。记录被否决的选项及其原因。
+
+## 产物
+
+本次对话创建、修改或访问了哪些产物、文件或资源？如果是文件修改，
+请列出具体路径并简述改动。这个章节用于防止产物信息静默丢失。
+
+## 后续步骤
+
+为完成会话意图，还有哪些具体任务需要执行？下一步应该做什么？
+
+</instructions>
+
+用户会提供完整消息历史，你需要从中提取用于替换的上下文。请仔细通读，
+认真判断哪些信息对总体目标最重要、最应该保留：
+
+<messages>
+需要总结的消息：
+{messages}
+</messages>
+
+只返回提取出的上下文，不要添加任何额外信息，也不要在前后添加说明。
+"""
 _CANNED_SUMMARIES = frozenset({
-    "No previous conversation history.",
-    "Previous conversation was too long to summarize.",
+    "没有更早的对话历史。",
+    "之前的对话过长，无法生成摘要。",
 })
 _SUMMARY_TAGS = ["middleware:summarize", TAG_NOSTREAM]
 
@@ -69,7 +117,7 @@ def compact_http_error(exc: Exception) -> tuple[int, str]:
     raise exc
 
 
-class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
+class MyFlowSummarizationMiddleware(SummarizationMiddleware):
     """Anchor model stays untagged. The summary copy carries nostream."""
 
     def __init__(
@@ -185,6 +233,20 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             raise SummaryGenerationError("summary generation failed")
         return None
 
+    def _create_summary(self, messages: list) -> str:
+        if not messages:
+            return "没有更早的对话历史。"
+        if not self._trim_messages_for_summary(messages):
+            return "之前的对话过长，无法生成摘要。"
+        return super()._create_summary(messages)
+
+    async def _acreate_summary(self, messages: list) -> str:
+        if not messages:
+            return "没有更早的对话历史。"
+        if not self._trim_messages_for_summary(messages):
+            return "之前的对话过长，无法生成摘要。"
+        return await super()._acreate_summary(messages)
+
     def _summary_prompt_text(self, messages: list) -> str | None:
         if not messages:
             return None
@@ -196,8 +258,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
     def _canned_summary(self, messages: list) -> str:
         if not messages:
-            return "No previous conversation history."
-        return "Previous conversation was too long to summarize."
+            return "没有更早的对话历史。"
+        return "之前的对话过长，无法生成摘要。"
 
     def _fallback_summary(self, messages: list) -> str | None:
         model = self._fallback_model
@@ -321,7 +383,7 @@ def create_summarization_middleware(
     app_config: AppConfig | None = None,
     keep: tuple[str, int | float] | None = None,
     run_model_name: str | None = None,
-) -> DeerFlowSummarizationMiddleware | None:
+) -> MyFlowSummarizationMiddleware | None:
     config = (app_config or get_app_config()).summarization
     if not config.enabled:
         return None
@@ -367,7 +429,7 @@ def create_summarization_middleware(
         except Exception:
             logger.debug("Fallback summary model %r failed to build", run_model_name, exc_info=True)
     parent_trigger: Any = trigger[0] if trigger and len(trigger) == 1 else trigger
-    return DeerFlowSummarizationMiddleware(
+    return MyFlowSummarizationMiddleware(
         model,
         trigger=parent_trigger,
         keep=keep_tuple,
@@ -383,7 +445,7 @@ async def compact_thread_context(
     checkpointer,
     thread_id: str,
     *,
-    middleware: DeerFlowSummarizationMiddleware,
+    middleware: MyFlowSummarizationMiddleware,
     force: bool = False,
 ) -> CompactOutcome:
     head = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
@@ -426,7 +488,7 @@ async def compact_with_reservation(
     thread_id: str,
     *,
     user_id: str | None,
-    middleware: DeerFlowSummarizationMiddleware,
+    middleware: MyFlowSummarizationMiddleware,
     force: bool = False,
 ) -> CompactOutcome:
     async with run_manager.reserve_thread_operation(

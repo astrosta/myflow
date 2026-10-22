@@ -21,7 +21,10 @@ from agentkit.agents.leader_agent import (
     CONTEXT_ONLY_KEYS,
     SERVER_OWNED_KEYS,
 )
+from agentkit.agents.middlewares.pii_middleware import PII_VAULT_CONTEXT_KEY
 from agentkit.agents.middlewares.provenance import PROVENANCE_KEYS
+from agentkit.subagents.status_contract import SUBAGENT_TOOL_MESSAGE_KEYS
+from agentkit.privacy import PIIRedactor, PIIVault, redact_raw_input
 from agentkit.utils.messages import ORIGINAL_USER_CONTENT_KEY
 from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.context import RunContext
@@ -69,11 +72,20 @@ _CREDDENTIAL_METADATA_KEYS = frozenset({"auth_token"})
 _CLIENT_IDENTITY_KEYS = ("user_id", "owner_id", "auth_user", "auth_user_id")
 
 # 客户端不能伪造的 additional_kwargs 键。internal 请求只保留 original_user_content。
-_SERVER_OWNED_MESSAGE_KEYS = PROVENANCE_KEYS | {
+# M8 §9.3：子代理的终态元数据（subagent_status / stop_reason / error / brief / sha256 /
+# model_name / token_usage）只接受**本进程 task 工具**盖过的值——回放的历史消息里
+# 带着这些键，一律当伪造处理。
+_SERVER_OWNED_MESSAGE_KEYS = PROVENANCE_KEYS | SUBAGENT_TOOL_MESSAGE_KEYS | {
     ORIGINAL_USER_CONTENT_KEY,
     "hide_from_ui",
     "dynamic_context_reminder",
     "reminder_date",
+    # M10 §2.8.1 / §2.8.3：画像注入标记只能由 MemoryMiddleware 盖。
+    "memory_profile",
+    "memory_profile_revision",
+    "memory_profile_sha256",
+    "memory_profile_tokens",
+    "memory_profile_truncated",
 }
 SERVER_OWNED_MESSAGE_KEYS: frozenset[str] = _SERVER_OWNED_MESSAGE_KEYS
 
@@ -130,6 +142,14 @@ async def start_run(
     # 拒绝metadata携带凭证数据（checkpoint持久化时会落库）
     _reject_metadata_secrets(body)
 
+    # PII 边界：在 normalize / 幂等比较 / run record 之前替换输入。mapping 只挂在
+    # runtime.context 里，绝不进入 body.input、RunRecord.kwargs 或 checkpoint。
+    pii_vault = _redact_run_input(
+        body,
+        app_config,
+        vault_id=_pii_vault_id(thread_id, idempotency_key, body.input),
+    )
+
     # 规范化stream_mode
     stream_modes = _normalize_stream_modes(body.stream_mode) 
 
@@ -164,6 +184,8 @@ async def start_run(
     # 写入服务端权威值
     run_id = new_run_id()
     inject_server_owned(config, caller, run_id=run_id, trace_id=run_metadata[TRACE_METADATA_KEY], body_context=body.context) 
+    if pii_vault is not None:
+        config["context"][PII_VAULT_CONTEXT_KEY] = pii_vault
 
     # 准入
     scoped_key = scope_idempotency_key(caller, thread_id, idempotency_key)
@@ -203,6 +225,35 @@ async def start_run(
         await _abandon_unattached_run(services, record, exc)
         raise
     return RunLaunch(record=record, reused=False)
+
+def _pii_vault_id(
+    thread_id: str, idempotency_key: str | None, raw_input: Any
+) -> str | None:
+    """Stable handle namespace for idempotent replays; random for ordinary runs.
+
+    The raw-input digest is part of the namespace so a reused Idempotency-Key with a
+    changed sensitive value cannot compare equal after tokenization.
+    """
+    if not idempotency_key:
+        return None
+    serialized = json.dumps(raw_input, ensure_ascii=False, sort_keys=True, default=str)
+    material = f"{thread_id}\0{idempotency_key}\0{serialized}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:8]
+
+
+def _redact_run_input(
+    body: RunCreateRequest,
+    app_config: AppConfig,
+    *,
+    vault_id: str | None = None,
+) -> PIIVault | None:
+    """Redact the raw request input once, before it is persisted or normalized."""
+    if not app_config.pii.enabled or not isinstance(body.input, dict):
+        return None
+    vault = PIIVault(vault_id=vault_id) if vault_id else PIIVault()
+    body.input = redact_raw_input(body.input, PIIRedactor(vault))
+    return vault
+
 
 def strip_client_identity(body: RunCreateRequest) -> None:
     """就地删掉客户端声明的身份（M9 §2.1）。
@@ -294,6 +345,8 @@ def normalize_input(raw: dict|None, *, command: Any, trusted: bool) -> dict:
         if not trusted:
             if message.type not in _CLIENT_MESSAGE_TYPES:
                 raise RunRequestInvalid(f"input.messages[{index}]: role {message.type!r} is not accepted from clients")
+            if message.id == "__user_profile__":
+                message = message.model_copy(update={"id": None})
         converted.append(message)
     return {**raw, "messages": converted}
 

@@ -24,6 +24,7 @@ REQUEST_SECRETS_KEY = "secrets"
 SLASH_SKILL_SOURCE_CONTEXT_KEY = "__slash_skill_secret_source"
 SKILL_TOOL_POLICY_DECISION_CONTEXT_KEY = "__skill_tool_policy_decision"
 SKILL_ACTIVATION_STATE_CONTEXT_KEY = "__skill_activation_state"
+PII_VAULT_CONTEXT_KEY = "__pii_vault"
 
 #: 这些键不许出现在被持久化 / 被回显的 context 副本里。
 REDACTED_CONTEXT_KEYS: frozenset[str] = frozenset(
@@ -31,6 +32,7 @@ REDACTED_CONTEXT_KEYS: frozenset[str] = frozenset(
         SLASH_SKILL_SOURCE_CONTEXT_KEY,
         SKILL_TOOL_POLICY_DECISION_CONTEXT_KEY,
         SKILL_ACTIVATION_STATE_CONTEXT_KEY,
+        PII_VAULT_CONTEXT_KEY,
     }
 )
 

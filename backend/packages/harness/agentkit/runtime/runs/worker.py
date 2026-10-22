@@ -16,6 +16,8 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agentkit.agents.thread_state import get_thread_state_schema
 from agentkit.runtime.context import RunContext
+from agentkit.persistence.events.base import RunEventStore
+from agentkit.runtime.events.catalog import SUBAGENT_END_EVENT
 from agentkit.runtime.events.journal import RunJournal
 from agentkit.runtime.runs.manager import RunManager, RunRecord
 from agentkit.runtime.runs.schemas import RunStartOutcome, RunStatus
@@ -26,6 +28,13 @@ from agentkit.runtime.task import spawn_detached
 from agentkit.runtime.user_context import AUTO
 from agentkit.agents.leader_agent import unwrap_agent_graph
 from agentkit.agents.leader_agent.runtime_keys import CLIENT_IDENTITY_KEYS
+from agentkit.subagents.results import (
+    SUBAGENT_CLEANUP_TIMEOUT_SECONDS,
+    cancel_all_for_run,
+    holders_for_run,
+    wait_for_run_cleanup,
+)
+from agentkit.subagents.step_events import SubagentEventRow, subagent_run_event
 from agentkit.trace_context import TRACE_METADATA_KEY
 
 logger = logging.getLogger(__name__)
@@ -131,7 +140,8 @@ async def run_agent(
     terminal, error, error_type = RunStatus.interrupted, None, None #try_start 拒绝、提前return时的终态
     rollback: RollbackPoint | None = None 
     usage = UsageCollector(run_manager, run_id)
-    journal = _open_journal(ctx, record)
+    journal = _open_journal(ctx, record, usage_sink=usage)
+    subagent_events = _open_subagent_events(ctx, record)
     deadline: asyncio.Timeout | None = None
     timeout_s: float | None = None
 
@@ -150,7 +160,7 @@ async def run_agent(
         timeout_s = ctx.app_config.runs.timeout_seconds if ctx.app_config is not None else None
         deadline = asyncio.timeout(timeout_s) #开始计时
         async with deadline:
-            await _stream_graph(bridge, record, ctx, graph, usage, journal) #每一帧都查abort
+            await _stream_graph(bridge, record, ctx, graph, usage, journal, subagent_events) #每一帧都查abort
         terminal, error = RunStatus.success, None
 
     except RunAborted:
@@ -170,13 +180,18 @@ async def run_agent(
 
     finally:
         record.finalizing = True
+        # §17：先把这次 run 的子代理收干净，再走 M3 的收尾。顺序有讲究：取消派发之后隔离循环
+        # 才可能把**最后一次**用量交回来（§7.5），而 totals 是在 _finalize 里算的——反过来就
+        # 会把取消那一刻已经烧掉的 token 漏掉。清理等不到也不能挡住 run 的终态。
+        with suppress(Exception):
+            await _finalize_subagents(record.run_id)
         try:
             # 收尾可能很多：回滚、写终态、token 汇总、事件账本落盘（M4）、标题投影（M6）。
             # 每一步都可能抛，_finalize 自己逐步兜底（见下）。
             await _finalize(
                 bridge, run_manager, record, ctx,
                 terminal=terminal, error=error, error_type=error_type, rollback=rollback, usage=usage,
-                journal=journal,
+                journal=journal, subagent_events=subagent_events,
             )
         finally:
             #无论收尾是否成功，流必须结束
@@ -215,11 +230,16 @@ async def _finalize(
     rollback: RollbackPoint | None,
     usage: UsageCollector,
     journal: RunJournal | None = None,
+    subagent_events: _SubagentEventBuffer | None = None,
 ) -> None:
     run_id, thread_id = record.run_id, record.thread_id
 
     if journal is not None:
         await _best_effort("journal flush", journal.flush())
+
+    # §14.3：worker 的 finally 是子代理事件的最后一道 flush（异常 / 取消都要走到）
+    if subagent_events is not None:
+        await _best_effort("subagent event flush", subagent_events.flush())
 
     if record.abort_event.is_set() and record.abort_action == "rollback":
         await _best_effort("rollback", restore_rollback_point(ctx, rollback))
@@ -319,13 +339,114 @@ def _thread_status(status: RunStatus) -> str:
 
 
 
-def _open_journal(ctx: RunContext, record: RunRecord) -> RunJournal | None:
-    """One ledger producer per run. Token totals stay on UsageCollector."""
+#: §14.3：子代理事件的批量阈值。``put()`` 是低频路径，每步一次会把热流循环打满。
+SUBAGENT_EVENT_FLUSH_THRESHOLD = 25
+
+
+class _SubagentEventBuffer:
+    """子代理事件**批量**落库（M8 §14.3）。
+
+    不要每步 ``put()``：``put()`` 是 per-thread 咨询锁的低频路径，``max_turns=150`` 的子代理
+    会在热流循环上打几百次。flush 时机：``subagent.end``、达到阈值、worker 的 ``finally``。
+
+    只吃 **root namespace** 上的 custom 帧（由调用方保证）：带 namespace 的是子代理自己的
+    事件，再记一次就是"自己记自己"（§3.1）。
+    """
+
+    FLUSH_THRESHOLD = SUBAGENT_EVENT_FLUSH_THRESHOLD
+
+    def __init__(self, store: RunEventStore, record: RunRecord) -> None:
+        self._store = store
+        self._record = record
+        self._buf: list[dict[str, Any]] = []
+
+    @property
+    def pending(self) -> int:
+        return len(self._buf)
+
+    async def record(self, chunk: object) -> bool:
+        """吃一条 custom 帧。返回是否记下了；够阈值或遇到 ``subagent.end`` 就地落库。"""
+        event = subagent_run_event(chunk)
+        if event is None:
+            return False
+        self._buf.append(self._envelope(event))
+        if (
+            len(self._buf) >= self.FLUSH_THRESHOLD
+            or event.event_type == SUBAGENT_END_EVENT.event_type
+        ):
+            await self.flush()
+        return True
+
+    async def flush(self) -> None:
+        """失败时整批放回队首再抛（和 RunJournal 同一条纪律）。"""
+        if not self._buf:
+            return
+        batch, self._buf = self._buf, []
+        try:
+            await self._store.put_batch(batch)
+        except Exception:
+            self._buf = batch + self._buf
+            raise
+
+    def _envelope(self, event: SubagentEventRow) -> dict[str, Any]:
+        return {
+            "thread_id": self._record.thread_id,
+            "run_id": self._record.run_id,
+            "user_id": self._record.user_id,  # 后台写没有 ContextVar，必须显式传
+            "event_type": event.event_type,
+            "category": event.category,
+            "content": event.content,
+            "metadata": event.metadata,
+        }
+
+
+async def _finalize_subagents(run_id: str) -> None:
+    """§17：父 run 收尾时取消这次 run 的所有子代理，并等隔离循环把它们清理干净（有超时）。
+
+    为什么必须由 worker 亲自做：**不能假设 ``task`` 工具的轮询循环还活着**——客户端断开时
+    ToolNode 可能已经把那个协程取消掉了，于是「工具自己会收尾」这句话不成立。取消 → 沙箱排空
+    → 租约释放 → 用量回程全都在隔离循环上，所以这里只等 future，而且要在 ``to_thread`` 里等
+    （父循环得空着去跑那些回程回调）。
+    """
+    if not run_id:
+        return
+    cancelled = cancel_all_for_run(run_id)
+    if not cancelled and not holders_for_run(run_id):
+        return  # 正常收尾：子代理早就终态并摘掉了，这条路径不该有任何开销
+    settled, pending = await asyncio.to_thread(
+        wait_for_run_cleanup, run_id, timeout=SUBAGENT_CLEANUP_TIMEOUT_SECONDS
+    )
+    if pending:
+        logger.warning(
+            "subagent cleanup at run end: %d of %d still running after %.1fs (run_id=%s)",
+            pending,
+            settled + pending,
+            SUBAGENT_CLEANUP_TIMEOUT_SECONDS,
+            run_id,
+        )
+    else:
+        logger.info("subagent cleanup at run end: cancelled=%d settled=%d", len(cancelled), settled)
+
+
+def _open_subagent_events(ctx: RunContext, record: RunRecord) -> _SubagentEventBuffer | None:
+    if ctx.event_store is None:
+        return None
+    return _SubagentEventBuffer(ctx.event_store, record)
+
+
+def _open_journal(
+    ctx: RunContext, record: RunRecord, *, usage_sink: UsageCollector | None = None
+) -> RunJournal | None:
+    """One ledger producer per run. Token totals stay on UsageCollector.
+
+    ``usage_sink`` 是 M8 §15 的转发目标：子代理的用量从隔离循环交回来后，journal 把它转给
+    累加器（自己一个 token 都不记）。这里接上，是为了"只解析到 journal"的调用方也能入账。
+    """
     if ctx.event_store is None:
         return None
     settings = getattr(ctx.app_config, "run_events", None)
     if settings is None:
-        return RunJournal(ctx.event_store, record)
+        return RunJournal(ctx.event_store, record, usage_sink=usage_sink)
     return RunJournal(
         ctx.event_store,
         record,
@@ -333,6 +454,7 @@ def _open_journal(ctx: RunContext, record: RunRecord) -> RunJournal | None:
         flush_interval=settings.flush_interval,
         track_token_usage=settings.track_token_usage,
         max_trace_content=settings.max_trace_content,
+        usage_sink=usage_sink,
     )
 
 
@@ -343,8 +465,19 @@ async def _stream_graph(
     graph: Any,
     usage: UsageCollector,
     journal: RunJournal | None,
+    subagent_events: _SubagentEventBuffer | None = None,
 ) -> None:
-    lg_modes = to_langgraph_stream_modes(ctx.stream_modes)
+    requested_modes = to_langgraph_stream_modes(ctx.stream_modes)
+    # §14.3：子代理事件靠 custom 帧落库，所以 worker **总要**订 custom——但只把客户端要的
+    # 那些 mode 推给 SSE。不这么做的话，``stream_mode=None``（默认 ["values"]）或只订
+    # ``messages-tuple`` 的调用方一条子代理事件都落不了库，而"刷新页面卡片还在"完全
+    # 依赖那份账本——持久化不该由客户端的订阅选择决定。
+    subscribed_modes = (
+        requested_modes
+        if subagent_events is None or "custom" in requested_modes
+        else [*requested_modes, "custom"]
+    )
+    published_modes = frozenset(requested_modes)
     callbacks = [*(ctx.run_config.get("callbacks") or ()), usage]
     if journal is not None:
         callbacks.append(journal)
@@ -360,18 +493,28 @@ async def _stream_graph(
         ctx.graph_input,
         config=config,
         context=context,
-        stream_mode=lg_modes,
+        stream_mode=subscribed_modes,
         subgraphs=False,
+        version="v2",
     )
     try:
         async for item in stream:
             _raise_if_aborted(record)
-            mode, chunk, namespace = unpack_stream_item(item)
-            await bridge.publish(
-                record.run_id,
-                sse_event_name(mode, namespace),
-                serialize(chunk, mode=mode),
-            )
+            mode, chunk, namespace = unpack_stream_part(item)
+            if is_root_custom_frame(mode, namespace) and subagent_events is not None:
+                # §14.3 / §3.1：**只处理根命名空间上的 custom 帧**。带 namespace 的是子代理
+                # 自己的事件，再记一次就是自己记自己。落库失败只影响卡片，不影响结果。
+                try:
+                    await subagent_events.record(chunk)
+                except Exception:
+                    logger.exception("Subagent event buffering failed; cards may be incomplete")
+            if mode in published_modes:
+                # 客户端没订的 mode（例如我们为落库额外订的 custom）不给它推。
+                await bridge.publish(
+                    record.run_id,
+                    sse_event_name(mode, namespace),
+                    serialize(chunk, mode=mode),
+                )
             await usage.maybe_report()
     finally:
         await _close_quitely(stream)
@@ -380,29 +523,19 @@ def _raise_if_aborted(record: RunRecord) -> None:
     if record.abort_event.is_set():
         raise RunAborted(record.abort_action)
 
-def unpack_stream_item(item: Any) -> tuple[str, Any, tuple[str, ...]]:
-    """把 LangGraph stream 的一条输出拆成 (mode, payload)。
-
-    v2（``stream(version="v2")``）每条都是字典 ``{"type": mode, "ns": ..., "data": payload}``。
-    mode 在 ``type`` 里，真正的状态或消息在 ``data`` 里。``messages`` 的 data 仍是
-    ``(message, metadata)``，后面的 ``_unpack_message_chunk`` 再拆第二层。
-
-    v1 多 mode 时是二元组 ``(mode, payload)``。只订一个 mode 时没有 mode 前缀，
-    那条输出就是 payload 本身；LangGraph 默认 mode 是 values，所以按状态快照处理。
-    """
-    if isinstance(item, tuple) and len(item) == 3: #subgraph=True
-        namespace, mode, chunk = item
-        return mode, chunk, tuple(namespace)
-    if isinstance(item, tuple) and len(item) == 2: #单mode v1
-        mode, chunk = item
-        return mode, chunk, ()
-    return "values", item, () # 防御：不该走到。单 mode 字符串才会产裸 chunk
-
 def unpack_stream_part(part: Mapping) -> tuple[str, Any, tuple[str, ...]]:
     return str(part["type"]), part["data"], tuple(part.get("ns") or ())
 
 def sse_event_name(mode: str, namespace: tuple[str, ...]) -> str:
     return "|".join((mode, *namespace)) if namespace else mode
+
+def is_root_custom_frame(mode: str, namespace: tuple[str, ...]) -> bool:
+    """§3.1 / §14.3：只处理**根命名空间**上的 custom 帧。
+
+    带 namespace 的是子代理自己的事件——子代理的帧继承父 namespace，再记一次就是
+    "自己记自己"。反过来说，根帧是唯一能安全落库的那些。
+    """
+    return mode == "custom" and not namespace
 
 async def _close_quitely(stream: AsyncIterable[Any]) -> None:
     try:

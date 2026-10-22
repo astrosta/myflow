@@ -23,7 +23,7 @@ from agentkit.runtime.user_context import AUTO
 _SERVER_RESERVED_METADATA_KEYS = frozenset({
     "owner_id",
     "user_id",
-    "deerflow_trace_id",
+    "myflow_trace_id",
 })
 
 

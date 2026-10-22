@@ -9,7 +9,7 @@ from sqlalchemy import event, inspect, text
 
 from agentkit.persistence import engine as engine_mod
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine
-from agentkit.persistence.models import ThreadMetaRow
+from agentkit.persistence.schema import ThreadMetaRow
 from agentkit.persistence.thread_meta.sql import strip_reserved_metadata
 
 
@@ -64,7 +64,7 @@ def test_strip_reserved_metadata_drops_server_keys_without_error() -> None:
     original = {
         "owner_id": "hidden",
         "user_id": "hidden",
-        "deerflow_trace_id": "trace",
+        "myflow_trace_id": "trace",
         "topic": "中文",
     }
     assert strip_reserved_metadata(original) == {"topic": "中文"}

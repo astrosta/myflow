@@ -6,7 +6,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agentkit.agents.middlewares.summarization_middleware import (
-    DeerFlowSummarizationMiddleware,
+    MyFlowSummarizationMiddleware,
     SummaryGenerationError,
     compact_http_error,
     compact_with_reservation,
@@ -46,8 +46,8 @@ class _Model:
         return {}
 
 
-def _middleware() -> DeerFlowSummarizationMiddleware:
-    return DeerFlowSummarizationMiddleware(
+def _middleware() -> MyFlowSummarizationMiddleware:
+    return MyFlowSummarizationMiddleware(
         _Model(),
         trigger=("messages", 3),
         keep=("messages", 2),

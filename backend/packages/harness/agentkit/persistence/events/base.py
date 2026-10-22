@@ -39,8 +39,14 @@ class RunEventStore(abc.ABC):
         run_id: str,
         event_types: Sequence[str] | None = None,
         after_seq: int | None = None,
+        task_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """该 run 的全部类别，按 seq 升序。"""
+        """该 run 的全部类别，按 seq 升序。
+
+        ``task_id``（M8 §14.3）按 ``metadata["task_id"]`` 过滤：展开一张子代理卡片时
+        只拉那一条委派的 ``subagent.*`` 事件。过滤骑在已有的
+        ``(thread_id, run_id, seq)`` 索引上，**不改 schema**。
+        """
 
     @abc.abstractmethod
     async def count_messages(self, thread_id: str) -> int:

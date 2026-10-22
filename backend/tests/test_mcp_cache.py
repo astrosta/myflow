@@ -124,7 +124,6 @@ def test_concurrent_callers_share_one_load(config_path, monkeypatch):
 
 def test_an_unconfigured_deployment_returns_no_tools(tmp_path, monkeypatch):
     monkeypatch.delenv("MYFLOW_EXTENSIONS_CONFIG_PATH", raising=False)
-    monkeypatch.delenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", raising=False)
     monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
     cache.reset_local_mcp_cache()
 

@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "valid_status_values": [
+    "completed",
+    "failed",
+    "cancelled",
+    "timed_out",
+    "polling_timed_out"
+  ],
+  "valid_stop_reason_values": [
+    "token_capped",
+    "turn_capped",
+    "loop_capped"
+  ],
+  "notes": [
+    "in_progress 是台账内部状态（还没终态的委派），不对外、不进前端枚举",
+    "polling_timed_out 与 timed_out 的差别只在谁先放弃等待：父侧轮询预算 or 子代理墙钟",
+    "stop_reason 是附加字段：状态仍然是 completed / failed，消费者不认识就忽略",
+    "max_turns_reached 是历史遗留值：读侧映射成 failed + turn_capped，写侧永不产出"
+  ]
+}

@@ -30,11 +30,8 @@ logger = logging.getLogger(__name__)
 
 SKILLS_PREFS_FILENAME = "skills_prefs.json"
 
-#: 显式断言"必须用这个文件"的两条通道；与 extensions_config 同一套语义。
-SKILLS_PREFS_ENV_NAMES = (
-    "MYFLOW_SKILLS_PREFS_PATH",
-    "DEER_FLOW_SKILLS_PREFS_PATH",
-)
+#: 显式断言"必须用这个文件"的那条通道；与 extensions_config 同一套语义。
+SKILLS_PREFS_ENV_NAMES = ("MYFLOW_SKILLS_PREFS_PATH",)
 
 #: 无认证时的桶名。M9 有 users 表之后这个桶就是"匿名/单用户"。
 DEFAULT_USER_BUCKET = "__default__"

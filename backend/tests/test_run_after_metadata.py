@@ -41,7 +41,7 @@ def _record(
         status=RunStatus.pending,
         on_disconnect="continue",
         user_id=user_id,
-        metadata={"topic": "demo", "deerflow_trace_id": "trace-1"} if metadata is None else metadata,
+        metadata={"topic": "demo", "myflow_trace_id": "trace-1"} if metadata is None else metadata,
     )
 
 

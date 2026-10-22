@@ -40,9 +40,7 @@ allowed-tools: [read_file, bash]
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.delenv("MYFLOW_MCP_STDIO_COMMAND_ALLOWLIST", raising=False)
-    monkeypatch.delenv("DEER_FLOW_MCP_STDIO_COMMAND_ALLOWLIST", raising=False)
     monkeypatch.delenv("MYFLOW_SKILLS_PREFS_PATH", raising=False)
-    monkeypatch.delenv("DEER_FLOW_SKILLS_PREFS_PATH", raising=False)
 
 
 @pytest.fixture

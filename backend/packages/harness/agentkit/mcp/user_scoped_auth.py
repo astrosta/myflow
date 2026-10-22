@@ -1,4 +1,4 @@
-"""per-user 凭据：DeerFlow 用户 → header 映射（M7 §5.5 层 ②）。
+"""per-user 凭据：用户 → header 映射（M7 §5.5 层 ②）。
 
 **fail-closed 是默认**：映射里没有当前用户、或解析出空值，就抛 ToolException 并只点名
 缺失的键。静默回落到发现凭据 = 一个租户用另一个凭据的权限在跑。

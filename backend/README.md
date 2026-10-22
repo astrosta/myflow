@@ -54,9 +54,40 @@ uv run --env-file .env --with uvicorn \
 
 沙箱段见 `config.yaml` 的 `sandbox`。本机 Local provider 默认不开宿主 bash；可信环境可设 `allow_host_bash: true`。
 
+### 持久记忆（M10 §2）
+
+`memory.enabled: true` 后，lifespan 按 `database.backend` 打开 LangGraph `BaseStore`
+（memory / sqlite / postgres 同一套选择），并按用户 namespace 存画像与 facts：
+
+| 数据 | namespace | key |
+|---|---|---|
+| 画像 | `users/<user_id>/profile` | `current` |
+| 所有记录 | `users/<user_id>/records` | `kind:id` |
+| 维护统计 | `users/<user_id>/stats` | `current` |
+
+画像在 `before_agent` 以隐藏 HumanMessage（id `__user_profile__`）注入；长尾事实只通过
+只读工具 `memory_search` 检索。写入走后台 debounce 抽取 + 确定性 proposal 门，模型不能
+声明"用户确认了"。HTTP 面是 `/api/memory`（profile / search / items / facts / conflicts /
+export / maintenance）。`memory.backend_class` 是启动项，换后端要重启并重置 manager。
+
+### PII / 敏感信息边界
+
+`pii.enabled: true`（默认）时，`start_run` 在 normalize 和持久化之前替换用户
+HumanMessage 中的高敏感文本；模型输出写回 state 前也会替换。`state` /
+`checkpoint` / `run record` 只保存 run 级 handle。handle 到原值的映射只在进程内存里（`runtime.context`），不写 state、
+checkpoint 或日志；进程重启后旧 handle 不可解析，工具必须 fail closed。
+
+- memory 只读取进一步的 memory view：handle 和字面 PII 都变成 `[REDACTED]`，
+  不写进 facts，也不作为 evidence；
+- 用户画像白名单字段允许持久化，不做通用 PII 替换；
+- 所有工具在调用前由 `PIIMiddleware` 还原 handle；无法解析的 handle 会变成
+  可恢复的工具错误，不会把 handle 当普通字符串发给外部服务；
+- **tool result 不在本策略保证范围内**：`ToolMessage` 中的敏感信息由工具自身负责；
+- 多模态、上传文件和 artifact 内容暂不覆盖，由对应工具/上传层负责。
+
 **MCP 与技能走第二份文件**：`extensions_config.json`（模板 `extensions_config.example.json`，已 gitignored）。
 它**由 API 读写**，所以整份 `config.yaml` 不能变成 API 可写。路径优先级和 `config.yaml` 一样，环境变量是
-`MYFLOW_EXTENSIONS_CONFIG_PATH`（也认 `DEER_FLOW_EXTENSIONS_CONFIG_PATH`）：显式路径或环境变量指向的文件不存在会直接报错，
+`MYFLOW_EXTENSIONS_CONFIG_PATH`：显式路径或环境变量指向的文件不存在会直接报错，
 只有"项目根下搜不到"才算没配扩展。所有读-改-写走 `agentkit.config.update_extensions_config()`：
 进程内 `threading.Lock` + 跨进程文件咨询锁 + 原子写，技能路由和 MCP 路由共用同一把锁。
 
@@ -112,7 +143,7 @@ M4 时代的数据都在 `users/default/`，换名字等于让老用户"数据�
 | 变量 | 作用 |
 |---|---|
 | `AUTH_JWT_SECRET` | HS256 密钥。**改它 = 所有会话立刻失效**（有意为之） |
-| `DEER_FLOW_INTERNAL_AUTH_TOKEN` | 通道 / 调度器代表用户的共享密钥，与 `auth.internal_tokens` 合并；写 `[new, old]` 即可不停机轮换 |
+| `MYFLOW_INTERNAL_AUTH_TOKEN` | 通道 / 调度器代表用户的共享密钥，与 `auth.internal_tokens` 合并；写 `[new, old]` 即可不停机轮换 |
 | `GATEWAY_CORS_ORIGINS` | 逗号分隔。`CORSMiddleware` 与 `CSRFMiddleware` **读同一个变量** |
 | `GATEWAY_ENABLE_DOCS=false` | 把 `/docs`、`/redoc`、`/openapi.json` 从公开白名单拿掉（生产默认关） |
 | `AUTH_TRUSTED_PROXIES` | 只有 peer 落在这里时才信 `X-Real-IP`；**永远不看 `X-Forwarded-For`** |
@@ -187,15 +218,15 @@ M4 时代的数据都在 `users/default/`，换名字等于让老用户"数据�
 ### 内部调用（通道 / 调度器）
 
 ```
-X-DeerFlow-Internal-Token: <共享密钥>
-X-DeerFlow-Owner-User-Id:  <owner 的存储 ID>
+X-MyFlow-Internal-Token: <共享密钥>
+X-MyFlow-Owner-User-Id:  <owner 的存储 ID>
 ```
 
 三关：令牌相等 → owner 存在且启用 → 该 owner 绑定过这个通道（绑定表属 9D，
 未注册时只打一次 warning）。**只有 AuthMiddleware 会读这只 owner 头**，
 其它代码路径读到都必须当普通不可信输入丢掉。
 
-> **已知边界**：把 `DEER_FLOW_INTERNAL_AUTH_TOKEN` 下发到终端（移动 App、浏览器）
+> **已知边界**：把 `MYFLOW_INTERNAL_AUTH_TOKEN` 下发到终端（移动 App、浏览器）
 > 等于允许伪造"代表某用户"。密钥只应放在 Gateway 本机 / 通道 worker / 调度器。
 
 ### 首次初始化与救援
@@ -230,7 +261,7 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 1. `users.system_role` **没有**唯一索引。设计里提过"admin 部分唯一索引"，
    但 `UNIQUE(system_role)` 会禁止第二个 admin，而 §2.13 又要求"不能把最后一个 admin 降级"。
    并发初始化改用条件插入（`WHERE NOT EXISTS (admin)`），降级/删除用条件写。
-2. `X-DeerFlow-Owner-User-Id` 的第三关（通道绑定）留了
+2. `X-MyFlow-Owner-User-Id` 的第三关（通道绑定）留了
    `register_owner_binding_check()` 这个接缝给 9D，未注册时只打一次 warning。
 
 ## 主要路由
@@ -268,6 +299,52 @@ M7 **没有创建类路由**：`PUT /api/mcp/config`（整份替换 = 新建 + �
 都返回 404/405 —— 创建能力留给后续阶段 + 业务管理员，路由不存在比 403 更诚实。
 
 浏览器应走前端同源 `/api`，不要直接跨源打 8001（开发时 Next rewrite，生产时 nginx）。
+
+## 知识库（MinerU + Qwen3-Embedding-8B + Milvus）
+
+`knowledge_base.enabled: true` 后，lifespan 建立知识库服务。**所有服务地址只来自
+config.yaml**，代码里没有默认端点；启用时缺 `parse.local.endpoint`（或云端
+`base_url` + `api_key`）、`embedding.base_url`、`vector_store.uri` 会拒绝启动。
+
+```bash
+# 只在启用知识库时需要；同时保留 postgres/mcp 等其它 extra
+uv sync --all-packages --all-extras
+```
+
+数据流：上传 → 用户级文件落盘 → 后台任务 → MinerU（PDF/Office）或本地读取
+（`.md/.markdown/.txt/.html/.htm/.csv`）→ 清洗 → 按类型 token 分片 →
+Qwen3-Embedding-8B（4096 维）→ Milvus。元数据与文档状态共用主数据库；文档数
+`document_count` 和当前活跃分片数 `chunk_count` 在知识库行上原子维护。
+
+创建知识库时必须选择类型（类型不可改）：技术文档、运维手册、FAQ、安全合规、
+API 参考。默认 token 档位：技术/运维/安全 512/64，FAQ 384/0，API 768/0；
+硬上界 1024 token。分片和查询都走 Qwen3 tokenizer，不可用时会明确回退近似计数。
+
+Agent 自动获得只读 `knowledge_search` 工具。工具把 `knowledge_base_type` 作为参数，
+由模型按问题语义路由；服务端始终按 `user_id` 过滤，模型不能传身份。首版入库任务
+在 Gateway 进程内运行，重启会中断；按单 worker 部署，多实例前需换成持久任务队列。
+
+检索是混合检索（§7.4）：问题拆成 `query`（向量）与 `keyword_query`（BM25 关键词，
+可省略、缺省时复用 `query`），两路各取 `retrieval.candidate_k` 条后由 Milvus 
+`hybrid_search` + `RRFRanker(k=retrieval.rrf_k)` 融合；`retrieval.rerank.enabled=true`
+时再把融合候选送给 rerank 模型精排（`protocol: cohere | tei`，模型默认
+`Qwen/Qwen3-Reranker-8B`）。关键词通道或精排不可用时按设计文档降级，并在返回值里
+如实标注 `retrieval_mode` 与 `reranked`。
+
+collection 需要 Milvus 2.5+ 的 BM25 能力：`content` 字段带 analyzer（默认 `chinese`）、
+`sparse` 字段由 BM25 Function 自动生成、稀疏索引 metric 为 `BM25`。上线前的旧
+collection 没有这些字段，关键词通道会报 `keyword_search_unavailable` 并降级为纯向量，
+需要新建 collection 后重索引。`retrieval.keyword.analyzer` 是 destructive 参数。
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| `GET` | `/api/knowledge/status` | 启用状态、限制、五类分片参数 |
+| `GET`/`POST` | `/api/knowledge/bases` | 列 / 建知识库 |
+| `GET`/`PATCH`/`DELETE` | `/api/knowledge/bases/{id}` | 详情 / 改名 / 级联删除 |
+| `GET`/`POST` | `/api/knowledge/bases/{id}/documents` | 文档列表 / 批量上传（202） |
+| `POST` | `/api/knowledge/bases/{id}/documents/{doc}/reindex` | 重新解析 / 索引 |
+| `DELETE` | `/api/knowledge/bases/{id}/documents/{doc}` | 删除文档与向量 |
+| `GET` | `/api/knowledge/search` | 检索测试（`q` 向量 + `keyword` BM25、`type` / `base_id` 过滤） |
 
 ## 测试
 

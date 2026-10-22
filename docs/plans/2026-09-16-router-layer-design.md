@@ -90,10 +90,9 @@ app/gateway/
 │   ├── models.py                  M1：模型清单
 │   ├── mcp.py                     M7 §2.4：配置与缓存
 │   ├── skills.py                  M7 §2.4：列表、启用、reload
-│   ├── scheduled_tasks.py         M9 §2.12
-│   ├── channels.py                M9 §2.12
-│   ├── feedback.py                M9 §2.12
-│   └── memory.py                  M10 §2.13
+│   ├── scheduled_tasks.py         M9 §4.10
+│   ├── channels.py                M9 §5.9
+│   └── memory.py                  M10 §2.12
 # 认证路由不在 routers/ 下，见 app/gateway/auth/routers.py（M9 §2.12，prefix=/v1/auth）
 └── request_path.py                路径规范化（nginx 前缀、尾部斜杠）
 ```
@@ -189,12 +188,16 @@ M1 的嵌入式客户端和 M8 的子代理就会被拖进 Web 框架（M3 §1 �
 | M1  | `GET /api/models`、`GET /api/models/{model_name}`（字段、handler、`models:read` 见 [M1 §7](2026-09-16-m1-minimal-agent-design.md)） |
 | M6  | `POST /api/threads/{id}/state`、`POST .../compact`、`GET .../history`、`GET .../branches`（[M6 §7.5](2026-09-16-m6-middleware-design.md)） |
 | M7  | `GET/PUT/PATCH /api/mcp/config`、`POST /api/mcp/cache/reset`、`GET /api/skills`、`POST /api/skills/reload`、`PATCH /api/skills/{name}`（[M7 §2.4](2026-09-16-m7-mcp-skills-design.md)） |
-| M9  | `/api/v1/auth/**`、`/api/scheduled-tasks/**`、`/api/channels/**`、`/api/runs/{run_id}/feedback`（[M9 §2.12](2026-09-16-m9-production-design.md)） |
-| M10 | `/api/memory/**`、`GET/PUT/DELETE /api/threads/{id}/goal`（[M10 §2.13](2026-09-16-m10-memory-guardrails-extensions-design.md)） |
+| M9  | `/api/v1/auth/**`、`/api/scheduled-tasks/**`、`/api/channels/**`（**只有飞书**）（[M9 §2.12](2026-09-16-m9-production-design.md)） |
+| M10 | `/api/memory/**`、`GET/PUT/DELETE /api/threads/{id}/goal`（[M10 §2.12](2026-09-16-m10-memory-guardrails-extensions-design.md)） |
 
 
 **模型目录、mcp、skills 各自一个 router 文件，不和 threads/runs 写在一起。**
-模型目录的能力是 `models:read`（M1 §7）。`GET /api/skills` 是 `skills:read`；MCP 配置和技能的写操作是 `admin`（M7 §2.4）。
+模型目录的能力是 `models:read`（M1 §7）。`GET /api/skills` 是 `skills:read`；
+**普通用户唯一的写操作是 `PUT /api/skills/{name}/preference`**（开关"我用不用"，也只影响自己）；
+全局开关、MCP 启停、reload 是 `admin`（M7 §2.4）。
+M7 **没有任何创建类路由**——技能的创建/上传与 MCP 服务器的新建/删除留给后续阶段，
+用能力位 `skills:create` / `mcp:create`（业务管理员），所以 `PUT /api/mcp/config` 现在**不注册**。
 混在一个文件里，迟早会复制错隔壁的 `Depends`。
 
 ### 3.3 每条路由的 handler
@@ -411,7 +414,7 @@ async def list_messages(
     services: Annotated[RunServices, Depends(get_run_services)],
 ) -> Page[MessageResponse]:
     await _require_visible_thread(services, thread_id, caller)
-    rows = await services.event_store.list_messages(          # agentkit/persistence/events/base.py
+    rows = await services.event_store.list_messages(          # agentkit/runtime/events/store/base.py
         thread_id,
         limit=params.limit + 1,
         before_seq=params.before_seq,
@@ -749,7 +752,7 @@ M3 §3 给了模型定义，这里补上**字段去哪**——写路由或 worke
 | 字段                             | 类型 / 约束                                    | 默认                    | 去向                                                              |
 | ------------------------------ | ------------------------------------------ | --------------------- | --------------------------------------------------------------- |
 | `assistant_id`                 | `str`，`min_length=1`，`max_length=128`      | 必填                    | `resolve_agent_factory`（M3 §4.2 第 6 步）                          |
-| `input`                        | `dict | None`                              | `None`                | `normalize_input` → `run_config` 的图输入                           |
+| `input`                        | `dict | None`                              | `None`                | PII 脱敏 → `normalize_input` → `run_config` 的图输入；run record 也存脱敏图输入 |
 | `command`                      | `dict | None`                              | `None`                | wire 上是 JSON 对象；`start_run` 第 7 步再转成 LangGraph `Command`（M6）    |
 | `config`                       | `dict | None`                              | `None`                | `build_run_config`：只认白名单键（M3 §4.7）                              |
 | `context`                      | `dict | None`                              | `None`                | `collect_client_switches` → `configurable` + `context`          |
@@ -794,6 +797,8 @@ class RunCreateRequest(BaseModel):
     multitask_strategy: Literal["reject", "interrupt", "rollback"] = "reject"
 
     # ── 兼容占位：只接受列出的值，不进 worker ──────────────────────────
+    # feedback_keys 继续收下并忽略：SDK 会带它，但**反馈功能不做**（M9 §12），
+    # 所以它既没有存储也没有读路径；收下只是为了让官方客户端不 422。
     webhook: None = None
     on_completion: None = None
     after_seconds: None = None
@@ -952,7 +957,7 @@ class RunResponse(BaseModel):
     on_disconnect: Literal["cancel", "continue"]
     multitask_strategy: Literal["reject", "interrupt", "rollback"]
     metadata: dict[str, Any]
-    kwargs: dict[str, Any]              # 已脱敏的 input/config；不含 secrets
+    kwargs: dict[str, Any]              # 已脱敏的 input（handle）/ config；不含 secrets
     model_name: str | None
     error: str | None
     created_at: str
@@ -1153,14 +1158,14 @@ async def read_run_terminal_state(services: RunServices, record: RunRecord) -> R
 | `AdminAlreadyExists`                         | 409  | `admin_already_exists`      | 已有 admin 再 `POST /initialize`（M9 §2.12）                               |
 | `RegistrationClosed`                         | 403  | `registration_closed`       | `auth.allow_registration` 为假（M9 §2.12）                                |
 | `SessionRequired`                            | 403  | `session_required`          | PAT 打了只允许会话的路由，例如改密（M9 §2.12）                                    |
-| `InvalidSchedule`                            | 422  | `invalid_schedule`          | cron / 时区 / `run_at` 不合法（M9 §2.12）                                  |
-| `ScheduledTaskNotFound`                      | 404  | `scheduled_task_not_found`  | 任务不存在或不属于 caller（M9 §2.12）                                         |
+| `InvalidSchedule`                            | 422  | `invalid_schedule`          | cron / 时区 / `run_at` 不合法（M9 §4.10）                                  |
+| `ScheduledTaskNotFound`                      | 404  | `scheduled_task_not_found`  | 任务不存在或不属于 caller（M9 §4.10）                                         |
 | `TaskActive`                                 | 409  | `task_active`               | 有 queued/launching/running 的 occurrence 时改或删任务（M9 §4.7、§2.12）      |
-| `MemoryNotSupported`                         | 501  | `memory_not_supported`      | 后端没有这条记忆方法（M10 §2.13）                                             |
-| `InvalidMemoryFact`                          | 422  | `invalid_memory_fact`       | 事实内容、类目，或 PATCH 三个字段都是 null（M10 §2.13）                          |
-| `MemoryConflictError`                        | 409  | `memory_conflict`           | `agentkit` 的事实 revision 冲突；不继承 Gateway 异常（M10 §2.13）              |
-| `MemoryCorrupted`                            | 500  | `memory_corrupted`          | detail 固定为 `Memory storage is unreadable`，无路径（M10 §2.13）            |
-| `FactNotFound`                               | 404  | `fact_not_found`            | `PATCH/DELETE /api/memory/facts/{fact_id}`（M10 §2.13）                  |
+| `MemoryNotSupported`                         | 501  | `memory_not_supported`      | 该 memory kind 未注册 service，或后端能力不支持（M10 §2.12）                    |
+| `InvalidMemoryProfile`                       | 422  | `invalid_memory_profile`    | 画像字段路径/类型/长度非法，或 tombstone 写入失败（M10 §2.12）                     |
+| `MemoryConflictError`                        | 409  | `memory_conflict`           | `agentkit` 的 profile/record revision 并发冲突；不继承 Gateway 异常（M10 §2.12） |
+| `MemoryCorrupted`                            | 500  | `memory_corrupted`          | detail 固定为 `Memory storage is unreadable`，无路径（M10 §2.12）            |
+| `RecordNotFound`                             | 404  | `record_not_found`          | `DELETE /api/memory/items/{kind}/{record_id}`（M10 §2.12）                 |
 | `ThreadNotFound`                             | 404  | `thread_not_found`          | 第 5 步；`/join` 的 thread 核对                                             |
 | `AssistantNotFound`                          | 404  | `assistant_not_found`       | 第 6 步                                                                 |
 | `CheckpointNotFound`                         | 404  | `checkpoint_not_found`      | 第 10 步                                                                |
@@ -1225,7 +1230,7 @@ _PERSISTENCE: dict[type[BaseException], tuple[int, str]] = {
     ThreadOwnershipConflictError: (409, "thread_ownership_conflict"),   # agentkit/persistence/thread_meta/base.py
     InvalidMetadataFilterError: (400, "invalid_metadata_filter"),       # agentkit/persistence/json_compat.py
     InvalidCursor: (422, "invalid_cursor"),                             # agentkit/persistence/base.py
-    MemoryConflictError: (409, "memory_conflict"),                      # agentkit/agents/memory/manager.py（M10 §2.13）
+    MemoryConflictError: (409, "memory_conflict"),                      # agentkit/agents/memory/manager.py（M10 §2.12）
 }
 
 
@@ -1238,7 +1243,7 @@ def install_error_handlers(app: FastAPI) -> None:
         McpServerNotFound, SkillNotFound, StdioCommandRejected, InvalidExtensionsConfig,  # M7 §2.4
         Unauthenticated, InvalidCredentials, LoginRateLimited, AdminAlreadyExists, RegistrationClosed, SessionRequired,  # M9 §2.12
         InvalidSchedule, ScheduledTaskNotFound, TaskActive,
-        MemoryNotSupported, InvalidMemoryFact, MemoryCorrupted, FactNotFound,  # M10 §2.13
+        MemoryNotSupported, InvalidMemoryProfile, MemoryCorrupted, RecordNotFound,  # M10 §2.12
     ):
         app.add_exception_handler(exc_type, _handle_domain_error)  # 类上都有 status_code / code
     for exc_type in _PERSISTENCE:
@@ -1364,7 +1369,7 @@ router = APIRouter(prefix="/threads", tags=["threads"])
 @router.post("/{thread_id}/compact")
 @router.get("/{thread_id}/history")
 @router.get("/{thread_id}/branches")
-@router.get("/{thread_id}/goal")                   # M10 §2.13
+@router.get("/{thread_id}/goal")                   # M10 §2.12
 @router.put("/{thread_id}/goal")
 @router.delete("/{thread_id}/goal")
 @router.get("/{thread_id}/messages")
@@ -1394,10 +1399,9 @@ def create_app() -> FastAPI:
     app.include_router(mcp.router, prefix="/api")              # M7 §2.4，prefix=/mcp
     app.include_router(skills.router, prefix="/api")           # M7 §2.4，prefix=/skills
     app.include_router(auth_router, prefix="/api")             # M9 §2.12，prefix=/v1/auth
-    app.include_router(scheduled_tasks.router, prefix="/api")  # M9 §2.12，prefix=/scheduled-tasks
-    app.include_router(channels.router, prefix="/api")         # M9 §2.12，prefix=/channels
-    app.include_router(feedback.router, prefix="/api")         # M9 §2.12，prefix=/runs
-    app.include_router(memory.router, prefix="/api")           # M10 §2.13，prefix=/memory
+    app.include_router(scheduled_tasks.router, prefix="/api")  # M9 §4.10，prefix=/scheduled-tasks
+    app.include_router(channels.router, prefix="/api")         # M9 §5.9，prefix=/channels
+    app.include_router(memory.router, prefix="/api")           # M10 §2.12，prefix=/memory
     app.include_router(health.router)                          # 不带 /api；路径 /healthz
     return app
 ```
@@ -1458,19 +1462,21 @@ RunId = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
 
 | 能力               | 覆盖的路由                                                                                |
 | ---------------- | ------------------------------------------------------------------------------------ |
-| `runs:create`    | `POST .../runs`、`.../runs/stream`、`.../runs/wait`、`POST /api/runs/stream`、`.../wait`。定时任务还要同时有 `threads:write`（M9 §2.12） |
-| `runs:read`      | `GET .../runs`、`GET .../runs/{run_id}`、`GET .../runs/{run_id}/join`、`GET/PUT /api/runs/{run_id}/feedback`（M9 §2.12） |
+| `runs:create`    | `POST .../runs`、`.../runs/stream`、`.../runs/wait`、`POST /api/runs/stream`、`.../wait`。定时任务还要同时有 `threads:write`（M9 §4.10） |
+| `runs:read`      | `GET .../runs`、`GET .../runs/{run_id}`、`GET .../runs/{run_id}/join`（M9 §2.12） |
 | `runs:cancel`    | `POST .../runs/{run_id}/cancel`；**以及** `multitask_strategy=interrupt/rollback` 的准入   |
-| `threads:read`   | thread 详情、`GET .../state`、`/messages`、threads 列表、`GET .../uploads/list`、`GET .../artifacts/{path}`（M2 §10）、`GET .../history`、`GET .../branches`（M6 §7.5）、`GET .../goal`（M10 §2.13） |
-| `threads:write`  | `POST /api/threads`、`PATCH`、`POST .../uploads`、`DELETE .../uploads/{filename}`（M2 §10）、`POST .../state`、`POST .../compact`（M6 §7.5）、`PUT/DELETE .../goal`（M10 §2.13）。定时任务路由要同时有这一项和 `runs:create`（M9 §2.12） |
-| `memory:read`    | `GET /api/memory`、`GET /api/memory/export`（M10 §2.13）                                       |
-| `memory:write`   | `POST /api/memory/reload`、`DELETE /api/memory`、`/facts`、`/import`（M10 §2.13）               |
+| `threads:read`   | thread 详情、`GET .../state`、`/messages`、threads 列表、`GET .../uploads/list`、`GET .../artifacts/{path}`（M2 §10）、`GET .../history`、`GET .../branches`（M6 §7.5）、`GET .../goal`（M10 §2.12） |
+| `threads:write`  | `POST /api/threads`、`PATCH`、`POST .../uploads`、`DELETE .../uploads/{filename}`（M2 §10）、`POST .../state`、`POST .../compact`（M6 §7.5）、`PUT/DELETE .../goal`（M10 §2.12）。定时任务路由要同时有这一项和 `runs:create`（M9 §4.10） |
+| `memory:read`    | `GET /api/memory`、`/search`、`/items`、`/profile`、`/conflicts`、`/export`（M10 §2.12）       |
+| `memory:write`   | `PATCH/DELETE /api/memory/profile*`、`DELETE /api/memory/items/*`、`POST /api/memory/items/*/remember`、`DELETE /api/memory`（M10 §2.12） |
+| `memory:admin`   | `POST /api/memory/maintenance/run`（M10 §2.12）                                             |
 | `threads:delete` | `DELETE /api/threads/{id}`                                                           |
 | `models:read`    | `GET /api/models`、`GET /api/models/{model_name}`（M1 §7；选择器要读，不是 admin 写接口） |
-| `skills:read`    | `GET /api/skills`（M7 §2.4；斜杠菜单要读，写配置仍是 `admin`）                         |
-| `admin`          | `GET/PUT/PATCH /api/mcp/config`、`POST /api/mcp/cache/reset`、`POST /api/skills/reload`、`PATCH /api/skills/{name}`（M7 §2.4）、`POST /api/channels/{name}/restart`（M9 §2.12） |
-| `channels:read`  | `GET /api/channels`（M9 §2.12）                                                            |
-| `channels:write` | `POST/DELETE /api/channels/{name}/bind`（M9 §2.12）                                          |
+| `skills:read`    | `GET /api/skills`、`PUT /api/skills/{name}/preference`（M7 §2.4；斜杠菜单要读，个人开关也只影响自己） |
+| `admin`          | `GET/PATCH /api/mcp/config`、`POST /api/mcp/cache/reset`、`POST /api/skills/reload`、`PATCH /api/skills/{name}`（全局开关）（M7 §2.4）、`POST /api/channels/{name}/restart`（M9 §5.9） |
+| `skills:create` / `mcp:create` | **M7 不实现**：技能的创建/上传、MCP 服务器的新建/删除/整份替换（`PUT /api/mcp/config`）。留给后续阶段，授予业务管理员 |
+| `channels:read`  | `GET /api/channels`（M9 §5.9）                                                            |
+| `channels:write` | `POST/DELETE /api/channels/{name}/bind`（M9 §5.9）                                          |
 
 
 **join 只要 `runs:read`。** 一个只读令牌连上再断开必须**不能**取消别人的 run
@@ -1658,7 +1664,7 @@ async def search_page(
 # 前面再加 order 的一个字符（"d" / "a"），这样客户端中途改 order 会在 _parse_cursor 里变成 InvalidCursor，而不是漏行。
 ```
 
-`RunStore.list_by_thread` 的所属文件是 `agentkit/persistence/run/sql.py`（接口声明在 `agentkit/persistence/run/base.py`）。游标解析失败抛 `InvalidCursor`（`agentkit/persistence/base.py`），路由不 `except`。
+`RunStore.list_by_thread` 的所属文件是 `agentkit/persistence/run/sql.py`（接口声明在 `agentkit/runtime/runs/store/base.py`）。游标解析失败抛 `InvalidCursor`（`agentkit/persistence/base.py`），路由不 `except`。
 
 ---
 

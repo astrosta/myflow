@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 _MISSING_TOOL_CALL_ID = "missing_tool_call_id"
 _UNKNOWN_TOOL_NAME = "unknown_tool"
-_RECOVERY_HINT = "Continue with available context, or choose an alternative tool."
+_RECOVERY_HINT = "请基于现有上下文继续，或者换一个工具。"
 _DETAIL_LIMIT = 500
 # Same key names the gateway drops from persisted config. Harness cannot import that helper.
 _SECRET_ASSIGNMENT = re.compile(r"(?i)\b(secrets|trace_id|__\w+)\s*[:=]\s*(\"[^\"]*\"|'[^']*'|\S+)")
@@ -44,7 +44,7 @@ class ToolErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         detail = _redact_detail(str(exc).strip() or exc.__class__.__name__)
         if len(detail) > _DETAIL_LIMIT:
             detail = detail[: _DETAIL_LIMIT - 3] + "..."
-        content = f"Error: Tool '{tool_name}' failed with {exc.__class__.__name__}: {detail}. {_RECOVERY_HINT}"
+        content = f"错误：工具 '{tool_name}' 调用失败（{exc.__class__.__name__}）：{detail}。{_RECOVERY_HINT}"
         message = ToolMessage(content=content, tool_call_id=tool_call_id, name=tool_name, status="error")
         return stamp_exception_meta(message, f"{exc.__class__.__name__}: {detail}")
 

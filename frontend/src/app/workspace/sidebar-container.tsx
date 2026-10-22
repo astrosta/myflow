@@ -90,6 +90,7 @@ export function SidebarContainer() {
         <Sidebar
           activeThreadId={activeThreadId}
           error={query.error ? (query.error instanceof Error ? query.error.message : String(query.error)) : null}
+          knowledgeActive={pathname?.startsWith("/workspace/knowledge") ?? false}
           loading={query.isLoading}
           onNewChat={newChat}
           onRefresh={() => {

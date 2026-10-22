@@ -43,13 +43,13 @@ def read_file(
     end_line: int | None = None,
     description: str = "",
 ) -> str:
-    """Read a text file from the sandbox.
+    """读取沙箱中的文本文件。
 
     Args:
-        path: Absolute virtual path, e.g. /mnt/user-data/workspace/main.py
-        start_line: 1-indexed first line to read (inclusive).
-        end_line: 1-indexed last line to read (inclusive).
-        description: Optional short label shown in the UI.
+        path: 绝对虚拟路径，例如 /mnt/user-data/workspace/main.py
+        start_line: 起始行号（从 1 开始，包含）。
+        end_line: 结束行号（从 1 开始，包含）。
+        description: 可选，界面上显示的短标签。
     """
     del description
     try:
@@ -69,13 +69,13 @@ def write_file(
     append: bool = False,
     description: str = "",
 ) -> str:
-    """Write a text file in the sandbox. Parent directories are created.
+    """在沙箱中写入文本文件，父目录会自动创建。
 
     Args:
-        path: Absolute virtual path.
-        content: Text to write.
-        append: When true, append instead of overwriting.
-        description: Optional short label shown in the UI.
+        path: 绝对虚拟路径。
+        content: 要写入的文本。
+        append: 为 true 时追加写入，而不是覆盖。
+        description: 可选，界面上显示的短标签。
     """
     del description
     try:
@@ -97,13 +97,13 @@ def str_replace(
     runtime: ToolRuntime,
     description: str = "",
 ) -> str:
-    """Replace one unique substring in a sandbox file.
+    """替换沙箱文件中一个唯一的子串。
 
     Args:
-        path: Absolute virtual path.
-        old_string: Exact text to replace. Must match exactly once.
-        new_string: Replacement text.
-        description: Optional short label shown in the UI.
+        path: 绝对虚拟路径。
+        old_string: 要替换的原文，必须恰好匹配一次。
+        new_string: 替换后的文本。
+        description: 可选，界面上显示的短标签。
     """
     del description
     try:
@@ -129,11 +129,11 @@ def str_replace(
 
 @tool
 def ls(path: str, runtime: ToolRuntime, description: str = "") -> str:
-    """List a sandbox directory as a tree, at most two levels deep.
+    """以树形列出沙箱目录，最多两层。
 
     Args:
-        path: Absolute virtual path.
-        description: Optional short label shown in the UI.
+        path: 绝对虚拟路径。
+        description: 可选，界面上显示的短标签。
     """
     del description
     try:
@@ -154,13 +154,13 @@ def glob(
     include_dirs: bool = False,
     description: str = "",
 ) -> str:
-    """Find files under a sandbox directory.
+    """在沙箱目录下查找文件。
 
     Args:
-        path: Absolute virtual directory.
-        pattern: Glob pattern, for example ``**/*.py``.
-        include_dirs: Include directories in the results.
-        description: Optional short label shown in the UI.
+        path: 绝对虚拟目录。
+        pattern: Glob 模式，例如 ``**/*.py``。
+        include_dirs: 是否在结果中包含目录。
+        description: 可选，界面上显示的短标签。
     """
     del description
     try:
@@ -184,15 +184,15 @@ def grep(
     case_sensitive: bool = False,
     description: str = "",
 ) -> str:
-    """Search file contents under a sandbox path.
+    """在沙箱路径下搜索文件内容。
 
     Args:
-        path: Absolute virtual file or directory.
-        pattern: Regular expression, or a literal string when ``literal`` is true.
-        glob: Optional filename glob.
-        literal: Treat ``pattern`` as plain text.
-        case_sensitive: Match case when true.
-        description: Optional short label shown in the UI.
+        path: 绝对虚拟文件或目录。
+        pattern: 正则表达式；``literal`` 为 true 时按普通字符串处理。
+        glob: 可选的文件名 glob。
+        literal: 把 ``pattern`` 当作普通文本。
+        case_sensitive: 为 true 时区分大小写。
+        description: 可选，界面上显示的短标签。
     """
     del description
     try:

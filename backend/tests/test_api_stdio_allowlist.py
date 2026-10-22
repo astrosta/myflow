@@ -35,7 +35,6 @@ def config_path(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
     monkeypatch.setenv("MYFLOW_CONFIG_PATH", str(write_app_config(tmp_path)))
     monkeypatch.delenv("MYFLOW_MCP_STDIO_COMMAND_ALLOWLIST", raising=False)
-    monkeypatch.delenv("DEER_FLOW_MCP_STDIO_COMMAND_ALLOWLIST", raising=False)
     return path
 
 

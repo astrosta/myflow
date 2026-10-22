@@ -81,6 +81,16 @@ export function CloseIcon(props: IconProps) {
   );
 }
 
+/** 知识库。打开的书——侧栏入口 */
+export function BookOpenIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M12 7v14" />
+      <path d="M3 18a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+    </Icon>
+  );
+}
+
 /** 停止。实心方块，比 "■" 字符的基线更可控 */
 export function StopIcon({ size = 18, ...props }: IconProps) {
   return (

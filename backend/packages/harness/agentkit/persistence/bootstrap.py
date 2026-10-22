@@ -14,7 +14,13 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-_OWNED_TABLES = frozenset({"threads_meta", "runs", "run_events"})
+_OWNED_TABLES = frozenset({
+    "threads_meta",
+    "runs",
+    "run_events",
+    "knowledge_bases",
+    "knowledge_documents",
+})
 _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 
@@ -89,7 +95,7 @@ async def _installed_revision(engine: AsyncEngine) -> str | None:
 
 
 async def _create_all(engine: AsyncEngine) -> None:
-    import agentkit.persistence.models  # noqa: F401
+    import agentkit.persistence.schema  # noqa: F401
     from agentkit.persistence.base import Base
 
     def _create(sync_conn) -> None:

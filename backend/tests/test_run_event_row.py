@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine
-from agentkit.persistence.models import RunEventRow
+from agentkit.persistence.schema import RunEventRow
 from agentkit.runtime.events.constants import (
     RUN_EVENT_CATEGORY_MAX_LENGTH,
     RUN_EVENT_TYPE_MAX_LENGTH,

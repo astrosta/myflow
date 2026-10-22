@@ -1,5 +1,6 @@
 import Link from "next/link";
 
+import { BookOpenIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { ThreadSummary } from "@/core/types";
 import { cn, formatTimestamp } from "@/lib/utils";
@@ -27,6 +28,8 @@ export interface SidebarProps {
    * "已经在这儿"而空转 —— 所以真实调用点必须走这个回调。
    */
   onNewChat?: () => void;
+  /** 当前是否在知识库路由；入口高亮用 */
+  knowledgeActive?: boolean;
   className?: string;
 }
 
@@ -37,6 +40,7 @@ export function Sidebar({
   error = null,
   onRefresh,
   onNewChat,
+  knowledgeActive = false,
   className,
 }: SidebarProps) {
   return (
@@ -69,6 +73,22 @@ export function Sidebar({
             ＋ 新对话
           </Link>
         )}
+      </div>
+
+      <div className="px-3 pb-3">
+        <Link
+          aria-current={knowledgeActive ? "page" : undefined}
+          className={cn(
+            "flex h-9 w-full items-center gap-2 rounded-md border px-3 text-xs font-medium transition-colors",
+            knowledgeActive
+              ? "border-neutral-300 bg-white text-neutral-900 shadow-sm"
+              : "border-transparent text-neutral-600 hover:bg-white/70 hover:text-neutral-900",
+          )}
+          href="/workspace/knowledge"
+        >
+          <BookOpenIcon className="shrink-0" size={15} />
+          知识库
+        </Link>
       </div>
 
       <nav className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">

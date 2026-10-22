@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateIndex
 
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine
-from agentkit.persistence.models import RunRow
+from agentkit.persistence.schema import RunRow
 from agentkit.persistence.run.sql import SqlRunStore
 from agentkit.runtime.runs.schemas import ThreadOperationKind
 from agentkit.runtime.user_context import AUTO, MissingUserContextError

@@ -41,10 +41,7 @@ _SECRET_MAPS = ("env", "headers")
 #: oauth 里的凭据字段（§5.5 层 ①）。GET 时和 env/headers 一样打码。
 _OAUTH_SECRET_KEYS = ("client_secret", "refresh_token")
 
-_STDIO_ALLOWLIST_ENV_NAMES = (
-    "MYFLOW_MCP_STDIO_COMMAND_ALLOWLIST",
-    "DEER_FLOW_MCP_STDIO_COMMAND_ALLOWLIST",
-)
+_STDIO_ALLOWLIST_ENV_NAMES = ("MYFLOW_MCP_STDIO_COMMAND_ALLOWLIST",)
 
 #: §5.7 第 1 条：API 注册 stdio 只接受允许列表里的**裸**可执行文件名。
 DEFAULT_STDIO_COMMAND_ALLOWLIST = frozenset({"npx", "uvx"})

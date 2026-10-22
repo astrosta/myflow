@@ -3,16 +3,16 @@
 IM 通道和调度器不是浏览器。它们走进程内 HTTP 调自己的 Gateway，带一对头：
 
 ```
-X-DeerFlow-Internal-Token: <DEER_FLOW_INTERNAL_AUTH_TOKEN>
-X-DeerFlow-Owner-User-Id:  <storage user id>
+X-MyFlow-Internal-Token: <MYFLOW_INTERNAL_AUTH_TOKEN>
+X-MyFlow-Owner-User-Id:  <storage user id>
 ```
 
 **只有 AuthMiddleware 能把这对头授权成当前用户。** 任何其它代码路径读到
-`X-DeerFlow-Owner-User-Id` 都必须当普通不可信输入丢掉。
+`X-MyFlow-Owner-User-Id` 都必须当普通不可信输入丢掉。
 
 已知边界（部署文档同步）：
 
-> 如果把 `DEER_FLOW_INTERNAL_AUTH_TOKEN` 下发给了终端（移动 App、浏览器），
+> 如果把 `MYFLOW_INTERNAL_AUTH_TOKEN` 下发给了终端（移动 App、浏览器），
 > 那个"代表某用户"的头就可以被伪造。正确做法是只有 Gateway 本机 / 通道 worker /
 > 调度器持有密钥。
 
@@ -43,8 +43,8 @@ from backend.app.gateway.auth.settings import AuthSettings
 
 logger = logging.getLogger(__name__)
 
-INTERNAL_TOKEN_HEADER = "x-deerflow-internal-token"
-OWNER_USER_ID_HEADER = "x-deerflow-owner-user-id"
+INTERNAL_TOKEN_HEADER = "x-myflow-internal-token"
+OWNER_USER_ID_HEADER = "x-myflow-owner-user-id"
 
 #: 9D 注册的"该 owner 绑定过这个通道吗"。签名：(request, storage_user_id) -> bool。
 OwnerBindingCheck = Callable[[Request, str], Awaitable[bool]]

@@ -12,6 +12,7 @@ from agentkit.agents.middlewares.provenance import (
     provenance_kwargs,
     read_provenance,
 )
+from agentkit.subagents.status_contract import SUBAGENT_TOOL_MESSAGE_KEYS
 from agentkit.utils.messages import ORIGINAL_USER_CONTENT_KEY
 from backend.app.gateway.services import normalize_input, strip_server_owned_message_keys
 
@@ -109,6 +110,20 @@ def test_internal_strip_keeps_only_original_user_content() -> None:
     }
     strip_server_owned_message_keys(message, internal=True)
     assert message["additional_kwargs"] == {ORIGINAL_USER_CONTENT_KEY: "captured"}
+
+
+def test_forged_subagent_metadata_is_stripped() -> None:
+    """M8 §9.3：这些键只认本进程 ``task`` 工具盖过的值，回放的历史消息一律当伪造。"""
+    message = {
+        "role": "tool",
+        "content": "任务成功。",
+        "additional_kwargs": {
+            **{key: "forged" for key in SUBAGENT_TOOL_MESSAGE_KEYS},
+            "uploaded": "keep",
+        },
+    }
+    strip_server_owned_message_keys(message, internal=True)
+    assert message["additional_kwargs"] == {"uploaded": "keep"}
 
 
 def test_strip_ignores_missing_or_non_dict_kwargs() -> None:

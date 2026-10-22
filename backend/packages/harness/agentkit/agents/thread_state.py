@@ -6,7 +6,25 @@ from typing import Annotated, NotRequired, TypedDict
 
 from langchain.agents import AgentState
 
-_LEDGER_MAX_ENTRIES = 50
+#: 台账最多留几条（M8 §6.1）。50 条 × (brief ≤ 2000 字) 已经是 checkpoint 的上限；
+#: 更早的历史靠 ``subagent.end`` 事件翻，不要往 state 里塞（M1 §2.3）。
+DELEGATION_LEDGER_MAX_ENTRIES = 50
+
+#: 非终态：已经派出去、还没有 ToolMessage 的委派。压缩之后它是"已经派出去过"的
+#: **唯一**记忆；丢了它 lead 会再派一次同一个活（§6.3）。
+DELEGATION_STATUS_IN_PROGRESS = "in_progress"
+
+#: 终态。**不可被非终态覆盖**（§6.2）：取消竞态里 worker 晚到的 ``in_progress``
+#: 不能把已经落地的结论复活成"还在跑"。
+TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "timed_out", "polling_timed_out"})
+
+#: 台账允许出现的全部 status。§9.3 的跨语言契约
+#: （``contracts/subagent_status_contract.json``）必须与它双向一致。
+DELEGATION_STATUSES = frozenset({DELEGATION_STATUS_IN_PROGRESS, *TERMINAL_STATUSES})
+
+#: 三条护栏轴（§13）。命中了状态仍然是 completed / failed，**另外**带一个 stop_reason；
+#: 不新增状态枚举值，老消费者直接忽略这个可选字段。
+STOP_REASONS = frozenset({"token_capped", "turn_capped", "loop_capped"})
 
 
 class SandboxState(TypedDict):
@@ -29,8 +47,25 @@ class ViewedImageData(TypedDict):
     actual_path: str
 
 
-class DelegationEntry(TypedDict, total=False):
+class DelegationEntry(TypedDict):
+    """一条委派台账（M8 §6.1）。
+
+    **state 里不放完整结果**：完整文本在 ``ToolMessage.content`` 和 ``subagent.end``
+    事件里，这里只留 brief + sha256，免得 checkpoint 被 50 次委派撑爆。
+
+    这张表**不写** ``receipt_verdict`` / ``acceptance_verdict``（§20）：M8 不做回执
+    校验，填了前端会当成已校验。
+    """
+
     id: str
+    description: str
+    subagent_type: str
+    status: str
+    created_at: str
+    run_id: NotRequired[str]
+    result_brief: NotRequired[str]
+    result_sha256: NotRequired[str]
+    stop_reason: NotRequired[str]
 
 
 class SkillEntry(TypedDict):
@@ -82,19 +117,41 @@ def merge_viewed_images(existing, new):
 
 
 def merge_delegations(existing, new):
-    """Merge by id, keep first-seen order, drop the oldest past 50. None and [] leave the ledger."""
+    """台账 reducer（M8 §6.2）：
+
+    * ``new`` 为 None / [] → 保留 existing（这个节点没碰台账）
+    * 按 id 合并，**首次出现顺序**保留
+    * 已是终态的条目，拒绝被非终态覆盖（取消竞态：晚到的 ``in_progress`` 不能复活它）
+    * ``created_at`` / ``run_id`` 以首次写入为准
+    * 超过 50 条截**最老的**
+
+    终态之间的覆盖（例如 ``timed_out`` → ``completed``）由写入方负责：执行器用
+    ``try_set_terminal`` 保证"第一次终态获胜"，reducer 只保证"不能复活"。
+    """
     if not new:
         return list(existing or [])
-    by_id: dict[str, dict] = {}
+    by_id: dict[str, DelegationEntry] = {}
     order: list[str] = []
     for entry in [*(existing or []), *new]:
         entry_id = entry["id"]
-        if entry_id not in by_id:
+        previous = by_id.get(entry_id)
+        if (
+            previous is not None
+            and previous["status"] in TERMINAL_STATUSES
+            and entry["status"] not in TERMINAL_STATUSES
+        ):
+            continue
+        if previous is None:
             order.append(entry_id)
+        else:
+            if previous.get("created_at"):
+                entry = {**entry, "created_at": previous["created_at"]}
+            if previous.get("run_id") and not entry.get("run_id"):
+                entry = {**entry, "run_id": previous["run_id"]}
         by_id[entry_id] = entry
     merged = [by_id[entry_id] for entry_id in order]
-    if len(merged) > _LEDGER_MAX_ENTRIES:
-        return merged[-_LEDGER_MAX_ENTRIES:]
+    if len(merged) > DELEGATION_LEDGER_MAX_ENTRIES:
+        return merged[-DELEGATION_LEDGER_MAX_ENTRIES:]
     return merged
 
 

@@ -141,7 +141,7 @@ def test_body_identity_never_reaches_the_caller() -> None:
 
     response = client.post(
         "/probe/caller",
-        headers={"X-DeerFlow-Owner-User-Id": "someone"},
+        headers={"X-MyFlow-Owner-User-Id": "someone"},
         json={
             "assistant_id": "lead_agent",
             "metadata": {"user_id": "someone", "owner_id": "someone", "topic": "x"},
@@ -170,8 +170,8 @@ def test_the_owner_and_internal_headers_alone_are_not_an_identity() -> None:
     response = client.post(
         "/probe/caller",
         headers={
-            "X-DeerFlow-Owner-User-Id": "someone",
-            "X-DeerFlow-Internal-Token": "not-a-real-token",
+            "X-MyFlow-Owner-User-Id": "someone",
+            "X-MyFlow-Internal-Token": "not-a-real-token",
         },
         json={"assistant_id": "lead_agent", "context": {"topic": "x"}},
     )

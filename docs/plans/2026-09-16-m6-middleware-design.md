@@ -62,6 +62,7 @@ agentkit/agents/middlewares/
 ├── dynamic_context_middleware.py  ★  # W2
 ├── durable_context_middleware.py  ★  # W2
 ├── summarization_middleware.py    ★  # W2
+├── pii_middleware.py                  # M10：PII 输入/输出；不在 M6 实现
 └── ...                               # W3 按需：budget / loop / coalescing / view_image / ...
 
 agentkit/config/
@@ -379,6 +380,8 @@ def build_runtime_middlewares(app_config: AppConfig, *, include_uploads: bool, l
     #         M10 填前三条，必须在 ToolErrorHandling 之外；GraphBubbleUp 原样再抛
     # 全部必须在 ToolErrorHandling 之前（更外），因为它们会短路返回自己的 ToolMessage
     chain.append(ToolErrorHandlingMiddleware(app_config)) # ★ 最内层 wrap_tool_call：盖 deerflow_tool_meta
+    # SLOT: PIIMiddleware (M10)                          # 必须在 ToolErrorHandling 之内：
+    #                                                      # handle 解析失败要收成可恢复 ToolMessage
     return chain
 
 
@@ -397,6 +400,7 @@ def build_middlewares(config, model_name, *, app_config=None, custom_middlewares
     # SLOT: TodoList if is_plan_mode
     chain.append(TitleMiddleware(app_config=app_config)) # ★ W1
     # SLOT: Memory                                       # M10 MemoryMiddleware；压缩前 add_nowait 见 summarization_hook
+    # SLOT: PIIOutputMiddleware (M10)                    # 最后注册：after_model 反序，先于 Memory/Title 跑
     # SLOT: ViewImage if supports_vision                 # W3
     # SLOT: SystemMessageCoalescing                      # W3 严格后端
     # SLOT: LoopDetection / TokenBudget                  # W3
@@ -1662,8 +1666,8 @@ id 已经以 `__user` 结尾的消息不再当注入目标，避免 `id__user__u
 lead 和将来的 subagent 日期中间件必须读同一处，YAML 热重载会让两边漂移。空字符串用服务器本地时区。
 非法值打 warning，回退服务器本地时区。`_format_current_date` 用该时区的 `datetime.now`。
 
-Memory 召回（M10）走同一个 `<memory>` 槽。M6 只留标签，`injection_enabled=False` 时为空。
-契约见 [M10 §2.9 / §2.13](2026-09-16-m10-memory-guardrails-extensions-design.md)。
+画像注入（M10）走同一个 `<memory>` 槽，正文用 `<user_profile>` 包裹。M6 只留标签，`profile.injection_enabled=false` 时为空。
+契约见 [M10 §2.8 / §2.12](2026-09-16-m10-memory-guardrails-extensions-design.md)。
 
 注入本身可能触发 tiktoken 冷加载。`asyncio.to_thread` + 5s 超时。
 现实现把整段 `_inject` 放进同一个超时，超时返回 `None`，日期也一起跳过。

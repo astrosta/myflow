@@ -726,8 +726,6 @@ def resolve_path(value: str | os.PathLike[str], *, base: Path | None = None) -> 
 
 ```
 {runtime_home}/
-├── memory.json
-├── USER.md                        # 全局用户画像（M10）
 ├── agents/{agent_name}/           # 自定义 agent（M9）
 └── threads/{thread_id}/
     └── user-data/                 # 沙箱里挂成 /mnt/user-data/
@@ -738,6 +736,9 @@ def resolve_path(value: str | os.PathLike[str], *, base: Path | None = None) -> 
 
 M0 只需要建出 `threads/{thread_id}/user-data/{workspace,uploads,outputs}` 这一支，
 并定义 `VIRTUAL_PATH_PREFIX = "/mnt/user-data"`。
+
+M10 的画像/facts 不落在这个文件树里，由 LangGraph `BaseStore` 持久化
+（sqlite 时由 store provider 管理，postgres 时在数据库）。
 
 #### `Paths` 的方法形状比实现更重要
 
@@ -906,7 +907,7 @@ MODULE_TO_PACKAGE_HINTS = {
 
 | 字段                                                                       | 谁在用                          |
 | ------------------------------------------------------------------------ | ---------------------------- |
-| `name` / `display_name` / `description`                                  | M3 的 `/api/models`、M5 的模型选择器 |
+| `name` / `display_name` / `description`                                  | M1 §7 的 `/api/models`、M5 的模型选择器 |
 | `use`                                                                    | 反射类路径                        |
 | `model`                                                                  | provider 侧模型 ID              |
 | `supports_thinking` + `when_thinking_enabled` / `when_thinking_disabled` | M5 的思考开关                     |

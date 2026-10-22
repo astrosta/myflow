@@ -48,8 +48,8 @@ def test_attachment_only_turn_uses_the_default_title_without_a_model(monkeypatch
     async def run() -> dict | None:
         return await middleware.aafter_model(_state(human, AIMessage(content="收到文件")), None)
 
-    assert middleware.after_model(_state(human, AIMessage(content="收到文件")), None) == {"title": "New Conversation"}
-    assert asyncio.run(run()) == {"title": "New Conversation"}
+    assert middleware.after_model(_state(human, AIMessage(content="收到文件")), None) == {"title": "新对话"}
+    assert asyncio.run(run()) == {"title": "新对话"}
 
 
 def test_interrupted_first_turn_falls_back_without_an_assistant_message() -> None:
@@ -95,7 +95,7 @@ def test_async_model_call_carries_nostream_and_strips_think_blocks(monkeypatch: 
     assert seen["create"]["app_config"] is app_config
     assert "今天天气怎么样" in seen["prompt"]
     assert "用户上传了" not in seen["prompt"]
-    assert "max 4 words" in seen["prompt"]
+    assert "最多 4 个词" in seen["prompt"]
     assert seen["config"]["run_name"] == "title_agent"
     assert seen["config"]["tags"] == ["keep", "middleware:title", TAG_NOSTREAM]
     assert parent["tags"] == ["keep"]

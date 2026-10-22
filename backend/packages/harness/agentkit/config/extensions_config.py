@@ -34,11 +34,8 @@ logger = logging.getLogger(__name__)
 
 EXTENSIONS_CONFIG_FILENAME = "extensions_config.json"
 
-#: 显式断言"必须用这个文件"的两条通道。前一条是本仓库前缀，后一条与设计文档一致。
-EXTENSIONS_CONFIG_ENV_NAMES = (
-    "MYFLOW_EXTENSIONS_CONFIG_PATH",
-    "DEER_FLOW_EXTENSIONS_CONFIG_PATH",
-)
+#: 显式断言"必须用这个文件"的那条通道。
+EXTENSIONS_CONFIG_ENV_NAMES = ("MYFLOW_EXTENSIONS_CONFIG_PATH",)
 
 #: 进程内写锁。**必须是 threading.Lock，不是 asyncio.Lock**（§2.2）：RMW 跑在 worker
 #: 线程里，await to_thread 外层的 task 被取消不能把锁提前放掉。

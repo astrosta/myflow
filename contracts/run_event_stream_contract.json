@@ -6,6 +6,10 @@
     {"event_type": "llm.human.input", "category": "message"},
     {"event_type": "llm.ai.response", "category": "message"},
     {"event_type": "llm.tool.result", "category": "message"},
-    {"event_type": "llm.error", "category": "trace"}
+    {"event_type": "llm.error", "category": "trace"},
+    {"event_type": "context:memory", "category": "context"},
+    {"event_type": "subagent.start", "category": "subagent"},
+    {"event_type": "subagent.step", "category": "subagent"},
+    {"event_type": "subagent.end", "category": "subagent"}
   ]
 }

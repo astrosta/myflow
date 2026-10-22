@@ -16,6 +16,7 @@ from agentkit.agents.leader_agent import (
 )
 from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.checkpointer import get_checkpointer
+from agentkit.utils import new_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -362,8 +363,25 @@ class AgentClient:
         app_config = self._app_config if self._app_config is not None else get_app_config()
         checkpointer = self._checkpointer if self._checkpointer is not None else get_checkpointer()
         user_id = self._resolve_user_id()
+        # §10.2：委派预算按 run 计，缺 run_id 时 Limit 中间件会把整个 thread 的委派都算进来
+        # （偏严）。嵌入路径同样是一次 run，所以这里也发一个。
+        run_id = str(overrides.get("run_id") or new_run_id())
         config = self._build_config(thread_id, overrides)
-        context = {"thread_id": thread_id, "user_id": user_id}
+        # run_id 只进 context：和 Gateway 那条路径同一个位置（worker 也是 setdefault 进 context）
+        context = {"thread_id": thread_id, "user_id": user_id, "run_id": run_id}
+        graph_input = self._input_state(message)
+        if app_config.pii.enabled:
+            from agentkit.agents.middlewares.pii_middleware import PII_VAULT_CONTEXT_KEY
+            from agentkit.privacy import PIIRedactor, PIIVault, redact_human_messages
+
+            vault = PIIVault()
+            graph_input = {
+                **graph_input,
+                "messages": redact_human_messages(
+                    list(graph_input.get("messages") or []), PIIRedactor(vault)
+                ),
+            }
+            context[PII_VAULT_CONTEXT_KEY] = vault
         assembly = self._ensure_agent(
             config,
             app_config=app_config,
@@ -371,7 +389,7 @@ class AgentClient:
             user_id=user_id,
         )
         items = assembly.graph.stream(
-            self._input_state(message),
+            graph_input,
             config=config,
             context=context,
             stream_mode=list(LANGGRAPH_STREAM_MODES),

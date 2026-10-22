@@ -67,7 +67,8 @@ agentkit/sandbox/
 ├── path_patterns.py                # 输出反向遮蔽
 ├── file_operation_lock.py          # (sandbox_id, path) 锁
 ├── search.py                       # glob / grep 的共享实现
-├── middleware.py                   # SandboxMiddleware（生命周期）
+│                                   # SandboxMiddleware（生命周期）已迁到
+│                                   # agentkit/agents/middlewares/sandbox_middleware.py
 ├── runtime.py                   ★  # ensure_sandbox_initialized —— 工具拿沙箱的唯一入口
 ├── tools/
 │   ├── __init__.py                 # 导出工具对象供 config 的 use: 引用

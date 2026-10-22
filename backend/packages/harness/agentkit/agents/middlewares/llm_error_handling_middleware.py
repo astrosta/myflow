@@ -39,16 +39,16 @@ _DETAIL_LIMIT = 500
 # Same key names the gateway drops from persisted config. Harness cannot import that helper.
 _SECRET_ASSIGNMENT = re.compile(r"(?i)\b(secrets|trace_id|__\w+)\s*[:=]\s*(\"[^\"]*\"|'[^']*'|\S+)")
 _QUOTA_MESSAGE = (
-    "The configured LLM provider rejected the request because the account is out of quota, "
-    "billing is unavailable, or usage is restricted. Please fix the provider account and try again."
+    "所配置的大模型服务商拒绝了本次请求，可能是账户额度不足、计费不可用或使用受限。"
+    "请修复服务商账户状态后重试。"
 )
 _AUTH_MESSAGE = (
-    "The configured LLM provider rejected the request because authentication or access is invalid. "
-    "Please check the provider credentials and try again."
+    "所配置的大模型服务商拒绝了本次请求，认证信息或访问权限无效。"
+    "请检查服务商凭据后重试。"
 )
 _UNAVAILABLE_MESSAGE = (
-    "The configured LLM provider is temporarily unavailable after multiple retries. "
-    "Please wait a moment and continue the conversation."
+    "所配置的大模型服务商在多次重试后仍暂时不可用。"
+    "请稍候片刻再继续对话。"
 )
 
 
@@ -201,14 +201,14 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             return _AUTH_MESSAGE
         if reason in {"busy", "transient"}:
             return _UNAVAILABLE_MESSAGE
-        return f"LLM request failed: {detail}"
+        return f"LLM 请求失败：{detail}"
 
     def _fallback_ai_message(self, exc: BaseException, reason: str) -> AIMessage:
         detail = _sanitize_detail(exc)
         return AIMessage(
             content=self._user_message(reason, detail),
             additional_kwargs={
-                "deerflow_error_fallback": True,
+                "myflow_error_fallback": True,
                 "error_type": type(exc).__name__,
                 "error_reason": reason,
                 "error_detail": detail,

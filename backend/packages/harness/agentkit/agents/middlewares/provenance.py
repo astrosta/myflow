@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
-MESSAGE_CONTENT_KIND_KEY = "deerflow_content_kind"
-MESSAGE_PRODUCER_KIND_KEY = "deerflow_producer_kind"
-MESSAGE_PRODUCER_ENTITY_ID_KEY = "deerflow_producer_entity_id"
+MESSAGE_CONTENT_KIND_KEY = "myflow_content_kind"
+MESSAGE_PRODUCER_KIND_KEY = "myflow_producer_kind"
+MESSAGE_PRODUCER_ENTITY_ID_KEY = "myflow_producer_entity_id"
 PROVENANCE_KEYS: frozenset[str] = frozenset({
     MESSAGE_CONTENT_KIND_KEY,
     MESSAGE_PRODUCER_KIND_KEY,

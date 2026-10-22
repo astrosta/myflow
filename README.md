@@ -5,9 +5,10 @@
 | 服务 | 目录 | 端口 | 说明 |
 |---|---|---|---|
 | 网关 | [`backend/`](backend/README.md) | `127.0.0.1:8001` | threads / runs / SSE / 上传 |
-| 前端 | [`frontend/`](frontend/README.md) | `127.0.0.1:3000` | 工作区聊天 |
+| 前端 | [`frontend/`](frontend/README.md) | `127.0.0.1:3000` | 工作区聊天 / 知识库 |
 
-更细的启动约束、配置和排障写在各自目录的 README 里。
+更细的启动约束、配置和排障写在各自目录的 README 里。知识库（MinerU + Qwen3-Embedding-8B +
+Milvus）默认关闭，配置、安装可选依赖和 API 见 [`backend/README.md`](backend/README.md#知识库mineru--qwen3-embedding-8b--milvus)。
 
 ## 前置
 

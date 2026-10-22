@@ -20,6 +20,8 @@ _LAZY_BACKENDS = {
     "DbRunEventStore": "agentkit.persistence.events.db",
     "JsonlRunEventStore": "agentkit.persistence.events.jsonl",
     "MemoryRunEventStore": "agentkit.persistence.events.memory",
+    # ORM 行也走懒加载：memory / jsonl 的使用者不该为了 import 这个包就拉进 ORM。
+    "RunEventRow": "agentkit.persistence.events.model",
 }
 
 _UNSET = object()
@@ -28,6 +30,7 @@ __all__ = [
     "DbRunEventStore",
     "JsonlRunEventStore",
     "MemoryRunEventStore",
+    "RunEventRow",
     "RunEventSeqConflict",
     "RunEventStore",
     "make_run_event_store",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from alembic import context
 from sqlalchemy import create_engine, event, pool
 
-import agentkit.persistence.models  # noqa: F401
+import agentkit.persistence.schema  # noqa: F401
 from agentkit.persistence.base import Base
 from agentkit.persistence.migrations._env_filters import include_object
 

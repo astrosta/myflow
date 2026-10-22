@@ -25,16 +25,16 @@ TOOL_NAME = "describe_skill"
 
 @tool
 def describe_skill(query: str = "", runtime: ToolRuntime = None) -> str:
-    """Describe the skills available in this deployment.
+    """查看当前部署中可用的技能。
 
     Args:
-        query: "" returns the first few skills; "select:a,b" returns exactly those names (no cap);
-            "+prefix" matches a name prefix; anything else is matched against name and description
-            (regular expression, falling back to a plain substring when the pattern is invalid).
+        query: "" 返回前几个技能；"select:a,b" 精确返回这些技能（不设数量上限）；
+            "+prefix" 按名称前缀匹配；其他内容按名称和描述做正则匹配
+            （模式无效时退化为普通子串匹配）。
     """
     config = safe_app_config()
     if config is None:
-        return "Error: application config is unavailable"
+        return "错误：应用配置不可用"
     registry = SkillRegistry(
         config=config.skills,
         user_id=runtime_user_bucket(runtime) if runtime is not None else None,

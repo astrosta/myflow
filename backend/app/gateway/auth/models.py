@@ -38,6 +38,8 @@ PAT_SCOPE_MENU = frozenset({
     "skills:read",
     "memory:read",
     "memory:write",
+    "knowledge:read",
+    "knowledge:write",
 })
 
 

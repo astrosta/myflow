@@ -31,8 +31,8 @@ def test_exception_becomes_a_stamped_error_message() -> None:
     assert message.tool_call_id == "c1"
     assert message.status == "error"
     assert message.content == (
-        "Error: Tool 'bash' failed with ValueError: connection timeout. "
-        "Continue with available context, or choose an alternative tool."
+        "错误：工具 'bash' 调用失败（ValueError）：connection timeout。"
+        "请基于现有上下文继续，或者换一个工具。"
     )
     meta = message.additional_kwargs[TOOL_META_KEY]
     assert meta["source"] == "exception"
@@ -55,7 +55,7 @@ def test_empty_exception_text_uses_the_class_name() -> None:
         raise RuntimeError("   ")
 
     message = ToolErrorHandlingMiddleware().wrap_tool_call(_request(), handler)
-    assert "RuntimeError: RuntimeError." in message.content
+    assert "（RuntimeError）：RuntimeError。" in message.content
 
 
 def test_long_detail_is_truncated_before_redaction_markers() -> None:
@@ -63,7 +63,7 @@ def test_long_detail_is_truncated_before_redaction_markers() -> None:
         raise RuntimeError("x" * 600)
 
     message = ToolErrorHandlingMiddleware().wrap_tool_call(_request(), handler)
-    detail = message.content.split("RuntimeError: ", 1)[1]
+    detail = message.content.split("（RuntimeError）：", 1)[1]
     assert detail.startswith("x" * 497 + "...")
     assert "x" * 498 not in detail
 

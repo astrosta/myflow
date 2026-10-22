@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine
-from agentkit.persistence.models.run_event import RunEventRow
+from agentkit.persistence.events.model import RunEventRow
 from agentkit.runtime.events.catalog import LLM_HUMAN_INPUT
 from agentkit.persistence.events import JsonlRunEventStore, MemoryRunEventStore
 from agentkit.persistence.events.base import RunEventSeqConflict

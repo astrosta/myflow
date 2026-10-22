@@ -205,7 +205,7 @@ async def start_run(
 
 | 参数                        | 类型                 | 谁给                                                         | 含义                                       |
 | ------------------------- | ------------------ | ---------------------------------------------------------- | ---------------------------------------- |
-| `body`                    | `RunCreateRequest` | 路由由 FastAPI 绑定；内部调用方自己构造                                   | 请求本身。**只读**，start_run 不改它的任何字段           |
+| `body`                    | `RunCreateRequest` | 路由由 FastAPI 绑定；内部调用方自己构造                                   | 请求本身。start_run 只在 PII 步骤替换 `body.input`（脱敏后的 handle）；其他字段不改 |
 | `thread_id`               | `str`              | URL 路径参数；内部调用方显式传                                          | checkpointer 的分区键。唯一可信来源，body 里的同名字段一律不看 |
 | `caller`                  | `RunCaller`        | `caller_from_request(request)` / `RunCaller.internal(...)` | 身份与权限。**所有身份相关的决定只看它**，不看 body           |
 | `services`                | `RunServices`      | `get_run_services(request)` / `app.state.run_services`     | 进程级单例的打包                                 |
@@ -348,7 +348,7 @@ M9 §4.1 草图里的 `start_run(..., user_id=user_id, context=context)` 落到�
 | 4   | 模型白名单                        | `_check_model_allowed`                              | 纯函数     | 400           |
 | 5   | thread 属主                    | `_thread_access_allowed`                            | 只读 IO   | 404           |
 | 6   | 解析 agent 工厂                  | `resolve_agent_factory`                             | 纯函数     | 404           |
-| 7   | 规范化 input                    | `normalize_input`                                   | 纯函数     | 422           |
+| 7   | PII 脱敏 + 规范化 input          | `_redact_run_input`、`normalize_input`              | 纯函数     | 422           |
 | 8   | 整理 metadata，盖 trace id       | `_build_run_metadata`                               | 纯函数     | ——            |
 | 9   | 组 `RunnableConfig` 骨架        | `build_run_config`                                  | 纯函数     | 422           |
 | 10  | checkpoint 选择                | `apply_checkpoint`                                  | 只读 IO   | 422 / 404     |
@@ -408,7 +408,10 @@ async def start_run(body, *, thread_id, caller, services, idempotency_key=None, 
 
     # ── 6–12：组装；除第 10 步外不做 IO ─────────────────────────────
     agent_factory = resolve_agent_factory(body.assistant_id)                              # 6
-    graph_input = normalize_input(body.input, command=body.command, trusted=caller.is_internal)  # 7
+    # 7a：在 normalize / 幂等比较 / run record 之前替换 input；mapping 只进 runtime.context
+    pii_vault = _redact_run_input(body, app_config,
+                                  vault_id=_pii_vault_id(thread_id, idempotency_key, body.input))
+    graph_input = normalize_input(body.input, command=body.command, trusted=caller.is_internal)  # 7b
     run_metadata = _build_run_metadata(body.metadata)                                     # 8
     config = build_run_config(thread_id, body.config, run_metadata, app_config=app_config)  # 9
     await apply_checkpoint(config, body, thread_id=thread_id, checkpointer=ctx.checkpointer)  # 10
@@ -416,6 +419,8 @@ async def start_run(body, *, thread_id, caller, services, idempotency_key=None, 
     run_id = new_run_id()
     inject_server_owned(config, caller, run_id=run_id,
                         trace_id=run_metadata[TRACE_METADATA_KEY], body_context=body.context)  # 12
+    if pii_vault is not None:
+        config["context"]["__pii_vault"] = pii_vault
 
     # ── 13–14：副作用（§4.5）───────────────────────────────────────
     scoped_key = scope_idempotency_key(caller, thread_id, idempotency_key)
@@ -831,7 +836,7 @@ await（§5.4 第 5 步），但这是一条靠纪律维持的性质，M9 很可
 ```python
 def _persisted_kwargs(body: RunCreateRequest) -> dict:
     return {
-        "input": body.input,                              # 原始值：幂等比对和 run API 回显都用它
+        "input": body.input,                              # 脱敏后的值：幂等比对和 run API 回显都用它
         "config": redact_config_secrets(body.config),
         "context": redact_context_secrets(body.context),
     }
@@ -839,8 +844,9 @@ def _persisted_kwargs(body: RunCreateRequest) -> dict:
 
 两个 `redact_*` 删掉 `secrets`、所有 `__` 前缀键和 trace 键。第 9–12 步组出来的 live config
 **保留**密钥——run 要用；只有落库回显的这份不留（M4 §4.2、M7 §4）。
-存原始 `input` 而不是第 7 步的结果：后者是消息对象，不是 JSON；而且幂等比对要拿它和下一次请求的
-原始 body 比。
+存脱敏后的 `input` 而不是第 7 步的消息对象：后者不是 JSON；幂等比对拿它和下一次请求的脱敏
+输入比。原始 `body.input` 在 PII 步骤已被替换；handle 到原值的 mapping 只在 run 内存的
+`__pii_vault` 里，不落库。
 
 #### `create_task` 失败：worker 的两条硬义务落到 start_run 身上
 
@@ -1240,7 +1246,7 @@ class RunRecord:
     operation_kind: ThreadOperationKind = ThreadOperationKind.run
     multitask_strategy: str = "reject"
     metadata: dict = field(default_factory=dict)
-    kwargs: dict = field(default_factory=dict)      # {"input": ..., "config": ...}，密钥已脱敏
+    kwargs: dict = field(default_factory=dict)      # {"input": ...} PII handle + 脱敏 config
     user_id: str | None = None
     model_name: str | None = None
     error: str | None = None

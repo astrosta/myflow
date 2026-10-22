@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_RECOVERY_ERROR_DETAIL_LEN = 500
 _UNKNOWN_TOOL_NAME = "unknown_tool"
-_EMPTY_TOOL_NAME_ERROR = "Tool call could not be executed because its name was missing or empty."
-_SYNTHETIC_TOOL_CALL_ID_PREFIX = "deerflow_synthetic_tool_call_"
+_EMPTY_TOOL_NAME_ERROR = "工具名缺失或为空，本次工具调用无法执行。"
+_SYNTHETIC_TOOL_CALL_ID_PREFIX = "myflow_synthetic_tool_call_"
 
 
 def synthetic_tool_call_id(msg_index: int, source: str, position: int) -> str:
@@ -169,26 +169,24 @@ class DanglingToolCallMiddleware(AgentMiddleware[AgentState]):
     @staticmethod
     def _synthetic_tool_message_content(tool_call: dict) -> str:
         if tool_call.get("invalid_tool_name"):
-            return f"[{_EMPTY_TOOL_NAME_ERROR} Use one of the available tool names when retrying.]"
+            return f"[{_EMPTY_TOOL_NAME_ERROR}重试时请使用可用的工具名。]"
         if tool_call.get("invalid"):
             name = tool_call.get("name")
             error = tool_call.get("error")
             error_text = error[:_MAX_RECOVERY_ERROR_DETAIL_LEN] if isinstance(error, str) and error else ""
             if name == "write_file":
-                details = f" Parser error: {error_text}" if error_text else ""
+                details = f" 解析错误：{error_text}" if error_text else ""
                 return (
-                    "[write_file failed before execution: the tool-call arguments were not valid JSON, "
-                    "so no file was written. This often happens when the model tries to write a very "
-                    "large Markdown file in a single tool call, especially when `content` contains "
-                    "unescaped quotes, inline JSON, backslashes, or code fences. Do not retry the same "
-                    "large `write_file` payload for this artifact; provide the report/content directly "
-                    "as normal assistant text in your next response. If a file write is still needed "
-                    f"later, split the file into smaller sections instead of one large payload.{details}]"
+                    "[write_file 在真正执行前就失败了：工具调用参数不是合法 JSON，因此没有写入任何文件。"
+                    "这通常发生在模型试图用一次工具调用写入很大的 Markdown 文件时，尤其是 `content` 里含有"
+                    "未转义的引号、内联 JSON、反斜杠或代码围栏。不要对同一文件重试同样巨大的 `write_file` 负载；"
+                    "请在下一轮回复中直接把报告/正文作为普通的助手文本输出。如果之后仍然需要写文件，"
+                    f"请把文件拆成更小的几段分别写入，而不要一次写完。{details}]"
                 )
             if error_text:
-                return f"[Tool call could not be executed because its arguments were invalid: {error_text}]"
-            return "[Tool call could not be executed because its arguments were invalid.]"
-        return "[Tool call was interrupted and did not return a result.]"
+                return f"[工具调用无法执行：参数不合法：{error_text}]"
+            return "[工具调用无法执行：参数不合法。]"
+        return "[工具调用被中断，没有返回结果。]"
 
     @staticmethod
     def _sanitize_ai_message_tool_calls(message):

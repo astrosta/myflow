@@ -11,9 +11,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from agentkit.persistence.base import row_to_dict
-from agentkit.persistence.models.run_event import RunEventRow
 from agentkit.persistence.events.base import RunEventSeqConflict, RunEventStore
 from agentkit.persistence.events.codec import decode_content, encode_for_db, normalize_event, same_thread
+from agentkit.persistence.events.model import RunEventRow
 
 SEQ_RETRIES = 3
 
@@ -81,6 +81,7 @@ class DbRunEventStore(RunEventStore):
         run_id: str,
         event_types: Sequence[str] | None = None,
         after_seq: int | None = None,
+        task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         statement = select(RunEventRow).where(
             RunEventRow.thread_id == thread_id,
@@ -90,6 +91,10 @@ class DbRunEventStore(RunEventStore):
             statement = statement.where(RunEventRow.event_type.in_(tuple(event_types)))
         if after_seq is not None:
             statement = statement.where(RunEventRow.seq > after_seq)
+        if task_id is not None:
+            # M8 §14.3：metadata["task_id"] 是 provider 的 tool_call_id。JSON 路径过滤，
+            # 走的是已有的 (thread_id, run_id, seq) 索引，不改 schema。
+            statement = statement.where(RunEventRow.event_metadata["task_id"].as_string() == task_id)
         statement = statement.order_by(RunEventRow.seq.asc())
         return await self._load(statement)
 

@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from agentkit.authz import ADMIN_ROLE
+from agentkit.knowledge.errors import KnowledgeError
 from agentkit.persistence.base import InvalidCursor
 from agentkit.persistence.json_compat import InvalidMetadataFilterError
 from agentkit.persistence.thread_meta.base import ThreadOwnershipConflictError
@@ -164,6 +165,41 @@ class InvalidExtensionsConfig(Exception):
     code: ClassVar[str] = "invalid_extensions_config"
 
 
+class MemoryConflictAPI(Exception):
+    status_code: ClassVar[int] = 409
+    code: ClassVar[str] = "memory_conflict"
+
+
+class InvalidMemoryProfile(Exception):
+    status_code: ClassVar[int] = 422
+    code: ClassVar[str] = "invalid_memory_profile"
+
+
+class MemoryRequestInvalid(Exception):
+    status_code: ClassVar[int] = 422
+    code: ClassVar[str] = "invalid_memory_request"
+
+
+class MemoryNotFoundAPI(Exception):
+    status_code: ClassVar[int] = 404
+    code: ClassVar[str] = "memory_not_found"
+
+
+class MemoryKindUnsupported(Exception):
+    status_code: ClassVar[int] = 501
+    code: ClassVar[str] = "memory_kind_unsupported"
+
+
+class MemoryCorrupted(Exception):
+    """Fixed detail: a corrupt store path must not leak into the response."""
+
+    status_code: ClassVar[int] = 500
+    code: ClassVar[str] = "memory_corrupted"
+
+    def __init__(self, detail: str = "Memory data is corrupt") -> None:
+        super().__init__(detail)
+
+
 _PERSISTENCE: dict[type[BaseException], tuple[int, str]] = {
     ThreadOwnershipConflictError: (409, "thread_ownership_conflict"),
     InvalidMetadataFilterError: (400, "invalid_metadata_filter"),
@@ -188,6 +224,13 @@ def install_error_handlers(app: FastAPI) -> None:
         SkillNotFound,
         StdioCommandRejected,
         InvalidExtensionsConfig,
+        MemoryConflictAPI,
+        InvalidMemoryProfile,
+        MemoryRequestInvalid,
+        MemoryNotFoundAPI,
+        MemoryKindUnsupported,
+        MemoryCorrupted,
+        KnowledgeError,
         *_M9_ERRORS,
     ):
         app.add_exception_handler(exc_type, _handle_coded_error)

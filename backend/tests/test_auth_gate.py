@@ -268,8 +268,8 @@ def test_internal_token_represents_an_existing_owner() -> None:
 
     storage_id = make_safe_user_id(owner["id"])
     headers = {
-        "X-DeerFlow-Internal-Token": "shared-secret",
-        "X-DeerFlow-Owner-User-Id": storage_id,
+        "X-MyFlow-Internal-Token": "shared-secret",
+        "X-MyFlow-Owner-User-Id": storage_id,
     }
 
     allowed = harness.client.get("/api/probe", headers=headers)
@@ -278,19 +278,19 @@ def test_internal_token_represents_an_existing_owner() -> None:
     assert allowed.json()["is_internal"] is True
 
     bad_token = harness.client.get(
-        "/api/probe", headers={**headers, "X-DeerFlow-Internal-Token": "nope"}
+        "/api/probe", headers={**headers, "X-MyFlow-Internal-Token": "nope"}
     )
     assert bad_token.status_code == 401
     assert bad_token.json()["code"] == "unauthenticated"
 
     unknown_owner = harness.client.get(
-        "/api/probe", headers={**headers, "X-DeerFlow-Owner-User-Id": "ghost"}
+        "/api/probe", headers={**headers, "X-MyFlow-Owner-User-Id": "ghost"}
     )
     assert unknown_owner.status_code == 401
     assert unknown_owner.json()["code"] == "unknown_owner"
 
     missing_owner = harness.client.get(
-        "/api/probe", headers={"X-DeerFlow-Internal-Token": "shared-secret"}
+        "/api/probe", headers={"X-MyFlow-Internal-Token": "shared-secret"}
     )
     assert missing_owner.status_code == 401
     assert missing_owner.json()["code"] == "unknown_owner"
@@ -305,8 +305,8 @@ def test_rotation_accepts_the_old_and_the_new_token() -> None:
         response = harness.client.get(
             "/api/probe",
             headers={
-                "X-DeerFlow-Internal-Token": token,
-                "X-DeerFlow-Owner-User-Id": make_safe_user_id(owner["id"]),
+                "X-MyFlow-Internal-Token": token,
+                "X-MyFlow-Owner-User-Id": make_safe_user_id(owner["id"]),
             },
         )
         assert response.status_code == 200, token
@@ -321,8 +321,8 @@ def test_a_disabled_owner_cannot_be_represented() -> None:
     response = harness.client.get(
         "/api/probe",
         headers={
-            "X-DeerFlow-Internal-Token": "shared-secret",
-            "X-DeerFlow-Owner-User-Id": make_safe_user_id(owner["id"]),
+            "X-MyFlow-Internal-Token": "shared-secret",
+            "X-MyFlow-Owner-User-Id": make_safe_user_id(owner["id"]),
         },
     )
     assert response.status_code == 401

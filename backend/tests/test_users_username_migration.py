@@ -16,6 +16,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
+from agentkit.persistence.bootstrap import _head_revision
 from agentkit.persistence.migrations import __file__ as migrations_file
 
 MIGRATIONS_DIR = Path(migrations_file).resolve().parent
@@ -112,7 +113,7 @@ def test_upgrading_a_database_that_is_already_at_the_new_shape(tmp_path: Path) -
 
     with engine.connect() as conn:
         assert conn.scalar(text("SELECT username FROM users WHERE id = 'u1'")) == "alice"
-        assert conn.scalar(text("SELECT version_num FROM alembic_version")) == "0003_users_username"
+        assert conn.scalar(text("SELECT version_num FROM alembic_version")) == _head_revision()
         indexes = {row[1] for row in conn.execute(text("PRAGMA index_list(users)"))}
     assert "ix_users_username" in indexes
     engine.dispose()

@@ -16,16 +16,16 @@ from agentkit.config import AppConfig
 from agentkit.config.llm_call_config import LlmCallConfig
 
 _QUOTA = (
-    "The configured LLM provider rejected the request because the account is out of quota, "
-    "billing is unavailable, or usage is restricted. Please fix the provider account and try again."
+    "所配置的大模型服务商拒绝了本次请求，可能是账户额度不足、计费不可用或使用受限。"
+    "请修复服务商账户状态后重试。"
 )
 _AUTH = (
-    "The configured LLM provider rejected the request because authentication or access is invalid. "
-    "Please check the provider credentials and try again."
+    "所配置的大模型服务商拒绝了本次请求，认证信息或访问权限无效。"
+    "请检查服务商凭据后重试。"
 )
 _UNAVAILABLE = (
-    "The configured LLM provider is temporarily unavailable after multiple retries. "
-    "Please wait a moment and continue the conversation."
+    "所配置的大模型服务商在多次重试后仍暂时不可用。"
+    "请稍候片刻再继续对话。"
 )
 
 
@@ -163,7 +163,7 @@ def test_401_does_not_retry(async_call: bool) -> None:
     assert isinstance(message, AIMessage)
     assert message.content == _AUTH
     kwargs = message.additional_kwargs
-    assert kwargs["deerflow_error_fallback"] is True
+    assert kwargs["myflow_error_fallback"] is True
     assert kwargs["error_type"] == "_ProviderError"
     assert kwargs["error_reason"] == "auth"
     assert kwargs["error_detail"] == "Unauthorized"
@@ -288,7 +288,7 @@ def test_generic_message_includes_the_sanitized_detail() -> None:
         raise RuntimeError("failed secrets=sk-live-secret")
 
     message = _middleware().wrap_model_call(_request(), handler)
-    assert message.content == "LLM request failed: failed secrets=[REDACTED]"
+    assert message.content == "LLM 请求失败：failed secrets=[REDACTED]"
     assert "sk-live-secret" not in message.additional_kwargs["error_detail"]
     assert message.additional_kwargs["error_reason"] == "generic"
     assert message.additional_kwargs["error_type"] == "RuntimeError"
@@ -302,7 +302,7 @@ def test_long_detail_is_truncated() -> None:
     detail = message.additional_kwargs["error_detail"]
     assert detail == "x" * 497 + "..."
     assert detail.endswith("...")
-    assert "LLM request failed: " + detail == message.content
+    assert "LLM 请求失败：" + detail == message.content
 
 
 def test_empty_exception_text_uses_the_class_name() -> None:
@@ -311,7 +311,7 @@ def test_empty_exception_text_uses_the_class_name() -> None:
 
     message = _middleware().wrap_model_call(_request(), handler)
     assert message.additional_kwargs["error_detail"] == "RuntimeError"
-    assert message.content == "LLM request failed: RuntimeError"
+    assert message.content == "LLM 请求失败：RuntimeError"
 
 
 def test_retry_emits_llm_retry(monkeypatch: pytest.MonkeyPatch) -> None:

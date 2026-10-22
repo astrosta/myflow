@@ -90,6 +90,32 @@ def _non_empty_string(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
+def clone_ai_message_with_tool_calls(message: object, tool_calls: list) -> object:
+    """换掉一条 AIMessage 的 tool_calls，并**同步 provider 的原始元数据**（M6 §5.1 / M8 §10.3）。
+
+    只改结构化字段会留下悬空调用：raw ``additional_kwargs["tool_calls"]`` 里那条还在，
+    下一次请求就会带着一个永远不会有结果的 tool_call 过去（严格后端直接 400）。
+    raw 列表按 id 对齐；没有 id 的条目留着（分辨不出是哪一条）。
+
+    返回值保持同一个 ``id`` —— ``add_messages`` 按 id 替换，所以在 ``after_model`` 里
+    直接 ``{"messages": [new]}`` 就是"换掉最后那条 AI 消息"。
+    """
+    kwargs = dict(getattr(message, "additional_kwargs", None) or {})
+    raw = kwargs.get("tool_calls")
+    if isinstance(raw, list):
+        kept_ids = {
+            call.get("id")
+            for call in tool_calls
+            if isinstance(call, Mapping) and isinstance(call.get("id"), str)
+        }
+        kwargs["tool_calls"] = [
+            entry
+            for entry in raw
+            if not isinstance(entry, Mapping) or entry.get("id") is None or entry.get("id") in kept_ids
+        ]
+    return message.model_copy(update={"tool_calls": list(tool_calls), "additional_kwargs": kwargs})
+
+
 def insert_after_leading_system_messages(messages: list, injected: list) -> list:
     """Place injected messages after the opening system prompt, without copying the input lists."""
     from langchain_core.messages import SystemMessage

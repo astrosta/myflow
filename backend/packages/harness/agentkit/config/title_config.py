@@ -11,9 +11,9 @@ class TitleConfig(BaseModel):
     max_chars: int = Field(default=60, ge=10, le=200)
     model_name: str | None = None
     prompt_template: str = (
-        "Generate a concise title (max {max_words} words) for this conversation.\n"
-        "User: {user_msg}\nAssistant: {assistant_msg}\n\n"
-        "Return ONLY the title, no quotes, no explanation."
+        "为下面这段对话生成一个简洁标题（最多 {max_words} 个词）。\n"
+        "用户：{user_msg}\n助手：{assistant_msg}\n\n"
+        "只返回标题本身，不要引号，不要解释。"
     )
 
 

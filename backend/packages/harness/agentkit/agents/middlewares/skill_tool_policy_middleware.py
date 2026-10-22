@@ -41,7 +41,7 @@ from agentkit.skills.types import Skill
 
 logger = logging.getLogger(__name__)
 
-POLICY_HINT = "Switch to another tool, or ask the user to activate a skill that declares it."
+POLICY_HINT = "请改用其他工具，或者请用户激活一个声明了该工具的技能。"
 
 
 class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
@@ -216,8 +216,8 @@ def _policy_error_tool_message(request: ToolCallRequest, decision: ToolPolicyDec
     name = _tool_call_name(request) or "unknown_tool"
     tool_call_id = str(tool_call.get("id") or "missing_tool_call_id") if isinstance(tool_call, Mapping) else "missing_tool_call_id"
     content = (
-        f"Error: Tool '{name}' is not available under the currently active skill "
-        f"(policy mode: {decision.mode}). {POLICY_HINT}"
+        f"错误：当前激活的技能下不可使用工具 '{name}'"
+        f"（策略模式：{decision.mode}）。{POLICY_HINT}"
     )
     message = ToolMessage(content=content, tool_call_id=tool_call_id, name=name, status="error")
     return normalize_tool_result(message, tool_call_id=tool_call_id)

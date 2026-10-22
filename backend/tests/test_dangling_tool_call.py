@@ -11,7 +11,7 @@ from agentkit.agents.middlewares.dangling_tool_call_middleware import (
     synthetic_tool_call_id,
 )
 
-_INTERRUPTED = "Tool call was interrupted and did not return a result."
+_INTERRUPTED = "[工具调用被中断，没有返回结果。]"
 
 
 def _request(*messages: object) -> ModelRequest:
@@ -23,7 +23,7 @@ def _call(call_id: str, name: str) -> dict:
 
 
 def test_synthetic_id_is_stable_for_the_same_triple() -> None:
-    assert synthetic_tool_call_id(2, "call", 1) == "deerflow_synthetic_tool_call_2_call_1"
+    assert synthetic_tool_call_id(2, "call", 1) == "myflow_synthetic_tool_call_2_call_1"
     assert synthetic_tool_call_id(2, "call", 1) == synthetic_tool_call_id(2, "call", 1)
 
 
@@ -56,7 +56,7 @@ def test_empty_name_becomes_unknown_tool() -> None:
     patched = DanglingToolCallMiddleware()._build_patched_messages([ai])
     assert patched[0].tool_calls[0]["name"] == "unknown_tool"
     assert patched[1].name == "unknown_tool"
-    assert "name" in patched[1].content.lower()
+    assert "工具名" in patched[1].content
 
 
 def test_orphan_tool_message_is_dropped() -> None:
@@ -94,7 +94,7 @@ def test_write_file_recovery_truncates_the_parser_error() -> None:
     )
     patched = DanglingToolCallMiddleware()._build_patched_messages([ai])
     placeholder = patched[1]
-    assert "not valid JSON" in placeholder.content
+    assert "不是合法 JSON" in placeholder.content
     assert "q" * 500 in placeholder.content
     assert "q" * 501 not in placeholder.content
 

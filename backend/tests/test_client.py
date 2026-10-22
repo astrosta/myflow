@@ -69,6 +69,20 @@ def test_thread_coordinates_and_recursion_limit_do_not_rebuild(monkeypatch: pyte
     assert last["config"]["recursion_limit"] == 4
 
 
+def test_every_embedded_run_carries_a_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M8 §10.2：委派预算按 run 计，嵌入路径也必须把 run_id 放进 runtime context。"""
+    assembled = _install_assemble(monkeypatch)
+    client = AgentClient(app_config=AppConfig(), checkpointer=object())
+
+    list(client.stream("hello", thread_id="t1"))
+    list(client.stream("hello", thread_id="t1"))
+
+    contexts = [call["context"] for call in assembled[0]["graph"].calls]
+    assert all(context["run_id"] for context in contexts)
+    assert contexts[0]["run_id"] != contexts[1]["run_id"], "两次 stream 是两次 run"
+    assert all(context["thread_id"] == "t1" for context in contexts)
+
+
 def test_reset_checkpointer_rebuilds_onto_the_new_saver(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provider, "_resolve_checkpointer_config", lambda: CheckpointerConfig())
     provider.reset_checkpointer()

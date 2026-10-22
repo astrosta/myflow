@@ -5,7 +5,7 @@ import asyncio
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agentkit.agents.middlewares.summarization_middleware import (
-    DeerFlowSummarizationMiddleware,
+    MyFlowSummarizationMiddleware,
     SummaryGenerationError,
     create_summarization_middleware,
 )
@@ -55,8 +55,8 @@ def _counter(messages) -> int:
     return len(list(messages))
 
 
-def _middleware(model: FakeModel | None = None, **kwargs) -> DeerFlowSummarizationMiddleware:
-    return DeerFlowSummarizationMiddleware(
+def _middleware(model: FakeModel | None = None, **kwargs) -> MyFlowSummarizationMiddleware:
+    return MyFlowSummarizationMiddleware(
         model or FakeModel(),
         trigger=kwargs.pop("trigger", ("messages", 3)),
         keep=kwargs.pop("keep", ("messages", 2)),
@@ -152,7 +152,7 @@ def test_canned_summary_does_not_call_the_fallback_model() -> None:
     async def run() -> str | None:
         return await middleware._asummarize_with([HumanMessage(content="hi", id="u1")], previous_summary=None)
 
-    assert asyncio.run(run()) == "Previous conversation was too long to summarize."
+    assert asyncio.run(run()) == "之前的对话过长，无法生成摘要。"
     assert fallback.calls == 0
 
 

@@ -16,12 +16,15 @@ from agentkit.runtime.runs.worker import _stream_graph
 def test_stream_graph_passes_context_to_astream() -> None:
     captured: dict = {}
 
-    async def astream(input, config=None, *, context=None, stream_mode=None, subgraphs=False):
+    async def astream(
+        input, config=None, *, context=None, stream_mode=None, subgraphs=False, version=None
+    ):
         captured["input"] = input
         captured["config"] = config
         captured["context"] = context
         captured["stream_mode"] = stream_mode
         captured["subgraphs"] = subgraphs
+        captured["version"] = version
         if False:
             yield None
 
@@ -56,3 +59,4 @@ def test_stream_graph_passes_context_to_astream() -> None:
     assert captured["context"]["model_name"] == "demo"
     assert "__pregel_runtime" not in (captured["config"] or {}).get("configurable", {})
     assert "context" not in (captured["config"] or {})
+    assert captured["version"] == "v2", "帧形状走 LangGraph v2（unpack_stream_part 认的是它）"
