@@ -221,6 +221,22 @@ skills:
       timeout_seconds: 30
       max_retries: 1
 
+    # active projection 的 Milvus 连接。投影是"当前激活状态"的物化视图，不是知识库
+    # 那张表：collection 固定 myflow_skills_active，绝不能和 myflow_knowledge 共用。
+    # uri/token/db_name 留空＝沿用 knowledge_base.vector_store 的连接参数（只借连接，
+    # 不借 collection——collection 是检索契约，不是部署参数）。
+    vector_store:
+      provider: milvus
+      uri: ""                     # 留空＝沿用知识库的 Milvus 连接
+      token: ""
+      db_name: ""
+      collection: myflow_skills_active
+      metric_type: COSINE
+      index_type: AUTOINDEX
+      consistency_level: Strong   # 审核通过后马上要能检索到，不用 Session 的最终一致
+      flush: true
+      timeout_seconds: 30
+
   # <active_skills>：已激活技能的核心 SOP 要不要跟着进持久上下文。
   # 正文**不进 state**（checkpoint 会膨胀）：每次投影按台账里的 path 现读现用，受这里的预算约束。
   active_context:

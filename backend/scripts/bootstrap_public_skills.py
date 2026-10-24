@@ -205,10 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     if not source.is_dir():
         print(f"source directory does not exist: {source}", flush=True)
         return 2
-    if not args.confirm:
+    # --dry-run 只是列出将要发布的技能，不写任何东西；--confirm 只有真正落库落库
+    # 才需要。否则"先跑 --dry-run 看看"这条建议根本执行不了。
+    if not args.confirm and not args.dry_run:
         print(
             "refusing to run without --confirm: bootstrapping publishes every discovered "
-            "skill to the public branch. Re-run with --confirm after checking --dry-run.",
+            "skill to the public branch. Re-run with --dry-run to list them, then with "
+            "--confirm to publish.",
             flush=True,
         )
         return 2

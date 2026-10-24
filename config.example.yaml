@@ -315,6 +315,22 @@ skills:
       timeout_seconds: 30
       max_retries: 1
 
+    # active projection 的 Milvus 连接。投影是"当前激活状态"的物化视图，不是知识库
+    # 那张表：collection 固定 myflow_skills_active，绝不能和 myflow_knowledge 共用。
+    # uri/token/db_name 留空＝沿用 knowledge_base.vector_store 的连接参数（只借连接，
+    # 不借 collection——collection 是检索契约，不是部署参数）。
+    vector_store:
+      provider: milvus
+      uri: ""                     # 留空＝沿用知识库的 Milvus 连接
+      token: ""
+      db_name: ""
+      collection: myflow_skills_active
+      metric_type: COSINE
+      index_type: AUTOINDEX
+      consistency_level: Strong   # 审核通过后马上要能检索到，不用 Session 的最终一致
+      flush: true
+      timeout_seconds: 30
+
   # <active_skills>：已激活技能的核心 SOP 要不要跟着进持久上下文。
   # 正文**不进 state**（checkpoint 会膨胀）：每次投影按台账里的 path 现读现用，受这里的预算约束。
   active_context:
@@ -438,3 +454,22 @@ knowledge_base:
     rrf_k: 60                       # RRF 融合的 k（与 Milvus RRFRanker 同参数）
     score_threshold: null           # 仅纯向量检索生效；COSINE 常用 0.2~0.4
     max_context_chars: 8000
+
+    # 关键词通道：BM25 稀疏检索，由 Milvus 服务端完成分词与打分。
+    keyword:
+      enabled: true
+      analyzer: chinese             # chinese | english | standard；改后需重建 collection
+      bm25_k1: 1.2
+      bm25_b: 0.75
+
+    # 精排：开关关掉时直接用 RRF 融合顺序。
+    rerank:
+      enabled: false                # 打开时下面的 base_url 与 model 必填
+      protocol: cohere              # cohere | tei（vLLM/Jina/Cohere 走 cohere，TEI 走 tei）
+      base_url: ""                  # 精排服务地址，例如 http://127.0.0.1:8000/rerank 的 host
+      path: /rerank
+      api_key: ""                   # 可写 $RERANK_API_KEY
+      model: Qwen/Qwen3-Reranker-8B
+      max_document_chars: 4000
+      timeout_seconds: 60
+      max_retries: 1
