@@ -362,6 +362,7 @@ def test_reject_returns_the_rejected_submission(monkeypatch: pytest.MonkeyPatch)
     assert body["submission_id"] == "submission-1"
     assert body["status"] == "rejected"
     assert body["owner_user_id"] == "alice"
+    assert body["reject_reason"] == "needs work"
     assert service.calls == [
         ("reject", "admin", "submission-1", "needs a clearer procedure")
     ]
@@ -413,7 +414,7 @@ def test_activate_maps_skill_conflict_to_409(monkeypatch: pytest.MonkeyPatch) ->
     assert response.json()["code"] == "skill_conflict"
 
 
-def test_every_state_changing_review_route_refreshes_the_catalog(
+def test_state_changing_review_routes_refresh_the_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = FakeReviewService()
@@ -428,15 +429,31 @@ def test_every_state_changing_review_route_refreshes_the_catalog(
     assert client.post(
         "/api/admin/skills/reviews/submission-1/approve"
     ).status_code == 200
-    assert client.post(
-        "/api/admin/skills/reviews/submission-1/reject",
-        json={"reason": "needs a clearer procedure"},
-    ).status_code == 200
     assert client.post("/api/admin/skills/skill-1/unpublish").status_code == 200
     assert client.post(
         "/api/admin/skills/skill-1/activate", json={"release_id": "release-1"}
     ).status_code == 204
-    assert calls == ["refresh", "refresh", "refresh", "refresh"]
+    assert calls == ["refresh", "refresh", "refresh"]
+
+
+def test_reject_does_not_refresh_the_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeReviewService()
+    client, _identity = _client(monkeypatch, service)
+    calls: list[str] = []
+
+    async def refresh() -> None:
+        calls.append("refresh")
+
+    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
+
+    assert client.post(
+        "/api/admin/skills/reviews/submission-1/reject",
+        json={"reason": "needs a clearer procedure"},
+    ).status_code == 200
+    # 驳回只改 submission 行，不移动 active 指针；重建整棵公共/私有树纯属浪费。
+    assert calls == []
 
 
 def test_a_failed_refresh_does_not_fail_a_committed_approval(

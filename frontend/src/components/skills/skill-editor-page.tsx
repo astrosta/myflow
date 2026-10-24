@@ -249,6 +249,15 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
               </div>
             </dl>
 
+            {draft.skill.reject_reason ? (
+              <p
+                className="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700"
+                role="status"
+              >
+                驳回原因：{draft.skill.reject_reason}
+              </p>
+            ) : null}
+
             {pending ? (
               <p
                 className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800"

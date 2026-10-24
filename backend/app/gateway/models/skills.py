@@ -11,13 +11,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-_SKILL_NAME = r"^[A-Za-z0-9_-]{1,64}$"
+from agentkit.skills.parser import SKILL_NAME_RE
+
+# 请求模型和打包器共用同一条规则：API 拒绝的名字必须正好是 build_package 拒绝的名字。
+_SKILL_NAME = SKILL_NAME_RE
 
 
 class CreateDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(pattern=_SKILL_NAME)
+    name: str = Field(pattern=_SKILL_NAME, max_length=64)
     description: str = Field(min_length=1, max_length=2000)
 
 
@@ -80,6 +83,7 @@ class SkillListItem(BaseModel):
     enabled: bool = True
     global_enabled: bool | None = None
     container_file: str | None = None
+    reject_reason: str | None = None
 
 
 class SkillListResponse(BaseModel):
@@ -107,6 +111,7 @@ class SubmissionResponse(BaseModel):
     status: str
     submitted_at: str
     owner_user_id: str
+    reject_reason: str | None = None
 
 
 class VersionListResponse(BaseModel):
@@ -183,6 +188,7 @@ __all__ = [
     "DraftView",
     "RejectRequest",
     "ReleaseResponse",
+    "SKILL_NAME_RE",
     "ReviewDetailResponse",
     "ReviewQueueResponse",
     "ReviewSummary",

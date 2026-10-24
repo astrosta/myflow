@@ -91,11 +91,14 @@ export function CreateSkillDialog({ onClose, onCreated }: CreateSkillDialogProps
               autoFocus
               className={INPUT_CLASS}
               disabled={busy}
-              maxLength={120}
+              maxLength={64}
               onChange={(event) => setName(event.target.value)}
-              placeholder="例如：周报助手、接口巡检"
+              placeholder="例如：weekly-report"
               value={name}
             />
+            <span className="block text-[11px] text-neutral-500">
+              只能使用小写字母、数字和连字符，最长 64 个字符。
+            </span>
           </label>
 
           <label className="block space-y-1.5">

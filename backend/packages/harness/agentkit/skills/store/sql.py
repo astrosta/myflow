@@ -551,6 +551,21 @@ class SqlSkillStore:
             )
             return _submission_record(row) if row is not None else None
 
+    async def latest_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
+        """最近一次提交，不论状态；作者据此看到驳回/撤回，而不是退回草稿。"""
+
+        async with self._sf() as session:
+            row = await session.scalar(
+                select(SkillSubmissionRow)
+                .where(SkillSubmissionRow.skill_id == skill_id)
+                .order_by(
+                    SkillSubmissionRow.submitted_at.desc(),
+                    SkillSubmissionRow.id.desc(),
+                )
+                .limit(1)
+            )
+            return _submission_record(row) if row is not None else None
+
     async def submission(self, submission_id: str) -> SkillSubmissionRecord | None:
         async with self._sf() as session:
             row = await session.get(SkillSubmissionRow, submission_id)

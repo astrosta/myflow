@@ -34,6 +34,8 @@ export interface SkillListItem {
   enabled: boolean;
   global_enabled?: boolean | null;
   container_file?: string | null;
+  /** 作者自己的最近一次审核结论；只有 /skills/mine 与草稿详情会带。 */
+  reject_reason?: string | null;
 }
 
 export interface DraftFile {
@@ -68,6 +70,7 @@ export interface SkillSubmission {
   status: string;
   submitted_at: string;
   owner_user_id: string;
+  reject_reason?: string | null;
 }
 
 export interface ReviewSummary {
@@ -137,6 +140,20 @@ async function readError(response: Response): Promise<SkillApiError> {
     if (typeof body.code === "string") code = body.code;
     if (typeof body.detail === "string") detail = body.detail;
     if (typeof body.trace_id === "string") traceId = body.trace_id;
+    // 参数校验的 422 把字段错误放在 errors[]，detail 只是通用文案；
+    // 丢掉 errors[] 会让用户只看到 "Request validation failed"。
+    if (
+      detail === "Request validation failed" &&
+      Array.isArray(body.errors) &&
+      body.errors.length > 0
+    ) {
+      const first = body.errors[0] as { loc?: unknown; msg?: unknown };
+      const loc = Array.isArray(first.loc)
+        ? first.loc.filter((part) => typeof part === "string" && part !== "body")
+        : [];
+      const field = loc.length > 0 ? loc.join(".") + ": " : "";
+      if (typeof first.msg === "string") detail = field + first.msg;
+    }
   } catch {
     /* 网关错误页可能不是 JSON */
   }

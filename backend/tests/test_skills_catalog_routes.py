@@ -78,6 +78,9 @@ class FakeStore:
     async def pending_submission(self, skill_id: str) -> Any:
         return self.pending.get(skill_id)
 
+    async def latest_submission(self, skill_id: str) -> Any:
+        return self.pending.get(skill_id)
+
 
 @dataclass
 class FakeCatalog:

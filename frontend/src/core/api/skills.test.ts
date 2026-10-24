@@ -183,6 +183,38 @@ describe("skills admin review API contract", () => {
 });
 
 describe("skills API errors", () => {
+  it("surfaces the first field error instead of the generic validation detail", async () => {
+    stubFetch(
+      jsonResponse(
+        {
+          code: "invalid_request",
+          detail: "Request validation failed",
+          trace_id: "trace-422",
+          errors: [
+            {
+              loc: ["body", "name"],
+              msg: "String should match pattern '^[a-z0-9]+(?:-[a-z0-9]+)*$'",
+              type: "string_pattern_mismatch",
+            },
+          ],
+        },
+        422,
+      ),
+    );
+
+    const error = await createSkill({ name: "Weekly-Report", description: "周报" }).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(SkillApiError);
+    const apiError = error as SkillApiError;
+    expect(apiError.status).toBe(422);
+    expect(apiError.code).toBe("invalid_request");
+    expect(apiError.message).toContain("name:");
+    expect(apiError.message).toContain("String should match pattern");
+    expect(apiError.message).not.toBe("Request validation failed");
+  });
+
   it("turns a coded error body into SkillApiError", async () => {
     stubFetch(
       jsonResponse(

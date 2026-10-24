@@ -27,7 +27,7 @@ from agentkit.skills.package import render_skill_md
 from backend.app.gateway import deps, skills_catalog
 from backend.app.gateway.app import install_error_handlers, install_middleware
 from backend.app.gateway.auth import AuthSettings
-from backend.app.gateway.routers import skill_drafts, skills
+from backend.app.gateway.routers import skill_drafts, skill_reviews, skills
 from backend.app.gateway.run_models import CallerKind, RunCaller
 
 WRITE = frozenset({"skills:write"})
@@ -179,6 +179,12 @@ class FakeAuthorService:
         self._owned(owner_user_id, skill_id)
         return list(self.versions[skill_id])
 
+    async def latest_submission(
+        self, *, owner_user_id: str, skill_id: str
+    ) -> SkillSubmissionRecord | None:
+        self._owned(owner_user_id, skill_id)
+        return self.pending.get(skill_id)
+
     async def submission_status(
         self, *, owner_user_id: str, skill_id: str
     ) -> str | None:
@@ -213,7 +219,7 @@ class FakeAuthorService:
         submission = self.pending.pop(skill_id, None)
         if submission is None:
             raise SkillConflict(f"skill {skill_id!r} has no pending submission")
-        return SkillSubmissionRecord(
+        withdrawn = SkillSubmissionRecord(
             id=submission.id,
             skill_id=submission.skill_id,
             version_id=submission.version_id,
@@ -226,6 +232,8 @@ class FakeAuthorService:
             reject_reason=None,
             public_release_id=None,
         )
+        self.pending[skill_id] = withdrawn
+        return withdrawn
 
     async def delete_draft(self, *, owner_user_id: str, skill_id: str) -> None:
         self._owned(owner_user_id, skill_id)
@@ -406,7 +414,7 @@ def test_open_draft_returns_the_staged_file_tree(monkeypatch: pytest.MonkeyPatch
 
 def test_file_crud_save_versions_and_delete(monkeypatch: pytest.MonkeyPatch) -> None:
     service = FakeAuthorService()
-    client, _identity = _client(monkeypatch, service)
+    client, identity = _client(monkeypatch, service)
     _create(client)
 
     written = client.put(
@@ -427,9 +435,11 @@ def test_file_crud_save_versions_and_delete(monkeypatch: pytest.MonkeyPatch) -> 
     assert saved.status_code == 200
     assert saved.json()["version"]["skill_version"] == "v1"
 
+    identity.as_(READ, user_id="alice")
     versions = client.get("/api/skills/skill-1/versions")
     assert [item["skill_version"] for item in versions.json()["versions"]] == ["v1"]
 
+    identity.as_(WRITE, user_id="alice")
     deleted = client.delete("/api/skills/skill-1/draft/file?path=notes.txt")
     assert deleted.status_code == 204
 
@@ -512,6 +522,124 @@ def test_mine_omits_private_container_file_when_mounts_are_unsupported(
     )
 
 
+def test_create_rejects_names_the_package_builder_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+
+    for name in ("周报助手", "Weekly-Report"):
+        response = client.post(
+            "/api/skills", json={"name": name, "description": "Alice's tools"}
+        )
+        assert response.status_code == 422, (name, response.text)
+        assert response.json()["code"] == "invalid_request"
+
+    assert service.skills == {}
+    assert client.post(
+        "/api/skills", json={"name": "weekly-report", "description": "Alice's tools"}
+    ).status_code == 201
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_create_omits_container_file_when_mounts_are_unsupported(
+    monkeypatch: pytest.MonkeyPatch, supported: bool
+) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+    monkeypatch.setattr(
+        skills_catalog, "_private_mounts_supported", lambda: supported
+    )
+
+    created = _create(client)
+
+    assert created["container_file"] == (
+        "/mnt/skills/private/alice-tools/SKILL.md" if supported else None
+    )
+
+
+def test_versions_use_the_read_scope_but_keep_the_owner_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeAuthorService()
+    client, identity = _client(monkeypatch, service)
+    _create(client)
+
+    identity.as_(READ, user_id="alice")
+    assert client.get("/api/skills/skill-1/versions").status_code == 200
+
+    identity.as_(READ, user_id="bob")
+    denied = client.get("/api/skills/skill-1/versions")
+    assert denied.status_code == 404
+    assert denied.json()["code"] == "skill_not_found"
+
+
+class _RejectingReviewService:
+    """把 admin reject 路由连到作者 fake 上，验证两条路由之间的真实契约。"""
+
+    def __init__(self, author: FakeAuthorService) -> None:
+        self.author = author
+
+    async def reject(
+        self, *, admin_user_id: str, submission_id: str, reason: str
+    ) -> SkillSubmissionRecord:
+        submission = self.author.pending[submission_id.removeprefix("submission-")]
+        rejected = SkillSubmissionRecord(
+            id=submission.id,
+            skill_id=submission.skill_id,
+            version_id=submission.version_id,
+            submitted_commit=submission.submitted_commit,
+            owner_user_id=submission.owner_user_id,
+            status="rejected",
+            submitted_at=submission.submitted_at,
+            reviewed_by=admin_user_id,
+            reviewed_at=_now(),
+            reject_reason=reason,
+            public_release_id=None,
+        )
+        self.author.pending[submission.skill_id] = rejected
+        return rejected
+
+
+def test_mine_maps_rejected_and_withdrawn_instead_of_falling_back_to_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeAuthorService()
+    client, identity = _client(monkeypatch, service)
+    application = client.app
+    application.state.skill_review_service = _RejectingReviewService(service)
+    application.include_router(skill_reviews.router, prefix="/api")
+    _create(client)
+    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
+    assert client.post("/api/skills/skill-1/submit").status_code == 200
+
+    identity.as_(frozenset({"admin"}), user_id="admin")
+    rejected = client.post(
+        "/api/admin/skills/reviews/submission-skill-1/reject",
+        json={"reason": "add a script example"},
+    )
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()["status"] == "rejected"
+    assert rejected.json()["reject_reason"] == "add a script example"
+
+    identity.as_(READ, user_id="alice")
+    owner_row = client.get("/api/skills/mine").json()["skills"][0]
+    assert owner_row["status"] == "rejected"
+    assert owner_row["reject_reason"] == "add a script example"
+
+    identity.as_(READ, user_id="bob")
+    assert client.get("/api/skills/mine").json()["skills"] == []
+
+    identity.as_(WRITE, user_id="alice")
+    assert client.post("/api/skills/skill-1/submit").status_code == 200
+    assert client.post("/api/skills/skill-1/withdraw").status_code == 200
+
+    identity.as_(READ, user_id="alice")
+    withdrawn = client.get("/api/skills/mine").json()["skills"][0]
+    assert withdrawn["status"] == "withdrawn"
+    assert withdrawn["reject_reason"] is None
+
+
 def test_route_order_keeps_mine_before_skill_id_routes() -> None:
     paths = [route.path for route in skill_drafts.router.routes]
     assert paths.index("/skills/mine") < paths.index("/skills/{skill_id}/draft")
@@ -540,6 +668,9 @@ class _ReadStore:
         return self.skills.get(skill_id)
 
     async def pending_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
+        return self.pending.get(skill_id)
+
+    async def latest_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
         return self.pending.get(skill_id)
 
     async def list_draft_files(self, skill_id: str) -> list[StagedFile]:
@@ -612,7 +743,7 @@ def test_author_read_file_returns_staged_bytes_and_rejects_traversal() -> None:
     asyncio.run(scenario())
 
 
-def test_author_submission_status_reports_only_pending() -> None:
+def test_author_submission_status_reports_the_latest_submission() -> None:
     alice = _record("skill-1", "alice", "alice-tools")
     submission = SkillSubmissionRecord(
         id="submission-1",

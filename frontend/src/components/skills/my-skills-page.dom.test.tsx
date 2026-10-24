@@ -202,6 +202,30 @@ describe("我的技能页", () => {
     await waitFor(() => expect(push).toHaveBeenCalledWith("/workspace/skills/new-1"));
   });
 
+  it("创建对话框渲染服务端的字段校验消息", async () => {
+    mockedListMine.mockResolvedValue([]);
+    mockedListCatalog.mockResolvedValue([]);
+    mockedCreate.mockRejectedValue(
+      new SkillApiError(
+        422,
+        "invalid_request",
+        "name: String should match pattern '^[a-z0-9]+(?:-[a-z0-9]+)*$'",
+        null,
+      ),
+    );
+
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "新建技能" }));
+    fireEvent.change(screen.getByLabelText("技能名称"), { target: { value: "Weekly-Report" } });
+    fireEvent.change(screen.getByLabelText("技能说明"), { target: { value: "周报" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("name:");
+    expect(alert.textContent).toContain("String should match pattern");
+  });
+
   it("接口报错时渲染一条人读的告警", async () => {
     mockedListMine.mockRejectedValue(
       new SkillApiError(500, "internal_error", "技能目录暂时不可用", null),

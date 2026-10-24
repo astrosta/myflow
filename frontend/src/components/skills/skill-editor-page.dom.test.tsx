@@ -195,6 +195,20 @@ describe("私有技能编辑器", () => {
     await waitFor(() => expect(mockedUpload).toHaveBeenCalledWith(SKILL_ID, [file]));
   });
 
+  it("被驳回时显示驳回原因，并保持保存可用", async () => {
+    const rejected = makeDraft(false);
+    rejected.skill.status = "rejected";
+    rejected.skill.reject_reason = "add a script example";
+    mockedGetDraft.mockResolvedValue(rejected);
+
+    renderPage();
+
+    await screen.findByLabelText("文件内容");
+    expect(screen.getByText(/add a script example/)).toBeTruthy();
+    expect(screen.getAllByText("已驳回").length).toBeGreaterThan(0);
+    expect((screen.getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("审核中时保存禁用、显示撤回提示和撤回按钮", async () => {
     primeDraft(true);
     mockedWithdraw.mockResolvedValue({

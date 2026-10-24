@@ -477,15 +477,15 @@ def _catalog_response(
 async def _status_for(runtime: SkillRuntime | None, skill: Skill) -> str:
     if _scope_value(skill.scope) == "public":
         return "approved"
-    pending = getattr(getattr(runtime, "store", None), "pending_submission", None)
-    if callable(pending) and skill.skill_id:
+    latest = getattr(getattr(runtime, "store", None), "latest_submission", None)
+    if callable(latest) and skill.skill_id:
         try:
-            submission = await pending(skill.skill_id)
+            submission = await latest(skill.skill_id)
         except Exception as exc:  # noqa: BLE001 - status is cosmetic, never a 500
-            logger.warning("Could not read pending state for %s: %s", skill.skill_id, exc)
+            logger.warning("Could not read submission state for %s: %s", skill.skill_id, exc)
         else:
             if submission is not None:
-                return "pending"
+                return submission.status
     return "draft"
 
 

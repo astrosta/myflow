@@ -1,6 +1,7 @@
 """Author-facing HTTP API for Git-backed private skill drafts (M11 task 8).
 
-Every write route requires skills:write; /skills/mine requires skills:read.
+Every write route requires skills:write; author reads (/skills/mine and
+/skills/{id}/versions) require skills:read.
 A foreign owner is always indistinguishable from an absent skill (404).  The
 responses contain sandbox container paths only, never host cache paths.
 """
@@ -135,6 +136,7 @@ def _submission(view: SkillSubmissionRecord) -> SubmissionResponse:
         status=view.status,
         submitted_at=view.submitted_at.isoformat(),
         owner_user_id=view.owner_user_id,
+        reject_reason=view.reject_reason,
     )
 
 
@@ -162,7 +164,7 @@ async def _list_item(
     record: SkillRecord,
     *,
     latest: SkillVersionRecord | None,
-    pending: str | None,
+    submission: SkillSubmissionRecord | None,
 ) -> SkillListItem:
     description = ""
     if latest is not None:
@@ -185,11 +187,16 @@ async def _list_item(
         version_id=latest.id if latest is not None else None,
         git_commit=latest.draft_commit if latest is not None else None,
         skill_path=latest.skill_path if latest is not None else None,
-        status=pending or "draft",
+        status=submission.status if submission is not None else "draft",
         enabled=True,
         global_enabled=None,
         container_file=(
             _container_file(name) if skills_catalog._private_mounts_supported() else None
+        ),
+        reject_reason=(
+            submission.reject_reason
+            if submission is not None and record.owner_user_id == caller.user_id
+            else None
         ),
     )
 
@@ -206,8 +213,8 @@ async def list_my_skills(
         versions = await _invoke(
             service.list_versions(owner_user_id=caller.user_id or "", skill_id=record.id)
         )
-        pending = await _invoke(
-            service.submission_status(
+        submission = await _invoke(
+            service.latest_submission(
                 owner_user_id=caller.user_id or "", skill_id=record.id
             )
         )
@@ -217,7 +224,7 @@ async def list_my_skills(
                 caller,
                 record,
                 latest=versions[-1] if versions else None,
-                pending=pending,
+                submission=submission,
             )
         )
     return SkillListResponse(skills=skills)
@@ -245,7 +252,11 @@ async def create_skill(
         status="draft",
         enabled=True,
         global_enabled=None,
-        container_file=_container_file(record.private_name),
+        container_file=(
+            _container_file(record.private_name)
+            if skills_catalog._private_mounts_supported()
+            else None
+        ),
     )
 
 
@@ -275,20 +286,20 @@ async def get_draft(
     versions = await _invoke(
         service.list_versions(owner_user_id=caller.user_id or "", skill_id=skill_id)
     )
-    pending = await _invoke(
-        service.submission_status(owner_user_id=caller.user_id or "", skill_id=skill_id)
+    submission = await _invoke(
+        service.latest_submission(owner_user_id=caller.user_id or "", skill_id=skill_id)
     )
     item = await _list_item(
         service,
         caller,
         record,
         latest=versions[-1] if versions else None,
-        pending=pending,
+        submission=submission,
     )
     return DraftView(
         skill=item,
         files=[_file_info(file) for file in files],
-        pending=pending == "pending",
+        pending=submission is not None and submission.status == "pending",
     )
 
 
@@ -455,7 +466,7 @@ async def withdraw_skill(
 @router.get("/{skill_id}/versions", response_model=VersionListResponse)
 async def list_versions(
     skill_id: SkillId,
-    caller: Writer,
+    caller: Reader,
     service: AuthorService,
 ) -> VersionListResponse:
     await _owned(service, caller, skill_id)

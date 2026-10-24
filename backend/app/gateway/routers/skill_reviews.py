@@ -121,6 +121,7 @@ def _submission(submission: SkillSubmissionRecord) -> SubmissionResponse:
         status=submission.status,
         submitted_at=submission.submitted_at.isoformat(),
         owner_user_id=submission.owner_user_id,
+        reject_reason=submission.reject_reason,
     )
 
 
@@ -182,7 +183,8 @@ async def reject_review(
             reason=body.reason,
         )
     )
-    await skills_catalog.refresh_skill_runtime()
+    # 驳回只写 submission 行和审计行，不移动任何 active 指针；刷新会重建公共树
+    # 和每个作者的私有树，这里纯属浪费。
     return _submission(submission)
 
 

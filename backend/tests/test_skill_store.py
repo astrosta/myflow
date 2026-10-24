@@ -279,6 +279,10 @@ def test_only_one_pending_submission_and_status_transitions(harness: Harness) ->
         assert reviewed.reviewed_at is not None
         assert reviewed.reject_reason == "needs tests"
         assert await harness.store.pending_submission(skill.id) is None
+        latest = await harness.store.latest_submission(skill.id)
+        assert latest is not None
+        assert latest.status == "rejected"
+        assert latest.reject_reason == "needs tests"
 
         again = await harness.store.create_submission(
             skill_id=skill.id,
@@ -287,6 +291,8 @@ def test_only_one_pending_submission_and_status_transitions(harness: Harness) ->
             submitted_commit=version.draft_commit,
         )
         assert again.status == "pending"
+        newest = await harness.store.latest_submission(skill.id)
+        assert newest is not None and newest.id == again.id
 
         with pytest.raises(SkillConflict):
             await harness.store.set_submission_status("missing", status="approved")

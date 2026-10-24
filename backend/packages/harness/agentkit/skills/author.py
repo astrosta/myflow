@@ -186,14 +186,23 @@ class SkillAuthorService:
             return None
         return skill
 
+    async def latest_submission(
+        self, *, owner_user_id: str, skill_id: str
+    ) -> SkillSubmissionRecord | None:
+        """The most recent submission, whatever its status."""
+
+        await self._owned_skill(owner_user_id, skill_id)
+        return await self._store.latest_submission(skill_id)
+
     async def submission_status(
         self, *, owner_user_id: str, skill_id: str
     ) -> str | None:
-        """The pending submission status, or None when the draft is editable."""
+        """The latest submission status, or None when nothing was ever submitted."""
 
-        await self._owned_skill(owner_user_id, skill_id)
-        pending = await self._store.pending_submission(skill_id)
-        return pending.status if pending is not None else None
+        latest = await self.latest_submission(
+            owner_user_id=owner_user_id, skill_id=skill_id
+        )
+        return latest.status if latest is not None else None
 
     # ------------------------------------------------------------------
     # staging
