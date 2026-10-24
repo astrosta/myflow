@@ -37,10 +37,13 @@ class LocalSandboxProvider(SandboxProvider):
             resolve_path(cache_dir) if cache_dir is not None else _skills_cache_dir()
         )
         self._skills_root = _skills_container_root()
+        self._skills_source = _skills_source()
         self._public_skills = f"{self._skills_root}/public"
         self._private_skills = f"{self._skills_root}/private"
         self._static_mappings = _static_mappings(
-            self._skills_cache_dir, container_root=self._skills_root
+            self._skills_cache_dir,
+            container_root=self._skills_root,
+            source=self._skills_source,
         )
 
     @property
@@ -129,17 +132,8 @@ class LocalSandboxProvider(SandboxProvider):
             root = runtime_home() / "users" / user_id / "threads" / thread_id / "user-data"
         for name in ("workspace", "uploads", "outputs"):
             (root / name).mkdir(parents=True, exist_ok=True)
-        mappings = [
-            *self._static_mappings,
-            # Public skills are one process-wide read-only tree.  Private skills
-            # use the same container path for every user, but each sandbox binds
-            # it to that user's own active tree.  Never add a mount for the cache
-            # root or for active/users itself.
-            PathMapping(
-                self._private_skills,
-                str(self._skills_cache_dir / "active" / "users" / user_id),
-                read_only=True,
-            ),
+        mappings = [*self._static_mappings, *self._private_skill_mappings(user_id)]
+        mappings += [
             PathMapping(_USER_DATA, str(root)),
             PathMapping(f"{_USER_DATA}/workspace", str(root / "workspace")),
             PathMapping(f"{_USER_DATA}/uploads", str(root / "uploads")),
@@ -147,6 +141,22 @@ class LocalSandboxProvider(SandboxProvider):
         ]
         timeout = float(sandbox_flag("bash_command_timeout", 600) or 600)
         return LocalSandbox(sandbox_id, mappings, command_timeout=timeout)
+
+    def _private_skill_mappings(self, user_id: str) -> list[PathMapping]:
+        """Per-sandbox private skill mount: only the git catalog has one."""
+
+        if self._skills_source != "git":
+            # filesystem 来源没有私有 active 树，整棵技能树已经由公共映射挂上。
+            return []
+        # 私有树对每个用户都是同一个容器路径，但每个沙箱绑到该用户自己的
+        # active 树上。绝不额外挂缓存根或 active/users 本身。
+        return [
+            PathMapping(
+                self._private_skills,
+                str(self._skills_cache_dir / "active" / "users" / user_id),
+                read_only=True,
+            )
+        ]
 
 
 def _sandbox_id_for_thread(thread_id: str, user_id: str) -> str:
@@ -181,18 +191,54 @@ def _skills_container_root() -> str:
     return raw.rstrip("/") or DEFAULT_SKILLS_CONTAINER_PATH
 
 
+def _skills_source() -> str:
+    """目录来源（git | filesystem）。
+
+    配置读不出来时按 git 处理：这是 M11 之前的状态，也是这个 provider 的
+    private 挂载能力所属的来源。真正跑 filesystem 来源的部署一定有可读配置，
+    那种情况下这里会如实返回 filesystem，挂载点随之变成整棵技能树。
+    """
+    try:
+        return str(get_app_config().skills.source)
+    except Exception:  # noqa: BLE001 - 单元测试可能没有可读的 app config
+        return "git"
+
+
+def _skills_tree_root() -> Path:
+    """filesystem 来源下真正要挂的宿主技能树根（skills.path），不是 active 缓存。"""
+    try:
+        return get_app_config().skills.root_dir()
+    except Exception:  # noqa: BLE001 - 同上
+        return runtime_home() / "skills"
+
+
 def _static_mappings(
-    skills_cache_dir: Path, *, container_root: str = DEFAULT_SKILLS_CONTAINER_PATH
+    skills_cache_dir: Path,
+    *,
+    container_root: str = DEFAULT_SKILLS_CONTAINER_PATH,
+    source: str = "git",
 ) -> list[PathMapping]:
-    """Process-wide mounts only. Never bind a user id here."""
+    """Process-wide mounts only. Never bind a user id here.
+
+    git 来源挂 active 公共树（私有树按用户挂，见 _build）。filesystem 来源没有
+    runtime，也就没有 active 树：它必须挂**技能树根本身**，否则提示词里写的
+    {container}/<category>/<name>/SKILL.md 在沙箱里根本不存在。
+    """
     root = container_root.rstrip("/") or "/"
-    mappings: list[PathMapping] = [
-        PathMapping(
-            f"{root}/public",
-            str(skills_cache_dir / "active" / "public"),
-            read_only=True,
-        ),
-    ]
+    mappings: list[PathMapping] = (
+        [
+            PathMapping(
+                f"{root}/public",
+                str(skills_cache_dir / "active" / "public"),
+                read_only=True,
+            )
+        ]
+        if source == "git"
+        else [PathMapping(root, str(_skills_tree_root()), read_only=True)]
+    )
+    protected = [skills_cache_dir.resolve()]
+    if source != "git":
+        protected.append(_skills_tree_root().resolve())
     raw = sandbox_flag("mounts", []) or []
     if isinstance(raw, list):
         cache_root = skills_cache_dir.resolve()
@@ -210,7 +256,11 @@ def _static_mappings(
             # with one public mount plus a per-sandbox private mount.
             if container_text == root or container_text.startswith(f"{root}/"):
                 continue
-            if local_path == cache_root or local_path.is_relative_to(cache_root):
+            if any(
+                local_path == protected_path
+                or local_path.is_relative_to(protected_path)
+                for protected_path in protected
+            ):
                 continue
             mappings.append(
                 PathMapping(

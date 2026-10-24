@@ -330,7 +330,11 @@ def test_durable_context_reads_the_private_body_from_the_snapshot(tmp_path: Path
 def test_provider_uses_the_configured_git_cache_dir(tmp_path: Path, monkeypatch) -> None:
     cache = tmp_path / "configured-cache"
     config = AppConfig(
-        skills=SkillsConfig(git=SkillGitConfig(repository="origin", cache_dir=str(cache)))
+        # active 树只在 git 来源存在；filesystem 来源挂的是整棵技能树。
+        skills=SkillsConfig(
+            source="git",
+            git=SkillGitConfig(repository="origin", cache_dir=str(cache)),
+        )
     )
     monkeypatch.setattr(
         "agentkit.sandbox.local.local_sandbox_provider.get_app_config", lambda: config
@@ -344,6 +348,32 @@ def test_provider_uses_the_configured_git_cache_dir(tmp_path: Path, monkeypatch)
     assert _mapping(sandbox, "/mnt/skills/private").local_path == str(
         cache / "active" / "users" / "user-a"
     )
+
+
+def test_filesystem_source_mounts_the_skill_tree_not_an_active_tree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """filesystem 来源没有 runtime，也就没有 active 树：必须挂整棵技能树。
+
+    M11 之前 /mnt/skills 直接绑 runtime_home()/skills。改成按用户挂 active 树以后，
+    filesystem 来源的技能在沙箱里读不到（提示词里写着 {container}/<category>/...）。
+    """
+    tree = tmp_path / "skills"
+    (tree / "public" / "demo").mkdir(parents=True)
+    config = AppConfig(
+        skills=SkillsConfig(source="filesystem", path=str(tree))
+    )
+    monkeypatch.setattr(
+        "agentkit.sandbox.local.local_sandbox_provider.get_app_config", lambda: config
+    )
+    provider = LocalSandboxProvider(cache_dir=tmp_path / "cache")
+    sandbox = provider.get(provider.acquire("thread-a", user_id="user-a"))
+    assert sandbox is not None
+
+    assert _mapping(sandbox, "/mnt/skills").local_path == str(tree)
+    containers = {mapping.container_path for mapping in sandbox.path_mappings}
+    assert "/mnt/skills/public" not in containers
+    assert "/mnt/skills/private" not in containers
 
 
 def test_snapshot_middleware_does_not_need_a_filesystem_config(tmp_path: Path) -> None:

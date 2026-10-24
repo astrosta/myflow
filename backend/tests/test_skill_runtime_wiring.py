@@ -796,6 +796,24 @@ def test_git_catalog_mode_requires_a_sql_database(monkeypatch: pytest.MonkeyPatc
     assert "skills.source=git" in message
     assert "database.backend='memory'" in message
 
+
+def test_git_catalog_mode_requires_a_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+    """空仓库地址不是"暂时连不上"：必须在启动前就炸，而不是健康地跑着空目录。"""
+
+    monkeypatch.setattr(skills_catalog, "get_session_factory", lambda: object())
+    config = AppConfig(
+        auth=AuthConfig(enabled=False),
+        skills={"source": "git"},
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        build_skill_runtime(config)
+
+    message = str(excinfo.value)
+    assert "skills.git.repository" in message
+    assert "SKILLS_GIT_REPOSITORY" in message
+
+
 # ---------------------------------------------------------------------------
 # lexical retrieval really answers without Milvus (Fix 1)
 # ---------------------------------------------------------------------------

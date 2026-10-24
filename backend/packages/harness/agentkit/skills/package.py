@@ -18,6 +18,16 @@ from agentkit.skills.types import SKILL_FILE_NAME
 
 _NUL = b"\x00"
 
+#: 技能包路径的长度上限。
+#:
+#: 设计 §12.2 要求"限制包大小、文件数、单文件大小、文件名长度"，这里给文件名
+#: 一个明确上限。顺带解决一个只在 PostgreSQL 上出现的坑：skill_draft_files 的
+#: 主键是 (skill_id, path)，而 btree 索引项有约 2704 字节上限，几百个多字节字符
+#: 的路径会直接 500。256 个字符离那个上限还有充足余量。
+MAX_SKILL_PATH_CHARS = 256
+#: 单个路径段的长度上限（文件名本体，不含目录）。
+MAX_SKILL_PATH_SEGMENT_CHARS = 128
+
 
 def validate_skill_path(path: str) -> str:
     """校验并返回一个规范、相对的 POSIX 技能包路径。
@@ -39,10 +49,20 @@ def validate_skill_path(path: str) -> str:
     if windows_path.is_absolute() or windows_path.drive:
         raise InvalidSkillPackage(f"skill path must be relative: {path!r}")
 
+    if len(path) > MAX_SKILL_PATH_CHARS:
+        raise InvalidSkillPackage(
+            f"skill path is longer than {MAX_SKILL_PATH_CHARS} characters"
+        )
+
     segments = path.split("/")
     for segment in segments:
         if segment in ("", ".", ".."):
             raise InvalidSkillPackage(f"invalid skill path segment in {path!r}")
+        if len(segment) > MAX_SKILL_PATH_SEGMENT_CHARS:
+            raise InvalidSkillPackage(
+                f"skill path segment is longer than {MAX_SKILL_PATH_SEGMENT_CHARS} "
+                f"characters: {segment[:32]!r}..."
+            )
     return path
 
 

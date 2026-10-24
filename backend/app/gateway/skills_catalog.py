@@ -311,6 +311,13 @@ def build_skill_runtime(
             f"factory, but database.backend={backend!r} provides none. Set "
             "database.backend to sqlite or postgres, or use skills.source=filesystem."
         )
+    if not skills.git.repository.strip():
+        # Git 是唯一内容源：地址为空不是"暂时连不上"，是没配。让它在这里炸，
+        # 而不是让进程带着空目录健康启动、每次保存/审核都在第一次用到时失败。
+        raise RuntimeError(
+            "skills.source=git requires skills.git.repository: set it (the shipped "
+            "config.yaml reads $SKILLS_GIT_REPOSITORY) or use skills.source=filesystem."
+        )
     store = SqlSkillStore(session)
     cache_dir = resolve_path(skills.git.cache_dir)
     git = SkillGitRepository(skills.git, cache_dir)

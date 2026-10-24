@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from agentkit.skills.package import MAX_SKILL_PATH_CHARS
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agentkit.skills.parser import SKILL_NAME_RE
@@ -33,7 +34,9 @@ class WriteFileRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    path: str = Field(min_length=1, max_length=1024)
+    # 和 agentkit.skills.package.MAX_SKILL_PATH_CHARS 同一个上限：写进来的路径
+    # 必须能通过包校验，也不该撑爆 skill_draft_files 的 (skill_id, path) 主键。
+    path: str = Field(min_length=1, max_length=MAX_SKILL_PATH_CHARS)
     content: str
     mode: Literal["text", "executable"] = "text"
 

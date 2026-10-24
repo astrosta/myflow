@@ -27,7 +27,13 @@ from agentkit.skills.domain import (
     StagedFileInfo,
     VisibleSkill,
 )
-from agentkit.skills.package import build_package, render_skill_md, validate_skill_path
+from agentkit.skills.package import (
+    MAX_SKILL_PATH_CHARS,
+    MAX_SKILL_PATH_SEGMENT_CHARS,
+    build_package,
+    render_skill_md,
+    validate_skill_path,
+)
 from agentkit.skills.parser import ParsedSkill, parse_skill_text
 from agentkit.skills.types import Skill, SkillCategory
 
@@ -370,3 +376,21 @@ def test_domain_error_codes_are_stable():
     assert SkillConflict.code == "skill_conflict"
     assert isinstance(InvalidSkillPackage(), ValueError)
     assert isinstance(SkillConflict(), RuntimeError)
+
+
+def test_validate_skill_path_rejects_overlong_paths_and_segments() -> None:
+    """§12.2 要求文件名长度受限：路径太长会先撞上 PG 的 btree 键上限。"""
+
+    assert validate_skill_path("scripts/ok.py") == "scripts/ok.py"
+
+    deep = "/".join(["a"] * (MAX_SKILL_PATH_CHARS // 2 + 1))
+    with pytest.raises(InvalidSkillPackage, match="longer than"):
+        validate_skill_path(deep)
+
+    long_segment = "x" * (MAX_SKILL_PATH_SEGMENT_CHARS + 1)
+    with pytest.raises(InvalidSkillPackage, match="segment is longer"):
+        validate_skill_path(f"scripts/{long_segment}")
+
+    # 多字节字符按字符数计：128 个汉字仍在上限内，允许。
+    cjk = "技" * MAX_SKILL_PATH_SEGMENT_CHARS
+    assert validate_skill_path(f"scripts/{cjk}") == f"scripts/{cjk}"

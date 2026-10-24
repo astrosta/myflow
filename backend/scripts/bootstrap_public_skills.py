@@ -155,6 +155,7 @@ async def bootstrap(
 
 async def run(*, source: Path, admin_user_id: str, apply: bool) -> int:
     from agentkit.config import get_app_config
+    from agentkit.config.runtime_paths import resolve_path
     from agentkit.persistence.engine import close_engine, get_session_factory, init_engine_from_config
     from agentkit.skills.author import SkillAuthorService
     from agentkit.skills.content import SkillContentStore
@@ -166,7 +167,10 @@ async def run(*, source: Path, admin_user_id: str, apply: bool) -> int:
     await init_engine_from_config(config.database)
     try:
         skills = config.skills
-        cache_dir = Path(skills.git.cache_dir)
+        # 和网关/沙箱同一套解析：相对路径相对**项目根**，不是当前工作目录。
+        # 否则在别的目录跑一次 bootstrap 就会多出一个裸镜像和提交缓存，网关再
+        # 自己克隆一份，磁盘状态和文档说的不是一回事。
+        cache_dir = resolve_path(skills.git.cache_dir)
         git = SkillGitRepository(skills.git, cache_dir)
         await git.ensure_ready()
         content = SkillContentStore(cache_dir, git)

@@ -27,7 +27,7 @@ from agentkit.skills.domain import (
     StagedFile,
     StagedFileInfo,
 )
-from agentkit.skills.package import validate_skill_path
+from agentkit.skills.package import MAX_SKILL_PATH_CHARS, validate_skill_path
 from agentkit.skills.parser import SkillParseError, parse_skill_text
 from backend.app.gateway import skills_catalog
 from backend.app.gateway.deps import get_skill_author_service, require_scope
@@ -51,7 +51,7 @@ from backend.app.gateway.run_models import RunCaller
 router = APIRouter(prefix="/skills", tags=["skill-drafts"])
 
 SkillId = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
-SkillPath = Annotated[str, Query(min_length=1, max_length=1024)]
+SkillPath = Annotated[str, Query(min_length=1, max_length=MAX_SKILL_PATH_CHARS)]
 AuthorService = Annotated[Any, Depends(get_skill_author_service)]
 Writer = Annotated[RunCaller, Depends(require_scope("skills:write"))]
 Reader = Annotated[RunCaller, Depends(require_scope("skills:read"))]

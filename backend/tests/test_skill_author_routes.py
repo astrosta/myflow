@@ -287,6 +287,33 @@ def _client(
     return TestClient(application, raise_server_exceptions=False), identity
 
 
+def test_authoring_is_a_503_when_the_git_catalog_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """filesystem 来源没有作者面：那是配置问题，要报 503 而不是裸 500。"""
+
+    application = FastAPI(redirect_slashes=False)
+    install_middleware(application, auth_settings=AuthSettings.disabled())
+    install_error_handlers(application)
+    # 刻意不设 app.state.skill_author_service：等价于 skills.source=filesystem。
+    application.include_router(skill_drafts.router, prefix="/api")
+    identity = _Identity(READ | WRITE, "alice")
+    monkeypatch.setattr(
+        deps,
+        "caller_from_request",
+        lambda request: RunCaller(
+            kind=CallerKind.HTTP,
+            user_id=identity["user_id"],
+            scopes=identity["scopes"],
+        ),
+    )
+    client = TestClient(application, raise_server_exceptions=False)
+    response = client.get("/api/skills/mine")
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "skill_runtime_unavailable"
+
+
 def _create(client: TestClient, name: str = "alice-tools") -> dict[str, Any]:
     response = client.post(
         "/api/skills", json={"name": name, "description": "Alice's tools"}

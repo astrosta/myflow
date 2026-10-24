@@ -19,6 +19,7 @@ from backend.app.gateway.auth.result import AuthKind, AuthResult
 from backend.app.gateway.auth.service import AuthService
 from backend.app.gateway.auth.store import make_user_store
 from backend.app.gateway.auth_middleware import require_session
+from backend.app.gateway.errors import SkillRuntimeUnavailable
 from backend.app.gateway.run_models import CallerKind, RunCaller
 
 __all__ = [
@@ -122,11 +123,16 @@ def get_skill_author_service(request: Request):
 
     Task 15 builds the real service in the app lifespan together with the
     catalog runtime; the author routes only need this injection point.
+    filesystem 来源根本没有作者面：那是配置问题，不是 500，所以给一个带
+    code 的 503，和目录运行时缺失时同一个错误形状。
     """
 
     service = getattr(request.app.state, "skill_author_service", None)
     if service is None:
-        raise RuntimeError("skill author service is not configured")
+        raise SkillRuntimeUnavailable(
+            "skill authoring is unavailable: this deployment has no Git skill catalog "
+            "(skills.source=filesystem)"
+        )
     return service
 
 
@@ -135,11 +141,15 @@ def get_skill_review_service(request: Request):
 
     Task 15 builds the real service in the app lifespan together with the
     catalog runtime; the admin review routes only need this injection point.
+    和作者面同理：没有 Git 目录就没有审核面，按 503 而不是 500 报。
     """
 
     service = getattr(request.app.state, "skill_review_service", None)
     if service is None:
-        raise RuntimeError("skill review service is not configured")
+        raise SkillRuntimeUnavailable(
+            "skill review is unavailable: this deployment has no Git skill catalog "
+            "(skills.source=filesystem)"
+        )
     return service
 
 
