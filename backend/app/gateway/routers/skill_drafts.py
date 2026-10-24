@@ -15,6 +15,7 @@ from typing import Annotated, Any, TypeVar
 from fastapi import APIRouter, Depends, File, Path, Query, Response, UploadFile
 from fastapi import status as http_status
 
+from agentkit.config import get_app_config
 from agentkit.config.skills_config import DEFAULT_SKILLS_CONTAINER_PATH
 from agentkit.skills.domain import (
     InvalidSkillPackage,
@@ -88,8 +89,18 @@ def _valid_path(path: str) -> str:
         raise SkillPackageInvalid(str(exc)) from exc
 
 
+def _container_root() -> str:
+    """Configured container root; the default is only a last resort when no config is readable."""
+    try:
+        configured = get_app_config().skills.container_path
+    except Exception:  # noqa: BLE001 - routes are testable without a config.yaml
+        return DEFAULT_SKILLS_CONTAINER_PATH
+    return configured.rstrip("/") or "/"
+
+
 def _container_file(name: str) -> str:
-    return f"{DEFAULT_SKILLS_CONTAINER_PATH}/private/{name}/SKILL.md"
+    """Private skills live under the configured container root, not a hardcoded one."""
+    return f"{_container_root()}/private/{name}/SKILL.md"
 
 
 def _version(view: SkillVersionRecord) -> SkillVersionResponse:

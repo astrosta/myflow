@@ -53,8 +53,10 @@ EXPECTED_ROUTES = {
     ("POST", "/api/mcp/cache/reset"),
     ("GET", "/api/skills"),
     ("POST", "/api/skills/reload"),
-    ("PUT", "/api/skills/{name}/preference"),
-    ("PATCH", "/api/skills/{name}"),
+    # M11 task 15: the path parameter is the internal skill_id, not the display
+    # name, so every skills/{...} route in the table uses the same placeholder.
+    ("PUT", "/api/skills/{skill_id}/preference"),
+    ("PATCH", "/api/skills/{skill_id}"),
     # M11 task 8: Git-backed private draft author surface. /skills/mine is
     # registered before the parameterized {skill_id} routes.
     ("GET", "/api/skills/mine"),

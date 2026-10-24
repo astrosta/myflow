@@ -49,8 +49,48 @@ from backend.app.gateway.routers import (
     threads,
     uploads,
 )
+from backend.app.gateway.skills_catalog import (
+    SkillRuntime,
+    build_skill_runtime,
+    configure_skill_runtime,
+    reset_skill_runtime,
+)
 
 logger = logging.getLogger(__name__)
+
+
+async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRuntime | None:
+    """Build and start the Git-backed catalog runtime (lifespan-owned).
+
+    filesystem 来源只保留 M7 的扫描器：不建 runtime、不读 Git、不挂 active 树。
+    Git 来源在数据库就绪后构建运行时，先刷新快照再启动 outbox worker；任何一步
+    失败都让启动失败——半启动的技能目录比不启动更难排查。
+    """
+    if app_config.skills.source != "git":
+        app.state.skill_runtime = None
+        return None
+    runtime = build_skill_runtime(app_config)
+    app.state.skill_runtime = runtime
+    app.state.skill_author_service = runtime.author
+    app.state.skill_review_service = runtime.review
+    app.state.skill_catalog = runtime.catalog
+    app.state.skill_search = runtime.search
+    configure_skill_runtime(runtime)
+    await runtime.start()
+    return runtime
+
+
+async def stop_skill_runtime(app: FastAPI) -> None:
+    """Stop the outbox worker, close the projection, and reset catalog state."""
+    runtime = getattr(app.state, "skill_runtime", None)
+    if runtime is not None:
+        await runtime.stop()
+    app.state.skill_runtime = None
+    app.state.skill_author_service = None
+    app.state.skill_review_service = None
+    app.state.skill_catalog = None
+    app.state.skill_search = None
+    reset_skill_runtime()
 
 
 def preflight_auth(app_config: AppConfig) -> AuthSettings:
@@ -99,6 +139,9 @@ async def lifespan(app: FastAPI):
                 app.state.run_services = services
                 # 账号表在 app 层（§1.2）：harness 不认识 UserRecord，只认识 CurrentUser Protocol。
                 app.state.auth_service = AuthService(make_user_store(session_factory))
+                # M11 Task 15：数据库就绪后构建 Git 技能目录运行时——刷新快照、物化
+                # active 挂载树、启动 outbox worker。filesystem 来源在这里是 no-op。
+                await start_skill_runtime(app, app_config)
                 # M10 §2.5.3 / §2.9.1：memory store 和 checkpointer 同一个 database 选择；
                 # maintenance 是独立服务，不复用定时任务服务（那个会创建 thread/run）。
                 configure_memory_store(memory_store)
@@ -127,6 +170,7 @@ async def lifespan(app: FastAPI):
                 try:
                     yield
                 finally:
+                    await stop_skill_runtime(app)
                     maintenance.stop()
                     if not memory_manager.flush(
                         app_config.memory.ingest.shutdown_flush_timeout_seconds

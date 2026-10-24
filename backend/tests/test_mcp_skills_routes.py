@@ -132,8 +132,12 @@ def test_skills_list_needs_skills_read_not_admin(config_path, monkeypatch):
     assert denied.json()["code"] == "permission_denied"
 
 
-def test_creating_routes_do_not_exist(config_path, monkeypatch):
-    """没有"创建"类能力：路由不存在，比 403 更诚实。"""
+def test_creation_lives_in_the_author_router_not_this_one(config_path, monkeypatch):
+    """M7 的路由对不声明创建；Task 8 起 POST /api/skills 由作者路由提供。
+
+    这个测试只装配 mcp + skills 两个 router，所以仍然是 404；应用级路由表里
+    POST /api/skills 必须存在（否则前端"新建技能"全 404）。
+    """
     client = _client(monkeypatch)
 
     put_mcp = client.put("/api/mcp/config", json={"mcpServers": {}})
@@ -141,6 +145,16 @@ def test_creating_routes_do_not_exist(config_path, monkeypatch):
 
     assert put_mcp.status_code in (404, 405)
     assert post_skills.status_code in (404, 405)
+
+    from backend.app.gateway.routers import skill_drafts
+
+    methods = {
+        method
+        for route in skill_drafts.router.routes
+        if route.path == "/skills"
+        for method in getattr(route, "methods", ()) or ()
+    }
+    assert "POST" in methods
 
 
 def test_admin_only_routes(config_path, monkeypatch):
@@ -160,10 +174,10 @@ def test_admin_only_routes(config_path, monkeypatch):
         assert response.json()["code"] == "permission_denied"
 
 
-def test_reload_is_declared_before_the_skill_name_route(config_path, monkeypatch):
+def test_reload_is_declared_before_the_skill_id_route(config_path, monkeypatch):
     paths = [route.path for route in skills.router.routes]
 
-    assert paths.index("/skills/reload") < paths.index("/skills/{name}")
+    assert paths.index("/skills/reload") < paths.index("/skills/{skill_id}")
     response = _client(monkeypatch).post("/api/skills/reload")
 
     assert response.status_code == 200
@@ -177,13 +191,19 @@ def test_a_plain_user_can_flip_only_their_own_preference(config_path, monkeypatc
     response = alice.put("/api/skills/foo/preference", json={"enabled": False})
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    # Task 15 追加了 Git 目录字段（本来源下都是 null），M7 的五个字段形状不变。
+    assert {
+        key: body[key]
+        for key in ("name", "description", "category", "enabled", "global_enabled")
+    } == {
         "name": "foo",
         "description": "处理 PDF 文档",
         "category": "public",
         "enabled": False,
         "global_enabled": None,
     }
+    assert body["skill_id"] is None and body["scope"] is None
     assert alice.get("/api/skills").json()["skills"][0]["enabled"] is False
     alice.identity.as_(SKILLS_READ, user_id="bob")
     assert alice.get("/api/skills").json()["skills"][0]["enabled"] is True

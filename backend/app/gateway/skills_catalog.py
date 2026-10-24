@@ -1,31 +1,232 @@
-"""技能目录 → SkillResponse（M7 §2.4/§3.5）。
+"""技能目录 → SkillResponse（M7 §2.4/§3.5）+ Git 目录运行时（M11 Task 15）。
 
-列表（GET /api/skills）与模型可见索引（<available_skills>）**必须来自同一份扫描**
-（agentkit.skills.storage.load_skills）：列表里有、索引里没有（或反过来）就是 bug。
+两种来源，两种路径，**不混用**：
 
-enabled 返回的是**有效状态** = 全局 and 个人偏好（§2.4 的两层开关）；只有 admin 传
-include_global=True 时才额外带上 global_enabled。
+- `skills.source = filesystem`（仅测试/迁移）：保留 M7 的文件系统扫描与
+  extensions_config.json 全局开关。列表与模型索引来自同一次 load_skills。
+- `skills.source = git`：**永不扫盘**。列表来自进程级不可变快照
+  （agentkit.skills.catalog.SkillSnapshot），全局开关写 PostgreSQL 的
+  skill_settings，个人偏好仍写 skills_prefs.json（键是内部 skill_id）。
+  运行时由 app lifespan 构建；缺失运行时或空快照 = fail-closed（空列表），
+  绝不回退到磁盘。
+
+个人偏好与全局开关是两层：effective = global and personal。路由只负责搬运，
+真正的读写落点由来源决定。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+from dataclasses import dataclass
+from typing import Any
 
 from agentkit.config import get_app_config
 from agentkit.config.extensions_config import (
     reset_extensions_config_cache,
     update_extensions_config,
 )
+from agentkit.config.runtime_paths import resolve_path
 from agentkit.config.skills_config import SkillsConfig
-from agentkit.config.skills_prefs import read_user_skill_prefs, write_user_skill_pref
+from agentkit.config.skills_prefs import read_user_skill_prefs, write_catalog_skill_pref, write_user_skill_pref
+from agentkit.knowledge.embedding import OpenAICompatibleEmbedder
+from agentkit.persistence.engine import get_session_factory
+from agentkit.skills import search as skill_search
+from agentkit.skills.author import SkillAuthorService
+from agentkit.skills.catalog import (
+    SkillCatalogService,
+    SkillSnapshot,
+    get_skill_snapshot,
+    set_skill_snapshot,
+)
+from agentkit.skills.content import SkillContentStore
+from agentkit.skills.git import SkillGitRepository
+from agentkit.skills.outbox import SkillIndexOutboxWorker
 from agentkit.skills.prefs import effective_enabled, global_enabled_map
 from agentkit.skills.prompt import clear_skill_prompt_cache
+from agentkit.skills.projection import MilvusSkillProjection
+from agentkit.skills.review import SkillReviewService
+from agentkit.skills.search import SkillSearchService
 from agentkit.skills.storage import load_skills
+from agentkit.skills.store.sql import SqlSkillStore
 from agentkit.skills.types import Skill
 from backend.app.gateway.errors import SkillNotFound
 from backend.app.gateway.models.response import SkillResponse
 
 logger = logging.getLogger(__name__)
+
+GIT_SOURCE = "git"
+
+
+# ---------------------------------------------------------------------------
+# 运行时：一个进程一份，由 app lifespan 拥有
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SkillRuntime:
+    """Every service the Git-backed catalog needs, built once per process.
+
+    Projection, outbox, and search are optional: without an embedding endpoint
+    the catalog still serves lists, authoring, review, and snapshots; only the
+    Milvus projection is absent.
+    """
+
+    store: Any
+    git: Any
+    content: Any
+    author: Any
+    review: Any
+    search: Any = None
+    catalog: Any = None
+    outbox: Any = None
+    projection: Any = None
+
+    async def refresh(self) -> Any:
+        """Rebuild the catalog snapshot, then the active mount trees.
+
+        The snapshot is what prompts and list routes see; the trees are what a
+        sandbox mounts.  Both are derived from the same active pointers, so a
+        caller must never refresh only one of them.
+        """
+        snapshot = await self.catalog.refresh()
+        await self.materialize_active_trees()
+        return snapshot
+
+    async def materialize_active_trees(self) -> None:
+        """Write active/public and active/users/<owner> from the active pointers.
+
+        A broken skill must not abort startup or a reload: materialization is a
+        per-tree best effort, exactly like the snapshot's per-skill skip.  The
+        previous tree stays in place until the swap succeeds (content store).
+        """
+        active = list(await self.store.all_active())
+        public = [row for row in active if _scope_value(row.scope) == "public"]
+        try:
+            await self.content.materialize_public(public)
+        except Exception as exc:  # noqa: BLE001 - one broken tree must not stop startup
+            logger.warning("Public skill tree materialization failed: %s", exc)
+
+        by_owner: dict[str, list[Any]] = {}
+        for row in active:
+            if _scope_value(row.scope) != "private":
+                continue
+            owner = row.skill.owner_user_id
+            if not owner:
+                logger.warning("Skipping private mount: active row has no owner")
+                continue
+            by_owner.setdefault(owner, []).append(row)
+        for owner, rows in by_owner.items():
+            try:
+                await self.content.materialize_private(owner, rows)
+            except Exception as exc:  # noqa: BLE001 - one owner must not stop the rest
+                logger.warning("Private skill tree materialization failed for %s: %s", owner, exc)
+
+    async def start(self) -> None:
+        """Read Git, publish the snapshot, then start the projection worker."""
+        ensure_ready = getattr(self.git, "ensure_ready", None)
+        if callable(ensure_ready):
+            await ensure_ready()
+        await self.refresh()
+        if self.outbox is not None:
+            await self.outbox.start()
+
+    async def stop(self) -> None:
+        """Stop background work and drop process-wide catalog state."""
+        if self.outbox is not None:
+            await self.outbox.stop()
+        if self.projection is not None:
+            await self.projection.aclose()
+        reset_skill_runtime()
+
+
+_runtime_lock = threading.Lock()
+_runtime: SkillRuntime | None = None
+
+
+def configure_skill_runtime(runtime: SkillRuntime | None) -> None:
+    """Install (or clear) the process-wide catalog runtime.
+
+    The builtin search_and_load_skills tool reads agentkit.skills.search's own
+    registry; pointing both at the same service is the only way the tool and
+    the routes can agree on which catalog is authoritative.
+    """
+    global _runtime
+    with _runtime_lock:
+        _runtime = runtime
+    skill_search.configure_skill_runtime(runtime.search if runtime is not None else None)
+
+
+def get_skill_runtime() -> SkillRuntime | None:
+    with _runtime_lock:
+        return _runtime
+
+
+def reset_skill_runtime() -> None:
+    """Drop the runtime, the search service, and the published snapshot."""
+    configure_skill_runtime(None)
+    set_skill_snapshot(SkillSnapshot(epoch="", public=(), private_by_owner={}))
+
+
+def runtime_for_request(request: Any) -> SkillRuntime | None:
+    """app.state first (lifespan-owned), then the process registry (tests/embedding)."""
+    state = getattr(getattr(request, "app", None), "state", None)
+    runtime = getattr(state, "skill_runtime", None)
+    return runtime if runtime is not None else get_skill_runtime()
+
+
+def build_skill_runtime(
+    app_config: Any, *, session_factory: Any | None = None
+) -> SkillRuntime:
+    """Build the Git-backed runtime from configuration.
+
+    No I/O happens here beyond constructing clients: the lifespan starts the
+    runtime once PostgreSQL and Git are reachable.
+    """
+    skills: SkillsConfig = app_config.skills
+    store = SqlSkillStore(session_factory or get_session_factory())
+    cache_dir = resolve_path(skills.git.cache_dir)
+    git = SkillGitRepository(skills.git, cache_dir)
+    content = SkillContentStore(cache_dir, git)
+    author = SkillAuthorService(store, git, content, skills.creation)
+    review = SkillReviewService(store, git, content, skills.review)
+    catalog = SkillCatalogService(store, content)
+
+    search = None
+    outbox = None
+    projection = None
+    embedding = skills.search.embedding
+    if embedding.enabled and embedding.base_url.strip():
+        embedder = OpenAICompatibleEmbedder(embedding)
+        projection = MilvusSkillProjection(
+            app_config.knowledge_base.vector_store, dimensions=embedding.dimensions
+        )
+        search = SkillSearchService(store, projection, content, embedder, skills.search)
+        outbox = SkillIndexOutboxWorker(
+            store,
+            content,
+            embedder,
+            projection,
+            poll_seconds=skills.index.outbox_poll_seconds,
+        )
+
+    return SkillRuntime(
+        store=store,
+        git=git,
+        content=content,
+        author=author,
+        review=review,
+        search=search,
+        catalog=catalog,
+        outbox=outbox,
+        projection=projection,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 兼容层：filesystem 来源的 M7 行为（不删、不改形状）
+# ---------------------------------------------------------------------------
 
 
 def skills_config() -> SkillsConfig:
@@ -37,7 +238,9 @@ def scan_skill_records() -> list[Skill]:
     return load_skills(skills_config(), enabled_map=global_enabled_map())
 
 
-def _to_response(skill: Skill, *, user_id: str | None, include_global: bool) -> SkillResponse:
+def _legacy_response(
+    skill: Skill, *, user_id: str | None, include_global: bool
+) -> SkillResponse:
     prefs = read_user_skill_prefs(user_id)
     return SkillResponse(
         name=skill.name,
@@ -50,31 +253,32 @@ def _to_response(skill: Skill, *, user_id: str | None, include_global: bool) -> 
 
 def scan_skills_for_api(*, user_id: str | None, include_global: bool = False) -> list[SkillResponse]:
     return [
-        _to_response(skill, user_id=user_id, include_global=include_global)
+        _legacy_response(skill, user_id=user_id, include_global=include_global)
         for skill in sorted(scan_skill_records(), key=lambda item: item.name)
     ]
 
 
-def _response_for(name: str, *, user_id: str | None, include_global: bool = False) -> SkillResponse:
+def _legacy_response_for(
+    name: str, *, user_id: str | None, include_global: bool = False
+) -> SkillResponse:
     for skill in scan_skill_records():
         if skill.name == name:
-            return _to_response(skill, user_id=user_id, include_global=include_global)
+            return _legacy_response(skill, user_id=user_id, include_global=include_global)
     raise SkillNotFound(f"Skill {name} not found")
 
 
 def set_user_skill_pref(user_id: str | None, name: str, enabled: bool) -> SkillResponse:
-    """个人开关（任何登录用户）：只写 skills_prefs.json。**不 reload 全局配置**——它没变。"""
+    """filesystem 来源的个人开关：只写 skills_prefs.json（按名字）。"""
     if name not in {skill.name for skill in scan_skill_records()}:
         raise SkillNotFound(f"Skill {name} not found")
     write_user_skill_pref(user_id, name, enabled)
-    return _response_for(name, user_id=user_id)
+    return _legacy_response_for(name, user_id=user_id)
 
 
 def patch_skill_enabled(name: str, enabled: bool) -> SkillResponse:
-    """全局开关（admin）：改 extensions_config.json 的 skills.<name>.enabled，动所有人。"""
+    """filesystem 来源的全局开关：写 extensions_config.json。"""
 
     def mutate(data: dict) -> None:
-        # 扫描在锁内：名字是不是真的存在，以写这一刻的磁盘为准（§2.4 步骤 3）
         scanned = {skill.name for skill in scan_skill_records()}
         if name not in scanned:
             raise SkillNotFound(f"Skill {name} not found")
@@ -88,11 +292,241 @@ def patch_skill_enabled(name: str, enabled: bool) -> SkillResponse:
         data["skills"] = skills
 
     update_extensions_config(mutate)
-    clear_skill_prompt_cache()  # 索引立刻反映新状态，不重扫目录
-    return _response_for(name, user_id=None, include_global=True)
+    clear_skill_prompt_cache()
+    return _legacy_response_for(name, user_id=None, include_global=True)
 
 
 def reload_skill_caches() -> None:
-    """POST /api/skills/reload：只清本进程的 prompt 段落 LRU 与配置缓存。"""
+    """filesystem 来源：清本进程的 prompt 段落 LRU 与配置缓存。"""
     clear_skill_prompt_cache()
     reset_extensions_config_cache()
+
+
+# ---------------------------------------------------------------------------
+# Git 来源：列表 / 个人偏好 / 全局开关 / reload
+# ---------------------------------------------------------------------------
+
+
+def _scope_value(scope: object) -> str | None:
+    if scope is None:
+        return None
+    return str(getattr(scope, "value", scope))
+
+
+def _skill_source() -> str:
+    return get_app_config().skills.source
+
+
+def _configured_container_file(skill: Skill) -> str:
+    """容器路径来自 skills.container_path，不是写死的 /mnt/skills。"""
+    root = get_app_config().skills.container_path.rstrip("/") or "/"
+    scope = _scope_value(skill.scope)
+    directory = skill.relative_path.as_posix()
+    return f"{root}/{scope}/{directory}/SKILL.md" if scope else skill.container_file
+
+
+def _private_mounts_supported() -> bool:
+    """Per-user private mounts are a sandbox-provider capability (Task 14)."""
+    try:
+        from agentkit.sandbox import get_sandbox_provider
+
+        return bool(getattr(get_sandbox_provider(), "supports_per_user_skill_mounts", False))
+    except Exception:  # noqa: BLE001 - no provider means no private container path
+        logger.warning("Sandbox provider unavailable; omitting private container paths")
+        return False
+
+
+def visible_catalog_rows(snapshot: SkillSnapshot, user_id: str | None) -> list[Skill]:
+    """Public plus the caller's private skills, private winning on a shared skill id.
+
+    Unlike SkillSnapshot.visible_for this does **not** filter disabled or
+    personally-switched-off skills: the settings page has to render both
+    switches, so it needs the row with its effective state.
+    """
+    private = tuple(snapshot.private_by_owner.get(user_id, ())) if user_id else ()
+    private_ids = {skill.skill_id for skill in private if skill.skill_id is not None}
+    public = [
+        skill
+        for skill in snapshot.public
+        if skill.skill_id is None or skill.skill_id not in private_ids
+    ]
+    rows = [*public, *private]
+    return sorted(
+        rows,
+        key=lambda skill: (
+            skill.name,
+            0 if _scope_value(skill.scope) == "public" else 1,
+            skill.skill_id or "",
+        ),
+    )
+
+
+def _catalog_response(
+    skill: Skill,
+    *,
+    user_id: str | None,
+    include_global: bool,
+    is_admin: bool,
+    status: str,
+) -> SkillResponse:
+    scope = _scope_value(skill.scope)
+    owner_visible = is_admin or (user_id is not None and skill.owner_user_id == user_id)
+    if scope == "private":
+        category = "custom"
+        global_enabled = None
+        container_file = _configured_container_file(skill) if _private_mounts_supported() else None
+    else:
+        category = "public"
+        global_enabled = skill.enabled if include_global else None
+        container_file = _configured_container_file(skill)
+    return SkillResponse(
+        name=skill.name,
+        description=skill.description,
+        category=category,
+        enabled=effective_enabled(skill, read_user_skill_prefs(user_id)),
+        global_enabled=global_enabled,
+        skill_id=skill.skill_id,
+        scope=scope,  # type: ignore[arg-type]
+        skill_version=skill.skill_version,
+        version_id=skill.version_id,
+        git_commit=skill.git_commit,
+        skill_path=skill.repo_path,
+        status=status,
+        owner_user_id=skill.owner_user_id if owner_visible else None,
+        container_file=container_file,
+    )
+
+
+async def _status_for(runtime: SkillRuntime | None, skill: Skill) -> str:
+    if _scope_value(skill.scope) == "public":
+        return "approved"
+    pending = getattr(getattr(runtime, "store", None), "pending_submission", None)
+    if callable(pending) and skill.skill_id:
+        try:
+            submission = await pending(skill.skill_id)
+        except Exception as exc:  # noqa: BLE001 - status is cosmetic, never a 500
+            logger.warning("Could not read pending state for %s: %s", skill.skill_id, exc)
+        else:
+            if submission is not None:
+                return "pending"
+    return "draft"
+
+
+async def _catalog_responses(
+    snapshot: SkillSnapshot,
+    *,
+    runtime: SkillRuntime | None,
+    user_id: str | None,
+    include_global: bool,
+    is_admin: bool,
+) -> list[SkillResponse]:
+    responses: list[SkillResponse] = []
+    for skill in visible_catalog_rows(snapshot, user_id):
+        responses.append(
+            _catalog_response(
+                skill,
+                user_id=user_id,
+                include_global=include_global,
+                is_admin=is_admin,
+                status=await _status_for(runtime, skill),
+            )
+        )
+    return responses
+
+
+async def list_skills_for_api(
+    *,
+    runtime: SkillRuntime | None,
+    user_id: str | None,
+    include_global: bool = False,
+    is_admin: bool = False,
+) -> list[SkillResponse]:
+    """GET /api/skills: filesystem scans disk; git reads the published snapshot."""
+    if _skill_source() != GIT_SOURCE:
+        return await asyncio.to_thread(
+            scan_skills_for_api, user_id=user_id, include_global=include_global
+        )
+    snapshot = get_skill_snapshot()
+    if runtime is None:
+        logger.error("Git skill catalog has no runtime; serving the published snapshot only")
+    return await _catalog_responses(
+        snapshot,
+        runtime=runtime,
+        user_id=user_id,
+        include_global=include_global,
+        is_admin=is_admin,
+    )
+
+
+async def set_skill_preference(
+    *,
+    runtime: SkillRuntime | None,
+    user_id: str | None,
+    skill_id: str,
+    enabled: bool,
+) -> SkillResponse:
+    """PUT /api/skills/{skill_id}/preference: JSON, keyed by internal skill_id."""
+    if _skill_source() != GIT_SOURCE:
+        return await asyncio.to_thread(set_user_skill_pref, user_id, skill_id, enabled)
+
+    snapshot = get_skill_snapshot()
+    skill = next(
+        (row for row in visible_catalog_rows(snapshot, user_id) if row.skill_id == skill_id),
+        None,
+    )
+    if skill is None:
+        raise SkillNotFound(f"Skill {skill_id} not found")
+    await asyncio.to_thread(_write_catalog_pref, user_id, skill, enabled)
+    return _catalog_response(
+        skill,
+        user_id=user_id,
+        include_global=False,
+        is_admin=False,
+        status=await _status_for(runtime, skill),
+    )
+
+
+def _write_catalog_pref(user_id: str | None, skill: Skill, enabled: bool) -> None:
+    key = skill.skill_id or skill.name
+    write_catalog_skill_pref(user_id, key, enabled)
+
+
+async def set_global_skill_enabled(
+    *, runtime: SkillRuntime | None, skill_id: str, enabled: bool, actor: str | None
+) -> SkillResponse:
+    """PATCH /api/skills/{skill_id}: admin-only global switch for a public skill."""
+    if _skill_source() != GIT_SOURCE:
+        return await asyncio.to_thread(patch_skill_enabled, skill_id, enabled)
+
+    if runtime is None:
+        logger.error("Refusing a global skill toggle: the skill runtime is not configured")
+        raise SkillNotFound(f"Skill {skill_id} not found")
+    snapshot = get_skill_snapshot()
+    target = next((row for row in snapshot.public if row.skill_id == skill_id), None)
+    if target is None:
+        raise SkillNotFound(f"Skill {skill_id} not found")
+
+    await runtime.store.set_global_enabled(skill_id, bool(enabled), actor or "admin")
+    await runtime.refresh()
+    refreshed = get_skill_snapshot()
+    updated = next((row for row in refreshed.public if row.skill_id == skill_id), target)
+    clear_skill_prompt_cache()
+    return _catalog_response(
+        updated,
+        user_id=actor,
+        include_global=True,
+        is_admin=True,
+        status="approved",
+    )
+
+
+async def reload_skills(*, runtime: SkillRuntime | None) -> None:
+    """POST /api/skills/reload: rebuild this process's snapshot (git) or caches."""
+    if _skill_source() != GIT_SOURCE:
+        await asyncio.to_thread(reload_skill_caches)
+        return
+    if runtime is None:
+        logger.error("Reload requested without a skill runtime; only local caches are cleared")
+    else:
+        await runtime.refresh()
+    clear_skill_prompt_cache()

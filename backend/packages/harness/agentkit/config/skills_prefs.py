@@ -121,14 +121,39 @@ def update_skills_prefs(
 def write_user_skill_pref(
     user_id: str | None, name: str, enabled: bool, *, path: Path | None = None
 ) -> dict[str, Any]:
-    """只写 skills_prefs.json。[user_id][name] = enabled。"""
+    """只写 skills_prefs.json。[user_id][name] = enabled。
+
+    M7 的 filesystem 技能按显示名作键；Git 目录用 write_catalog_skill_pref，
+    键是不可变的内部 skill_id。
+    """
+    return write_skill_pref(user_id, name, enabled, path=path)
+
+
+def write_skill_pref(
+    user_id: str | None, key: str, enabled: bool, *, path: Path | None = None
+) -> dict[str, Any]:
+    """The single bucket writer: [user_id][key] = enabled."""
     bucket = user_bucket(user_id)
 
     def mutate(data: dict[str, Any]) -> None:
         entries = data.get(bucket)
         if not isinstance(entries, dict):
             entries = {}
-        entries[name] = bool(enabled)
+        entries[key] = bool(enabled)
         data[bucket] = entries
 
     return update_skills_prefs(mutate, path=path)
+
+
+def write_catalog_skill_pref(
+    user_id: str | None, skill_id: str, enabled: bool, *, path: Path | None = None
+) -> dict[str, Any]:
+    """Catalog preference: the key is the internal skill_id, never the display name.
+
+    A rename or a public/private name collision must not move another skill's
+    switch, so every write from the Git catalog goes through here.  Name-keyed
+    M7 entries keep working through skills.prefs.effective_enabled.
+    """
+    if not skill_id:
+        raise ValueError("a catalog skill preference needs a skill_id")
+    return write_skill_pref(user_id, skill_id, enabled, path=path)

@@ -278,8 +278,14 @@ def _wire_time(value: Any) -> str | None:
 class SkillResponse(BaseModel):
     """category 是 public / custom，不是磁盘路径。
 
-    enabled 是**有效状态** = 全局启用 and 个人偏好；global_enabled 只在
-    admin 传 ?scope=global 时回填（§2.4 的两层开关）。
+    M7 的五个字段保持不变（filesystem 来源仍然只回填它们）。Git 来源在此之上
+    追加目录字段：skill_id/scope/版本/commit/path/status。新增字段全部可空，
+    旧客户端只读它认识的字段就不会看到形状变化。
+
+    - enabled 是**有效状态** = 全局启用 and 个人偏好；
+    - global_enabled 只在 admin 传 ?scope=global 时回填（§2.4 的两层开关）；
+    - owner_user_id 只对本人/admin 返回；
+    - container_file 是沙箱路径，私有技能只对所有者（且 provider 支持按用户挂载时）返回。
     """
 
     name: str
@@ -287,6 +293,16 @@ class SkillResponse(BaseModel):
     category: Literal["public", "custom"]
     enabled: bool
     global_enabled: bool | None = None
+    # ---- Git catalog fields (Task 15) ----
+    skill_id: str | None = None
+    scope: Literal["public", "private"] | None = None
+    skill_version: str | None = None
+    version_id: str | None = None
+    git_commit: str | None = None
+    skill_path: str | None = None
+    status: str | None = None
+    owner_user_id: str | None = None
+    container_file: str | None = None
 
 
 class SkillsListResponse(BaseModel):

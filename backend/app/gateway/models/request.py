@@ -59,9 +59,11 @@ class ThreadCompactRequest(BaseModel):
 # M7 §2.4：MCP 配置与技能启用开关
 # ---------------------------------------------------------------------------
 
-#: 技能目录名、PATCH 的 name、mcpServers 的键共用这一条：斜杠和 .. 进不了文件名。
+#: 技能目录名、PATCH 的 id、mcpServers 的键共用这一条：斜杠和 .. 进不了文件名。
+#: Git 目录里同一个位置放的是内部 skill_id（UUID/十六进制），形状落在同一字符集里。
 _NAME = r"^[A-Za-z0-9_-]{1,64}$"
 SkillName = Annotated[str, Path(pattern=_NAME)]
+SkillId = Annotated[str, Path(pattern=_NAME)]
 McpServerName = Annotated[str, StringConstraints(pattern=_NAME)]
 McpTransport = Literal["stdio", "sse", "http", "streamable_http"]
 
@@ -146,7 +148,11 @@ class McpServerEnabledPatch(BaseModel):
 
 
 class SkillUpdateRequest(BaseModel):
-    """**全局**开关（admin）。改的是 extensions_config.json 里的 skills.<name>.enabled。"""
+    """**全局**开关（admin）。
+
+    Git 来源写 PostgreSQL 的 skill_settings 并刷新快照；filesystem 来源
+    （仅测试/迁移）仍写 extensions_config.json 的 skills.<name>.enabled。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -154,7 +160,10 @@ class SkillUpdateRequest(BaseModel):
 
 
 class SkillPreferenceRequest(BaseModel):
-    """**个人**开关（任何登录用户）。只写 skills_prefs.json，不影响别人。"""
+    """**个人**开关（任何登录用户）。只写 skills_prefs.json，不影响别人。
+
+    Git 来源的键是内部 skill_id（不是显示名）：改名或公私重名都不会串到别人。
+    """
 
     model_config = ConfigDict(extra="forbid")
 

@@ -1,25 +1,26 @@
-"""技能路由（M7 §2.4）。prefix=/skills，create_app 再加 /api。
+"""技能路由（M7 §2.4 / M11 Task 15）。prefix=/skills，create_app 再加 /api。
 
 - GET /api/skills：任何登录用户（skills:read）。斜杠菜单与设置页共用。
-- PUT /api/skills/{name}/preference：**普通用户在 M7 里唯一的写操作**——开关"我用不用"。
-- PATCH /api/skills/{name}：admin 的**全局**开关，动所有人。
-- POST /api/skills/reload：admin，只清本进程的 prompt 段落 LRU。
+  来源决定数据从哪里来：filesystem 扫盘；git 读进程级快照（公共 + 本人私有）。
+- PUT /api/skills/{skill_id}/preference：**普通用户唯一的写操作**——开关"我用不用"。
+  只写 skills_prefs.json；git 来源的键是内部 skill_id。
+- PATCH /api/skills/{skill_id}：admin 的**全局**开关，动所有人。
+  git 来源写 PostgreSQL 的 skill_settings + outbox，然后刷新快照。
+- POST /api/skills/reload：admin。git 来源重建快照，两种来源都清 prompt 段落 LRU。
 
-M7 的旧文件系统清单与开关继续保留到 Task 15。Git 草稿的作者路由在
-skill_drafts.py（create_app 里先于本 router 注册，/skills/mine 不会被
-/skills/{skill_id} 捕获）；本模块仍不声明创建路由。
+Git 草稿的作者路由在 skill_drafts.py（create_app 里先于本 router 注册，
+/skills/mine 不会被 /skills/{skill_id} 捕获）；本模块仍不声明创建路由。
 """
 
 from __future__ import annotations
 
-import asyncio
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from backend.app.gateway.deps import require_scope
 from backend.app.gateway.models.request import (
-    SkillName,
+    SkillId,
     SkillPreferenceRequest,
     SkillUpdateRequest,
 )
@@ -27,10 +28,11 @@ from backend.app.gateway.models.response import SkillReloadResponse, SkillRespon
 from backend.app.gateway.run_models import RunCaller
 from backend.app.gateway.services import RunPermissionDenied
 from backend.app.gateway.skills_catalog import (
-    patch_skill_enabled,
-    reload_skill_caches,
-    scan_skills_for_api,
-    set_user_skill_pref,
+    list_skills_for_api,
+    reload_skills,
+    runtime_for_request,
+    set_global_skill_enabled,
+    set_skill_preference,
 )
 
 router = APIRouter(prefix="/skills", tags=["skills"])
@@ -38,46 +40,61 @@ router = APIRouter(prefix="/skills", tags=["skills"])
 
 @router.get("", response_model=SkillsListResponse)
 async def list_skills(
+    request: Request,
     caller: Annotated[RunCaller, Depends(require_scope("skills:read"))],
     scope: Annotated[Literal["effective", "global"], Query()] = "effective",
 ) -> SkillsListResponse:
     """默认给**有效状态**；admin 传 ?scope=global 才额外看到全局值。"""
     if scope == "global" and not caller.allows("admin"):
         raise RunPermissionDenied("missing scope: admin")
-    include_global = scope == "global"
-    skills = await asyncio.to_thread(
-        scan_skills_for_api, user_id=caller.user_id, include_global=include_global
+    skills = await list_skills_for_api(
+        runtime=runtime_for_request(request),
+        user_id=caller.user_id,
+        include_global=scope == "global",
+        is_admin=caller.allows("admin"),
     )
     return SkillsListResponse(skills=skills)
 
 
-# 必须写在 PATCH /{name} 前面：反了之后一旦再加 GET /skills/{name}，reload 会被当成技能名。
+# 必须写在 PATCH /{skill_id} 前面：反了之后一旦再加 GET /skills/{skill_id}，reload 会被当成技能 id。
 @router.post("/reload", response_model=SkillReloadResponse)
-async def reload_skills(
+async def reload_skill_routes(
+    request: Request,
     caller: Annotated[RunCaller, Depends(require_scope("admin"))],
 ) -> SkillReloadResponse:
-    """只清本进程；别的 worker 要各自打（§2.4）。"""
+    """只刷新本进程；别的 worker 要各自打（§2.4）或等下一次刷新。"""
     del caller
-    await asyncio.to_thread(reload_skill_caches)
+    await reload_skills(runtime=runtime_for_request(request))
     return SkillReloadResponse()
 
 
-@router.put("/{name}/preference", response_model=SkillResponse)
-async def set_skill_preference(
-    name: SkillName,
+@router.put("/{skill_id}/preference", response_model=SkillResponse)
+async def set_preference(
+    request: Request,
+    skill_id: SkillId,
     body: SkillPreferenceRequest,
     caller: Annotated[RunCaller, Depends(require_scope("skills:read"))],  # ★ 普通用户
 ) -> SkillResponse:
     """唯一对普通用户开放的写操作：只影响自己，不碰技能正文，也不 reload 全局配置。"""
-    return await asyncio.to_thread(set_user_skill_pref, caller.user_id, name, body.enabled)
+    return await set_skill_preference(
+        runtime=runtime_for_request(request),
+        user_id=caller.user_id,
+        skill_id=skill_id,
+        enabled=body.enabled,
+    )
 
 
-@router.patch("/{name}", response_model=SkillResponse)
+@router.patch("/{skill_id}", response_model=SkillResponse)
 async def update_skill(
-    name: SkillName,
+    request: Request,
+    skill_id: SkillId,
     body: SkillUpdateRequest,
     caller: Annotated[RunCaller, Depends(require_scope("admin"))],  # ★ 全局开关
 ) -> SkillResponse:
-    """读-改-写-重载整个循环在 worker 线程里、持双锁完成（§2.2）。"""
-    del caller
-    return await asyncio.to_thread(patch_skill_enabled, name, body.enabled)
+    """全局开关：PG 事务（setting + outbox + audit）之后刷新快照并清索引缓存。"""
+    return await set_global_skill_enabled(
+        runtime=runtime_for_request(request),
+        skill_id=skill_id,
+        enabled=body.enabled,
+        actor=caller.user_id,
+    )
