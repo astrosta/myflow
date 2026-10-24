@@ -664,6 +664,33 @@ class SqlSkillStore:
             ).all()
             return [_version_record(row) for row in rows]
 
+    async def list_all_versions(self) -> list[SkillVersionRecord]:
+        """Return every version for retention and reconciliation scans."""
+        async with self._sf() as session:
+            rows = (
+                await session.scalars(
+                    select(SkillVersionRow).order_by(
+                        SkillVersionRow.skill_id.asc(),
+                        SkillVersionRow.version_seq.asc(),
+                        SkillVersionRow.id.asc(),
+                    )
+                )
+            ).all()
+            return [_version_record(row) for row in rows]
+
+    async def set_version_index_status(self, version_id: str, status: str) -> None:
+        """Update only the mutable projection status of one immutable version."""
+        if status not in {"pending", "ready", "failed"}:
+            raise ValueError(f"unsupported index status: {status!r}")
+        async with self._sf() as session:
+            row = await session.get(SkillVersionRow, version_id)
+            if row is None:
+                return
+            row.index_status = status
+            await self._commit(
+                session, f"skill version {version_id!r} index status conflicts"
+            )
+
     # ------------------------------------------------------------------
     # public releases and active pointers
     # ------------------------------------------------------------------
@@ -1256,6 +1283,21 @@ class SqlSkillStore:
             )
             return int(count or 0)
 
+    async def list_pending_outbox(self) -> list[OutboxEvent]:
+        """Return pending events for retention keep-set decisions."""
+        async with self._sf() as session:
+            rows = (
+                await session.scalars(
+                    select(SkillIndexOutboxRow)
+                    .where(SkillIndexOutboxRow.status == "pending")
+                    .order_by(
+                        SkillIndexOutboxRow.created_at.asc(),
+                        SkillIndexOutboxRow.id.asc(),
+                    )
+                )
+            ).all()
+            return [_outbox_event(row) for row in rows]
+
     # ------------------------------------------------------------------
     # visibility, projection confirmation, and audit
     # ------------------------------------------------------------------
@@ -1316,6 +1358,147 @@ class SqlSkillStore:
             for _active, version, skill in private_rows
         )
         return visible
+
+    async def list_active_visible(self) -> list[VisibleSkill]:
+        """Return every public and private active pointer, regardless of owner.
+
+        The outbox reconciler and retention scan need the complete active set;
+        normal request-time visibility still goes through visible_for_user.
+        """
+        async with self._sf() as session:
+            public_rows = (
+                await session.execute(
+                    select(
+                        SkillReleaseRow,
+                        SkillVersionRow,
+                        SkillPublicActiveRow,
+                        SkillRow,
+                        SkillSettingsRow,
+                    )
+                    .join(SkillRow, SkillRow.id == SkillReleaseRow.skill_id)
+                    .join(SkillVersionRow, SkillVersionRow.id == SkillReleaseRow.version_id)
+                    .join(
+                        SkillPublicActiveRow,
+                        (SkillPublicActiveRow.skill_id == SkillRow.id)
+                        & (SkillPublicActiveRow.release_id == SkillReleaseRow.id),
+                    )
+                    .outerjoin(SkillSettingsRow, SkillSettingsRow.skill_id == SkillRow.id)
+                    .where(SkillRow.deleted_at.is_(None))
+                    .order_by(
+                        func.coalesce(SkillRow.public_name, SkillRow.private_name).asc(),
+                        SkillRow.id.asc(),
+                    )
+                )
+            ).all()
+            private_rows = (
+                await session.execute(
+                    select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
+                    .join(
+                        SkillVersionRow,
+                        SkillVersionRow.id == SkillPrivateActiveRow.version_id,
+                    )
+                    .join(SkillRow, SkillRow.id == SkillPrivateActiveRow.skill_id)
+                    .where(SkillRow.deleted_at.is_(None))
+                    .order_by(
+                        SkillPrivateActiveRow.owner_user_id.asc(),
+                        SkillRow.private_name.asc(),
+                        SkillRow.id.asc(),
+                    )
+                )
+            ).all()
+
+        visible = [
+            _visible(
+                skill,
+                version,
+                scope=SkillScope.PUBLIC,
+                enabled=bool(settings.enabled) if settings is not None else True,
+                release=release,
+            )
+            for release, version, _active, skill, settings in public_rows
+        ]
+        visible.extend(
+            _visible(skill, version, scope=SkillScope.PRIVATE, enabled=True)
+            for _active, version, skill in private_rows
+        )
+        return visible
+
+    async def get_active_visible(
+        self,
+        *,
+        scope: str | SkillScope,
+        skill_id: str,
+        owner_user_id: str | None = None,
+    ) -> VisibleSkill | None:
+        """Re-read one projection target from the authoritative active pointer."""
+        scope_value = str(scope)
+        async with self._sf() as session:
+            if scope_value == SkillScope.PUBLIC.value:
+                row = (
+                    await session.execute(
+                        select(
+                            SkillReleaseRow,
+                            SkillVersionRow,
+                            SkillPublicActiveRow,
+                            SkillRow,
+                            SkillSettingsRow,
+                        )
+                        .join(SkillRow, SkillRow.id == SkillReleaseRow.skill_id)
+                        .join(
+                            SkillVersionRow,
+                            SkillVersionRow.id == SkillReleaseRow.version_id,
+                        )
+                        .join(
+                            SkillPublicActiveRow,
+                            (SkillPublicActiveRow.skill_id == SkillRow.id)
+                            & (SkillPublicActiveRow.release_id == SkillReleaseRow.id),
+                        )
+                        .outerjoin(
+                            SkillSettingsRow, SkillSettingsRow.skill_id == SkillRow.id
+                        )
+                        .where(
+                            SkillPublicActiveRow.skill_id == skill_id,
+                            SkillRow.deleted_at.is_(None),
+                        )
+                        .limit(1)
+                    )
+                ).first()
+                if row is None:
+                    return None
+                release, version, _active, skill, settings = row
+                return _visible(
+                    skill,
+                    version,
+                    scope=SkillScope.PUBLIC,
+                    enabled=bool(settings.enabled) if settings is not None else True,
+                    release=release,
+                )
+            if scope_value == SkillScope.PRIVATE.value:
+                if owner_user_id is None:
+                    return None
+                row = (
+                    await session.execute(
+                        select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
+                        .join(
+                            SkillVersionRow,
+                            SkillVersionRow.id == SkillPrivateActiveRow.version_id,
+                        )
+                        .join(SkillRow, SkillRow.id == SkillPrivateActiveRow.skill_id)
+                        .where(
+                            SkillPrivateActiveRow.skill_id == skill_id,
+                            SkillPrivateActiveRow.owner_user_id == owner_user_id,
+                            SkillRow.deleted_at.is_(None),
+                        )
+                        .limit(1)
+                    )
+                ).first()
+                if row is None:
+                    return None
+                _active, version, skill = row
+                return _visible(
+                    skill, version, scope=SkillScope.PRIVATE, enabled=True
+                )
+        raise ValueError(f"unsupported projection scope: {scope_value!r}")
 
     async def private_skill_ids(self, user_id: str) -> tuple[str, ...]:
         async with self._sf() as session:
