@@ -654,6 +654,23 @@ def test_deleting_the_private_draft_keeps_the_public_release_visible(harness: Ha
             == []
         )
 
+        # 投影重读（outbox 的 `get_active_visible`）也必须还能看到公共指针：
+        # 否则删除草稿后的一次公共重投影会判定"公共行已下架"，把 Milvus 里的
+        # 公共行删掉，所有人按向量检索都找不到它。
+        public_target = await harness.store.get_active_visible(
+            scope="public", skill_id=skill.id
+        )
+        assert public_target is not None
+        assert public_target.release is not None
+        assert public_target.version.id == version.id
+        # 私有指针已经不存在了：重投影该删的就是它。
+        assert (
+            await harness.store.get_active_visible(
+                scope="private", skill_id=skill.id, owner_user_id="u1"
+            )
+            is None
+        )
+
         # 记录本身仍是软删：按记录查的路径（get_skill / 名唯一性）保持原样。
         assert await harness.store.get_skill(skill.id) is None
         async with harness.session_factory() as session:

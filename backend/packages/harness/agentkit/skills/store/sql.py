@@ -1462,10 +1462,11 @@ class SqlSkillStore:
                         .outerjoin(
                             SkillSettingsRow, SkillSettingsRow.skill_id == SkillRow.id
                         )
-                        .where(
-                            SkillPublicActiveRow.skill_id == skill_id,
-                            SkillRow.deleted_at.is_(None),
-                        )
+                        .where(SkillPublicActiveRow.skill_id == skill_id)
+                        # 这里刻意不筛 deleted_at：软删只删私有草稿指针，公共版本
+                        # 不受影响（§2.2）。筛掉会让删除草稿后的公共投影重读返回
+                        # None，outbox 据此把 Milvus 里的公共行删掉。公共可见性由
+                        # skill_public_active 决定（下架即删这一行）。
                         .limit(1)
                     )
                 ).first()
