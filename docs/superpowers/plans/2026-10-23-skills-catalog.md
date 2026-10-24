@@ -22,7 +22,7 @@
 - Every public release row contains skill_id, skill_version, git_repository, git_commit, and skill_path.
 - Public name is immutable after first approval; rename requires unpublish plus a new skill in V1.
 - Outbox rows are written in the same PostgreSQL transaction as the state change they project.
-- Tests run with: cd backend && uv run pytest tests/<file> -v
+- Tests run with: uv run python -m pytest backend/tests/<file> -v (from repo root)
 - Frontend tests run with: cd frontend && pnpm vitest run <path>
 
 ## Review Focus
@@ -125,7 +125,7 @@ Add a second test that inserts two pending submissions for one skill and expects
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: cd backend && uv run pytest tests/test_skill_catalog_schema.py -v
+Run: uv run python -m pytest backend/tests/test_skill_catalog_schema.py -v
 
 Expected: FAIL because the tables and scope are absent.
 
@@ -146,7 +146,7 @@ Make 0005 idempotent with sa.inspect(op.get_bind()).has_table(), matching 0004.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: cd backend && uv run pytest tests/test_skill_catalog_schema.py tests/test_bootstrap_schema.py -v
+Run: uv run python -m pytest backend/tests/test_skill_catalog_schema.py backend/tests/test_bootstrap_schema.py -v
 
 Expected: all PASS.
 
@@ -212,7 +212,7 @@ def test_private_skill_container_path_uses_private_root():
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_package.py -v
+Run: uv run python -m pytest backend/tests/test_skill_package.py -v
 
 - [ ] **Step 3: Implement domain types, validation, hash, and frontmatter generation**
 
@@ -220,7 +220,7 @@ Canonical hash input is sorted by POSIX relative path: path + NUL + mode + NUL +
 
 - [ ] **Step 4: Run tests and existing skill parser tests**
 
-Run: cd backend && uv run pytest tests/test_skill_package.py tests/test_skill_parser.py tests/test_skill_loading.py -v
+Run: uv run python -m pytest backend/tests/test_skill_package.py backend/tests/test_skill_parser.py backend/tests/test_skill_loading.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -272,7 +272,7 @@ Use a SQLite async engine, Base.metadata.create_all, and a session factory. Asse
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_store.py -v
+Run: uv run python -m pytest backend/tests/test_skill_store.py -v
 
 - [ ] **Step 3: Implement the store in focused methods**
 
@@ -280,7 +280,7 @@ Every method opens one session. record_saved_version, create_submission, and rec
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_store.py -v
+Run: uv run python -m pytest backend/tests/test_skill_store.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -313,7 +313,7 @@ Assert draft file upsert replaces bytes and updates sha256/size, deleting the la
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_drafts_store.py -v
+Run: uv run python -m pytest backend/tests/test_skill_drafts_store.py -v
 
 - [ ] **Step 3: Implement using one transaction per public method**
 
@@ -321,7 +321,7 @@ Use SELECT ... FOR UPDATE SKIP LOCKED on PostgreSQL for claim_outbox; on SQLite,
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_drafts_store.py tests/test_skill_store.py -v
+Run: uv run python -m pytest backend/tests/test_skill_drafts_store.py backend/tests/test_skill_store.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -395,7 +395,7 @@ Add tests for parent traversal, symlink archive entry rejection, refusing a comm
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_git.py tests/test_skill_content_store.py -v
+Run: uv run python -m pytest backend/tests/test_skill_git.py backend/tests/test_skill_content_store.py -v
 
 - [ ] **Step 3: Implement Git wrapper and content cache**
 
@@ -403,7 +403,7 @@ Use asyncio.to_thread for subprocess calls. Keep a bare mirror at cache_dir/repo
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_git.py tests/test_skill_content_store.py -v
+Run: uv run python -m pytest backend/tests/test_skill_git.py backend/tests/test_skill_content_store.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -454,7 +454,7 @@ Use fakes for git/content and the real SQLite store. Assert:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_author_service.py -v
+Run: uv run python -m pytest backend/tests/test_skill_author_service.py -v
 
 - [ ] **Step 3: Implement the service**
 
@@ -462,7 +462,7 @@ Use build_package for validation. Use a per-skill PostgreSQL advisory lock aroun
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_author_service.py tests/test_skill_store.py -v
+Run: uv run python -m pytest backend/tests/test_skill_author_service.py backend/tests/test_skill_store.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -509,7 +509,7 @@ Assert:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_review_service.py -v
+Run: uv run python -m pytest backend/tests/test_skill_review_service.py -v
 
 - [ ] **Step 3: Implement approval, rejection, unpublish, and activation**
 
@@ -517,7 +517,7 @@ Use a PostgreSQL advisory lock keyed by the public branch for approval. Do not h
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_review_service.py tests/test_skill_author_service.py -v
+Run: uv run python -m pytest backend/tests/test_skill_review_service.py backend/tests/test_skill_author_service.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -568,7 +568,7 @@ Use FastAPI + AuthSettings.disabled and a fake author service. Assert:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_author_routes.py -v
+Run: uv run python -m pytest backend/tests/test_skill_author_routes.py -v
 
 - [ ] **Step 3: Implement router and Pydantic models**
 
@@ -576,7 +576,7 @@ Use require_scope("skills:write") for writes and skills:read for mine. Map Inval
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_author_routes.py -v
+Run: uv run python -m pytest backend/tests/test_skill_author_routes.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -617,7 +617,7 @@ Assert:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_review_routes.py -v
+Run: uv run python -m pytest backend/tests/test_skill_review_routes.py -v
 
 - [ ] **Step 3: Implement the admin router**
 
@@ -625,7 +625,7 @@ Keep the route order so reviews/{submission_id} is declared before any future ge
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_review_routes.py -v
+Run: uv run python -m pytest backend/tests/test_skill_review_routes.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -672,7 +672,7 @@ Use a FakeMilvus client modeled on backend/tests/test_knowledge_vector_store.py.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_projection.py -v
+Run: uv run python -m pytest backend/tests/test_skill_projection.py -v
 
 - [ ] **Step 3: Implement the protocol and Milvus adapter**
 
@@ -680,7 +680,7 @@ Import pymilvus lazily and raise a clear error if it is absent. Escape string va
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_projection.py tests/test_knowledge_vector_store.py -v
+Run: uv run python -m pytest backend/tests/test_skill_projection.py backend/tests/test_knowledge_vector_store.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -718,7 +718,7 @@ Assert:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_outbox.py -v
+Run: uv run python -m pytest backend/tests/test_skill_outbox.py -v
 
 - [ ] **Step 3: Implement the worker**
 
@@ -726,7 +726,7 @@ Use run_once in tests and a background asyncio task in start. Coalesce multiple 
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_outbox.py tests/test_skill_projection.py -v
+Run: uv run python -m pytest backend/tests/test_skill_outbox.py backend/tests/test_skill_projection.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -783,7 +783,7 @@ Add tests for one search call, body budget, lexical fallback, and no public fall
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_search_service.py tests/test_search_and_load_skills_tool.py -v
+Run: uv run python -m pytest backend/tests/test_skill_search_service.py backend/tests/test_search_and_load_skills_tool.py -v
 
 - [ ] **Step 3: Implement the search service and tool adapter**
 
@@ -791,7 +791,7 @@ Use the existing Embedder protocol and SearchOutcome budget conventions where pr
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_search_service.py tests/test_search_and_load_skills_tool.py -v
+Run: uv run python -m pytest backend/tests/test_skill_search_service.py backend/tests/test_search_and_load_skills_tool.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -849,7 +849,7 @@ def test_prompt_renders_public_and_private_roots(snapshot):
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_catalog_snapshot.py tests/test_skill_index.py -v
+Run: uv run python -m pytest backend/tests/test_skill_catalog_snapshot.py backend/tests/test_skill_index.py -v
 
 - [ ] **Step 3: Implement snapshot loading and prompt rendering**
 
@@ -857,7 +857,7 @@ Load content paths with SkillContentStore.ensure for each active commit; skip a 
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_catalog_snapshot.py tests/test_skill_index.py tests/test_skill_loading.py -v
+Run: uv run python -m pytest backend/tests/test_skill_catalog_snapshot.py backend/tests/test_skill_index.py backend/tests/test_skill_loading.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -899,7 +899,7 @@ Assert:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skill_private_mounts.py tests/test_skill_activation_request_only.py -v
+Run: uv run python -m pytest backend/tests/test_skill_private_mounts.py backend/tests/test_skill_activation_request_only.py -v
 
 - [ ] **Step 3: Implement snapshot-aware middleware and mounts**
 
@@ -907,7 +907,7 @@ Do not widen the tool policy boundary. If a sandbox provider cannot support per-
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skill_private_mounts.py tests/test_skill_activation_request_only.py tests/test_skill_policy.py tests/test_durable_context.py -v
+Run: uv run python -m pytest backend/tests/test_skill_private_mounts.py backend/tests/test_skill_activation_request_only.py backend/tests/test_skill_policy.py backend/tests/test_durable_context.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -950,7 +950,7 @@ Assert:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: cd backend && uv run pytest tests/test_skills_catalog_routes.py tests/test_skill_runtime_wiring.py -v
+Run: uv run python -m pytest backend/tests/test_skills_catalog_routes.py backend/tests/test_skill_runtime_wiring.py -v
 
 - [ ] **Step 3: Implement runtime wiring and route behavior**
 
@@ -958,7 +958,7 @@ Keep the old filesystem registry only when source=filesystem. In git mode, missi
 
 - [ ] **Step 4: Run tests**
 
-Run: cd backend && uv run pytest tests/test_skills_catalog_routes.py tests/test_skill_runtime_wiring.py tests/test_mcp_skills_routes.py -v
+Run: uv run python -m pytest backend/tests/test_skills_catalog_routes.py backend/tests/test_skill_runtime_wiring.py backend/tests/test_mcp_skills_routes.py -v
 
 - [ ] **Step 5: Commit**
 
@@ -1004,7 +1004,7 @@ Add tests that the bootstrap script refuses without --confirm and that migration
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: cd backend && uv run pytest tests/test_skill_catalog_e2e.py -v
+Run: uv run python -m pytest backend/tests/test_skill_catalog_e2e.py -v
 
 - [ ] **Step 3: Implement scripts, config examples, and test wiring**
 
@@ -1012,7 +1012,7 @@ Use a local bare Git repository and fake projection/embedder in the test. Do not
 
 - [ ] **Step 4: Run backend regression**
 
-Run: cd backend && uv run pytest tests/test_skill_catalog_e2e.py tests/test_skill_author_routes.py tests/test_skill_review_routes.py tests/test_skills_catalog_routes.py tests/test_search_and_load_skills_tool.py tests/test_skill_private_mounts.py -v
+Run: uv run python -m pytest backend/tests/test_skill_catalog_e2e.py backend/tests/test_skill_author_routes.py backend/tests/test_skill_review_routes.py backend/tests/test_skills_catalog_routes.py backend/tests/test_search_and_load_skills_tool.py backend/tests/test_skill_private_mounts.py -v
 
 - [ ] **Step 5: Commit**
 
