@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -70,7 +71,10 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   const router = useRouter();
   const queryClient = useQueryClient();
   const [selectedPath, setSelectedPath] = useState("SKILL.md");
-  const [text, setText] = useState("");
+  // 本地编辑区只在"用户改过当前文件"时存在：服务端内容到达时由下文的 text 派生，
+  // 不在 effect 里 setState——那会触发级联渲染，而且用户切文件时会把旧的本地
+  // 内容盖回去。不点保存就永远不写后端。
+  const [edit, setEdit] = useState<{ path: string; text: string } | null>(null);
   const [lastVersion, setLastVersion] = useState<SkillVersion | null>(null);
   const [busy, setBusy] = useState<Busy>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -90,10 +94,11 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
     enabled: selectedPath.length > 0,
   });
 
-  // 服务端内容到达后放进本地编辑区；之后的输入只改本地状态，直到点保存。
-  useEffect(() => {
-    if (fileQuery.data) setText(fileQuery.data.content);
-  }, [fileQuery.data]);
+  // 编辑区正文：改过就用本地那份，否则直接用服务端读回来的。
+  const serverText = fileQuery.data?.content ?? "";
+  const text = edit?.path === selectedPath ? edit.text : serverText;
+  const dirty = text !== serverText;
+  const setText = (next: string) => setEdit({ path: selectedPath, text: next });
 
   const draft = draftQuery.data;
   const files = filesQuery.data ?? draft?.files ?? [];
@@ -116,7 +121,8 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
 
   const selectPath = (path: string) => {
     setSelectedPath(path);
-    setText("");
+    // 换文件 = 放弃上一份未保存的本地内容（不静默写盘）。
+    setEdit(null);
     setActionError(null);
   };
 
@@ -125,6 +131,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
     begin("save");
     try {
       await writeDraftFile(skillId, { path: selectedPath, content: text });
+      setEdit(null);
       setLastVersion(await saveDraft(skillId));
       await invalidateDraft();
       setNotice("已保存");
@@ -195,12 +202,12 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
       <div className="mx-auto w-full max-w-6xl px-5 py-6 sm:px-8">
         <header className="flex flex-wrap items-start justify-between gap-3 border-b border-neutral-200 pb-5">
           <div className="min-w-0">
-            <a
+            <Link
               className="text-[11px] text-neutral-500 hover:text-neutral-900"
               href="/workspace/skills"
             >
               ← 返回技能列表
-            </a>
+            </Link>
             <div className="mt-1 flex flex-wrap items-center gap-2">
               <h1 className="truncate text-xl font-semibold tracking-tight text-neutral-900">
                 {draft?.skill.name || "技能编辑器"}
@@ -302,6 +309,8 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
                   </h2>
                   {fileQuery.isFetching ? (
                     <span className="text-[11px] text-neutral-400">加载中…</span>
+                  ) : dirty ? (
+                    <span className="text-[11px] text-amber-700">未保存的修改</span>
                   ) : null}
                 </div>
 
