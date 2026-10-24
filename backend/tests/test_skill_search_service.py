@@ -1,0 +1,469 @@
+"""Task 12: one-query retrieval over the active skills projection.
+
+Every request is one query embedding plus one Milvus search.  PostgreSQL
+confirms the hits, the commit cache supplies the bodies, and a private row
+always wins over a public row for the same skill id.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from agentkit.config.skills_config import (
+    SkillEmbeddingChannelConfig,
+    SkillSearchConfig,
+)
+from agentkit.persistence.schema import Base
+from agentkit.skills.domain import PackageManifest, StagedFile
+from agentkit.skills.package import build_package
+from agentkit.skills.projection import MilvusSkillProjection, ProjectionHit
+from agentkit.skills.search import (
+    SkillSearchHit,
+    SkillSearchOutcome,
+    SkillSearchService,
+    SkillSearchUnavailable,
+)
+from agentkit.skills.store.sql import SqlSkillStore
+
+LIMITS = {"max_files": 20, "max_file_bytes": 4096, "max_package_bytes": 16384}
+PUBLIC_COMMIT = "1" * 40
+
+
+def skill_md(name: str, description: str = "Does things", body: str = "# Body\n") -> bytes:
+    return f"---\nname: {name}\ndescription: {description}\n---\n\n{body}".encode()
+
+
+def manifest(
+    name: str, *, description: str = "Does things", body: str = "# Body\n"
+) -> PackageManifest:
+    files = {"SKILL.md": StagedFile("SKILL.md", skill_md(name, description, body), "text")}
+    return build_package(files, **LIMITS)
+
+
+class FakeProjection:
+    """Records the filter contract without a Milvus server."""
+
+    def __init__(self) -> None:
+        self.searches: list[dict[str, Any]] = []
+        self.hits: list[ProjectionHit] = []
+        self.fail = False
+
+    async def search(
+        self,
+        *,
+        user_id: str,
+        private_skill_ids: list[str] | tuple[str, ...],
+        vector: list[float] | tuple[float, ...],
+        limit: int,
+    ) -> list[ProjectionHit]:
+        self.searches.append(
+            {
+                "user_id": user_id,
+                "private_skill_ids": list(private_skill_ids),
+                "vector": list(vector),
+                "limit": limit,
+                "filter": MilvusSkillProjection._filter(user_id, private_skill_ids),
+            }
+        )
+        if self.fail:
+            raise RuntimeError("Milvus is unavailable")
+        return list(self.hits)
+
+
+class FakeContent:
+    """Commit cache backed by a dict; a missing row fails like a missing commit."""
+
+    def __init__(self) -> None:
+        self.texts: dict[tuple[str, str], str] = {}
+        self.reads: list[tuple[str, str]] = []
+
+    async def read_text(self, commit: str, path: str) -> str:
+        self.reads.append((commit, path))
+        try:
+            return self.texts[(commit, path)]
+        except KeyError:
+            raise FileNotFoundError(f"{commit}:{path}") from None
+
+
+class FakeEmbedder:
+    def __init__(self) -> None:
+        self.query_calls: list[str] = []
+        self.fail = False
+        self.vector = [1.0, 0.0, 0.0]
+
+    async def embed_query(self, text: str) -> list[float]:
+        self.query_calls.append(text)
+        if self.fail:
+            raise RuntimeError("embedding service is unavailable")
+        return list(self.vector)
+
+    async def embed_documents(self, texts: list[str] | tuple[str, ...]) -> list[list[float]]:
+        return [list(self.vector) for _ in texts]
+
+
+@dataclass
+class Harness:
+    store: SqlSkillStore
+    session_factory: async_sessionmaker[AsyncSession]
+    projection: FakeProjection = field(default_factory=FakeProjection)
+    content: FakeContent = field(default_factory=FakeContent)
+    embedder: FakeEmbedder = field(default_factory=FakeEmbedder)
+
+    def service(self, config: SkillSearchConfig | None = None) -> SkillSearchService:
+        return SkillSearchService(
+            self.store,
+            self.projection,  # type: ignore[arg-type]
+            self.content,  # type: ignore[arg-type]
+            self.embedder,
+            config or search_config(),
+        )
+
+
+def search_config(**overrides: Any) -> SkillSearchConfig:
+    embedding = SkillEmbeddingChannelConfig(
+        enabled=True, base_url="http://embed.invalid", dimensions=3
+    )
+    values = {"embedding": embedding, **overrides}
+    return SkillSearchConfig(**values)
+
+
+@pytest.fixture(name="harness")
+def harness_fixture(tmp_path: Path):
+    async def _build() -> tuple[Harness, object]:
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///" + (tmp_path / "skills.db").as_posix()
+        )
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        return Harness(SqlSkillStore(factory), factory), engine
+
+    built, engine = asyncio.run(_build())
+    yield built
+    asyncio.run(engine.dispose())
+
+
+async def save_private(
+    harness: Harness,
+    *,
+    owner: str,
+    name: str,
+    body: str = "# Body\n",
+    description: str = "Does things",
+    seq: int = 1,
+) -> tuple[Any, Any]:
+    skill = await harness.store.create_skill(owner_user_id=owner, private_name=name)
+    commit = chr(ord("a") + seq) * 40
+    path = f"users/{owner}/{skill.id}/SKILL.md"
+    version = await harness.store.record_saved_version(
+        skill_id=skill.id,
+        owner_user_id=owner,
+        manifest=manifest(name, description=description, body=body),
+        draft_ref=f"refs/heads/myflow/drafts/{owner}",
+        draft_commit=commit,
+        skill_path=path,
+    )
+    harness.content.texts[(commit, path)] = skill_md(name, description, body).decode()
+    return skill, version
+
+
+async def publish(
+    harness: Harness,
+    *,
+    owner: str,
+    skill: Any,
+    version: Any,
+    public_name: str | None = None,
+    body: str = "# Public body\n",
+) -> Any:
+    submission = await harness.store.create_submission(
+        skill_id=skill.id,
+        version=version,
+        owner_user_id=owner,
+        submitted_commit=version.draft_commit,
+    )
+    release = await harness.store.record_public_release(
+        submission=submission,
+        public_name=public_name or skill.private_name,
+        git_repository="https://example.invalid/skills.git",
+        git_commit=PUBLIC_COMMIT,
+        skill_path=f"public/{public_name or skill.private_name}/SKILL.md",
+        source_commit=version.draft_commit,
+        actor="admin",
+    )
+    harness.content.texts[(PUBLIC_COMMIT, release.skill_path)] = skill_md(
+        public_name or skill.private_name, body=body
+    ).decode()
+    return release
+
+
+def hit(
+    *,
+    scope: str,
+    owner: str | None,
+    skill_id: str,
+    version_id: str,
+    score: float = 0.5,
+) -> ProjectionHit:
+    key = f"public:{skill_id}" if scope == "public" else f"private:{owner}:{skill_id}"
+    return ProjectionHit(
+        projection_key=key,
+        scope=scope,
+        owner_user_id=owner,
+        skill_id=skill_id,
+        version_id=version_id,
+        score=score,
+    )
+
+
+def call(harness: Harness, **overrides: Any):
+    config = overrides.pop("config", None)
+    values = {
+        "user_id": "u1",
+        "task_query": "pgvector",
+        "domain_keywords": [],
+        "available_skills": None,
+        "prefs": None,
+        **overrides,
+    }
+    return harness.service(config).search(**values)
+
+
+@pytest.mark.asyncio
+async def test_one_search_and_private_precedence(harness: Harness) -> None:
+    skill, version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# Private body\npgvector 多租户排查\n"
+    )
+    await publish(harness, owner="u1", skill=skill, version=version)
+    harness.projection.hits = [
+        hit(scope="public", owner=None, skill_id=skill.id, version_id=version.id, score=0.9),
+        hit(scope="private", owner="u1", skill_id=skill.id, version_id=version.id, score=0.5),
+    ]
+
+    outcome = await call(harness)
+
+    assert len(harness.projection.searches) == 1
+    search = harness.projection.searches[0]
+    assert "skill_id not in" in search["filter"]
+    assert "owner_user_id" in search["filter"]
+    assert search["private_skill_ids"] == [skill.id]
+    assert search["limit"] == 20
+    assert search["vector"] == [1.0, 0.0, 0.0]
+    assert harness.embedder.query_calls == ["pgvector"]
+    assert [item.scope for item in outcome.hits] == ["private"]
+    [loaded] = outcome.hits
+    assert isinstance(loaded, SkillSearchHit)
+    assert loaded.version_id == version.id
+    assert loaded.release_id is None
+    assert loaded.skill.name == "pdf-tools"
+    assert "pgvector 多租户排查" in loaded.body
+    assert "description:" not in loaded.body
+    assert outcome.candidates == 1
+    assert outcome.warnings == ()
+
+
+@pytest.mark.asyncio
+async def test_other_users_private_hits_are_rejected(harness: Harness) -> None:
+    skill, _version = await save_private(harness, owner="u1", name="pdf-tools")
+    harness.projection.hits = [
+        hit(scope="private", owner="u2", skill_id=skill.id, version_id="v2", score=0.9)
+    ]
+
+    outcome = await call(harness)
+
+    assert outcome == SkillSearchOutcome(hits=(), candidates=0, warnings=())
+    assert harness.content.reads == []
+
+
+@pytest.mark.asyncio
+async def test_a_stale_active_version_is_dropped(harness: Harness) -> None:
+    skill, _version = await save_private(harness, owner="u1", name="pdf-tools")
+    harness.projection.hits = [
+        hit(scope="private", owner="u1", skill_id=skill.id, version_id="stale", score=0.9)
+    ]
+
+    outcome = await call(harness)
+
+    assert outcome.hits == ()
+    assert harness.content.reads == []
+
+
+@pytest.mark.asyncio
+async def test_public_hits_are_visible_to_another_user(harness: Harness) -> None:
+    skill, version = await save_private(harness, owner="u1", name="pdf-tools")
+    release = await publish(
+        harness, owner="u1", skill=skill, version=version, public_name="pdf-public"
+    )
+    harness.projection.hits = [
+        hit(scope="public", owner=None, skill_id=skill.id, version_id=version.id, score=0.9)
+    ]
+
+    outcome = await call(harness, user_id="u2")
+
+    assert harness.projection.searches[0]["private_skill_ids"] == []
+    assert "skill_id not in" not in harness.projection.searches[0]["filter"]
+    [loaded] = outcome.hits
+    assert loaded.scope == "public"
+    assert loaded.release_id == release.id
+    assert loaded.skill.name == "pdf-public"
+    assert loaded.body.strip() == "# Public body"
+
+
+@pytest.mark.asyncio
+async def test_each_body_is_clipped_to_max_body_chars(harness: Harness) -> None:
+    skill, version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# 长正文\n" + "步骤 " * 400
+    )
+    harness.projection.hits = [
+        hit(scope="private", owner="u1", skill_id=skill.id, version_id=version.id)
+    ]
+
+    outcome = await call(harness, config=search_config(max_body_chars=200))
+
+    [loaded] = outcome.hits
+    assert len(loaded.body) <= 200
+    assert loaded.body.endswith("完整内容请 read_file 读 path）")
+
+
+@pytest.mark.asyncio
+async def test_the_total_body_budget_stops_loading_more_hits(harness: Harness) -> None:
+    first, first_version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# A\n" + "步骤 " * 400, seq=1
+    )
+    second, second_version = await save_private(
+        harness, owner="u1", name="csv-tools", body="# B\n" + "步骤 " * 400, seq=2
+    )
+    harness.projection.hits = [
+        hit(scope="private", owner="u1", skill_id=first.id, version_id=first_version.id, score=0.9),
+        hit(scope="private", owner="u1", skill_id=second.id, version_id=second_version.id, score=0.8),
+    ]
+
+    outcome = await call(
+        harness, config=search_config(max_body_chars=400, max_context_chars=250)
+    )
+
+    assert len(outcome.hits) == 1
+    assert len(outcome.hits[0].body) <= 250
+    assert outcome.candidates == 2
+
+
+@pytest.mark.asyncio
+async def test_a_missing_private_body_warns_and_never_falls_back_to_public(
+    harness: Harness,
+) -> None:
+    skill, version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# Private body\n"
+    )
+    release = await publish(harness, owner="u1", skill=skill, version=version)
+    harness.content.texts.pop((version.draft_commit, version.skill_path))
+    harness.projection.hits = [
+        hit(scope="private", owner="u1", skill_id=skill.id, version_id=version.id, score=0.9),
+        hit(scope="public", owner=None, skill_id=skill.id, version_id=version.id, score=0.8),
+    ]
+
+    outcome = await call(harness)
+
+    assert outcome.hits == ()
+    assert outcome.candidates == 1
+    assert outcome.warnings == ("content_unavailable",)
+    assert (PUBLIC_COMMIT, release.skill_path) not in harness.content.reads
+
+
+@pytest.mark.asyncio
+async def test_milvus_failure_falls_back_to_local_lexical_scoring(harness: Harness) -> None:
+    skill, _version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# 排查\npgvector 多租户 search_path 串库\n"
+    )
+    harness.projection.fail = True
+
+    outcome = await call(harness, domain_keywords=["pgvector"])
+
+    assert len(harness.projection.searches) == 1
+    assert harness.embedder.query_calls == ["pgvector"]
+    assert outcome.warnings == ("vector_unavailable", "lexical_fallback")
+    [loaded] = outcome.hits
+    assert loaded.scope == "private"
+    assert loaded.skill.skill_id == skill.id
+    assert "search_path" in loaded.body
+    assert loaded.score > 0
+
+
+@pytest.mark.asyncio
+async def test_embedding_failure_skips_the_vector_search(harness: Harness) -> None:
+    _skill, _version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# 排查\npgvector 多租户\n"
+    )
+    harness.embedder.fail = True
+
+    outcome = await call(harness)
+
+    assert harness.projection.searches == []
+    assert harness.embedder.query_calls == ["pgvector"]
+    assert outcome.warnings == ("vector_unavailable", "lexical_fallback")
+    assert [item.scope for item in outcome.hits] == ["private"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_embedding_channel_uses_lexical_scoring(harness: Harness) -> None:
+    await save_private(harness, owner="u1", name="pdf-tools", body="# 排查\npgvector\n")
+    keyword_only = SkillSearchConfig()
+
+    outcome = await call(harness, config=keyword_only)
+
+    assert harness.projection.searches == []
+    assert outcome.warnings == ("vector_unavailable", "lexical_fallback")
+    assert [item.skill.name for item in outcome.hits] == ["pdf-tools"]
+
+
+@pytest.mark.asyncio
+async def test_preferences_and_available_skills_filter_hits(harness: Harness) -> None:
+    skill, version = await save_private(harness, owner="u1", name="pdf-tools")
+    harness.projection.hits = [
+        hit(scope="private", owner="u1", skill_id=skill.id, version_id=version.id)
+    ]
+
+    disabled = await call(harness, prefs={skill.id: False})
+    assert disabled.hits == ()
+    assert disabled.candidates == 1
+
+    denied = await call(harness, available_skills=frozenset({"other"}))
+    assert denied.hits == ()
+
+    allowed = await call(harness, available_skills=frozenset({"pdf-tools"}))
+    assert [item.skill.skill_id for item in allowed.hits] == [skill.id]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_catalog_fails_closed_without_unconfirmed_hits(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _skill, _version = await save_private(harness, owner="u1", name="pdf-tools")
+    harness.projection.hits = [
+        hit(scope="private", owner="u1", skill_id="whatever", version_id="v1", score=0.9)
+    ]
+
+    async def unavailable(user_id: str, hits: list[ProjectionHit]) -> list[Any]:
+        raise RuntimeError("PostgreSQL is unavailable")
+
+    monkeypatch.setattr(harness.store, "confirm_hits", unavailable)
+
+    with pytest.raises(SkillSearchUnavailable):
+        await call(harness)
+    assert harness.content.reads == []
+
+
+@pytest.mark.asyncio
+async def test_an_empty_query_returns_no_hits(harness: Harness) -> None:
+    await save_private(harness, owner="u1", name="pdf-tools")
+
+    outcome = await call(harness, task_query="   ")
+
+    assert outcome == SkillSearchOutcome(hits=(), candidates=0, warnings=())
+    assert harness.projection.searches == []
+    assert harness.embedder.query_calls == []

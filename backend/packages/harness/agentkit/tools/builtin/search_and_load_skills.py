@@ -23,10 +23,17 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from agentkit.runtime.user_context import DEFAULT_USER_ID
 from agentkit.sandbox.runtime import runtime_user_bucket
 from agentkit.sandbox.security import safe_app_config
-from agentkit.skills.loader import build_payload
+from agentkit.skills.loader import BODY_TRUNCATION_MARKER, build_payload
+from agentkit.skills.prefs import read_user_skill_prefs
 from agentkit.skills.router import search_skills
+from agentkit.skills.search import (
+    SkillSearchOutcome,
+    SkillSearchUnavailable,
+    get_skill_runtime,
+)
 from agentkit.skills.storage import SkillRegistry
 
 logger = logging.getLogger(__name__)
@@ -38,6 +45,13 @@ MAX_DOMAIN_KEYWORDS = 8
 
 EMPTY_RESULT_MESSAGE = (
     "没有检索到匹配的技能（当前部署可能一个技能都没启用，或技能树为空）。",
+    "不要用本工具重复尝试相似的说法：直接看系统提示词里的技能索引，需要正文就 read_file 读它的 SKILL.md，",
+    "或者用已有工具与通用常识继续完成任务。",
+)
+
+#: 检索运行时不可用（数据库不可达 / git 模式未完成注入）：**不扫盘、不猜**。
+UNAVAILABLE_MESSAGE = (
+    "技能检索暂不可用（技能目录运行时未就绪，或数据库/索引暂时不可达）。",
     "不要用本工具重复尝试相似的说法：直接看系统提示词里的技能索引，需要正文就 read_file 读它的 SKILL.md，",
     "或者用已有工具与通用常识继续完成任务。",
 )
@@ -115,6 +129,20 @@ async def search_and_load_skills(
         )
     keywords = _clean_keywords(domain_keywords)
 
+    user_id = runtime_user_bucket(runtime) if runtime is not None else DEFAULT_USER_ID
+    service = get_skill_runtime()
+    if service is not None:
+        return await _search_catalog(
+            service, user_id=user_id, query=query, keywords=keywords
+        )
+
+    # 老配置对象/测试替身可能没有 source：缺省按文件系统处理，保持既有行为。
+    if getattr(config.skills, "source", "filesystem") != "filesystem":
+        # git 模式没有运行时就是不可用：绝不回退去扫宿主机目录
+        return json.dumps(
+            {"skills": [], "message": UNAVAILABLE_MESSAGE}, ensure_ascii=False
+        )
+
     registry = SkillRegistry(
         config=config.skills,
         user_id=runtime_user_bucket(runtime) if runtime is not None else None,
@@ -137,6 +165,11 @@ async def search_and_load_skills(
                     await stage.aclose()  # type: ignore[union-attr]
 
     payload = build_payload(outcome, config=search_config)
+    for item in payload["skills"]:
+        # 文件系统技能没有目录身份：字段仍在，值为 null（形状与目录模式一致）
+        item.setdefault("scope", None)
+        item.setdefault("version_id", None)
+        item.setdefault("release_id", None)
     if not payload["skills"]:
         return json.dumps(
             {"skills": [], "retrieval": payload["retrieval"], "message": EMPTY_RESULT_MESSAGE},
@@ -144,6 +177,72 @@ async def search_and_load_skills(
         )
     payload["message"] = USAGE_NOTES
     return json.dumps(payload, ensure_ascii=False)
+
+
+async def _search_catalog(
+    service: Any,
+    *,
+    user_id: str,
+    query: str,
+    keywords: list[str],
+) -> str:
+    """目录模式：召回、确认、正文都由进程级服务负责，工具只管形状与措辞。"""
+    try:
+        outcome = await service.search(
+            user_id=user_id,
+            task_query=query,
+            domain_keywords=keywords,
+            available_skills=None,
+            prefs=read_user_skill_prefs(user_id),
+        )
+    except SkillSearchUnavailable:
+        logger.warning("Skill search catalog is unavailable; failing closed")
+        return json.dumps(
+            {"skills": [], "message": UNAVAILABLE_MESSAGE}, ensure_ascii=False
+        )
+
+    payload = _catalog_payload(outcome)
+    if not payload["skills"]:
+        return json.dumps(
+            {"skills": [], "retrieval": payload["retrieval"], "message": EMPTY_RESULT_MESSAGE},
+            ensure_ascii=False,
+        )
+    payload["message"] = USAGE_NOTES
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _catalog_payload(outcome: SkillSearchOutcome) -> dict:
+    """与文件系统模式同一 payload 形状，外加 scope/version_id/release_id。"""
+    channels = ["keyword"] if "lexical_fallback" in outcome.warnings else ["embedding"]
+    skills: list[dict] = []
+    for hit in outcome.hits:
+        skill = hit.skill
+        skills.append(
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "category": skill.category.value,
+                "scope": hit.scope,
+                "version_id": hit.version_id,
+                "release_id": hit.release_id,
+                "dir": skill.container_dir,
+                "path": skill.container_file,
+                "score": hit.score,
+                "channels": list(channels),
+                "body_truncated": hit.body.endswith(BODY_TRUNCATION_MARKER),
+                "body": hit.body,
+            }
+        )
+    return {
+        "skills": skills,
+        "retrieval": {
+            "channels": list(channels),
+            "candidates": outcome.candidates,
+            "reranked": False,
+            "warnings": list(outcome.warnings),
+            "skipped": [],
+        },
+    }
 
 
 def _clean_keywords(domain_keywords: object) -> list[str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from langchain.tools import ToolRuntime
@@ -11,10 +12,21 @@ from langchain.tools import ToolRuntime
 from agentkit.agents.leader_agent.prompt import apply_prompt_template
 from agentkit.config import AppConfig, set_app_config
 from agentkit.config.skills_config import SkillSearchConfig, SkillsConfig
+from agentkit.skills.domain import SkillScope
+from agentkit.skills.loader import BODY_TRUNCATION_MARKER
+from agentkit.skills.search import (
+    SkillSearchHit,
+    SkillSearchOutcome,
+    configure_skill_runtime,
+    reset_skill_runtime,
+)
 from agentkit.skills.tool_policy import ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES
+from agentkit.skills.types import Skill, SkillCategory
 from agentkit.tools.builtin.search_and_load_skills import (
+    EMPTY_RESULT_MESSAGE,
     MAX_DOMAIN_KEYWORDS,
     TOOL_NAME,
+    USAGE_NOTES,
     _clean_keywords,
     search_and_load_skills,
 )
@@ -44,6 +56,77 @@ def _restore_app_config():
         app_config_module._app_config_signature,
         app_config_module._app_config_is_custom,
     ) = saved
+
+
+@pytest.fixture(autouse=True)
+def _reset_the_search_runtime():
+    """技能检索服务也是进程级注入：每个用例从"没有运行时"开始，结束后再清一次。"""
+    reset_skill_runtime()
+    yield
+    reset_skill_runtime()
+
+
+class FakeSearchService:
+    """只记录调用、只返回预设结果：工具不该自己构造真实服务。"""
+
+    def __init__(self, outcome: SkillSearchOutcome) -> None:
+        self.outcome = outcome
+        self.calls: list[dict] = []
+
+    async def search(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.outcome
+
+
+def catalog_skill(
+    *,
+    name: str = SKILL,
+    scope: SkillScope = SkillScope.PRIVATE,
+    owner: str | None = "u1",
+    skill_id: str = "skill-1",
+    version_id: str = "version-1",
+    release_id: str | None = None,
+) -> Skill:
+    return Skill(
+        name=name,
+        description="PostgreSQL 多租户与连接池",
+        license=None,
+        skill_dir=Path("/catalog") / scope.value / name,
+        skill_file=Path("/catalog") / scope.value / name / "SKILL.md",
+        relative_path=Path(name),
+        category=SkillCategory.CUSTOM,
+        enabled=True,
+        skill_id=skill_id,
+        scope=scope,
+        owner_user_id=owner,
+        version_id=version_id,
+        skill_version="v1",
+        release_id=release_id,
+    )
+
+
+def catalog_outcome(
+    *,
+    body: str = f"# 排查\n{BODY_MARKER}。\n",
+    scope: str = "private",
+    release_id: str | None = None,
+    warnings: tuple[str, ...] = (),
+    candidates: int = 1,
+) -> SkillSearchOutcome:
+    return SkillSearchOutcome(
+        hits=(
+            SkillSearchHit(
+                skill=catalog_skill(scope=SkillScope(scope), release_id=release_id),
+                body=body,
+                score=0.87,
+                scope=scope,
+                version_id="version-1",
+                release_id=release_id,
+            ),
+        ),
+        candidates=candidates,
+        warnings=warnings,
+    )
 
 
 def _tree(tmp_path) -> SkillsConfig:
@@ -182,6 +265,7 @@ def test_the_tool_runs_inside_a_real_agent_loop(tmp_path):
             return self
 
     _install(_tree(tmp_path))
+    configure_skill_runtime(FakeSearchService(catalog_outcome()))
     model = _ToolCallingFake(
         messages=iter(
             [
@@ -214,7 +298,8 @@ def test_the_tool_runs_inside_a_real_agent_loop(tmp_path):
     )
     payload = json.loads(tool_message.content)
     assert [item["name"] for item in payload["skills"]] == [SKILL]
-    assert payload["skills"][0]["path"] == f"/mnt/skills/public/{SKILL}/SKILL.md"
+    assert payload["skills"][0]["path"] == f"/mnt/skills/private/{SKILL}/SKILL.md"
+    assert payload["skills"][0]["scope"] == "private"
 
 
 def test_the_tool_is_registered_only_when_the_config_allows_it(tmp_path):
@@ -271,3 +356,162 @@ def test_a_non_string_keyword_is_rejected_by_the_schema(tmp_path):
         _call(domain_keywords=["search_path", {"bad": True}])
 
     assert "domain_keywords" in str(caught.value)
+
+
+def test_a_catalog_hit_returns_scope_version_and_release(tmp_path):
+    _install(_tree(tmp_path))
+    service = FakeSearchService(catalog_outcome())
+    configure_skill_runtime(service)
+
+    payload = _call()
+
+    [skill] = payload["skills"]
+    assert skill["name"] == SKILL
+    assert skill["scope"] == "private"
+    assert skill["version_id"] == "version-1"
+    assert skill["release_id"] is None
+    assert skill["path"] == f"/mnt/skills/private/{SKILL}/SKILL.md"
+    assert skill["dir"] == f"/mnt/skills/private/{SKILL}"
+    assert skill["body_truncated"] is False
+    assert BODY_MARKER in skill["body"]
+    assert skill["channels"] == ["embedding"]
+    assert payload["retrieval"]["channels"] == ["embedding"]
+    assert payload["retrieval"]["candidates"] == 1
+    assert payload["retrieval"]["warnings"] == []
+    assert payload["message"] == list(USAGE_NOTES)
+    [called] = service.calls
+    assert called["user_id"] == "u1"
+    assert called["task_query"] == "PostgreSQL 多租户 search_path 串库排查"
+    assert called["domain_keywords"] == ["search_path"]
+    assert called["available_skills"] is None
+
+
+def test_a_public_catalog_hit_carries_its_release_id(tmp_path):
+    _install(_tree(tmp_path))
+    outcome = SkillSearchOutcome(
+        hits=(
+            SkillSearchHit(
+                skill=catalog_skill(
+                    scope=SkillScope.PUBLIC, owner=None, release_id="release-1"
+                ),
+                body="# 公开正文\n",
+                score=0.9,
+                scope="public",
+                version_id="version-1",
+                release_id="release-1",
+            ),
+        ),
+        candidates=1,
+        warnings=(),
+    )
+    configure_skill_runtime(FakeSearchService(outcome))
+
+    [skill] = _call()["skills"]
+
+    assert skill["scope"] == "public"
+    assert skill["release_id"] == "release-1"
+    assert skill["path"] == f"/mnt/skills/public/{SKILL}/SKILL.md"
+
+
+def test_the_catalog_runtime_replaces_the_filesystem_tree(tmp_path):
+    _install(_tree(tmp_path))
+    outcome = SkillSearchOutcome(
+        hits=(
+            SkillSearchHit(
+                skill=catalog_skill(name="catalog-only"),
+                body="# 目录正文\n",
+                score=0.5,
+                scope="private",
+                version_id="version-1",
+                release_id=None,
+            ),
+        ),
+        candidates=1,
+        warnings=(),
+    )
+    configure_skill_runtime(FakeSearchService(outcome))
+
+    payload = _call()
+
+    assert [item["name"] for item in payload["skills"]] == ["catalog-only"]
+    assert BODY_MARKER not in payload["skills"][0]["body"]
+
+
+def test_a_lexical_fallback_is_reported_to_the_model(tmp_path):
+    _install(_tree(tmp_path))
+    configure_skill_runtime(
+        FakeSearchService(
+            catalog_outcome(warnings=("vector_unavailable", "lexical_fallback"))
+        )
+    )
+
+    payload = _call()
+
+    assert payload["retrieval"]["channels"] == ["keyword"]
+    assert payload["retrieval"]["warnings"] == ["vector_unavailable", "lexical_fallback"]
+
+
+def test_a_truncated_body_is_flagged(tmp_path):
+    _install(_tree(tmp_path))
+    configure_skill_runtime(
+        FakeSearchService(catalog_outcome(body="x" * 50 + BODY_TRUNCATION_MARKER))
+    )
+
+    [skill] = _call()["skills"]
+
+    assert skill["body_truncated"] is True
+
+
+def test_an_empty_catalog_result_tells_the_model_not_to_retry(tmp_path):
+    _install(_tree(tmp_path))
+    configure_skill_runtime(
+        FakeSearchService(SkillSearchOutcome(hits=(), candidates=0, warnings=()))
+    )
+
+    payload = _call()
+
+    assert payload["skills"] == []
+    assert payload["retrieval"]["candidates"] == 0
+    assert payload["message"] == list(EMPTY_RESULT_MESSAGE)
+
+
+def test_the_user_preferences_are_forwarded_to_the_service(tmp_path, monkeypatch):
+    from agentkit.config.skills_prefs import write_user_skill_pref
+
+    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(tmp_path / "skills_prefs.json"))
+    _install(_tree(tmp_path))
+    write_user_skill_pref("u1", SKILL, False)
+    service = FakeSearchService(catalog_outcome())
+    configure_skill_runtime(service)
+
+    _call()
+
+    assert service.calls[0]["prefs"] == {SKILL: False}
+
+
+def test_git_mode_without_a_runtime_fails_closed(tmp_path):
+    skills = _tree(tmp_path)
+    skills.source = "git"
+    _install(skills)
+
+    payload = _call()
+
+    assert payload["skills"] == []
+    assert "不可用" in payload["message"][0]
+
+
+def test_an_unavailable_catalog_is_not_replaced_by_the_filesystem_tree(tmp_path):
+    from agentkit.skills.search import SkillSearchUnavailable
+
+    class BrokenSearch:
+        async def search(self, **_kwargs):
+            raise SkillSearchUnavailable("catalog is down")
+
+    _install(_tree(tmp_path))
+    configure_skill_runtime(BrokenSearch())
+
+    payload = _call()
+
+    assert payload["skills"] == []
+    assert "不可用" in payload["message"][0]
+    assert "不要用本工具重复尝试" in payload["message"][1]
