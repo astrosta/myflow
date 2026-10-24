@@ -17,6 +17,7 @@ EXPECTED = {
     "skills", "skill_versions", "skill_submissions", "skill_release_batches",
     "skill_releases", "skill_public_active", "skill_private_active",
     "skill_settings", "skill_audit_events", "skill_draft_files", "skill_index_outbox",
+    "skill_catalog_epoch",
 }
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 
@@ -60,6 +61,7 @@ def test_skills_config_keeps_filesystem_source_and_catalog_defaults():
     assert config.review.require_admin is True
     assert config.review.allow_self_approval is True
     assert config.index.outbox_poll_seconds == 2.0
+    assert config.index.catalog_poll_seconds == 5.0
     assert config.index.reconciliation_interval_minutes == 10
     assert config.retention.keep_versions_per_skill == 20
     assert config.retention.cache_ttl_days == 30

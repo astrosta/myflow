@@ -276,6 +276,11 @@ class SkillIndexConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     outbox_poll_seconds: float = Field(default=2.0, gt=0, description="outbox worker 轮询间隔。")
+    catalog_poll_seconds: float = Field(
+        default=5.0,
+        ge=0,
+        description="跨 worker catalog epoch 轮询间隔；0 = 关闭轮询（单 worker 部署）。",
+    )
     reconciliation_interval_minutes: int = Field(
         default=10, ge=1, description="active projection 对账任务的运行间隔。"
     )

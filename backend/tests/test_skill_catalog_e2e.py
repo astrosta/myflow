@@ -29,7 +29,7 @@ from agentkit.config.skills_config import (
 )
 from agentkit.persistence.schema import Base, SkillSettingsRow
 from agentkit.skills.author import SkillAuthorService
-from agentkit.skills.catalog import SkillCatalogService
+from agentkit.skills.catalog import SkillCatalogService, get_skill_snapshot
 from agentkit.skills.content import SkillContentStore
 from agentkit.skills.domain import PackageManifest, StagedFile
 from agentkit.skills.git import SkillGitRepository
@@ -39,7 +39,7 @@ from agentkit.skills.projection import ProjectionHit, ProjectionRow
 from agentkit.skills.review import SkillReviewService
 from agentkit.skills.search import SkillSearchService
 from agentkit.skills.store.sql import SqlSkillStore
-from backend.app.gateway import deps
+from backend.app.gateway import deps, skills_catalog
 from backend.app.gateway.app import install_error_handlers, install_middleware
 from backend.app.gateway.auth import AuthSettings
 from backend.app.gateway.routers import skill_drafts, skills
@@ -418,3 +418,135 @@ async def _all_settings(harness: Harness) -> dict[str, bool]:
     async with harness.store._sf() as session:  # noqa: SLF001 - read-only assertion
         rows = (await session.execute(select(SkillSettingsRow))).scalars().all()
     return {row.skill_id: row.enabled for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# Cross-worker catalog invalidation (final review I1)
+# ---------------------------------------------------------------------------
+
+
+def _worker_runtime(harness: Harness, *, poll_seconds: float = 5.0) -> SkillRuntime:
+    """A worker has its own store/session and catalog service over the shared DB."""
+    session_factory = async_sessionmaker(harness.engine, expire_on_commit=False)
+    store = SqlSkillStore(session_factory)
+    return SkillRuntime(
+        store=store,
+        git=harness.git,
+        content=harness.content,
+        author=harness.author,
+        review=harness.review,
+        search=harness.search,
+        catalog=SkillCatalogService(store, harness.content),
+        catalog_poll_seconds=poll_seconds,
+    )
+
+
+async def _save_one_private_skill(harness: Harness) -> str:
+    skill = await harness.author.create_draft(
+        owner_user_id="u1", name="pdf-tools", description="PDF"
+    )
+    await harness.author.put_file(
+        owner_user_id="u1",
+        skill_id=skill.id,
+        path="SKILL.md",
+        content=valid_skill_bytes("pdf-tools"),
+    )
+    await harness.author.save(owner_user_id="u1", skill_id=skill.id)
+    return skill.id
+
+
+def _private_names(snapshot: Any, owner: str = "u1") -> list[str]:
+    return [skill.name for skill in snapshot.private_by_owner.get(owner, ())]
+
+
+@pytest.mark.asyncio
+async def test_two_workers_see_a_save_after_exactly_one_epoch_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = await build_harness(tmp_path)
+    monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(tmp_path / "skills_prefs.json"))
+    config_path = write_app_config(
+        tmp_path,
+        source="git",
+        git={"repository": (tmp_path / "remote.git").as_posix()},
+    )
+    monkeypatch.setenv("MYFLOW_CONFIG_PATH", str(config_path))
+
+    worker_a = _worker_runtime(harness)
+    worker_b = _worker_runtime(harness)
+    configure_skill_runtime(worker_a)
+    try:
+        await worker_a.refresh()
+        b_before = await worker_b.refresh()
+        assert _private_names(b_before) == []
+        assert await worker_b.poll_catalog_epoch_once() is False
+
+        await _save_one_private_skill(harness)
+        await skills_catalog.refresh_skill_runtime()
+
+        a_after = get_skill_snapshot()
+        assert _private_names(a_after) == ["pdf-tools"]
+        assert _private_names(b_before) == []
+        assert worker_b._catalog_epoch != await worker_b.store.catalog_epoch()
+
+        assert await worker_b.poll_catalog_epoch_once() is True
+        b_after = get_skill_snapshot()
+        assert _private_names(b_after) == ["pdf-tools"]
+
+        assert await worker_b.poll_catalog_epoch_once() is False
+        assert get_skill_snapshot() is b_after
+    finally:
+        reset_skill_runtime()
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_never_bumps_the_catalog_epoch(tmp_path: Path) -> None:
+    harness = await build_harness(tmp_path)
+    worker = _worker_runtime(harness)
+    try:
+        assert await worker.store.catalog_epoch() == 0
+        await worker.refresh()
+        await worker.refresh()
+        assert await worker.store.catalog_epoch() == 0
+
+        await worker.store.bump_catalog_epoch()
+        for _ in range(3):
+            await worker.refresh()
+        assert await worker.store.catalog_epoch() == 1
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_epoch_poller_starts_and_stops_with_the_runtime(
+    tmp_path: Path,
+) -> None:
+    harness = await build_harness(tmp_path)
+    worker = _worker_runtime(harness, poll_seconds=0.01)
+    assert worker.outbox is None and worker.projection is None
+    try:
+        await worker.start()
+        task = worker._catalog_epoch_task
+        assert task is not None
+        assert task.get_name() == "skill-catalog-epoch"
+        assert not task.done()
+
+        await worker.stop()
+        assert task.cancelled()
+        assert worker._catalog_epoch_task is None
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_poll_seconds_zero_starts_no_poller(tmp_path: Path) -> None:
+    harness = await build_harness(tmp_path)
+    worker = _worker_runtime(harness, poll_seconds=0)
+    try:
+        await worker.start()
+        assert worker._catalog_epoch_task is None
+        await worker.stop()
+    finally:
+        await harness.engine.dispose()

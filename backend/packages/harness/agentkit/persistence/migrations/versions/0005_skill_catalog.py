@@ -1,4 +1,4 @@
-"""Add the eleven skill catalog tables.
+"""Add the twelve skill catalog tables.
 
 Revision ID: 0005_skill_catalog
 Revises: 0004_knowledge_base
@@ -299,6 +299,14 @@ def upgrade() -> None:
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         )
 
+    if not _has_table("skill_catalog_epoch"):
+        op.create_table(
+            "skill_catalog_epoch",
+            sa.Column("id", sa.Text(), primary_key=True),
+            sa.Column("epoch", sa.Integer(), nullable=False, server_default="0"),
+            sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        )
+
     if not _has_table("skill_index_outbox"):
         op.create_table(
             "skill_index_outbox",
@@ -327,6 +335,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     for table in (
+        "skill_catalog_epoch",
         "skill_index_outbox",
         "skill_draft_files",
         "skill_audit_events",

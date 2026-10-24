@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from agentkit.config import get_app_config
@@ -82,6 +82,18 @@ class SkillRuntime:
     catalog: Any = None
     outbox: Any = None
     projection: Any = None
+    catalog_poll_seconds: float = 0.0
+    _catalog_epoch: int | None = field(default=None, init=False, repr=False)
+    _catalog_epoch_task: asyncio.Task[None] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    async def _catalog_epoch_value(self) -> int:
+        """读持久代数；旧测试替身没有这个方法时按 0 处理。"""
+        reader = getattr(self.store, "catalog_epoch", None)
+        if not callable(reader):
+            return 0
+        return int(await reader())
 
     async def refresh(self) -> Any:
         """Rebuild the catalog snapshot, then the active mount trees.
@@ -90,9 +102,21 @@ class SkillRuntime:
         sandbox mounts.  Both are derived from the same active pointers, so a
         caller must never refresh only one of them.
         """
+        epoch = await self._catalog_epoch_value()
         snapshot = await self.catalog.refresh()
         await self.materialize_active_trees()
+        # 先读后建：构建期间别的 worker 再 bump 时，下一轮轮询还能看见，
+        # 不会把一次并发变更误认为已经包含在当前快照里。
+        self._catalog_epoch = epoch
         return snapshot
+
+    async def poll_catalog_epoch_once(self) -> bool:
+        """刷新一次持久代数；有变化就重建快照并返回 True。"""
+        current = await self._catalog_epoch_value()
+        if current == self._catalog_epoch:
+            return False
+        await self.refresh()
+        return True
 
     async def materialize_active_trees(self) -> None:
         """Write active/public and active/users/<owner> from the active pointers.
@@ -161,6 +185,36 @@ class SkillRuntime:
         await self.refresh()
         if self.outbox is not None:
             await self.outbox.start()
+        if self.catalog_poll_seconds > 0 and (
+            self._catalog_epoch_task is None or self._catalog_epoch_task.done()
+        ):
+            self._catalog_epoch_task = asyncio.create_task(
+                self._catalog_epoch_loop(), name="skill-catalog-epoch"
+            )
+
+    async def _catalog_epoch_loop(self) -> None:
+        """短轮询：失败只记日志，绝不悄悄杀死任务。"""
+        while True:
+            try:
+                await self.poll_catalog_epoch_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the poll loop must survive
+                logger.warning(
+                    "Skill catalog epoch poll failed (%s: %s)", type(exc).__name__, exc
+                )
+            await asyncio.sleep(self.catalog_poll_seconds)
+
+    async def _stop_catalog_poller(self) -> None:
+        task = self._catalog_epoch_task
+        self._catalog_epoch_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self) -> None:
         """Stop background work and drop process-wide catalog state.
@@ -170,6 +224,7 @@ class SkillRuntime:
         next get_skill_runtime() would hand that dead service to a request.
         """
         try:
+            await self._stop_catalog_poller()
             if self.outbox is not None:
                 await self.outbox.stop()
             if self.projection is not None:
@@ -221,6 +276,11 @@ async def refresh_skill_runtime() -> None:
         if runtime is None:
             logger.warning("Skill runtime is not installed; skipping catalog refresh")
             return
+        # 先 bump 再本地刷新：别的 worker 靠代际看见这次提交，本 worker 把
+        # 自己的 bump 吸收进当前快照，下一轮轮询就不会再重建。
+        bump = getattr(runtime.store, "bump_catalog_epoch", None)
+        if callable(bump):
+            await bump()
         await runtime.refresh()
         clear_skill_prompt_cache()
     except Exception as exc:  # noqa: BLE001 - committed writes must not become 500s
@@ -306,6 +366,7 @@ def build_skill_runtime(
         catalog=catalog,
         outbox=outbox,
         projection=projection,
+        catalog_poll_seconds=skills.index.catalog_poll_seconds,
     )
 
 

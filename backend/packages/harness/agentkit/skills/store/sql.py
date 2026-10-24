@@ -36,6 +36,7 @@ from agentkit.skills.domain import (
 )
 from agentkit.skills.store.model import (
     SkillAuditEventRow,
+    SkillCatalogEpochRow,
     SkillDraftFileRow,
     SkillIndexOutboxRow,
     SkillPrivateActiveRow,
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 
 
 _MAX_OUTBOX_PAYLOAD_BYTES = 64 * 1024
+_CATALOG_EPOCH_KEY = "catalog"
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +303,63 @@ class SqlSkillStore:
 
     def __init__(self, session_factory) -> None:
         self._sf = session_factory
+
+    # ------------------------------------------------------------------
+    # catalog generation (cross-worker invalidation)
+    # ------------------------------------------------------------------
+
+    async def catalog_epoch(self) -> int:
+        """当前目录代数；单例行不存在时按 0 处理（空库/首次启动）。"""
+        async with self._sf() as session:
+            value = await session.scalar(
+                select(SkillCatalogEpochRow.epoch).where(
+                    SkillCatalogEpochRow.id == _CATALOG_EPOCH_KEY
+                )
+            )
+            return int(value or 0)
+
+    async def bump_catalog_epoch(self) -> int:
+        """原子递增目录代数并返回新值，多 worker 并发安全。
+
+        先 UPDATE 再 INSERT：并发首次插入时只有一个能提交，输掉的一方回滚后
+        重跑 UPDATE，因此不会丢增量，也不会把 epoch 退回 1。
+        """
+        now = _now()
+        async with self._sf() as session:
+            result = await session.execute(
+                update(SkillCatalogEpochRow)
+                .where(SkillCatalogEpochRow.id == _CATALOG_EPOCH_KEY)
+                .values(epoch=SkillCatalogEpochRow.epoch + 1, updated_at=now)
+            )
+            if result.rowcount:
+                value = await session.scalar(
+                    select(SkillCatalogEpochRow.epoch).where(
+                        SkillCatalogEpochRow.id == _CATALOG_EPOCH_KEY
+                    )
+                )
+                await self._commit(session, "catalog epoch could not be committed")
+                return int(value or 0)
+
+            session.add(
+                SkillCatalogEpochRow(id=_CATALOG_EPOCH_KEY, epoch=1, updated_at=now)
+            )
+            try:
+                await session.commit()
+                return 1
+            except IntegrityError:
+                await session.rollback()
+                await session.execute(
+                    update(SkillCatalogEpochRow)
+                    .where(SkillCatalogEpochRow.id == _CATALOG_EPOCH_KEY)
+                    .values(epoch=SkillCatalogEpochRow.epoch + 1, updated_at=_now())
+                )
+                value = await session.scalar(
+                    select(SkillCatalogEpochRow.epoch).where(
+                        SkillCatalogEpochRow.id == _CATALOG_EPOCH_KEY
+                    )
+                )
+                await self._commit(session, "catalog epoch could not be committed")
+                return int(value or 0)
 
     # ------------------------------------------------------------------
     # identity and versions

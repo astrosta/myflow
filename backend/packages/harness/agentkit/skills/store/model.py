@@ -1,4 +1,4 @@
-"""Eleven ORM tables for the Git-backed skill catalog.
+"""Twelve ORM tables for the Git-backed skill catalog.
 
 PostgreSQL is authoritative in production; SQLite is the test backend.  Partial
 unique indexes therefore carry both `sqlite_where` and `postgresql_where` so the
@@ -285,6 +285,20 @@ class SkillDraftFileRow(Base):
     )
 
 
+class SkillCatalogEpochRow(Base):
+    """Singleton catalog generation. Every mutation bumps it; every worker polls it."""
+
+    __tablename__ = "skill_catalog_epoch"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+
 class SkillIndexOutboxRow(Base):
     """Reliable Milvus active-projection queue written in the business transaction."""
 
@@ -322,6 +336,7 @@ class SkillIndexOutboxRow(Base):
 
 __all__ = [
     "SkillAuditEventRow",
+    "SkillCatalogEpochRow",
     "SkillDraftFileRow",
     "SkillIndexOutboxRow",
     "SkillPrivateActiveRow",

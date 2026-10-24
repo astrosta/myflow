@@ -261,6 +261,7 @@ skills:
   # Milvus active projection 的 outbox 与对账节奏。
   index:
     outbox_poll_seconds: 2
+    catalog_poll_seconds: 5    # 跨 worker catalog epoch 轮询间隔；0 = 单 worker 不同步
     reconciliation_interval_minutes: 10
 
   # 可重建缓存的保留策略；元数据与公共历史永久保留。
