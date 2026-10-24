@@ -5,8 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agentkit.config.skills_config import DEFAULT_SKILLS_CONTAINER_PATH
+
+if TYPE_CHECKING:
+    from agentkit.skills.domain import SkillScope
 
 SKILL_FILE_NAME = "SKILL.md"
 
@@ -42,11 +46,22 @@ class Skill:
     secrets_autonomous: bool = True
     argument_hint: str | None = None
     container_path: str = DEFAULT_SKILLS_CONTAINER_PATH
+    skill_id: str | None = None
+    scope: SkillScope | None = None
+    owner_user_id: str | None = None
+    version_id: str | None = None
+    skill_version: str | None = None
+    release_id: str | None = None
+    git_repository: str | None = None
+    git_commit: str | None = None
+    repo_path: str | None = None
 
     @property
     def container_dir(self) -> str:
-        """沙箱里的目录：{container_path}/{public|custom}/<relative>（§3.5 的 dir=）。"""
-        return f"{self.container_path}/{self.category.value}/{self.relative_path.as_posix()}"
+        """沙箱目录：catalog 技能用 public/private，filesystem 技能保留 category。"""
+        scope = getattr(self.scope, "value", self.scope)
+        root = scope if scope is not None else self.category.value
+        return f"{self.container_path}/{root}/{self.relative_path.as_posix()}"
 
     @property
     def container_file(self) -> str:
