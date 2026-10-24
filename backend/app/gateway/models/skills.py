@@ -1,14 +1,15 @@
-"""Wire models for the Git-backed skill author API (M11 task 8).
+"""Wire models for the Git-backed skill author and admin review APIs.
 
 The author surface deliberately exposes container paths, never host cache paths.
 Private details (owner id and container_file) are only filled for the owner.
+Review detail is supplied by SkillReviewService from the submitted Git commit.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _SKILL_NAME = r"^[A-Za-z0-9_-]{1,64}$"
 
@@ -112,17 +113,85 @@ class VersionListResponse(BaseModel):
     versions: list[SkillVersionResponse]
 
 
+class RejectRequest(BaseModel):
+    """Admin rejection reason; whitespace alone is not a reason."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value
+
+
+class ReviewSummary(BaseModel):
+    submission_id: str
+    skill_id: str
+    name: str
+    version: str
+    owner_user_id: str
+    submitted_at: str
+    submitted_commit: str
+
+
+class ReviewDetailResponse(ReviewSummary):
+    files: list[DraftFileInfo]
+    skill_md: str
+    diff: str
+    metadata: dict[str, Any]
+    package_bytes: int
+
+
+class ReviewQueueResponse(BaseModel):
+    items: list[ReviewSummary]
+
+
+class ReleaseResponse(BaseModel):
+    release_id: str
+    skill_id: str
+    skill_version: str
+    git_repository: str
+    git_commit: str
+    skill_path: str
+    public_name: str
+    source_commit: str | None = None
+    approved_by: str
+    created_at: str
+
+
+class UnpublishResponse(BaseModel):
+    skill_id: str
+    unpublished: bool = True
+
+
+class ActivateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    release_id: str = Field(min_length=1, max_length=128)
+
+
 __all__ = [
+    "ActivateRequest",
     "CreateDraftRequest",
     "DraftFileContentResponse",
     "DraftFileInfo",
     "DraftTreeResponse",
     "DraftView",
+    "RejectRequest",
+    "ReleaseResponse",
+    "ReviewDetailResponse",
+    "ReviewQueueResponse",
+    "ReviewSummary",
     "SaveResponse",
     "SkillListItem",
     "SkillListResponse",
     "SkillVersionResponse",
     "SubmissionResponse",
+    "UnpublishResponse",
     "VersionListResponse",
     "WriteFileRequest",
 ]

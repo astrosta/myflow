@@ -71,6 +71,13 @@ EXPECTED_ROUTES = {
     ("POST", "/api/skills/{skill_id}/withdraw"),
     ("GET", "/api/skills/{skill_id}/versions"),
     ("DELETE", "/api/skills/{skill_id}"),
+    # M11 task 9: admin review and public-release surface.
+    ("GET", "/api/admin/skills/reviews"),
+    ("GET", "/api/admin/skills/reviews/{submission_id}"),
+    ("POST", "/api/admin/skills/reviews/{submission_id}/approve"),
+    ("POST", "/api/admin/skills/reviews/{submission_id}/reject"),
+    ("POST", "/api/admin/skills/{skill_id}/unpublish"),
+    ("POST", "/api/admin/skills/{skill_id}/activate"),
     # M10 §2.12：记忆（prefix=/memory，/api 由 create_app 加）
     ("GET", "/api/memory"),
     ("GET", "/api/memory/profile"),

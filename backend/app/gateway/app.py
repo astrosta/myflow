@@ -43,6 +43,7 @@ from backend.app.gateway.routers import (
     memory,
     models,
     skill_drafts,
+    skill_reviews,
     skills,
     thread_runs,
     threads,
@@ -189,6 +190,9 @@ def create_app() -> FastAPI:
     # Git-backed author API。放在旧 skills router 前：/api/skills/mine 必须先
     # 于任何 {skill_id} 路由注册，旧文件系统路由在 Task 15 前继续保留。
     application.include_router(skill_drafts.router, prefix="/api")
+    # Admin review API. Its literal /reviews routes are declared before any
+    # /{skill_id} route inside the router, so "reviews" is never a skill id.
+    application.include_router(skill_reviews.router, prefix="/api")
     application.include_router(skills.router, prefix="/api")
     # Human-facing knowledge base; same /api prefix as the rest of the browser API.
     application.include_router(knowledge.router, prefix="/api")

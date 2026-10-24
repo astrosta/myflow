@@ -32,6 +32,7 @@ __all__ = [
     "get_knowledge_service_optional",
     "get_memory_manager_service",
     "get_skill_author_service",
+    "get_skill_review_service",
     "get_request_id",
     "get_run_services",
     "get_run_store",
@@ -126,6 +127,19 @@ def get_skill_author_service(request: Request):
     service = getattr(request.app.state, "skill_author_service", None)
     if service is None:
         raise RuntimeError("skill author service is not configured")
+    return service
+
+
+def get_skill_review_service(request: Request):
+    """Process-owned SkillReviewService (or a narrow fake in route tests).
+
+    Task 15 builds the real service in the app lifespan together with the
+    catalog runtime; the admin review routes only need this injection point.
+    """
+
+    service = getattr(request.app.state, "skill_review_service", None)
+    if service is None:
+        raise RuntimeError("skill review service is not configured")
     return service
 
 
