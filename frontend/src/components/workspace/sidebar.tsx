@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { BookOpenIcon } from "@/components/ui/icons";
+import { BookOpenIcon, SettingsIcon, ToolIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { ThreadSummary } from "@/core/types";
 import { cn, formatTimestamp } from "@/lib/utils";
@@ -20,6 +20,21 @@ import { cn, formatTimestamp } from "@/lib/utils";
 const NEW_CHAT_CLASS =
   "flex h-9 w-full items-center justify-center rounded-md border border-neutral-300 bg-white text-xs font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900";
 
+/**
+ * 导航项（知识库 / 技能 / 审核）共用一套形制。
+ *
+ * 三个入口是同一类东西——"去哪"，形状就得一致；各写一份 class 的话，
+ * 加第三个入口时高亮态迟早会跟上两个不一样。
+ */
+function navItemClass(active: boolean): string {
+  return cn(
+    "flex h-9 w-full items-center gap-2 rounded-md border px-3 text-xs font-medium transition-colors",
+    active
+      ? "border-neutral-300 bg-white text-neutral-900 shadow-sm"
+      : "border-transparent text-neutral-600 hover:bg-white/70 hover:text-neutral-900",
+  );
+}
+
 export interface SidebarProps {
   threads: readonly ThreadSummary[];
   activeThreadId?: string | null;
@@ -36,6 +51,18 @@ export interface SidebarProps {
   onNewChat?: () => void;
   /** 当前是否在知识库路由；入口高亮用 */
   knowledgeActive?: boolean;
+  /** 当前是否在技能路由（/workspace/skills 及其子路由） */
+  skillsActive?: boolean;
+  /** 当前是否在审核路由（/workspace/admin/skills） */
+  reviewActive?: boolean;
+  /**
+   * 当前会话是不是管理员；只决定要不要画「审核」入口。
+   *
+   * **这是展示层的显隐，不是权限闸门。** 真正的闸门在后端 /admin 路由的
+   * admin scope 上：普通用户直接访问 /workspace/admin/skills 会拿到 403。
+   * 藏起来只是"别给一个必然失败的链接"，任何客户端判断都不能替代服务端。
+   */
+  isAdmin?: boolean;
   className?: string;
 }
 
@@ -47,6 +74,9 @@ export function Sidebar({
   onRefresh,
   onNewChat,
   knowledgeActive = false,
+  skillsActive = false,
+  reviewActive = false,
+  isAdmin = false,
   className,
 }: SidebarProps) {
   return (
@@ -81,21 +111,38 @@ export function Sidebar({
         )}
       </div>
 
-      <div className="px-3 pb-3">
+      <nav aria-label="功能导航" className="space-y-1 px-3 pb-3">
         <Link
           aria-current={knowledgeActive ? "page" : undefined}
-          className={cn(
-            "flex h-9 w-full items-center gap-2 rounded-md border px-3 text-xs font-medium transition-colors",
-            knowledgeActive
-              ? "border-neutral-300 bg-white text-neutral-900 shadow-sm"
-              : "border-transparent text-neutral-600 hover:bg-white/70 hover:text-neutral-900",
-          )}
+          className={navItemClass(knowledgeActive)}
           href="/workspace/knowledge"
         >
           <BookOpenIcon className="shrink-0" size={15} />
           知识库
         </Link>
-      </div>
+        <Link
+          aria-current={skillsActive ? "page" : undefined}
+          className={navItemClass(skillsActive)}
+          href="/workspace/skills"
+        >
+          <ToolIcon className="shrink-0" size={15} />
+          技能
+        </Link>
+        {/**
+         * 「审核」只对管理员画出来：普通用户看不到这个链接。
+         * 再次强调——藏起来不等于挡住，闸门在后端 admin scope。
+         */}
+        {isAdmin ? (
+          <Link
+            aria-current={reviewActive ? "page" : undefined}
+            className={navItemClass(reviewActive)}
+            href="/workspace/admin/skills"
+          >
+            <SettingsIcon className="shrink-0" size={15} />
+            审核
+          </Link>
+        ) : null}
+      </nav>
 
       <nav aria-label="最近对话" className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
         <h2 className="flex items-baseline gap-1.5 px-2 pb-1.5 text-[11px] font-medium text-neutral-400">

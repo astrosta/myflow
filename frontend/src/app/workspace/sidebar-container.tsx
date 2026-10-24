@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 import { Sidebar } from "@/components/workspace/sidebar";
 import { UserMenu } from "@/components/workspace/user-menu";
 import { listThreads } from "@/core/api/threads";
+import { useSession } from "@/core/auth/use-session";
 import type { ThreadSummary } from "@/core/types";
 
 import { useChatSession } from "./chat-session";
@@ -59,6 +60,12 @@ const THREAD_ID_IN_PATH = /\/workspace\/chats\/([^/?#]+)/;
 export function SidebarContainer() {
   const pathname = usePathname();
   const { activeThreadId: sessionThreadId, newChat } = useChatSession();
+  /**
+   * 角色只用来决定侧栏要不要画「审核」入口（和 UserMenu 用同一个 useSession，
+   * 不再单独探一次 /me）。**这不是权限判断**：谁能审由后端的 admin scope 定，
+   * 前端判断只影响"画不画这个链接"。
+   */
+  const { user } = useSession();
   const query = useQuery({
     queryKey: ["threads"],
     queryFn: fetchThreads,
@@ -90,8 +97,12 @@ export function SidebarContainer() {
         <Sidebar
           activeThreadId={activeThreadId}
           error={query.error ? (query.error instanceof Error ? query.error.message : String(query.error)) : null}
+          // 高亮按前缀判：/workspace/skills/{id} 也算在「技能」里
+          isAdmin={user?.system_role === "admin"}
           knowledgeActive={pathname?.startsWith("/workspace/knowledge") ?? false}
           loading={query.isLoading}
+          reviewActive={pathname?.startsWith("/workspace/admin/skills") ?? false}
+          skillsActive={pathname?.startsWith("/workspace/skills") ?? false}
           onNewChat={newChat}
           onRefresh={() => {
             void query.refetch();
