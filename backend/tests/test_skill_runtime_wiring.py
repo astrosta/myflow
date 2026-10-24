@@ -8,6 +8,7 @@ projection lifetime) without PostgreSQL, Git, or Milvus.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,9 +18,12 @@ import pytest
 
 from agentkit.config.app_config import AppConfig
 from agentkit.config.auth_config import AuthConfig
+from agentkit.config.skills_config import SkillSearchConfig
 from agentkit.skills import search as skill_search
 from agentkit.skills.catalog import SkillSnapshot, get_skill_snapshot, set_skill_snapshot
 from agentkit.skills.domain import SkillScope
+from agentkit.skills.git import GitCommandError
+from agentkit.skills.projection import MilvusSkillProjection, ProjectionRow
 from backend.app.gateway import app as gateway_app
 from backend.app.gateway import skills_catalog
 from backend.app.gateway.skills_catalog import (
@@ -449,6 +453,298 @@ def test_factory_builds_projection_outbox_and_search_when_configured(
     assert runtime.projection is not None
     assert runtime.outbox is not None
     assert runtime.search is not None
-    assert ("projection", (config.knowledge_base.vector_store, 8)) in seen.calls
+    # The projection gets its own vector-store config, never the knowledge one.
+    assert ("projection", (config.skills.search.vector_store, 8)) in seen.calls
     assert ("outbox", 0.5) in seen.calls
     assert any(name == "search" for name, _ in seen.calls)
+
+
+# ---------------------------------------------------------------------------
+# the projection targets the skills active collection, never the knowledge one
+# ---------------------------------------------------------------------------
+
+_EMBEDDING = {
+    "enabled": True,
+    "base_url": "http://embed.test/v1",
+    "dimensions": 8,
+    "model": "fake-embedding",
+}
+
+_EMBEDDING_SKILLS = {
+    "source": "git",
+    "git": {"repository": "https://example.test/skills.git"},
+    "search": {"embedding": dict(_EMBEDDING)},
+}
+
+# The real deployment spells an explicit collection here (config.yaml does).
+_KNOWLEDGE_VECTOR_STORE = {
+    "uri": "http://knowledge-milvus:19530",
+    "collection": "myflow_knowledge",
+}
+
+
+class FakeMilvusClient:
+    """Records which collection every projection write/read targets."""
+
+    def __init__(self) -> None:
+        self.upserts: list[dict] = []
+        self.searches: list[dict] = []
+
+    def has_collection(self, name: str) -> bool:
+        return True
+
+    def load_collection(self, name: str) -> None:
+        return None
+
+    def describe_collection(self, name: str) -> dict:
+        return {"fields": []}
+
+    def upsert(self, collection_name: str, data: list[dict]) -> dict:
+        self.upserts.append({"collection_name": collection_name, "data": data})
+        return {"upsert_count": len(data)}
+
+    def search(self, collection_name: str, **kwargs: Any) -> list[list[dict]]:
+        self.searches.append({"collection_name": collection_name, **kwargs})
+        return [[]]
+
+
+def _captured_projection(seen: _Constructed) -> tuple[Any, int]:
+    payloads = [payload for name, payload in seen.calls if name == "projection"]
+    assert len(payloads) == 1, f"expected exactly one projection build, got {payloads}"
+    return payloads[0]
+
+
+def _projection_row(dimensions: int) -> ProjectionRow:
+    return ProjectionRow(
+        projection_key="public:s1",
+        scope="public",
+        owner_user_id=None,
+        skill_id="s1",
+        version_id="v1",
+        skill_version="1.0.0",
+        enabled=True,
+        name="public skill",
+        description="public description",
+        package_sha256="p1",
+        skill_md_sha256="m1",
+        embedding=[0.1] * dimensions,
+    )
+
+
+def test_skills_search_vector_store_defaults_to_the_active_collection() -> None:
+    assert SkillSearchConfig().vector_store.collection == "myflow_skills_active"
+
+
+@pytest.mark.asyncio
+async def test_projection_targets_the_skills_active_collection_not_the_knowledge_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _patch_factory(monkeypatch, embedding=True)
+    config = AppConfig(
+        auth=AuthConfig(enabled=False),
+        skills=_EMBEDDING_SKILLS,
+        knowledge_base={"vector_store": dict(_KNOWLEDGE_VECTOR_STORE)},
+    )
+
+    build_skill_runtime(config, session_factory=object())
+
+    projection_config, dimensions = _captured_projection(seen)
+    # Connection parameters fall back to the knowledge Milvus; the collection does not.
+    assert projection_config.uri == "http://knowledge-milvus:19530"
+    assert projection_config.collection == "myflow_skills_active"
+
+    client = FakeMilvusClient()
+    projection = MilvusSkillProjection(projection_config, dimensions=dimensions, client=client)
+    await projection.upsert_active(_projection_row(dimensions))
+    await projection.search(
+        user_id="alice", private_skill_ids=(), vector=[0.1] * dimensions, limit=3
+    )
+
+    assert [call["collection_name"] for call in client.upserts] == ["myflow_skills_active"]
+    assert [call["collection_name"] for call in client.searches] == ["myflow_skills_active"]
+
+
+@pytest.mark.asyncio
+async def test_skills_vector_store_uri_overrides_the_knowledge_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _patch_factory(monkeypatch, embedding=True)
+    skills = {
+        "source": "git",
+        "git": {"repository": "https://example.test/skills.git"},
+        "search": {
+            "embedding": dict(_EMBEDDING),
+            "vector_store": {"uri": "http://skills-milvus:19530"},
+        },
+    }
+    config = AppConfig(
+        auth=AuthConfig(enabled=False),
+        skills=skills,
+        knowledge_base={"vector_store": dict(_KNOWLEDGE_VECTOR_STORE)},
+    )
+
+    build_skill_runtime(config, session_factory=object())
+
+    projection_config, dimensions = _captured_projection(seen)
+    assert projection_config.uri == "http://skills-milvus:19530"
+    assert projection_config.collection == "myflow_skills_active"
+
+    client = FakeMilvusClient()
+    projection = MilvusSkillProjection(projection_config, dimensions=dimensions, client=client)
+    await projection.upsert_active(_projection_row(dimensions))
+
+    assert [call["collection_name"] for call in client.upserts] == ["myflow_skills_active"]
+
+
+# ---------------------------------------------------------------------------
+# startup tolerates a Git outage but not a broken catalog
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FailingGit:
+    """Remote Git is unreachable: ensure_ready fails, the cache is still readable."""
+
+    order: list[str]
+    message: str = "fatal: unable to access 'https://example.test/skills.git'"
+
+    async def ensure_ready(self) -> None:
+        self.order.append("git.ensure_ready")
+        raise GitCommandError(("git", "clone", "--mirror"), 128, self.message)
+
+
+@pytest.mark.asyncio
+async def test_start_survives_a_git_outage_and_serves_the_local_cache(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    order: list[str] = []
+    catalog = FakeCatalog(order=order)
+    outbox = FakeOutbox(order=order)
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FailingGit(order),
+        content=FakeContent(order=order),
+        author=None,
+        review=None,
+        catalog=catalog,
+        outbox=outbox,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=skills_catalog.__name__):
+        await runtime.start()
+
+    assert order == [
+        "git.ensure_ready",
+        "catalog.refresh",
+        "store.all_active",
+        "content.materialize_public",
+        "outbox.start",
+    ]
+    assert outbox.started is True
+    assert get_skill_snapshot() is catalog.snapshot
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("unable to access" in message for message in messages), messages
+    # The outage is not hidden from the write paths: the warning says they still fail.
+    assert any(
+        "Saving, publishing, and cache rebuilds will keep failing" in message
+        for message in messages
+    ), messages
+
+
+@pytest.mark.asyncio
+async def test_start_accepts_an_empty_snapshot_when_the_cache_has_nothing() -> None:
+    order: list[str] = []
+    empty = SkillSnapshot(epoch="empty", public=(), private_by_owner={})
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FailingGit(order),
+        content=FakeContent(order=order),
+        author=None,
+        review=None,
+        catalog=FakeCatalog(order=order, snapshot=empty),
+        outbox=FakeOutbox(order=order),
+    )
+
+    await runtime.start()
+
+    assert get_skill_snapshot() is empty
+    assert get_skill_snapshot().public == ()
+
+
+@pytest.mark.asyncio
+async def test_start_still_fails_when_the_catalog_cannot_be_read() -> None:
+    class BrokenCatalog:
+        async def refresh(self) -> Any:
+            raise RuntimeError("postgres is down")
+
+    runtime = SkillRuntime(
+        store=FakeStore(),
+        git=FakeGit(),
+        content=FakeContent(),
+        author=None,
+        review=None,
+        catalog=BrokenCatalog(),
+        outbox=FakeOutbox(),
+    )
+
+    with pytest.raises(RuntimeError, match="postgres is down"):
+        await runtime.start()
+
+
+# ---------------------------------------------------------------------------
+# a runtime that fails to start is torn down, not left half-installed
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FailingStartRuntime(FakeRuntime):
+    async def start(self) -> None:
+        self.order.append("runtime.start")
+        raise RuntimeError("outbox worker refused to start")
+
+
+def test_a_failed_runtime_start_stops_it_and_clears_app_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FailingStartRuntime()
+    monkeypatch.setattr(gateway_app, "build_skill_runtime", lambda config: fake)
+    config = AppConfig(auth=AuthConfig(enabled=False), skills=GIT_SKILLS)
+
+    async def scenario() -> None:
+        app = SimpleNamespace(state=SimpleNamespace())
+        with pytest.raises(RuntimeError, match="refused to start"):
+            await gateway_app.start_skill_runtime(app, config)
+        assert fake.order == ["runtime.start", "runtime.stop"]
+        assert fake.stopped is True
+        assert app.state.skill_runtime is None
+        assert app.state.skill_author_service is None
+        assert app.state.skill_review_service is None
+        assert app.state.skill_catalog is None
+        assert app.state.skill_search is None
+        assert get_skill_runtime() is None
+        assert skill_search.get_skill_runtime() is None
+        assert get_skill_snapshot().epoch == ""
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# git catalog mode needs a SQL database
+# ---------------------------------------------------------------------------
+
+
+def test_git_catalog_mode_requires_a_sql_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(skills_catalog, "get_session_factory", lambda: None)
+    config = AppConfig(
+        auth=AuthConfig(enabled=False),
+        skills=GIT_SKILLS,
+        database={"backend": "memory"},
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        build_skill_runtime(config)
+
+    message = str(excinfo.value)
+    assert "SQL database" in message
+    assert "skills.source=git" in message
+    assert "database.backend='memory'" in message

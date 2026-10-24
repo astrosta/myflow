@@ -124,10 +124,27 @@ class SkillRuntime:
                 logger.warning("Private skill tree materialization failed for %s: %s", owner, exc)
 
     async def start(self) -> None:
-        """Read Git, publish the snapshot, then start the projection worker."""
+        """Ready Git if possible, publish the snapshot, start the projection worker.
+
+        Design §5.10: startup does not require Git to be online.  With the PG
+        active pointers plus the local commit cache the catalog can serve, so a
+        remote outage only degrades to a warning here.  refresh() itself may
+        still raise (a dead database is not a degraded cache), and the write
+        paths (save/publish) keep calling git.ensure_ready() themselves, so this
+        tolerance never hides an outage from them.
+        """
         ensure_ready = getattr(self.git, "ensure_ready", None)
         if callable(ensure_ready):
-            await ensure_ready()
+            try:
+                await ensure_ready()
+            except Exception as exc:  # noqa: BLE001 - a Git outage must not abort startup
+                logger.warning(
+                    "Skill Git repository is unavailable (%s: %s); starting from the "
+                    "local commit cache. Saving, publishing, and cache rebuilds will "
+                    "keep failing until Git is reachable again.",
+                    type(exc).__name__,
+                    exc,
+                )
         await self.refresh()
         if self.outbox is not None:
             await self.outbox.start()
@@ -185,7 +202,15 @@ def build_skill_runtime(
     runtime once PostgreSQL and Git are reachable.
     """
     skills: SkillsConfig = app_config.skills
-    store = SqlSkillStore(session_factory or get_session_factory())
+    session = session_factory if session_factory is not None else get_session_factory()
+    if session is None:
+        backend = getattr(getattr(app_config, "database", None), "backend", "unknown")
+        raise RuntimeError(
+            "skills.source=git requires a SQL database: SqlSkillStore needs a session "
+            f"factory, but database.backend={backend!r} provides none. Set "
+            "database.backend to sqlite or postgres, or use skills.source=filesystem."
+        )
+    store = SqlSkillStore(session)
     cache_dir = resolve_path(skills.git.cache_dir)
     git = SkillGitRepository(skills.git, cache_dir)
     content = SkillContentStore(cache_dir, git)
@@ -200,7 +225,10 @@ def build_skill_runtime(
     if embedding.enabled and embedding.base_url.strip():
         embedder = OpenAICompatibleEmbedder(embedding)
         projection = MilvusSkillProjection(
-            app_config.knowledge_base.vector_store, dimensions=embedding.dimensions
+            # The skills projection owns its collection (myflow_skills_active);
+            # only the Milvus connection may be borrowed from the knowledge base.
+            skills.search.active_vector_store(app_config.knowledge_base.vector_store),
+            dimensions=embedding.dimensions,
         )
         search = SkillSearchService(store, projection, content, embedder, skills.search)
         outbox = SkillIndexOutboxWorker(

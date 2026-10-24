@@ -18,7 +18,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agentkit.config.reload_boundary import format_field_description
 from agentkit.config.runtime_paths import resolve_path
-from agentkit.knowledge.config import EmbeddingConfig, RerankConfig
+from agentkit.knowledge.config import EmbeddingConfig, MilvusConfig, RerankConfig
+from agentkit.skills.projection import ACTIVE_COLLECTION
 
 DEFAULT_SKILLS_PATH = "skills"
 DEFAULT_SKILLS_CONTAINER_PATH = "/mnt/skills"
@@ -62,6 +63,24 @@ class SkillRerankStageConfig(RerankConfig):
     """可选的精排（cross-encoder）。失败一律回退融合顺序，不影响"能不能加载"。"""
 
 
+class SkillVectorStoreConfig(MilvusConfig):
+    """skills active projection 的 Milvus 连接。
+
+    投影是**当前激活状态**的物化视图，和知识库不是同一张表：collection 默认
+    myflow_skills_active，**不继承** myflow_knowledge。uri 留空时由
+    build_skill_runtime 借用 knowledge_base.vector_store 的连接参数（uri/token/
+    db_name），collection 仍然强制为这张表——那是检索契约，不是部署参数。
+    """
+
+    collection: str = Field(
+        default=ACTIVE_COLLECTION,
+        description=(
+            "active projection 的 collection 名（默认 myflow_skills_active）。"
+            "投影只放当前激活的技能行，绝不能和知识库共用 collection。"
+        ),
+    )
+
+
 class SkillSearchConfig(BaseModel):
     """`search_and_load_skills` 的两段式检索：召回 candidate_k → 精排 top_k。"""
 
@@ -97,6 +116,7 @@ class SkillSearchConfig(BaseModel):
     keyword: SkillKeywordChannelConfig = Field(default_factory=SkillKeywordChannelConfig)
     embedding: SkillEmbeddingChannelConfig = Field(default_factory=SkillEmbeddingChannelConfig)
     rerank: SkillRerankStageConfig = Field(default_factory=SkillRerankStageConfig)
+    vector_store: SkillVectorStoreConfig = Field(default_factory=SkillVectorStoreConfig)
 
     @model_validator(mode="after")
     def _stages_are_coherent(self) -> Self:
@@ -122,6 +142,23 @@ class SkillSearchConfig(BaseModel):
                 "enable skills.search.keyword or skills.search.embedding"
             )
         return self
+
+    def active_vector_store(
+        self, knowledge_vector_store: MilvusConfig
+    ) -> SkillVectorStoreConfig:
+        """投影实际使用的 Milvus 连接。
+
+        技能自己配了 uri 就用它；没配就退回知识库的连接参数，让只部署了一套
+        Milvus 的节点不必重复填地址。collection 例外：它永远是
+        myflow_skills_active，绝不跟着知识库的 myflow_knowledge 走。
+        """
+        if self.vector_store.uri.strip():
+            return self.vector_store
+        return SkillVectorStoreConfig(
+            uri=knowledge_vector_store.uri,
+            token=knowledge_vector_store.token,
+            db_name=knowledge_vector_store.db_name,
+        )
 
     def recall_channels(self) -> tuple[str, ...]:
         """实际会跑的召回通道，用于工具返回里告诉模型"这次是怎么找到的"。"""

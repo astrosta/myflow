@@ -64,7 +64,9 @@ async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRunti
 
     filesystem 来源只保留 M7 的扫描器：不建 runtime、不读 Git、不挂 active 树。
     Git 来源在数据库就绪后构建运行时，先刷新快照再启动 outbox worker；任何一步
-    失败都让启动失败——半启动的技能目录比不启动更难排查。
+    失败都让启动失败——半启动的技能目录比不启动更难排查。所以 start() 抛错时
+    先把已经装上的运行时停掉并清空注册表，再让异常继续向上冒（否则 outbox 任务
+    会活到事件循环关闭，对着已经释放的 engine 轮询）。
     """
     if app_config.skills.source != "git":
         app.state.skill_runtime = None
@@ -76,7 +78,15 @@ async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRunti
     app.state.skill_catalog = runtime.catalog
     app.state.skill_search = runtime.search
     configure_skill_runtime(runtime)
-    await runtime.start()
+    try:
+        await runtime.start()
+    except BaseException:
+        logger.warning("Skill runtime failed to start; tearing it down", exc_info=True)
+        try:
+            await stop_skill_runtime(app)
+        except Exception:  # noqa: BLE001 - cleanup must not mask the startup failure
+            logger.exception("Stopping the failed skill runtime also failed")
+        raise
     return runtime
 
 
