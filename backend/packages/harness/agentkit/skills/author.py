@@ -250,12 +250,14 @@ class SkillAuthorService:
         if version is None or not version.draft_ref:
             raise SkillConflict(f"skill {skill_id!r} has no saved version")
 
-        # The branch head is authoritative for review.  It can legitimately be
-        # newer than version.draft_commit only if SKILL.md itself is unchanged;
-        # anything else is a conflict the author must re-save.
+        # The branch head is authoritative for review.  The whole package,
+        # not only SKILL.md, must match the saved version, otherwise an
+        # attachment could change between save and review.
         submitted_commit = await self._git.head(version.draft_ref)
-        skill_md = await self._git.read_file(submitted_commit, version.skill_path)
-        if hashlib.sha256(skill_md).hexdigest() != version.skill_md_sha256:
+        submitted_package = await self._git.package_sha256(
+            submitted_commit, version.skill_path
+        )
+        if submitted_package != version.package_sha256:
             raise SkillConflict(
                 f"skill {skill_id!r} draft changed since the saved version"
             )

@@ -99,10 +99,41 @@ class FakeGit:
     async def read_file(self, commit: str, path: str) -> bytes:
         return self.commits[commit][path].content
 
+    async def package_sha256(self, commit: str, path: str) -> str:
+        suffix = "/SKILL.md"
+        directory = path[: -len(suffix)] if path.endswith(suffix) else path.rstrip("/")
+        prefix = directory + "/"
+        relative = {
+            key[len(prefix) :]: staged
+            for key, staged in self.commits[commit].items()
+            if key.startswith(prefix)
+        }
+        if not relative:
+            raise InvalidSkillPackage(f"source tree has no files: {commit}:{directory}")
+        if "SKILL.md" not in relative:
+            raise InvalidSkillPackage("package is missing SKILL.md")
+        hasher = hashlib.sha256()
+        for rel in sorted(relative):
+            staged = relative[rel]
+            hasher.update(rel.encode("utf-8"))
+            hasher.update(b"\x00")
+            hasher.update(staged.mode.encode("utf-8"))
+            hasher.update(b"\x00")
+            hasher.update(staged.content)
+            hasher.update(b"\x00")
+        return hasher.hexdigest()
+
     def rewrite_skill(self, ref: str, content: bytes) -> None:
         current = dict(self.commits[self.heads[ref]])
         path = next(key for key in current if key.endswith("/SKILL.md"))
         current[path] = StagedFile(path, content, "text")
+        self.heads[ref] = self._new_commit(current)
+
+    def rewrite_file(
+        self, ref: str, path: str, content: bytes, mode: str = "text"
+    ) -> None:
+        current = dict(self.commits[self.heads[ref]])
+        current[path] = StagedFile(path, content, mode)
         self.heads[ref] = self._new_commit(current)
 
     def publish(self, source_commit: str, public_name: str) -> str:
@@ -293,6 +324,13 @@ def test_submit_uses_the_saved_version_commit(harness: Harness) -> None:
         skill = await harness.service.create_draft(
             owner_user_id="u1", name="pdf-tools", description="Does things"
         )
+        await harness.service.put_file(
+            owner_user_id="u1",
+            skill_id=skill.id,
+            path="scripts/run.sh",
+            content=b"echo ok\n",
+            mode="executable",
+        )
         version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
         submission = await harness.service.submit(
             owner_user_id="u1", skill_id=skill.id
@@ -313,6 +351,33 @@ def test_submit_rejects_changed_git_head(harness: Harness) -> None:
         )
         version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
         harness.git.rewrite_skill(version.draft_ref or "", skill_md("pdf-tools", "evil\n"))
+
+        with pytest.raises(SkillConflict):
+            await harness.service.submit(owner_user_id="u1", skill_id=skill.id)
+        assert await harness.store.pending_submission(skill.id) is None
+
+    harness.run(scenario)
+
+
+def test_submit_rejects_changed_attachment_at_git_head(harness: Harness) -> None:
+    async def scenario() -> None:
+        skill = await harness.service.create_draft(
+            owner_user_id="u1", name="pdf-tools", description="Does things"
+        )
+        await harness.service.put_file(
+            owner_user_id="u1",
+            skill_id=skill.id,
+            path="scripts/run.sh",
+            content=b"echo ok\n",
+            mode="executable",
+        )
+        version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        harness.git.rewrite_file(
+            version.draft_ref or "",
+            f"users/u1/{skill.id}/scripts/run.sh",
+            b"echo evil\n",
+            mode="executable",
+        )
 
         with pytest.raises(SkillConflict):
             await harness.service.submit(owner_user_id="u1", skill_id=skill.id)

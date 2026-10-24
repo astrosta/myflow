@@ -12,6 +12,7 @@ import pytest
 from agentkit.config.skills_config import SkillGitConfig
 from agentkit.skills.domain import InvalidSkillPackage, StagedFile
 from agentkit.skills.git import GitCommandError, GitCommit, SkillGitRepository
+from agentkit.skills.package import build_package
 
 
 def _git(*args: str, cwd: Path | None = None, input_bytes: bytes | None = None) -> bytes:
@@ -334,6 +335,70 @@ async def test_materialize_rejects_oversized_archives(
     monkeypatch.setattr(git_module, "MAX_ARCHIVE_BYTES", 32)
     with pytest.raises(InvalidSkillPackage):
         await git_fixture.repo.materialize(git_fixture.draft.commit, tmp_path / "out")
+
+
+@pytest.mark.asyncio
+async def test_package_sha256_matches_the_canonical_package_hash(
+    git_fixture: GitFixture,
+):
+    directory = "users/u1/s1"
+    skill = StagedFile(
+        "SKILL.md", b"---\nname: foo\ndescription: x\n---\nbody\n", "text"
+    )
+    script = StagedFile("scripts/run.sh", b"echo ok\n", "executable")
+    expected = build_package(
+        {item.path: item for item in (skill, script)},
+        max_files=20,
+        max_file_bytes=4096,
+        max_package_bytes=16384,
+    ).package_sha256
+
+    first = await git_fixture.repo.package_sha256(
+        git_fixture.draft.commit, directory
+    )
+    assert first == expected
+    assert (
+        await git_fixture.repo.package_sha256(
+            git_fixture.draft.commit, f"{directory}/SKILL.md"
+        )
+        == first
+    )
+
+    changed_content = await git_fixture.repo.save_draft(
+        owner_user_id="u1",
+        skill_id="s1",
+        files=[skill, StagedFile("scripts/run.sh", b"echo changed\n", "executable")],
+        message="changed content",
+    )
+    assert await git_fixture.repo.package_sha256(changed_content.commit, directory) != first
+
+    changed_mode = await git_fixture.repo.save_draft(
+        owner_user_id="u1",
+        skill_id="s1",
+        files=[skill, StagedFile("scripts/run.sh", b"echo ok\n", "text")],
+        message="changed mode",
+    )
+    assert await git_fixture.repo.package_sha256(changed_mode.commit, directory) != first
+
+
+@pytest.mark.asyncio
+async def test_package_sha256_rejects_an_empty_tree(git_fixture: GitFixture):
+    with pytest.raises(InvalidSkillPackage):
+        await git_fixture.repo.package_sha256(
+            git_fixture.draft.commit, "users/u1/missing"
+        )
+
+
+@pytest.mark.asyncio
+async def test_package_sha256_rejects_a_missing_skill_md(git_fixture: GitFixture):
+    saved = await git_fixture.repo.save_draft(
+        owner_user_id="u1",
+        skill_id="s2",
+        files=[StagedFile("notes.txt", b"no skill\n")],
+        message="missing skill file",
+    )
+    with pytest.raises(InvalidSkillPackage):
+        await git_fixture.repo.package_sha256(saved.commit, "users/u1/s2")
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,7 @@ MAX_FILE_BYTES = 16 * 1024 * 1024
 _HEX = frozenset("0123456789abcdefABCDEF")
 _REF_FORBIDDEN = frozenset(" ~^:?*[\\")
 _SKILL_FILE = "SKILL.md"
+_NUL = b"\x00"
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +629,45 @@ class SkillGitRepository:
             else:
                 raise InvalidSkillPackage(f"tree entry escapes its path: {entry.path!r}")
         return relative
+
+    async def package_sha256(self, commit: str, path: str) -> str:
+        """Hash one skill directory exactly as build_package hashes its files."""
+
+        source = _validate_commit_id(commit)
+        directory = _source_directory(path)
+        entries = await self._tree_entries(source, directory)
+        if not entries:
+            raise InvalidSkillPackage(
+                f"source tree has no files: {source}:{directory}"
+            )
+
+        relative: list[tuple[str, _TreeEntry]] = []
+        for entry in entries:
+            if entry.path == directory:
+                rel = PurePosixPath(directory).name
+            elif entry.path.startswith(directory + "/"):
+                rel = entry.path[len(directory) + 1 :]
+            else:
+                raise InvalidSkillPackage(
+                    f"tree entry escapes its path: {entry.path!r}"
+                )
+            relative.append((rel, entry))
+
+        relative.sort(key=lambda item: item[0])
+        if _SKILL_FILE not in {rel for rel, _entry in relative}:
+            raise InvalidSkillPackage(f"package is missing {_SKILL_FILE}")
+
+        hasher = hashlib.sha256()
+        for rel, entry in relative:
+            content = await self._read_blob(entry.oid)
+            mode = "executable" if entry.mode == "100755" else "text"
+            hasher.update(rel.encode("utf-8"))
+            hasher.update(_NUL)
+            hasher.update(mode.encode("utf-8"))
+            hasher.update(_NUL)
+            hasher.update(content)
+            hasher.update(_NUL)
+        return hasher.hexdigest()
 
     async def read_file(self, commit: str, path: str) -> bytes:
         source = _validate_commit_id(commit)
