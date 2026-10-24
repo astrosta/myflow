@@ -145,6 +145,12 @@ async def migrate(
 
         atomic_write_json(Path(prefs_path), prefs)
 
+    if apply and summary.changed:
+        # 脚本绕过网关，必须自己发出跨 worker 失效提示；dry run 不写任何东西。
+        bump = getattr(store, "bump_catalog_epoch", None)
+        if callable(bump):
+            await bump()
+
     return summary
 
 

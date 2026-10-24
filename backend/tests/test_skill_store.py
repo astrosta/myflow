@@ -677,8 +677,11 @@ def test_deleting_the_private_draft_keeps_the_public_release_visible(harness: Ha
             is None
         )
 
-        # 记录本身仍是软删：按记录查的路径（get_skill / 名唯一性）保持原样。
+        # 默认仍是草稿级语义：软删的记录不能编辑/保存；发布级调用方
+        # 必须显式 include_deleted=True 才能看见它。
         assert await harness.store.get_skill(skill.id) is None
+        published = await harness.store.get_skill(skill.id, include_deleted=True)
+        assert published is not None and published.id == skill.id
         async with harness.session_factory() as session:
             row = await session.get(SkillRow, skill.id)
             assert row is not None and row.deleted_at is not None

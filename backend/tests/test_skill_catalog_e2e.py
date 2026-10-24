@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from agentkit.config.skills_config import (
@@ -326,6 +326,40 @@ def test_bootstrap_refuses_without_confirm(tmp_path: Path, capsys: pytest.Captur
     assert not (tmp_path / "cache").exists()
 
 
+@pytest.mark.asyncio
+async def test_bootstrap_bumps_the_epoch_only_when_it_applies(tmp_path: Path) -> None:
+    from backend.scripts import bootstrap_public_skills
+
+    harness = await build_harness(tmp_path)
+    source = tmp_path / "import"
+    (source / "public" / "pdf-tools").mkdir(parents=True)
+    (source / "public" / "pdf-tools" / "SKILL.md").write_bytes(
+        valid_skill_bytes("pdf-tools")
+    )
+    try:
+        assert await bootstrap_public_skills.bootstrap(
+            store=harness.store,
+            author=harness.author,
+            review=harness.review,
+            source=source,
+            admin_user_id="admin",
+            apply=False,
+        ) == 1
+        assert await harness.store.catalog_epoch() == 0
+
+        assert await bootstrap_public_skills.bootstrap(
+            store=harness.store,
+            author=harness.author,
+            review=harness.review,
+            source=source,
+            admin_user_id="admin",
+            apply=True,
+        ) == 1
+        assert await harness.store.catalog_epoch() == 1
+    finally:
+        await harness.engine.dispose()
+
+
 async def _publish_for_migration(harness: Harness) -> tuple[Any, Any]:
     """直接在 catalog 上落一条 public release：迁移只关心名字与开关。"""
 
@@ -391,6 +425,7 @@ async def test_migration_is_idempotent(tmp_path: Path) -> None:
         )
         assert first.settings_written == 1
         assert first.pref_keys_rewritten == 1
+        assert await harness.store.catalog_epoch() == 1
 
         rows = (await _all_settings(harness)).get(skill.id)
         assert rows is False
@@ -409,7 +444,22 @@ async def test_migration_is_idempotent(tmp_path: Path) -> None:
         )
         assert second.settings_written == 0
         assert second.pref_keys_rewritten == 0
+        assert await harness.store.catalog_epoch() == 1
         assert (extensions.read_bytes(), prefs.read_bytes()) == snapshot
+
+        extensions.write_text(
+            json.dumps({"skills": {"pdf-tools": {"enabled": True}}}),
+            encoding="utf-8",
+        )
+        dry = await migrate(
+            store=harness.store,
+            extensions_path=extensions,
+            prefs_path=prefs,
+            actor="migration",
+            apply=False,
+        )
+        assert dry.settings_written == 1
+        assert await harness.store.catalog_epoch() == 1
     finally:
         await harness.engine.dispose()
 
@@ -537,6 +587,28 @@ async def test_catalog_epoch_poller_starts_and_stops_with_the_runtime(
         assert task.cancelled()
         assert worker._catalog_epoch_task is None
     finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_database_without_the_epoch_table_still_starts_and_reports_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = await build_harness(tmp_path)
+    async with harness.engine.begin() as conn:
+        await conn.execute(text("DROP TABLE skill_catalog_epoch"))
+    worker = _worker_runtime(harness, poll_seconds=5)
+    caplog.set_level("ERROR", logger="backend.app.gateway.skills_catalog")
+    try:
+        # 缺表只丢跨 worker 失效提示；启动和本地服务必须继续。
+        await worker.start()
+        assert get_skill_snapshot() is not None
+        await worker.refresh()
+        await skills_catalog._bump_catalog_epoch(worker)
+        assert caplog.text.count("skill_catalog_epoch is missing") == 1
+        assert "alembic upgrade head" in caplog.text
+    finally:
+        await worker.stop()
         await harness.engine.dispose()
 
 

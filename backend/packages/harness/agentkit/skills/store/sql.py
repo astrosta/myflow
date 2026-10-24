@@ -382,15 +382,42 @@ class SqlSkillStore:
             await self._commit(session, f"skill {private_name!r} already exists for this owner")
             return record
 
-    async def get_skill(self, skill_id: str) -> SkillRecord | None:
+    async def get_skill(
+        self, skill_id: str, *, include_deleted: bool = False
+    ) -> SkillRecord | None:
+        """读取技能记录；默认不含已软删的私有草稿。
+
+        发布状态（unpublish）和重新打开草稿必须以“记录是否仍存在”为准，
+        调用方显式传 include_deleted=True；编辑/保存等草稿级路径保持默认值，
+        已删除的草稿仍然不可写。
+        """
+        conditions = [SkillRow.id == skill_id]
+        if not include_deleted:
+            conditions.append(SkillRow.deleted_at.is_(None))
+        async with self._sf() as session:
+            row = await session.scalar(select(SkillRow).where(*conditions))
+            return _skill_record(row) if row is not None else None
+
+    async def revive_private_draft(
+        self, *, skill_id: str, owner_user_id: str
+    ) -> bool:
+        """清掉软删标记，让作者能重新编辑仍然发布的技能。"""
         async with self._sf() as session:
             row = await session.scalar(
                 select(SkillRow).where(
                     SkillRow.id == skill_id,
-                    SkillRow.deleted_at.is_(None),
+                    SkillRow.owner_user_id == owner_user_id,
                 )
             )
-            return _skill_record(row) if row is not None else None
+            if row is None:
+                return False
+            if row.deleted_at is not None:
+                row.deleted_at = None
+                row.updated_at = _now()
+                await self._commit(
+                    session, f"private draft for skill {skill_id!r} could not be revived"
+                )
+            return True
 
     async def list_owned(self, owner_user_id: str) -> list[SkillRecord]:
         async with self._sf() as session:

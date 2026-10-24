@@ -59,6 +59,45 @@ logger = logging.getLogger(__name__)
 GIT_SOURCE = "git"
 
 
+def _is_missing_catalog_epoch_table(exc: Exception) -> bool:
+    """区分“旧库没建表”和真正的数据库故障。"""
+    message = str(exc).lower()
+    return "skill_catalog_epoch" in message and (
+        "no such table" in message
+        or "does not exist" in message
+        or "undefinedtable" in message
+    )
+
+
+def _report_missing_catalog_epoch(runtime: Any) -> None:
+    """缺表只报一次：启动后每次写都刷同一条日志等于没有告警。"""
+    if getattr(runtime, "_catalog_epoch_missing", False):
+        return
+    setattr(runtime, "_catalog_epoch_missing", True)
+    logger.error(
+        "skill_catalog_epoch is missing from the database schema; "
+        "cross-worker skill catalog invalidation is disabled until the table "
+        "exists. Run 'alembic upgrade head' (or bootstrap_schema) against this "
+        "database and restart the gateway."
+    )
+
+
+async def _bump_catalog_epoch(runtime: Any) -> None:
+    """Bump when possible; a soft-deleted legacy database must keep serving."""
+    if getattr(runtime, "_catalog_epoch_missing", False):
+        return
+    store = getattr(runtime, "store", None)
+    bump = getattr(store, "bump_catalog_epoch", None)
+    if not callable(bump):
+        return
+    try:
+        await bump()
+    except Exception as exc:  # noqa: BLE001 - 缺表降级，其它故障交给调用方
+        if not _is_missing_catalog_epoch_table(exc):
+            raise
+        _report_missing_catalog_epoch(runtime)
+
+
 # ---------------------------------------------------------------------------
 # 运行时：一个进程一份，由 app lifespan 拥有
 # ---------------------------------------------------------------------------
@@ -87,13 +126,22 @@ class SkillRuntime:
     _catalog_epoch_task: asyncio.Task[None] | None = field(
         default=None, init=False, repr=False
     )
+    _catalog_epoch_missing: bool = field(default=False, init=False, repr=False)
 
     async def _catalog_epoch_value(self) -> int:
         """读持久代数；旧测试替身没有这个方法时按 0 处理。"""
+        if self._catalog_epoch_missing:
+            return 0
         reader = getattr(self.store, "catalog_epoch", None)
         if not callable(reader):
             return 0
-        return int(await reader())
+        try:
+            return int(await reader())
+        except Exception as exc:  # noqa: BLE001 - 旧库缺表要降级，其余数据库故障照常抛
+            if not _is_missing_catalog_epoch_table(exc):
+                raise
+            _report_missing_catalog_epoch(self)
+            return 0
 
     async def refresh(self) -> Any:
         """Rebuild the catalog snapshot, then the active mount trees.
@@ -182,6 +230,9 @@ class SkillRuntime:
                     type(exc).__name__,
                     exc,
                 )
+        # 旧库可能停在 0005 而没有 epoch 表：在这里发现一次、报一条可操作的
+        # ERROR，然后继续启动；缺的只是跨 worker 失效提示，不是目录本身。
+        await self._catalog_epoch_value()
         await self.refresh()
         if self.outbox is not None:
             await self.outbox.start()
@@ -268,19 +319,31 @@ async def refresh_skill_runtime() -> None:
     turn an already-committed save or review decision into an HTTP error.  The
     filesystem source keeps reading disk per request, so it has nothing to
     invalidate here.
+
+    The epoch is an invalidation hint, not the authority: the active pointers
+    are authoritative.  The bump therefore runs in its own transaction after
+    the mutation commits, and a crash between the two is repaired by any later
+    mutation, reload, or restart.  A failed bump must never suppress the local
+    refresh, and a failed refresh must never surface as a failed request.
     """
     try:
         if _skill_source() != GIT_SOURCE:
             return
         runtime = get_skill_runtime()
-        if runtime is None:
-            logger.warning("Skill runtime is not installed; skipping catalog refresh")
-            return
-        # 先 bump 再本地刷新：别的 worker 靠代际看见这次提交，本 worker 把
-        # 自己的 bump 吸收进当前快照，下一轮轮询就不会再重建。
-        bump = getattr(runtime.store, "bump_catalog_epoch", None)
-        if callable(bump):
-            await bump()
+    except Exception as exc:  # noqa: BLE001 - committed writes must not become 500s
+        logger.warning("Skill catalog refresh failed after a committed mutation: %s", exc)
+        return
+    if runtime is None:
+        logger.warning("Skill runtime is not installed; skipping catalog refresh")
+        return
+    # 先 bump 再本地刷新：别的 worker 靠代际看见这次提交，本 worker 把
+    # 自己的 bump 吸收进当前快照，下一轮轮询就不会再重建。两步必须独立：
+    # bump 失败只丢跨 worker 提示，本地快照仍然要更新。
+    try:
+        await _bump_catalog_epoch(runtime)
+    except Exception as exc:  # noqa: BLE001 - the local refresh must still run
+        logger.warning("Skill catalog epoch bump failed: %s", exc)
+    try:
         await runtime.refresh()
         clear_skill_prompt_cache()
     except Exception as exc:  # noqa: BLE001 - committed writes must not become 500s
@@ -655,6 +718,9 @@ async def set_global_skill_enabled(
         raise SkillNotFound(f"Skill {skill_id} not found")
 
     await runtime.store.set_global_enabled(skill_id, bool(enabled), actor or "admin")
+    # 全局开关也是目录状态：先 bump 再刷新，否则别的 worker 还按旧开关
+    # 过滤 prompt 和列表。返回值和 prompt 缓存行为保持原样。
+    await _bump_catalog_epoch(runtime)
     await runtime.refresh()
     refreshed = get_skill_snapshot()
     updated = next((row for row in refreshed.public if row.skill_id == skill_id), target)
@@ -680,4 +746,7 @@ async def reload_skills(*, runtime: SkillRuntime | None) -> None:
             "skills catalog runtime is not configured; reload cannot refresh the snapshot"
         )
     await runtime.refresh()
+    # 一次 reload 也承担跨 worker 失效：否则管理员得在每个 worker 上重复
+    # 调用，和路由文档里承诺的单次修复不一致。
+    await _bump_catalog_epoch(runtime)
     clear_skill_prompt_cache()

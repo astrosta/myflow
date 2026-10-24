@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -98,19 +98,27 @@ class FakeAuthorService:
         ]
 
     async def get_owned_skill(
-        self, *, owner_user_id: str, skill_id: str
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        include_deleted: bool = False,
     ) -> SkillRecord | None:
         skill = self.skills.get(skill_id)
         if (
             skill is None
             or skill.owner_user_id != owner_user_id
-            or skill.deleted_at is not None
+            or (skill.deleted_at is not None and not include_deleted)
         ):
             return None
         return skill
 
     async def open_draft(self, *, owner_user_id: str, skill_id: str) -> list[StagedFileInfo]:
-        self._owned(owner_user_id, skill_id)
+        skill = self._owned(owner_user_id, skill_id)
+        if skill.deleted_at is not None:
+            self.skills[skill_id] = replace(
+                skill, deleted_at=None, updated_at=_now()
+            )
         return [
             _info(file.path, file.content, file.mode)
             for file in self.files[skill_id]
@@ -439,6 +447,22 @@ def test_open_draft_returns_the_staged_file_tree(monkeypatch: pytest.MonkeyPatch
     assert [file["path"] for file in response.json()["files"]] == ["SKILL.md"]
 
 
+def test_open_draft_revives_a_soft_deleted_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+    _create(client)
+    service.skills["skill-1"] = replace(
+        service.skills["skill-1"], deleted_at=_now()
+    )
+
+    response = client.post("/api/skills/skill-1/draft/open")
+
+    assert response.status_code == 200
+    assert service.skills["skill-1"].deleted_at is None
+
+
 def test_file_crud_save_versions_and_delete(monkeypatch: pytest.MonkeyPatch) -> None:
     service = FakeAuthorService()
     client, identity = _client(monkeypatch, service)
@@ -679,10 +703,14 @@ class _ReadStore:
         skills: dict[str, SkillRecord],
         files: dict[str, list[StagedFile]],
         pending: dict[str, SkillSubmissionRecord] | None = None,
+        latest: dict[str, SkillSubmissionRecord] | None = None,
     ) -> None:
         self.skills = skills
         self.files = files
         self.pending = pending or {}
+        # 真实 store 里 pending_submission 只返回 pending，latest_submission
+        # 返回任意终态；fake 必须区分，否则测不出“不再只看 pending”。
+        self.latest = latest or {}
 
     async def list_owned(self, owner_user_id: str) -> list[SkillRecord]:
         return [
@@ -691,14 +719,19 @@ class _ReadStore:
             if skill.owner_user_id == owner_user_id and skill.deleted_at is None
         ]
 
-    async def get_skill(self, skill_id: str) -> SkillRecord | None:
-        return self.skills.get(skill_id)
+    async def get_skill(
+        self, skill_id: str, *, include_deleted: bool = False
+    ) -> SkillRecord | None:
+        skill = self.skills.get(skill_id)
+        if not include_deleted and skill is not None and skill.deleted_at is not None:
+            return None
+        return skill
 
     async def pending_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
         return self.pending.get(skill_id)
 
     async def latest_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
-        return self.pending.get(skill_id)
+        return self.latest.get(skill_id)
 
     async def list_draft_files(self, skill_id: str) -> list[StagedFile]:
         return self.files[skill_id]
@@ -778,24 +811,27 @@ def test_author_submission_status_reports_the_latest_submission() -> None:
         version_id="version-1",
         submitted_commit="c" * 40,
         owner_user_id="alice",
-        status="pending",
+        status="rejected",
         submitted_at=_now(),
-        reviewed_by=None,
-        reviewed_at=None,
-        reject_reason=None,
+        reviewed_by="admin",
+        reviewed_at=_now(),
+        reject_reason="add an example",
         public_release_id=None,
     )
     service = _service(
         _ReadStore(
             {alice.id: alice},
             {alice.id: []},
-            {alice.id: submission},
+            pending={},
+            latest={alice.id: submission},
         )
     )
 
     async def scenario() -> None:
+        # pending_submission 为 None 时仍必须报告最近一次（rejected）状态；
+        # 旧实现回退成 "draft"，会在这里失败。
         assert await service.submission_status(
             owner_user_id="alice", skill_id=alice.id
-        ) == "pending"
+        ) == "rejected"
 
     asyncio.run(scenario())

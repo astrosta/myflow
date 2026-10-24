@@ -185,7 +185,8 @@ class SkillReviewService:
         )
 
     async def unpublish(self, *, admin_user_id: str, skill_id: str) -> None:
-        skill = await self._store.get_skill(skill_id)
+        # 作者删掉私有草稿后记录仍是软删；公共版本还在，管理员必须能下架。
+        skill = await self._store.get_skill(skill_id, include_deleted=True)
         if skill is None:
             raise SkillConflict(f"skill {skill_id!r} does not exist")
         # clear_public_active has no actor parameter, so its transactional audit

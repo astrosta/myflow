@@ -430,6 +430,15 @@ def test_delete_draft_keeps_public_release(harness: Harness) -> None:
         assert await harness.store.list_draft_files(skill.id) == []
         with pytest.raises(SkillConflict):
             await harness.service.list_files(owner_user_id="u1", skill_id=skill.id)
+        with pytest.raises(SkillConflict):
+            await harness.service.put_file(
+                owner_user_id="u1",
+                skill_id=skill.id,
+                path="SKILL.md",
+                content=skill_md("pdf-tools", "resurrected"),
+            )
+        with pytest.raises(SkillConflict):
+            await harness.service.save(owner_user_id="u1", skill_id=skill.id)
         async with harness.session_factory() as session:
             assert await session.get(SkillPrivateActiveRow, skill.id) is None
             assert await session.get(SkillPublicActiveRow, skill.id) is not None

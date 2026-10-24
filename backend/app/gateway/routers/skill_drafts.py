@@ -71,11 +71,19 @@ async def _invoke(action: Awaitable[T]) -> T:
         raise SkillConflictAPI(str(exc)) from exc
 
 
-async def _owned(service: Any, caller: RunCaller, skill_id: str) -> SkillRecord:
+async def _owned(
+    service: Any,
+    caller: RunCaller,
+    skill_id: str,
+    *,
+    include_deleted: bool = False,
+) -> SkillRecord:
     """Return the caller's skill or raise the same 404 an absent skill gets."""
 
     skill = await service.get_owned_skill(
-        owner_user_id=caller.user_id or "", skill_id=skill_id
+        owner_user_id=caller.user_id or "",
+        skill_id=skill_id,
+        include_deleted=include_deleted,
     )
     if skill is None:
         raise SkillNotFound(_ABSENT)
@@ -266,7 +274,8 @@ async def open_draft(
     caller: Writer,
     service: AuthorService,
 ) -> DraftTreeResponse:
-    await _owned(service, caller, skill_id)
+    # 作者删掉私有草稿后公共版本仍在：编辑入口必须能重新打开并恢复记录。
+    await _owned(service, caller, skill_id, include_deleted=True)
     files = await _invoke(
         service.open_draft(owner_user_id=caller.user_id or "", skill_id=skill_id)
     )

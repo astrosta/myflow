@@ -60,6 +60,11 @@ class FakeStore:
     outbox_events: list[tuple[str, str]] = field(default_factory=list)
     pending: dict[str, Any] = field(default_factory=dict)
     catalog: "FakeCatalog | None" = None
+    epoch_bumps: int = 0
+
+    async def bump_catalog_epoch(self) -> int:
+        self.epoch_bumps += 1
+        return self.epoch_bumps
 
     async def all_active(self) -> list[Any]:
         return list(self.active)
@@ -458,6 +463,7 @@ def test_global_toggle_writes_pg_and_outbox_not_extensions_config(
     assert body["global_enabled"] is True
     assert runtime.store.settings_calls == [("s-pub", True, "root")]
     assert runtime.store.outbox_events == [("upsert_active", "public:s-pub")]
+    assert runtime.store.epoch_bumps == 1
     assert runtime.catalog.refresh_calls == 1
     assert cleared == ["clear"]
     assert extensions.read_text(encoding="utf-8") == before
@@ -540,6 +546,8 @@ def test_reload_refreshes_the_snapshot_and_clears_the_prompt_cache(
     assert response.status_code == 200
     assert response.json() == {"reloaded": True}
     assert runtime.catalog.refresh_calls == 1
+    # 一次 reload 也必须让其它 worker 的轮询看见变化。
+    assert runtime.store.epoch_bumps == 1
     assert cleared == ["clear"]
     assert {item["name"] for item in client.get("/api/skills").json()["skills"]} == {"renamed"}
 
@@ -771,8 +779,34 @@ async def test_refresh_skill_runtime_refreshes_and_clears_prompt_cache(
 
     await skills_catalog.refresh_skill_runtime()
 
+    assert runtime.store.epoch_bumps == 1
     assert runtime.catalog.refresh_calls == 1
     assert cleared == ["cleared"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_epoch_bump_still_refreshes_locally_and_clears_the_cache(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    runtime = _runtime(SkillSnapshot("e", (), {}))
+
+    async def failing_bump() -> int:
+        raise RuntimeError("catalog epoch table is unavailable")
+
+    runtime.store.bump_catalog_epoch = failing_bump  # type: ignore[method-assign]
+    cleared: list[str] = []
+    monkeypatch.setattr(skills_catalog, "_skill_source", lambda: "git")
+    monkeypatch.setattr(skills_catalog, "get_skill_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        skills_catalog, "clear_skill_prompt_cache", lambda: cleared.append("cleared")
+    )
+    caplog.set_level(logging.WARNING, logger="backend.app.gateway.skills_catalog")
+
+    await skills_catalog.refresh_skill_runtime()
+
+    assert runtime.catalog.refresh_calls == 1
+    assert cleared == ["cleared"]
+    assert "epoch bump failed" in caplog.text
 
 
 @pytest.mark.asyncio

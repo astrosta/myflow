@@ -516,6 +516,56 @@ def test_unpublish_removes_public_active_but_keeps_release_rows(
     harness.run(scenario)
 
 
+def test_unpublish_succeeds_after_the_author_deleted_the_private_draft(
+    harness: Harness,
+) -> None:
+    async def scenario() -> None:
+        skill, _version, submission = await _submitted(harness)
+        await harness.review.approve(
+            admin_user_id="admin", submission_id=submission.id
+        )
+        await harness.author.delete_draft(owner_user_id="u1", skill_id=skill.id)
+
+        # 公共版本还在，管理员必须还能下架；不能因为私有记录是软删就 409。
+        await harness.review.unpublish(admin_user_id="admin", skill_id=skill.id)
+
+        assert [
+            item
+            for item in await harness.store.all_active()
+            if item.scope.value == "public" and item.skill.skill_id == skill.id
+        ] == []
+        assert await harness.store.get_skill(skill.id) is None
+
+    harness.run(scenario)
+
+
+def test_open_draft_revives_a_soft_deleted_skill_and_save_works(
+    harness: Harness,
+) -> None:
+    async def scenario() -> None:
+        skill, _version, submission = await _submitted(harness)
+        await harness.review.approve(
+            admin_user_id="admin", submission_id=submission.id
+        )
+        await harness.author.delete_draft(owner_user_id="u1", skill_id=skill.id)
+        assert await harness.store.get_skill(skill.id) is None
+
+        files = await harness.author.open_draft(
+            owner_user_id="u1", skill_id=skill.id
+        )
+        assert [file.path for file in files] == ["SKILL.md"]
+        revived = await harness.store.get_skill(skill.id)
+        assert revived is not None and revived.id == skill.id
+        async with harness.session_factory() as session:
+            row = await session.get(SkillRow, skill.id)
+            assert row is not None and row.deleted_at is None
+
+        saved = await harness.author.save(owner_user_id="u1", skill_id=skill.id)
+        assert saved.skill_id == skill.id
+
+    harness.run(scenario)
+
+
 def test_activate_rolls_back_to_an_older_release_without_committing_git(
     harness: Harness,
 ) -> None:

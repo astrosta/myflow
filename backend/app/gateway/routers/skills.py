@@ -62,7 +62,7 @@ async def reload_skill_routes(
     request: Request,
     caller: Annotated[RunCaller, Depends(require_scope("admin"))],
 ) -> SkillReloadResponse:
-    """只刷新本进程；别的 worker 要各自打（§2.4）或等下一次刷新。"""
+    """刷新本进程并 bump 目录代数，一次调用即可让其它 worker 跟上（§2.4）。"""
     del caller
     await reload_skills(runtime=runtime_for_request(request))
     return SkillReloadResponse()

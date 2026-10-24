@@ -128,7 +128,12 @@ class SkillAuthorService:
     ) -> list[StagedFileInfo]:
         """Return staged files, seeding an empty draft from the public release."""
 
-        await self._owned_skill(owner_user_id, skill_id)
+        # 重新打开是公共状态路径：作者删掉私有草稿后，记录仍是软删，
+        # 但已发布的版本还在。先确认所有权并恢复记录，再按需从公共版本播种。
+        await self._owned_skill(owner_user_id, skill_id, include_deleted=True)
+        await self._store.revive_private_draft(
+            skill_id=skill_id, owner_user_id=owner_user_id
+        )
         existing = await self._store.list_draft_files(skill_id)
         if existing:
             return [_staged_info(file) for file in existing]
@@ -177,11 +182,15 @@ class SkillAuthorService:
         return await self._store.list_owned(owner_user_id)
 
     async def get_owned_skill(
-        self, *, owner_user_id: str, skill_id: str
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        include_deleted: bool = False,
     ) -> SkillRecord | None:
         """Return the skill only when this caller owns it; None for absent/foreign."""
 
-        skill = await self._store.get_skill(skill_id)
+        skill = await self._store.get_skill(skill_id, include_deleted=include_deleted)
         if skill is None or skill.owner_user_id != owner_user_id:
             return None
         return skill
@@ -345,8 +354,10 @@ class SkillAuthorService:
     # internals
     # ------------------------------------------------------------------
 
-    async def _owned_skill(self, owner_user_id: str, skill_id: str) -> SkillRecord:
-        skill = await self._store.get_skill(skill_id)
+    async def _owned_skill(
+        self, owner_user_id: str, skill_id: str, *, include_deleted: bool = False
+    ) -> SkillRecord:
+        skill = await self._store.get_skill(skill_id, include_deleted=include_deleted)
         if skill is None or skill.owner_user_id != owner_user_id:
             # Deliberately indistinguishable from a missing skill: another
             # owner must not learn that this draft exists.

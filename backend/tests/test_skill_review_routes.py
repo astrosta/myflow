@@ -464,6 +464,8 @@ def test_a_failed_refresh_does_not_fail_a_committed_approval(
     real_refresh = skills_catalog.refresh_skill_runtime
 
     class BrokenRuntime:
+        store = object()
+
         async def refresh(self) -> None:
             raise RuntimeError("database went away after commit")
 
