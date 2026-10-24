@@ -167,6 +167,9 @@ venv.bak/
 # mkdocs documentation
 /site
 
+# Subagent-driven-development scratch workspace
+.superpowers/
+
 # mypy
 .mypy_cache/
 .dmypy.json
