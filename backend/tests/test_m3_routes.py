@@ -55,6 +55,22 @@ EXPECTED_ROUTES = {
     ("POST", "/api/skills/reload"),
     ("PUT", "/api/skills/{name}/preference"),
     ("PATCH", "/api/skills/{name}"),
+    # M11 task 8: Git-backed private draft author surface. /skills/mine is
+    # registered before the parameterized {skill_id} routes.
+    ("GET", "/api/skills/mine"),
+    ("POST", "/api/skills"),
+    ("POST", "/api/skills/{skill_id}/draft/open"),
+    ("GET", "/api/skills/{skill_id}/draft"),
+    ("GET", "/api/skills/{skill_id}/draft/tree"),
+    ("GET", "/api/skills/{skill_id}/draft/file"),
+    ("PUT", "/api/skills/{skill_id}/draft/file"),
+    ("POST", "/api/skills/{skill_id}/draft/files"),
+    ("DELETE", "/api/skills/{skill_id}/draft/file"),
+    ("POST", "/api/skills/{skill_id}/draft/save"),
+    ("POST", "/api/skills/{skill_id}/submit"),
+    ("POST", "/api/skills/{skill_id}/withdraw"),
+    ("GET", "/api/skills/{skill_id}/versions"),
+    ("DELETE", "/api/skills/{skill_id}"),
     # M10 §2.12：记忆（prefix=/memory，/api 由 create_app 加）
     ("GET", "/api/memory"),
     ("GET", "/api/memory/profile"),
@@ -146,6 +162,8 @@ def test_business_routes_declare_a_response_model() -> None:
         for route in _iter_routes(create_app())
         if getattr(route, "mounted_path", route.path).startswith("/api")
         and getattr(route, "mounted_path", route.path) not in STREAMING_PATHS
+        # A 204 route cannot carry a response body, so it has no response model.
+        and getattr(route, "status_code", 200) not in {204, 304}
         and getattr(route, "response_model", None) is None
     ]
     assert bare == []

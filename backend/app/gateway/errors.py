@@ -148,6 +148,20 @@ class SkillNotFound(Exception):
     code: ClassVar[str] = "skill_not_found"
 
 
+class SkillPackageInvalid(Exception):
+    """A staging path or package failed validation (Git catalog author API)."""
+
+    status_code: ClassVar[int] = 422
+    code: ClassVar[str] = "invalid_skill_package"
+
+
+class SkillConflictAPI(Exception):
+    """A pending submission, quota, or version precondition blocked a write."""
+
+    status_code: ClassVar[int] = 409
+    code: ClassVar[str] = "skill_conflict"
+
+
 class StdioCommandRejected(Exception):
     """API 注册/启用的 stdio command 不在允许列表（M7 §5.7）。
 
@@ -222,6 +236,8 @@ def install_error_handlers(app: FastAPI) -> None:
         SummarizationFailed,
         McpServerNotFound,
         SkillNotFound,
+        SkillPackageInvalid,
+        SkillConflictAPI,
         StdioCommandRejected,
         InvalidExtensionsConfig,
         MemoryConflictAPI,

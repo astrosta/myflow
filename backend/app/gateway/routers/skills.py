@@ -5,8 +5,9 @@
 - PATCH /api/skills/{name}：admin 的**全局**开关，动所有人。
 - POST /api/skills/reload：admin，只清本进程的 prompt 段落 LRU。
 
-M7 没有"创建"类路由：POST /api/skills 是 404（不是 403）——创建能力确实没实现，
-而不是"你没权限"。
+M7 的旧文件系统清单与开关继续保留到 Task 15。Git 草稿的作者路由在
+skill_drafts.py（create_app 里先于本 router 注册，/skills/mine 不会被
+/skills/{skill_id} 捕获）；本模块仍不声明创建路由。
 """
 
 from __future__ import annotations

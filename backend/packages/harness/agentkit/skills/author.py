@@ -167,6 +167,34 @@ class SkillAuthorService:
         await self._owned_skill(owner_user_id, skill_id)
         return await self._store.list_versions(skill_id)
 
+    async def list_mine(self, *, owner_user_id: str) -> list[SkillRecord]:
+        """Owned, non-deleted skills, including drafts that have no version yet.
+
+        The route layer needs this before a first save; visible_for_user() only
+        contains rows with an active version, so it cannot back /skills/mine.
+        """
+
+        return await self._store.list_owned(owner_user_id)
+
+    async def get_owned_skill(
+        self, *, owner_user_id: str, skill_id: str
+    ) -> SkillRecord | None:
+        """Return the skill only when this caller owns it; None for absent/foreign."""
+
+        skill = await self._store.get_skill(skill_id)
+        if skill is None or skill.owner_user_id != owner_user_id:
+            return None
+        return skill
+
+    async def submission_status(
+        self, *, owner_user_id: str, skill_id: str
+    ) -> str | None:
+        """The pending submission status, or None when the draft is editable."""
+
+        await self._owned_skill(owner_user_id, skill_id)
+        pending = await self._store.pending_submission(skill_id)
+        return pending.status if pending is not None else None
+
     # ------------------------------------------------------------------
     # staging
     # ------------------------------------------------------------------
@@ -203,6 +231,18 @@ class SkillAuthorService:
         await self._owned_skill(owner_user_id, skill_id)
         files = await self._store.list_draft_files(skill_id)
         return [_staged_info(file) for file in files]
+
+    async def read_file(
+        self, *, owner_user_id: str, skill_id: str, path: str
+    ) -> StagedFile | None:
+        """Read one staged file; None means the path is not staged for this skill."""
+
+        await self._owned_skill(owner_user_id, skill_id)
+        validate_skill_path(path)
+        for file in await self._store.list_draft_files(skill_id):
+            if file.path == path:
+                return file
+        return None
 
     # ------------------------------------------------------------------
     # save, submit, withdraw

@@ -31,6 +31,7 @@ __all__ = [
     "get_knowledge_service",
     "get_knowledge_service_optional",
     "get_memory_manager_service",
+    "get_skill_author_service",
     "get_request_id",
     "get_run_services",
     "get_run_store",
@@ -113,6 +114,19 @@ def get_knowledge_service_optional(request: Request) -> KnowledgeService | None:
     # app.state is process-owned; tests may inject a narrow fake implementing the service API.
     service = getattr(request.app.state, "knowledge_service", None)
     return service if service is not None else None
+
+
+def get_skill_author_service(request: Request):
+    """Process-owned SkillAuthorService (or a narrow fake in route tests).
+
+    Task 15 builds the real service in the app lifespan together with the
+    catalog runtime; the author routes only need this injection point.
+    """
+
+    service = getattr(request.app.state, "skill_author_service", None)
+    if service is None:
+        raise RuntimeError("skill author service is not configured")
+    return service
 
 
 def get_knowledge_service(request: Request) -> KnowledgeService:
