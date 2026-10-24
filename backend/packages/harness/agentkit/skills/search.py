@@ -142,11 +142,17 @@ class SkillSearchService:
     def __init__(
         self,
         store: SqlSkillStore,
-        projection: SkillProjectionStore,
+        projection: SkillProjectionStore | None,
         content: SkillContentStore,
-        embedder: Embedder,
+        embedder: Embedder | None,
         config: SkillSearchConfig,
     ) -> None:
+        """Projection and embedder are optional: without them only BM25 runs.
+
+        The shipped configuration is lexical-only (search.enabled=true,
+        embedding.enabled=false), so a missing projection/embedder must mean
+        "local BM25", never "no retrieval service at all".
+        """
         self._store = store
         self._projection = projection
         self._content = content
@@ -170,6 +176,17 @@ class SkillSearchService:
         warnings: list[str] = []
         vector = await self._query_vector(query)
         if vector is None:
+            warnings.append(VECTOR_UNAVAILABLE)
+            return await self._lexical(
+                user_id=user_id,
+                query=query,
+                domain_keywords=domain_keywords,
+                available_skills=available_skills,
+                prefs=prefs,
+                warnings=warnings,
+            )
+
+        if self._projection is None:  # 没有投影 = 只跑词法通道，绝不猜
             warnings.append(VECTOR_UNAVAILABLE)
             return await self._lexical(
                 user_id=user_id,
@@ -253,7 +270,7 @@ class SkillSearchService:
     async def _query_vector(self, query: str) -> list[float] | None:
         """Embed the task intent exactly once; a failure degrades to lexical."""
         embedding = self._config.embedding
-        if not embedding.enabled or not embedding.base_url.strip():
+        if self._embedder is None or not embedding.enabled or not embedding.base_url.strip():
             return None
         try:
             vector = list(await self._embedder.embed_query(query))

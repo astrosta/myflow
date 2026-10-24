@@ -51,7 +51,7 @@ from agentkit.skills.search import SkillSearchService
 from agentkit.skills.storage import load_skills
 from agentkit.skills.store.sql import SqlSkillStore
 from agentkit.skills.types import Skill
-from backend.app.gateway.errors import SkillNotFound
+from backend.app.gateway.errors import SkillNotFound, SkillRuntimeUnavailable
 from backend.app.gateway.models.response import SkillResponse
 
 logger = logging.getLogger(__name__)
@@ -123,6 +123,19 @@ class SkillRuntime:
             except Exception as exc:  # noqa: BLE001 - one owner must not stop the rest
                 logger.warning("Private skill tree materialization failed for %s: %s", owner, exc)
 
+        # 上一轮物化过、这一轮已经没有私有激活行的用户：把旧树收成空树。
+        # 不收的话，用户删掉最后一个私有技能之后沙箱还在挂一棵不该存在的目录。
+        try:
+            existing = set(self.content.existing_private_owners())
+        except Exception as exc:  # noqa: BLE001 - pruning is best effort like materialization
+            logger.warning("Could not enumerate private mount trees: %s", exc)
+            return
+        for owner in sorted(existing - set(by_owner)):
+            try:
+                await self.content.materialize_private(owner, [])
+            except Exception as exc:  # noqa: BLE001 - one owner must not stop the rest
+                logger.warning("Private skill tree prune failed for %s: %s", owner, exc)
+
     async def start(self) -> None:
         """Ready Git if possible, publish the snapshot, start the projection worker.
 
@@ -150,12 +163,19 @@ class SkillRuntime:
             await self.outbox.start()
 
     async def stop(self) -> None:
-        """Stop background work and drop process-wide catalog state."""
-        if self.outbox is not None:
-            await self.outbox.stop()
-        if self.projection is not None:
-            await self.projection.aclose()
-        reset_skill_runtime()
+        """Stop background work and drop process-wide catalog state.
+
+        Dropping the registry is unconditional: a failing outbox stop or a failing
+        projection close must not leave a half-dead runtime installed, because the
+        next get_skill_runtime() would hand that dead service to a request.
+        """
+        try:
+            if self.outbox is not None:
+                await self.outbox.stop()
+            if self.projection is not None:
+                await self.projection.aclose()
+        finally:
+            reset_skill_runtime()
 
 
 _runtime_lock = threading.Lock()
@@ -221,23 +241,39 @@ def build_skill_runtime(
     search = None
     outbox = None
     projection = None
-    embedding = skills.search.embedding
-    if embedding.enabled and embedding.base_url.strip():
-        embedder = OpenAICompatibleEmbedder(embedding)
-        projection = MilvusSkillProjection(
-            # The skills projection owns its collection (myflow_skills_active);
-            # only the Milvus connection may be borrowed from the knowledge base.
-            skills.search.active_vector_store(app_config.knowledge_base.vector_store),
-            dimensions=embedding.dimensions,
-        )
+    # 关键词（BM25）通道不依赖任何外部服务，而 shipped 配置正是
+    # search.enabled=true + embedding.enabled=false。检索服务必须无条件建起来，
+    # 否则 git 来源在默认部署下根本没有检索——投影与 outbox 才是可选的那部分。
+    if skills.search.enabled:
+        embedding = skills.search.embedding
+        embedder = None
+        if embedding.enabled and embedding.base_url.strip():
+            vector_store = skills.search.active_vector_store(
+                app_config.knowledge_base.vector_store
+            )
+            if not vector_store.uri.strip():
+                # 空地址不会在启动时炸，只会在第一次 upsert 时变成一个沉默的超时。
+                raise RuntimeError(
+                    "skills.search.embedding.enabled=true but no Milvus endpoint is "
+                    "configured: set skills.search.vector_store.uri, or borrow one with "
+                    "knowledge_base.vector_store.uri."
+                )
+            embedder = OpenAICompatibleEmbedder(embedding)
+            projection = MilvusSkillProjection(
+                # The skills projection owns its collection (myflow_skills_active);
+                # only the Milvus connection may be borrowed from the knowledge base.
+                vector_store,
+                dimensions=embedding.dimensions,
+            )
         search = SkillSearchService(store, projection, content, embedder, skills.search)
-        outbox = SkillIndexOutboxWorker(
-            store,
-            content,
-            embedder,
-            projection,
-            poll_seconds=skills.index.outbox_poll_seconds,
-        )
+        if projection is not None:
+            outbox = SkillIndexOutboxWorker(
+                store,
+                content,
+                embedder,
+                projection,
+                poll_seconds=skills.index.outbox_poll_seconds,
+            )
 
     return SkillRuntime(
         store=store,
@@ -474,9 +510,12 @@ async def list_skills_for_api(
         return await asyncio.to_thread(
             scan_skills_for_api, user_id=user_id, include_global=include_global
         )
-    snapshot = get_skill_snapshot()
     if runtime is None:
-        logger.error("Git skill catalog has no runtime; serving the published snapshot only")
+        # 没有运行时 = 没有权威目录。已发布的快照只是上一次刷新留下的残影，
+        # 拿它当答案等于把删除的技能继续列出来，所以 git 来源 fail-closed。
+        logger.error("Git skill catalog has no runtime; failing closed with an empty list")
+        return []
+    snapshot = get_skill_snapshot()
     return await _catalog_responses(
         snapshot,
         runtime=runtime,
@@ -554,7 +593,10 @@ async def reload_skills(*, runtime: SkillRuntime | None) -> None:
         await asyncio.to_thread(reload_skill_caches)
         return
     if runtime is None:
-        logger.error("Reload requested without a skill runtime; only local caches are cleared")
-    else:
-        await runtime.refresh()
+        # 报 200 却什么都没刷新，比失败更糟：调用方会以为新技能已经生效。
+        logger.error("Refusing to reload: the skill runtime is not configured")
+        raise SkillRuntimeUnavailable(
+            "skills catalog runtime is not configured; reload cannot refresh the snapshot"
+        )
+    await runtime.refresh()
     clear_skill_prompt_cache()

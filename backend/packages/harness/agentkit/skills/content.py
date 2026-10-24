@@ -181,6 +181,22 @@ class SkillContentStore:
             )
         return await self._materialize_active(self.active_dir / "users" / owner, specs)
 
+    def existing_private_owners(self) -> list[str]:
+        """已经物化出私有挂载树的所有者（active/users/<owner>）。
+
+        运行时用它找出"这一轮没有私有激活行、但上一轮留了树"的用户并收掉旧树；
+        少了这一步，用户删掉最后一个私有技能之后沙箱还在挂一棵不该存在的目录。
+        """
+        root = self.active_dir / "users"
+        if root.is_symlink() or not root.is_dir():
+            return []
+        with os.scandir(root) as entries:
+            return sorted(
+                entry.name
+                for entry in entries
+                if entry.is_dir(follow_symlinks=False) and not entry.name.startswith(".")
+            )
+
     async def _materialize_active(
         self,
         target: Path,

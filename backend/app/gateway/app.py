@@ -93,14 +93,18 @@ async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRunti
 async def stop_skill_runtime(app: FastAPI) -> None:
     """Stop the outbox worker, close the projection, and reset catalog state."""
     runtime = getattr(app.state, "skill_runtime", None)
-    if runtime is not None:
-        await runtime.stop()
-    app.state.skill_runtime = None
-    app.state.skill_author_service = None
-    app.state.skill_review_service = None
-    app.state.skill_catalog = None
-    app.state.skill_search = None
-    reset_skill_runtime()
+    try:
+        if runtime is not None:
+            await runtime.stop()
+    finally:
+        # 清理是无条件的：outbox.stop() 或 projection.aclose() 抛错也不能把一个
+        # 半死的运行时留在 app.state / 进程注册表里。
+        app.state.skill_runtime = None
+        app.state.skill_author_service = None
+        app.state.skill_review_service = None
+        app.state.skill_catalog = None
+        app.state.skill_search = None
+        reset_skill_runtime()
 
 
 def preflight_auth(app_config: AppConfig) -> AuthSettings:
@@ -152,47 +156,54 @@ async def lifespan(app: FastAPI):
                 # M11 Task 15：数据库就绪后构建 Git 技能目录运行时——刷新快照、物化
                 # active 挂载树、启动 outbox worker。filesystem 来源在这里是 no-op。
                 await start_skill_runtime(app, app_config)
-                # M10 §2.5.3 / §2.9.1：memory store 和 checkpointer 同一个 database 选择；
-                # maintenance 是独立服务，不复用定时任务服务（那个会创建 thread/run）。
-                configure_memory_store(memory_store)
-                memory_manager = get_memory_manager(
-                    store=memory_store, app_config=app_config
-                )
-                app.state.memory_manager = memory_manager
-                # Knowledge metadata shares the app database; providers are built once.
-                app.state.knowledge_config = app_config.knowledge_base
-                app.state.knowledge_service = await configure_knowledge_service(
-                    app_config.knowledge_base
-                )
-                maintenance = MemoryMaintenanceService(memory_manager)
-                app.state.memory_maintenance = maintenance
-                if app_config.memory.enabled and app_config.memory.maintenance.enabled:
-                    maintenance.start()
-                # M8 §10.1：进程级子代理容量控制器在这里冻结一次（subagent_runtime.* 是
-                # startup-only）。建在启动时而不是"第一个启用子代理的 run"，是为了让 YAML
-                # 里那个值在启动那一刻就定下来——热重载不能悄悄抬高已经宣告出去的容量。
-                get_subagent_runtime(app_config)
-                recovered = await recover_inflight_runs(
-                    run_store, thread_meta, gateway_workers=workers
-                )
-                if recovered:
-                    logger.warning("recovered %s inflight runs as error after restart", recovered)
+                # 运行时一旦装进 app.state，后面任何一步启动失败都必须把它拆掉：
+                # 否则 outbox worker 会活到事件循环关闭，对着已经释放的 engine 轮询。
                 try:
-                    yield
+                    # M10 §2.5.3 / §2.9.1：memory store 和 checkpointer 同一个 database 选择；
+                    # maintenance 是独立服务，不复用定时任务服务（那个会创建 thread/run）。
+                    configure_memory_store(memory_store)
+                    memory_manager = get_memory_manager(
+                        store=memory_store, app_config=app_config
+                    )
+                    app.state.memory_manager = memory_manager
+                    # Knowledge metadata shares the app database; providers are built once.
+                    app.state.knowledge_config = app_config.knowledge_base
+                    app.state.knowledge_service = await configure_knowledge_service(
+                        app_config.knowledge_base
+                    )
+                    maintenance = MemoryMaintenanceService(memory_manager)
+                    app.state.memory_maintenance = maintenance
+                    if app_config.memory.enabled and app_config.memory.maintenance.enabled:
+                        maintenance.start()
+                    # M8 §10.1：进程级子代理容量控制器在这里冻结一次（subagent_runtime.* 是
+                    # startup-only）。建在启动时而不是"第一个启用子代理的 run"，是为了让 YAML
+                    # 里那个值在启动那一刻就定下来——热重载不能悄悄抬高已经宣告出去的容量。
+                    get_subagent_runtime(app_config)
+                    recovered = await recover_inflight_runs(
+                        run_store, thread_meta, gateway_workers=workers
+                    )
+                    if recovered:
+                        logger.warning("recovered %s inflight runs as error after restart", recovered)
+                    try:
+                        yield
+                    finally:
+                        maintenance.stop()
+                        if not memory_manager.flush(
+                            app_config.memory.ingest.shutdown_flush_timeout_seconds
+                        ):
+                            logger.warning("Memory extraction flush exceeded its shutdown budget")
+                        reset_memory_manager()
+                        await reset_knowledge_service()
+                        app.state.knowledge_service = None
+                        timeout = app_config.runs.shutdown_timeout_seconds
+                        # 先排空 run manager，再停技能运行时：优雅停机期间还在跑的 run
+                        # 仍要读快照和检索服务，先拆掉会让它们半路失明。
+                        await services.run_manager.shutdown(timeout=timeout if timeout is not None else 10.0)
+                        await stop_skill_runtime(app)
+                        cancel_detached()
+                        await services.bridge.aclose()  # 最后放掉桥的连接池（Redis 后端才有事可做）
                 finally:
                     await stop_skill_runtime(app)
-                    maintenance.stop()
-                    if not memory_manager.flush(
-                        app_config.memory.ingest.shutdown_flush_timeout_seconds
-                    ):
-                        logger.warning("Memory extraction flush exceeded its shutdown budget")
-                    reset_memory_manager()
-                    await reset_knowledge_service()
-                    app.state.knowledge_service = None
-                    timeout = app_config.runs.shutdown_timeout_seconds
-                    await services.run_manager.shutdown(timeout=timeout if timeout is not None else 10.0)
-                    cancel_detached()
-                    await services.bridge.aclose()  # 最后放掉桥的连接池（Redis 后端才有事可做）
     finally:
         await close_engine()
 

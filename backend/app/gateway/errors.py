@@ -148,6 +148,13 @@ class SkillNotFound(Exception):
     code: ClassVar[str] = "skill_not_found"
 
 
+class SkillRuntimeUnavailable(Exception):
+    """git 来源的技能运行时没装上：需要权威目录的请求必须失败，不能假装成功。"""
+
+    status_code: ClassVar[int] = 503
+    code: ClassVar[str] = "skill_runtime_unavailable"
+
+
 class SkillPackageInvalid(Exception):
     """A staging path or package failed validation (Git catalog author API)."""
 
@@ -236,6 +243,7 @@ def install_error_handlers(app: FastAPI) -> None:
         SummarizationFailed,
         McpServerNotFound,
         SkillNotFound,
+        SkillRuntimeUnavailable,
         SkillPackageInvalid,
         SkillConflictAPI,
         StdioCommandRejected,

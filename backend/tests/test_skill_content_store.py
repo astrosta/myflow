@@ -326,3 +326,60 @@ async def test_prune_removes_only_cache_directories_not_in_the_keep_set(
     assert not (commits / stale).exists()
     assert unrelated.read_bytes() == b"keep me"
     assert await content_fixture.content.prune({keep, stale}) == 0
+
+@pytest.mark.asyncio
+async def test_existing_private_owners_lists_the_materialized_trees(
+    content_fixture: ContentFixture,
+):
+    assert content_fixture.content.existing_private_owners() == []
+
+    one = _private(
+        skill_id="s1",
+        name="foo",
+        owner="u1",
+        commit=content_fixture.draft_one.commit,
+        path="users/u1/s1/SKILL.md",
+    )
+    await content_fixture.content.materialize_private("u1", [one])
+    await content_fixture.content.materialize_private("u2", [])
+
+    assert content_fixture.content.existing_private_owners() == ["u1", "u2"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_prunes_the_real_tree_of_an_owner_who_lost_every_skill(
+    content_fixture: ContentFixture,
+):
+    from backend.app.gateway import skills_catalog
+
+    one = _private(
+        skill_id="s1",
+        name="foo",
+        owner="u1",
+        commit=content_fixture.draft_one.commit,
+        path="users/u1/s1/SKILL.md",
+    )
+    await content_fixture.content.materialize_private("u1", [one])
+    tree = content_fixture.cache_dir / "active" / "users" / "u1"
+    assert (tree / "foo" / "SKILL.md").is_file()
+
+    class _Rows:
+        def __init__(self, rows: list) -> None:
+            self.rows = rows
+
+        async def all_active(self) -> list:
+            return list(self.rows)
+
+    runtime = skills_catalog.SkillRuntime(
+        store=_Rows([]),
+        git=None,
+        content=content_fixture.content,
+        author=None,
+        review=None,
+        catalog=None,
+    )
+
+    await runtime.materialize_active_trees()
+
+    # 空树换掉旧树：目录还在（挂载点存在），但里面一个技能都不剩。
+    assert not list(tree.iterdir()) if tree.exists() else True

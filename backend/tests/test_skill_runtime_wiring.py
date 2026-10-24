@@ -19,11 +19,19 @@ import pytest
 from agentkit.config.app_config import AppConfig
 from agentkit.config.auth_config import AuthConfig
 from agentkit.config.skills_config import SkillSearchConfig
+from agentkit.knowledge.config import MilvusConfig
 from agentkit.skills import search as skill_search
 from agentkit.skills.catalog import SkillSnapshot, get_skill_snapshot, set_skill_snapshot
 from agentkit.skills.domain import SkillScope
 from agentkit.skills.git import GitCommandError
 from agentkit.skills.projection import MilvusSkillProjection, ProjectionRow
+from agentkit.skills.search import (
+    LEXICAL_FALLBACK,
+    VECTOR_UNAVAILABLE,
+    SkillSearchService,
+)
+from agentkit.skills.types import Skill, SkillCategory
+from pydantic import ValidationError
 from backend.app.gateway import app as gateway_app
 from backend.app.gateway import skills_catalog
 from backend.app.gateway.skills_catalog import (
@@ -108,6 +116,7 @@ class FakeContent:
     order: list[str] = field(default_factory=list)
     public: list[list[Any]] = field(default_factory=list)
     private: list[tuple[str, list[Any]]] = field(default_factory=list)
+    existing_owners: list[str] = field(default_factory=list)
 
     async def materialize_public(self, active: list[Any]) -> Path:
         self.order.append("content.materialize_public")
@@ -118,6 +127,9 @@ class FakeContent:
         self.order.append(f"content.materialize_private:{owner}")
         self.private.append((owner, list(active)))
         return Path("active/users") / owner
+
+    def existing_private_owners(self) -> list[str]:
+        return list(self.existing_owners)
 
 
 def _row(scope: SkillScope, owner: str | None) -> SimpleNamespace:
@@ -383,7 +395,7 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
 
     class Search:
         def __init__(self, store: Any, projection: Any, content: Any, embedder: Any, config: Any) -> None:
-            seen.calls.append(("search", config))
+            seen.calls.append(("search", (projection, embedder, config)))
 
     class Outbox:
         def __init__(
@@ -405,20 +417,30 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
     return seen
 
 
-def test_factory_without_an_embedding_endpoint_builds_no_projection(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_shipped_git_config_still_builds_the_lexical_search_service(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The shipped config is search.enabled=true + embedding.enabled=false.
+
+    Git mode must still wire the search service: the documented local BM25 path
+    is the only retrieval channel there, so a missing embedding endpoint may drop
+    the projection and the outbox but never the service itself.
+    """
     seen = _patch_factory(monkeypatch, embedding=False)
     config = _config(**GIT_SKILLS)
+    assert config.skills.search.enabled is True
+    assert config.skills.search.embedding.enabled is False
 
     runtime = build_skill_runtime(config, session_factory=object())
 
     assert runtime.store is not None
     assert runtime.author is not None and runtime.review is not None
     assert runtime.catalog is not None
-    assert runtime.search is None
-    assert runtime.outbox is None
+    # Lexical-only: the service exists, the Milvus projection and its outbox do not.
+    assert runtime.search is not None
     assert runtime.projection is None
+    assert runtime.outbox is None
+    assert ("search", (None, None, config.skills.search)) in seen.calls
     assert [name for name, _ in seen.calls] == [
         "store",
         "git",
@@ -426,7 +448,31 @@ def test_factory_without_an_embedding_endpoint_builds_no_projection(
         "author",
         "review",
         "catalog",
+        "search",
     ]
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_answers_without_milvus_or_an_embedder() -> None:
+    """No projection, no embedder: the same query is answered by local BM25."""
+    service = SkillSearchService(
+        store=_LexicalStore(),
+        projection=None,
+        content=_LexicalContent(),
+        embedder=None,
+        config=SkillSearchConfig(),
+    )
+
+    outcome = await service.search(
+        user_id="alice",
+        task_query="pdf report",
+        domain_keywords=(),
+        available_skills=None,
+        prefs=None,
+    )
+
+    assert [hit.skill.name for hit in outcome.hits] == ["pdf-report"]
+    assert outcome.warnings == (VECTOR_UNAVAILABLE, LEXICAL_FALLBACK)
 
 
 def test_factory_builds_projection_outbox_and_search_when_configured(
@@ -442,7 +488,8 @@ def test_factory_builds_projection_outbox_and_search_when_configured(
                 "base_url": "http://embed.test/v1",
                 "dimensions": 8,
                 "model": "fake-embedding",
-            }
+            },
+            "vector_store": {"uri": "http://skills-milvus:19530"},
         },
         "index": {"outbox_poll_seconds": 0.5},
     }
@@ -748,3 +795,253 @@ def test_git_catalog_mode_requires_a_sql_database(monkeypatch: pytest.MonkeyPatc
     assert "SQL database" in message
     assert "skills.source=git" in message
     assert "database.backend='memory'" in message
+
+# ---------------------------------------------------------------------------
+# lexical retrieval really answers without Milvus (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+def _lexical_visible(name: str = "pdf-report") -> Any:
+    skill = Skill(
+        name=name,
+        description="pdf report generator",
+        license=None,
+        skill_dir=Path("cache") / "s1",
+        skill_file=Path("cache") / "s1" / "SKILL.md",
+        relative_path=Path(name),
+        category=SkillCategory.CUSTOM,
+        enabled=True,
+        skill_id="s1",
+        scope=SkillScope.PRIVATE,
+        owner_user_id="alice",
+        version_id="version-s1",
+    )
+    return SimpleNamespace(
+        skill=skill,
+        scope=SkillScope.PRIVATE,
+        version=SimpleNamespace(
+            skill_id="s1",
+            id="version-s1",
+            draft_commit="a" * 40,
+            skill_path="users/alice/s1/SKILL.md",
+        ),
+        release=None,
+    )
+
+
+class _LexicalStore:
+    """Only the three reads SkillSearchService performs on the catalog."""
+
+    async def private_skill_ids(self, user_id: str) -> tuple[str, ...]:
+        return ("s1",)
+
+    async def visible_for_user(self, user_id: str) -> list[Any]:
+        return [_lexical_visible()]
+
+
+class _LexicalContent:
+    async def read_text(self, commit: str, path: str) -> str:
+        return (
+            "---\nname: pdf-report\ndescription: pdf report generator\n---\n"
+            "Build the pdf report from the template.\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# the active collection is pinned and the connection knobs survive (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+def test_skills_vector_store_rejects_a_foreign_collection() -> None:
+    """The projection collection is a retrieval contract, not a deployment knob."""
+    with pytest.raises(ValidationError) as excinfo:
+        SkillSearchConfig(vector_store={"collection": "myflow_knowledge"})
+
+    assert "myflow_skills_active" in str(excinfo.value)
+
+
+def test_borrowing_the_knowledge_connection_keeps_the_tuning_knobs() -> None:
+    config = SkillSearchConfig(
+        vector_store={
+            "consistency_level": "Bounded",
+            "metric_type": "L2",
+            "index_type": "IVF_FLAT",
+            "flush": False,
+            "timeout_seconds": 7.5,
+        }
+    )
+
+    effective = config.active_vector_store(
+        MilvusConfig(uri="http://knowledge-milvus:19530", token="secret", db_name="kb")
+    )
+
+    assert effective.uri == "http://knowledge-milvus:19530"
+    assert effective.token == "secret"
+    assert effective.db_name == "kb"
+    assert effective.collection == "myflow_skills_active"
+    assert effective.consistency_level == "Bounded"
+    assert effective.metric_type == "L2"
+    assert effective.index_type == "IVF_FLAT"
+    assert effective.flush is False
+    assert effective.timeout_seconds == 7.5
+
+
+def test_embeddings_without_any_milvus_endpoint_fail_at_build_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No skills endpoint and nothing to borrow: fail loudly, not at first upsert."""
+    _patch_factory(monkeypatch, embedding=True)
+    config = AppConfig(auth=AuthConfig(enabled=False), skills=_EMBEDDING_SKILLS)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        build_skill_runtime(config, session_factory=object())
+
+    message = str(excinfo.value)
+    assert "skills.search.vector_store.uri" in message
+    assert "knowledge_base.vector_store.uri" in message
+
+
+# ---------------------------------------------------------------------------
+# private mount trees of owners who lost their last skill are pruned (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_prunes_private_trees_of_owners_without_private_skills() -> None:
+    content = FakeContent(existing_owners=["alice", "carol"])
+    store = FakeStore(rows=[_row(SkillScope.PRIVATE, "alice")])
+    runtime = SkillRuntime(
+        store=store,
+        git=FakeGit(),
+        content=content,
+        author=None,
+        review=None,
+        catalog=FakeCatalog(),
+    )
+
+    await runtime.refresh()
+
+    assert [owner for owner, _rows in content.private] == ["alice", "carol"]
+    assert content.private[0][1] == [store.rows[0]]
+    # An owner with no remaining active rows gets an empty tree written over the old one.
+    assert content.private[1] == ("carol", [])
+
+
+@pytest.mark.asyncio
+async def test_a_broken_private_tree_does_not_stop_the_other_prunes() -> None:
+    class HalfBrokenContent(FakeContent):
+        async def materialize_private(self, owner: str, active: list[Any]) -> Path:
+            await super().materialize_private(owner, active)
+            if owner == "alice":
+                raise RuntimeError("disk full")
+            return Path("active/users") / owner
+
+    content = HalfBrokenContent(existing_owners=["alice", "carol", "dave"])
+    runtime = SkillRuntime(
+        store=FakeStore(rows=[]),
+        git=FakeGit(),
+        content=content,
+        author=None,
+        review=None,
+        catalog=FakeCatalog(),
+    )
+
+    await runtime.refresh()
+
+    assert [owner for owner, _rows in content.private] == ["alice", "carol", "dave"]
+
+
+# ---------------------------------------------------------------------------
+# a later startup failure still tears the runtime down (Fix 4)
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_later_startup_step_tears_the_runtime_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeRuntime()
+    monkeypatch.setattr(gateway_app, "get_app_config", _config)
+    monkeypatch.setattr(gateway_app, "build_skill_runtime", lambda config: fake)
+
+    def boom(config: Any) -> Any:
+        raise RuntimeError("subagent runtime exploded")
+
+    monkeypatch.setattr(gateway_app, "get_subagent_runtime", boom)
+
+    async def scenario() -> None:
+        app = SimpleNamespace(state=SimpleNamespace())
+        with pytest.raises(RuntimeError, match="exploded"):
+            async with gateway_app.lifespan(app):
+                pytest.fail("lifespan must not reach its yield")
+        assert fake.started is True
+        assert fake.stopped is True
+        assert fake.order == ["runtime.start", "runtime.stop"]
+        assert app.state.skill_runtime is None
+        assert app.state.skill_author_service is None
+        assert app.state.skill_review_service is None
+        assert app.state.skill_catalog is None
+        assert app.state.skill_search is None
+        assert get_skill_runtime() is None
+        assert skill_search.get_skill_runtime() is None
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_knowledge_service_start_tears_the_runtime_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeRuntime()
+    monkeypatch.setattr(gateway_app, "get_app_config", _config)
+    monkeypatch.setattr(gateway_app, "build_skill_runtime", lambda config: fake)
+
+    async def boom(config: Any) -> Any:
+        raise RuntimeError("knowledge metadata is unreachable")
+
+    monkeypatch.setattr(gateway_app, "configure_knowledge_service", boom)
+
+    async def scenario() -> None:
+        app = SimpleNamespace(state=SimpleNamespace())
+        with pytest.raises(RuntimeError, match="unreachable"):
+            async with gateway_app.lifespan(app):
+                pytest.fail("lifespan must not reach its yield")
+        assert fake.stopped is True
+        assert app.state.skill_runtime is None
+        assert get_skill_runtime() is None
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# graceful shutdown drains runs before it stops the skill runtime (Fix 5)
+# ---------------------------------------------------------------------------
+
+
+def test_shutdown_drains_the_run_manager_before_stopping_the_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    fake = FakeRuntime(order=order)
+    monkeypatch.setattr(gateway_app, "get_app_config", _config)
+    monkeypatch.setattr(gateway_app, "build_skill_runtime", lambda config: fake)
+
+    async def shutdown(timeout: float) -> None:
+        order.append("run_manager.shutdown")
+
+    class Bridge:
+        async def aclose(self) -> None:
+            order.append("bridge.aclose")
+
+    services = SimpleNamespace(
+        run_manager=SimpleNamespace(shutdown=shutdown), bridge=Bridge()
+    )
+    monkeypatch.setattr(gateway_app, "build_run_services", lambda *a, **k: services)
+
+    async def scenario() -> None:
+        app = SimpleNamespace(state=SimpleNamespace())
+        async with gateway_app.lifespan(app):
+            pass
+
+    asyncio.run(scenario())
+
+    assert "run_manager.shutdown" in order and "runtime.stop" in order
+    assert order.index("run_manager.shutdown") < order.index("runtime.stop")

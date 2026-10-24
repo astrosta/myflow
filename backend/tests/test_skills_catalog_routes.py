@@ -211,6 +211,9 @@ def _client(
         application.state.skill_author_service = author
     application.include_router(skills.router, prefix="/api")
     application.state.skill_runtime = runtime
+    # 私有 container_file 是沙箱 provider 的能力，不是环境事实：钉住它，测试不再
+    # 依赖本机配置或执行顺序。
+    monkeypatch.setattr(skills_catalog, "_private_mounts_supported", lambda: True)
     identity = _Identity(scopes, user_id)
     monkeypatch.setattr(
         deps,
@@ -637,3 +640,36 @@ def test_draft_route_container_file_uses_the_configured_container_path(
 
     assert response.status_code == 201, response.text
     assert response.json()["container_file"] == "/opt/skills/private/alice-tools/SKILL.md"
+
+# ---------------------------------------------------------------------------
+# fail closed without a runtime: stale snapshots are not an answer (Fix 6)
+# ---------------------------------------------------------------------------
+
+
+def test_git_mode_without_a_runtime_lists_nothing_even_with_a_live_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A populated snapshot is stale state, not catalog truth: fail closed."""
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"})
+    set_skill_snapshot(_snapshot())
+    client = _client(monkeypatch, runtime=None)
+
+    response = client.get("/api/skills")
+
+    assert response.status_code == 200
+    assert response.json() == {"skills": []}
+
+
+def test_git_mode_without_a_runtime_refuses_to_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reporting success without refreshing anything is the bug: fail with 503."""
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"})
+    set_skill_snapshot(_snapshot())
+    client = _client(monkeypatch, scopes=ADMIN, user_id="root", runtime=None)
+
+    response = client.post("/api/skills/reload")
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "skill_runtime_unavailable"
+    assert response.json().get("reloaded") is not True

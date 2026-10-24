@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentkit.config.reload_boundary import format_field_description
 from agentkit.config.runtime_paths import resolve_path
@@ -75,10 +75,21 @@ class SkillVectorStoreConfig(MilvusConfig):
     collection: str = Field(
         default=ACTIVE_COLLECTION,
         description=(
-            "active projection 的 collection 名（默认 myflow_skills_active）。"
+            "active projection 的 collection 名（固定 myflow_skills_active）。"
             "投影只放当前激活的技能行，绝不能和知识库共用 collection。"
         ),
     )
+
+    @field_validator("collection")
+    @classmethod
+    def _pin_the_active_collection(cls, value: str) -> str:
+        if value != ACTIVE_COLLECTION:
+            raise ValueError(
+                f"skills.search.vector_store.collection must be {ACTIVE_COLLECTION!r}: "
+                "the active projection owns its own collection and never reuses the "
+                "knowledge base's."
+            )
+        return ACTIVE_COLLECTION
 
 
 class SkillSearchConfig(BaseModel):
@@ -154,10 +165,15 @@ class SkillSearchConfig(BaseModel):
         """
         if self.vector_store.uri.strip():
             return self.vector_store
-        return SkillVectorStoreConfig(
-            uri=knowledge_vector_store.uri,
-            token=knowledge_vector_store.token,
-            db_name=knowledge_vector_store.db_name,
+        # 只借连接参数：metric_type / index_type / consistency_level / flush /
+        # timeout_seconds 是调优项，重新构造一份默认配置会把它们悄悄丢掉。
+        return self.vector_store.model_copy(
+            update={
+                "uri": knowledge_vector_store.uri,
+                "token": knowledge_vector_store.token,
+                "db_name": knowledge_vector_store.db_name,
+                "collection": ACTIVE_COLLECTION,
+            }
         )
 
     def recall_channels(self) -> tuple[str, ...]:
