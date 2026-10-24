@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from agentkit.config.skills_config import SkillsConfig
+from agentkit.skills.catalog import SkillSnapshot
+from agentkit.skills.domain import SkillScope
 from agentkit.skills.prompt import (
     SKILL_INDEX_FOOTER,
     SKILL_INDEX_HEADER,
@@ -13,6 +16,7 @@ from agentkit.skills.prompt import (
     render_skill_index,
 )
 from agentkit.skills.storage import SkillRegistry, load_skills
+from agentkit.skills.types import Skill, SkillCategory
 from fakes.skill_tree import skills_config, write_skill
 
 
@@ -175,3 +179,41 @@ def test_the_render_cache_is_cleared_on_reload(tmp_path):
 
     clear_skill_prompt_cache()
     assert "- two [" in _index(tmp_path)
+
+
+def test_a_catalog_snapshot_uses_two_roots_and_scope_markers(tmp_path):
+    def catalog_skill(name, scope, owner):
+        return Skill(
+            name=name,
+            description="Does a thing",
+            license=None,
+            skill_dir=Path("unused"),
+            skill_file=Path("unused/SKILL.md"),
+            relative_path=Path(name),
+            category=SkillCategory.CUSTOM,
+            enabled=True,
+            scope=scope,
+            owner_user_id=owner,
+            skill_id=name,
+            version_id=f"{name}-v1",
+        )
+
+    snapshot = SkillSnapshot(
+        epoch="e1",
+        public=(catalog_skill("public-one", SkillScope.PUBLIC, "u9"),),
+        private_by_owner={
+            "u1": (catalog_skill("private-one", SkillScope.PRIVATE, "u1"),)
+        },
+    )
+    config = skills_config(tmp_path)
+    clear_skill_prompt_cache()
+
+    section = build_skills_section(
+        config=config,
+        registry=SkillRegistry(config=config, snapshot=snapshot, user_id="u1"),
+    )
+
+    assert "/mnt/skills/public/" in section
+    assert "/mnt/skills/private/" in section
+    assert "- private-one [private]:" in section
+    assert "- public-one [public]:" in section

@@ -16,13 +16,17 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.skills.parser import SkillParseError, parse_skill_file
 from agentkit.skills.prefs import effective_enabled, global_enabled_map, read_user_skill_prefs
 from agentkit.skills.types import SKILL_FILE_NAME, Skill, SkillCategory, SkillPathError
+
+if TYPE_CHECKING:
+    from agentkit.skills.catalog import SkillSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -129,17 +133,19 @@ def validate_skill_file_path(skill: Skill) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class SkillRegistry:
-    """live registry：每次读都现扫盘、现读两层开关（§3.4/§3.5）。
+    """Skill view for the prompt, slash, policy, and durable-context paths.
 
-    索引（L0）和策略（§3.9）都从这里取技能，**不缓存目录**：技能被全局禁用、被删除，
-    或被这个用户自己关掉之后，必须立刻从索引与激活集里消失。
+    With a snapshot, reads project that immutable catalog generation for this
+    user; without one, the legacy filesystem scanner runs on every read so tests
+    and filesystem-source deployments keep their old behavior.
     """
 
-    config: SkillsConfig
+    config: SkillsConfig | None = None
     user_id: str | None = None
     available_skills: frozenset[str] | None = None
     prefs_path: Path | None = None
     _enabled_map: Mapping[str, bool] | None = field(default=None, repr=False)
+    snapshot: "SkillSnapshot | None" = None
 
     def enabled_map(self) -> Mapping[str, bool]:
         return self._enabled_map if self._enabled_map is not None else global_enabled_map()
@@ -147,11 +153,48 @@ class SkillRegistry:
     def prefs(self) -> Mapping[str, bool]:
         return read_user_skill_prefs(self.user_id, path=self.prefs_path)
 
+    def _snapshot_skills(
+        self,
+        *,
+        prefs: Mapping[str, bool] | None,
+        available_skills: frozenset[str] | None,
+    ) -> list[Skill]:
+        snapshot = self.snapshot
+        if snapshot is None:  # pragma: no cover - guarded by callers
+            return []
+        return [
+            replace(
+                skill,
+                container_path=(
+                    self.config.container_path
+                    if self.config is not None
+                    else skill.container_path
+                ),
+            )
+            for skill in snapshot._visible_for(
+                self.user_id,
+                available_skills=available_skills,
+                prefs=prefs,
+            )
+        ]
+
     def load(self) -> list[Skill]:
+        if self.snapshot is not None:
+            return self._snapshot_skills(prefs=None, available_skills=None)
+        if self.config is None:
+            raise ValueError("SkillRegistry needs config when no snapshot is supplied")
         return load_skills(self.config, enabled_map=self.enabled_map())
 
     def visible(self) -> list[Skill]:
         """对当前用户**有效启用**、且在该 agent 白名单里的技能。加载失败 → 空（fail-closed）。"""
+        if self.snapshot is not None:
+            try:
+                return self._snapshot_skills(
+                    prefs=self.prefs(), available_skills=self.available_skills
+                )
+            except Exception:
+                logger.exception("Skill snapshot unavailable; failing closed")
+                return []
         try:
             skills = self.load()
         except Exception:  # 配置读不出来 / 路径解析失败：宁可模型"不知道有这个技能"
@@ -166,11 +209,13 @@ class SkillRegistry:
         ]
 
     def find(self, name: str) -> Skill | None:
-        """slash 解析：按 name 取第一条有效启用的命中（custom 已经在 load 里盖过 public）。"""
-        for skill in self.visible():
-            if skill.name == name:
+        """slash 解析：同名时私有 active 优先于公共行（custom 覆盖 public 的旧规则保留）。"""
+        matches = [skill for skill in self.visible() if skill.name == name]
+        for skill in matches:
+            scope = getattr(skill.scope, "value", skill.scope)
+            if scope == "private" and skill.owner_user_id == self.user_id:
                 return skill
-        return None
+        return matches[0] if matches else None
 
     def index_by_container_file(self) -> dict[str, Skill]:
         return {skill.container_file: skill for skill in self.visible()}

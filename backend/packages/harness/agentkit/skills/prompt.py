@@ -42,6 +42,12 @@ SKILL_ROOT_CONVENTION = (
     "`SKILL.md`，即 `{root}/<category>/<技能名>/SKILL.md`（category 是 public 或 custom，"
     "写在索引行的方括号里；同名时 custom 覆盖 public）。"
 )
+SKILL_CATALOG_ROOT_CONVENTION = (
+    "技能根目录：公共技能在 `{public_root}`，私有技能在 `{private_root}`。"
+    "每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的 `SKILL.md`，"
+    "即 `{public_root}/<name>/SKILL.md`（公共）或 `{private_root}/<name>/SKILL.md`（私有）；"
+    "索引行方括号里的 public / private 标明作用域，同名时私有优先。"
+)
 SKILL_INDEX_PREAMBLE = (
     "下面是技能索引 `<available_skills>`：每个已启用技能一行，只有名字、类别和截断描述"
     "（需要密钥的会标出来），**不含正文**。已加载技能的名字与正文在持久上下文的 "
@@ -53,13 +59,17 @@ _index_cache: "OrderedDict[str, str]" = OrderedDict()
 
 
 def _entry_marker(skill: Skill) -> tuple[str, str]:
-    """`(名字后缀, 行尾补充)`。目录名与 frontmatter 的 name 不一致时**直接给路径**：
+    """Return (name suffix, trailing hint) for one index row.
 
-    那种技能按"目录名即技能名"的约定会推到一个错路径，与其让模型 read_file 撞 404，
-    不如在索引行里多花一次 `dir=`。
+    A catalog skill is marked by visibility scope; legacy filesystem skills keep
+    the public/custom category marker.  A directory name that differs from the
+    frontmatter name would make the root convention point at the wrong path, so
+    that row gets an explicit dir=.
     """
+    scope = getattr(skill.scope, "value", skill.scope)
+    marker = scope if scope is not None else skill.category.value
     if skill.relative_path.as_posix() == skill.name:
-        return f" [{skill.category.value}]", ""
+        return f" [{marker}]", ""
     return "", f" | dir={skill.container_dir}"
 
 
@@ -110,7 +120,7 @@ def build_skills_section(
         return cached
     index = render_skill_index(skills, max_description_chars=config.index_description_max_chars)
     section = (
-        f"{SKILL_ROOT_CONVENTION.format(root=config.container_path)}\n{SKILL_INDEX_PREAMBLE}\n\n{index}"
+        f"{_root_convention(skills, config)}\n{SKILL_INDEX_PREAMBLE}\n\n{index}"
         if index
         else ""
     )
@@ -125,6 +135,17 @@ def clear_skill_prompt_cache() -> None:
     _index_cache.clear()
 
 
+def _root_convention(skills: Sequence[Skill], config: SkillsConfig) -> str:
+    """Use the two catalog roots when the registry returned snapshot skills."""
+    if not any(getattr(skill.scope, "value", skill.scope) is not None for skill in skills):
+        return SKILL_ROOT_CONVENTION.format(root=config.container_path)
+    root = config.container_path.rstrip("/") or config.container_path
+    return SKILL_CATALOG_ROOT_CONVENTION.format(
+        public_root=f"{root}/public",
+        private_root=f"{root}/private",
+    )
+
+
 def _cache_key(skills: Sequence[Skill], max_description_chars: int) -> str:
     material = json.dumps(
         [
@@ -132,6 +153,9 @@ def _cache_key(skills: Sequence[Skill], max_description_chars: int) -> str:
                 skill.name,
                 skill.description,
                 skill.category.value,
+                getattr(skill.scope, "value", skill.scope),
+                skill.owner_user_id,
+                skill.version_id,
                 skill.container_dir,
                 [item.name for item in skill.required_secrets],
             ]

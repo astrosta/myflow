@@ -29,6 +29,7 @@ __all__ = [
     "DEFAULT_USER_BUCKET",
     "effective_enabled",
     "global_enabled_map",
+    "preference_key",
     "read_skills_prefs",
     "read_user_skill_prefs",
     "resolve_skills_prefs_path",
@@ -46,8 +47,22 @@ def global_enabled_map() -> dict[str, bool]:
     return {name: entry.enabled for name, entry in config.skills.items()}
 
 
+def preference_key(skill: Skill) -> str:
+    """Catalog skills are keyed by skill_id; legacy filesystem skills by name."""
+    return skill.skill_id or skill.name
+
+
 def effective_enabled(skill: Skill, prefs: Mapping[str, bool] | None = None) -> bool:
-    """全局启用 **且** 个人没关掉。pref 缺省 true（没表过态就是开）。"""
+    """全局启用 **且** 个人没关掉。pref 缺省 true（没表过态就是开）。
+
+    Catalog preferences are keyed by skill_id (Task 15 migration); a name-keyed
+    entry is still accepted so filesystem skills and un-migrated preferences
+    keep working.
+    """
     if not skill.enabled:
         return False
-    return True if prefs is None else bool(prefs.get(skill.name, True))
+    if prefs is None:
+        return True
+    if skill.skill_id and skill.skill_id in prefs:
+        return bool(prefs[skill.skill_id])
+    return bool(prefs.get(skill.name, True))

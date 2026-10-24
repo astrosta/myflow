@@ -1423,6 +1423,10 @@ class SqlSkillStore:
         )
         return visible
 
+    async def all_active(self) -> list[VisibleSkill]:
+        """Snapshot refresh alias: every public and private active pointer."""
+        return await self.list_active_visible()
+
     async def get_active_visible(
         self,
         *,
