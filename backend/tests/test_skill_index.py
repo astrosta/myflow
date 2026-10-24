@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 
 from agentkit.config.skills_config import SkillsConfig
-from agentkit.skills.catalog import SkillSnapshot
+from agentkit.skills.catalog import (
+    SkillSnapshot,
+    get_skill_snapshot,
+    set_skill_snapshot,
+)
 from agentkit.skills.domain import SkillScope
 from agentkit.skills.prompt import (
     SKILL_INDEX_FOOTER,
@@ -217,3 +221,91 @@ def test_a_catalog_snapshot_uses_two_roots_and_scope_markers(tmp_path):
     assert "/mnt/skills/private/" in section
     assert "- private-one [private]:" in section
     assert "- public-one [public]:" in section
+
+
+def _catalog_skill(name: str, scope: SkillScope, owner: str) -> Skill:
+    return Skill(
+        name=name,
+        description="Does a thing",
+        license=None,
+        skill_dir=Path("unused"),
+        skill_file=Path("unused/SKILL.md"),
+        relative_path=Path(name),
+        category=SkillCategory.CUSTOM,
+        enabled=True,
+        scope=scope,
+        owner_user_id=owner,
+        skill_id=name,
+        version_id=f"{name}-v1",
+    )
+
+
+class _Published:
+    """Publish one process snapshot for a test and restore the previous one after."""
+
+    def __init__(self, snapshot: SkillSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def __enter__(self) -> SkillSnapshot:
+        self._original = get_skill_snapshot()
+        set_skill_snapshot(self._snapshot)
+        clear_skill_prompt_cache()
+        return self._snapshot
+
+    def __exit__(self, *exc_info: object) -> None:
+        set_skill_snapshot(self._original)
+        clear_skill_prompt_cache()
+
+
+def test_git_source_renders_the_snapshot_instead_of_scanning_disk(tmp_path):
+    # 磁盘上留着一条老技能：git 源下它不该出现在提示词里。
+    write_skill(tmp_path, "public", "legacy-on-disk")
+    snapshot = SkillSnapshot(
+        epoch="e1",
+        public=(_catalog_skill("public-one", SkillScope.PUBLIC, "alice"),),
+        private_by_owner={
+            "alice": (_catalog_skill("alice-private", SkillScope.PRIVATE, "alice"),)
+        },
+    )
+    config = skills_config(tmp_path, source="git")
+
+    with _Published(snapshot):
+        alice = build_skills_section(config=config, user_id="alice")
+        owner_less = build_skills_section(config=config)
+        bob = build_skills_section(config=config, user_id="bob")
+
+    assert "- public-one [public]:" in alice
+    assert "- alice-private [private]:" in alice
+    assert "legacy-on-disk" not in alice
+    assert "- public-one [public]:" in owner_less
+    assert "alice-private" not in owner_less
+    # 别人的私有技能不进 bob 的提示词，公共技能照旧。
+    assert "- public-one [public]:" in bob
+    assert "alice-private" not in bob
+
+
+def test_git_source_with_an_empty_snapshot_renders_nothing(tmp_path):
+    # 空快照 = 没有已发布技能，绝不能退回去扫磁盘。
+    write_skill(tmp_path, "public", "legacy-on-disk")
+    config = skills_config(tmp_path, source="git")
+
+    with _Published(SkillSnapshot(epoch="", public=(), private_by_owner={})):
+        assert build_skills_section(config=config, user_id="alice") == ""
+
+    assert SkillRegistry(config=config).visible() != []  # 显式 registry 仍是旧行为
+
+
+def test_filesystem_source_still_scans_the_disk(tmp_path):
+    write_skill(tmp_path, "public", "on-disk")
+    snapshot = SkillSnapshot(
+        epoch="e1",
+        public=(_catalog_skill("public-one", SkillScope.PUBLIC, "alice"),),
+        private_by_owner={},
+    )
+    config = skills_config(tmp_path, source="filesystem")
+
+    with _Published(snapshot):
+        section = build_skills_section(config=config, user_id="alice")
+
+    assert "- on-disk [" in section
+    assert "public-one" not in section

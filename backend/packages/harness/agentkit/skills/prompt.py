@@ -24,6 +24,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 
 from agentkit.config.skills_config import SkillsConfig
+from agentkit.skills.catalog import get_skill_snapshot
 from agentkit.skills.storage import SkillRegistry
 from agentkit.skills.types import Skill
 
@@ -97,6 +98,26 @@ def render_skill_index(skills: Sequence[Skill], *, max_description_chars: int) -
     return "\n".join(lines)
 
 
+def _default_registry(
+    *,
+    config: SkillsConfig,
+    user_id: str | None,
+    available_skills: frozenset[str] | None,
+) -> SkillRegistry:
+    """没显式给 registry 时按技能源取视图。
+
+    git 源（生产）只能读进程里的快照：磁盘上没有可渲染的技能树，回退扫描只会渲染出
+    遗留目录。空快照就是空索引，绝不扫盘。filesystem 源保留逐次扫盘的旧行为。
+    """
+    snapshot = get_skill_snapshot() if config.source == "git" else None
+    return SkillRegistry(
+        config=config,
+        user_id=user_id,
+        available_skills=available_skills,
+        snapshot=snapshot,
+    )
+
+
 def build_skills_section(
     *,
     config: SkillsConfig,
@@ -105,7 +126,7 @@ def build_skills_section(
     registry: SkillRegistry | None = None,
 ) -> str:
     """系统提示词的技能块。注册表加载失败 → 空串（fail-closed，§3.5 规则 1）。"""
-    live = registry or SkillRegistry(
+    live = registry or _default_registry(
         config=config, user_id=user_id, available_skills=available_skills
     )
     try:

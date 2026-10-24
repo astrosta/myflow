@@ -1383,7 +1383,9 @@ class SqlSkillStore:
                         & (SkillPublicActiveRow.release_id == SkillReleaseRow.id),
                     )
                     .outerjoin(SkillSettingsRow, SkillSettingsRow.skill_id == SkillRow.id)
-                    .where(SkillRow.deleted_at.is_(None))
+                    # 公共分支不看 skills.deleted_at：删除自己的私有草稿只删指针，
+                    # 已批准公共版本对所有用户都还在（§2.2）。是否在架由 skill_public_active 决定，
+                    # 下架（unpublish）会删掉那一行。记录级的过滤留在私有分支与按记录查的路径上。
                     .order_by(
                         func.coalesce(SkillRow.public_name, SkillRow.private_name).asc(),
                         SkillRow.id.asc(),

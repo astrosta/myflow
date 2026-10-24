@@ -18,6 +18,7 @@ from agentkit.persistence.schema import (
     SkillIndexOutboxRow,
     SkillPrivateActiveRow,
     SkillPublicActiveRow,
+    SkillRow,
     SkillSettingsRow,
 )
 from agentkit.skills.domain import (
@@ -593,5 +594,70 @@ def test_counts_are_visible_for_transaction_assertions(harness: Harness) -> None
             assert await session.scalar(select(func.count()).select_from(SkillAuditEventRow)) == 1
             active = await session.get(SkillPrivateActiveRow, skill.id)
             assert active is not None and active.version_id == version.id
+
+    harness.run(scenario)
+
+
+def test_deleting_the_private_draft_keeps_the_public_release_visible(harness: Harness) -> None:
+    async def scenario() -> None:
+        skill, version = await create_owned(harness, owner="u1", name="pdf-tools")
+        await approve(harness, owner="u1", skill=skill, version=version)
+
+        assert await harness.store.delete_private_draft(
+            skill_id=skill.id, owner_user_id="u1", actor="u1"
+        )
+
+        # 删除的是自己的私有草稿指针；公共版本对所有人都还在（§2.2）。
+        active = await harness.store.all_active()
+        assert [item.skill.skill_id for item in active if item.scope is SkillScope.PUBLIC] == [
+            skill.id
+        ]
+        assert [item for item in active if item.scope is SkillScope.PRIVATE] == []
+
+        for user in ("u1", "u2"):
+            visible = await harness.store.visible_for_user(user)
+            assert [item.scope for item in visible] == [SkillScope.PUBLIC]
+            assert visible[0].release is not None
+
+        # owner 的私有 active 指针已删，私有名唯一性不再拦着它。
+        assert await harness.store.private_skill_ids("u1") == ()
+
+        # 检索确认与快照一致：公共命中还在，私有命中随草稿消失。
+        confirmed = await harness.store.confirm_hits(
+            "u2",
+            [
+                ProjectionHit(
+                    projection_key=f"public:{skill.id}",
+                    scope="public",
+                    owner_user_id=None,
+                    skill_id=skill.id,
+                    version_id=version.id,
+                    score=1.0,
+                )
+            ],
+        )
+        assert [item.skill.skill_id for item in confirmed] == [skill.id]
+        assert (
+            await harness.store.confirm_hits(
+                "u1",
+                [
+                    ProjectionHit(
+                        projection_key=f"private:u1:{skill.id}",
+                        scope="private",
+                        owner_user_id="u1",
+                        skill_id=skill.id,
+                        version_id=version.id,
+                        score=1.0,
+                    )
+                ],
+            )
+            == []
+        )
+
+        # 记录本身仍是软删：按记录查的路径（get_skill / 名唯一性）保持原样。
+        assert await harness.store.get_skill(skill.id) is None
+        async with harness.session_factory() as session:
+            row = await session.get(SkillRow, skill.id)
+            assert row is not None and row.deleted_at is not None
 
     harness.run(scenario)
