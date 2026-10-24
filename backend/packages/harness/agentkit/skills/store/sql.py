@@ -9,12 +9,15 @@ half-applied catalog change.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from agentkit.skills.domain import (
@@ -27,10 +30,13 @@ from agentkit.skills.domain import (
     SkillScope,
     SkillSubmissionRecord,
     SkillVersionRecord,
+    StagedFile,
+    StagedFileInfo,
     VisibleSkill,
 )
 from agentkit.skills.store.model import (
     SkillAuditEventRow,
+    SkillDraftFileRow,
     SkillIndexOutboxRow,
     SkillPrivateActiveRow,
     SkillPublicActiveRow,
@@ -47,6 +53,24 @@ if TYPE_CHECKING:
     # Task 10 owns the Milvus projection record.  Importing it only for type
     # checking keeps this store usable before projection.py exists.
     from agentkit.skills.projection import ProjectionHit
+
+
+_MAX_OUTBOX_PAYLOAD_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxEvent:
+    """A claimed projection-outbox row, without worker-only bookkeeping fields."""
+
+    id: str
+    op: str
+    projection_key: str
+    scope: str
+    owner_user_id: str | None
+    skill_id: str
+    version_id: str | None
+    payload: dict[str, Any]
+    attempts: int
 
 
 def _now() -> datetime:
@@ -228,6 +252,30 @@ def _visible(
         scope=scope,
         version=_version_record(version),
         release=_release_record(release) if release is not None else None,
+    )
+
+
+def _validate_outbox_payload(payload: dict[str, Any]) -> None:
+    """Reject payloads whose stored JSON would exceed the 64 KiB contract."""
+    try:
+        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("outbox payload must be JSON serializable") from exc
+    if len(encoded) > _MAX_OUTBOX_PAYLOAD_BYTES:
+        raise ValueError("outbox payload exceeds 64 KiB")
+
+
+def _outbox_event(row: SkillIndexOutboxRow) -> OutboxEvent:
+    return OutboxEvent(
+        id=row.id,
+        op=row.op,
+        projection_key=row.projection_key,
+        scope=row.scope,
+        owner_user_id=row.owner_user_id,
+        skill_id=row.skill_id,
+        version_id=row.version_id,
+        payload=dict(row.payload_json or {}),
+        attempts=row.attempts,
     )
 
 
@@ -914,6 +962,241 @@ class SqlSkillStore:
             await self._commit(session, f"skill setting for {skill_id!r} conflicts")
 
     # ------------------------------------------------------------------
+    # draft staging
+    # ------------------------------------------------------------------
+
+    async def put_draft_file(
+        self,
+        skill_id: str,
+        path: str,
+        content: bytes,
+        mode: str = "text",
+    ) -> StagedFileInfo:
+        content = bytes(content)
+        sha256 = hashlib.sha256(content).hexdigest()
+        size_bytes = len(content)
+        now = _now()
+        async with self._sf() as session:
+            row = await session.get(SkillDraftFileRow, (skill_id, path))
+            if row is None:
+                session.add(
+                    SkillDraftFileRow(
+                        skill_id=skill_id,
+                        path=path,
+                        content=content,
+                        sha256=sha256,
+                        size_bytes=size_bytes,
+                        mode=mode,
+                        updated_at=now,
+                    )
+                )
+            else:
+                row.content = content
+                row.sha256 = sha256
+                row.size_bytes = size_bytes
+                row.mode = mode
+                row.updated_at = now
+            await self._commit(session, f"draft file {path!r} for skill {skill_id!r} conflicts")
+        return StagedFileInfo(
+            path=path,
+            size_bytes=size_bytes,
+            mode=mode,
+            sha256=sha256,
+        )
+
+    async def list_draft_files(self, skill_id: str) -> list[StagedFile]:
+        async with self._sf() as session:
+            rows = (
+                await session.scalars(
+                    select(SkillDraftFileRow)
+                    .where(SkillDraftFileRow.skill_id == skill_id)
+                    .order_by(SkillDraftFileRow.path.asc())
+                )
+            ).all()
+            return [
+                StagedFile(
+                    path=row.path,
+                    content=bytes(row.content),
+                    mode=row.mode,
+                )
+                for row in rows
+            ]
+
+    async def delete_draft_file(self, skill_id: str, path: str) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                delete(SkillDraftFileRow).where(
+                    SkillDraftFileRow.skill_id == skill_id,
+                    SkillDraftFileRow.path == path,
+                )
+            )
+            deleted = result.rowcount > 0
+            await self._commit(
+                session, f"draft file {path!r} for skill {skill_id!r} could not be deleted"
+            )
+            return deleted
+
+    async def delete_all_draft_files(self, skill_id: str) -> None:
+        async with self._sf() as session:
+            await session.execute(
+                delete(SkillDraftFileRow).where(SkillDraftFileRow.skill_id == skill_id)
+            )
+            await self._commit(
+                session, f"draft files for skill {skill_id!r} could not be deleted"
+            )
+
+    # ------------------------------------------------------------------
+    # projection outbox
+    # ------------------------------------------------------------------
+
+    async def enqueue_outbox(
+        self,
+        *,
+        op: str,
+        projection_key: str,
+        scope: str,
+        owner_user_id: str | None,
+        skill_id: str,
+        version_id: str | None,
+        payload: dict,
+    ) -> None:
+        now = _now()
+        async with self._sf() as session:
+            self._outbox_row(
+                session,
+                op=op,
+                projection_key=projection_key,
+                scope=scope,
+                owner_user_id=owner_user_id,
+                skill_id=skill_id,
+                version_id=version_id,
+                payload=payload,
+                now=now,
+            )
+            await self._commit(session, "projection outbox event could not be enqueued")
+
+    async def claim_outbox(self, limit: int = 20) -> list[OutboxEvent]:
+        if limit <= 0:
+            return []
+        now = _now()
+        async with self._sf() as session:
+            dialect = session.get_bind().dialect.name
+            if dialect == "postgresql":
+                rows = (
+                    await session.scalars(
+                        select(SkillIndexOutboxRow)
+                        .where(
+                            SkillIndexOutboxRow.status == "pending",
+                            SkillIndexOutboxRow.next_attempt_at <= now,
+                        )
+                        .order_by(
+                            SkillIndexOutboxRow.created_at.asc(),
+                            SkillIndexOutboxRow.id.asc(),
+                        )
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+                for row in rows:
+                    row.status = "running"
+                    row.attempts += 1
+                    row.updated_at = now
+                events = [_outbox_event(row) for row in rows]
+                await self._commit(session, "projection outbox claim conflicts")
+                return events
+
+            # SQLite has no FOR UPDATE.  Select candidates and then claim them
+            # with a conditional UPDATE in the same transaction; a concurrent
+            # caller that lost the race gets no rows back and never duplicates
+            # an event.
+            candidates = (
+                await session.scalars(
+                    select(SkillIndexOutboxRow)
+                    .where(
+                        SkillIndexOutboxRow.status == "pending",
+                        SkillIndexOutboxRow.next_attempt_at <= now,
+                    )
+                    .order_by(
+                        SkillIndexOutboxRow.created_at.asc(),
+                        SkillIndexOutboxRow.id.asc(),
+                    )
+                    .limit(limit)
+                )
+            ).all()
+            if not candidates:
+                return []
+
+            attempts = {row.id: row.attempts for row in candidates}
+            result = await session.execute(
+                update(SkillIndexOutboxRow)
+                .where(
+                    SkillIndexOutboxRow.id.in_([row.id for row in candidates]),
+                    SkillIndexOutboxRow.status == "pending",
+                )
+                .values(
+                    status="running",
+                    attempts=SkillIndexOutboxRow.attempts + 1,
+                    updated_at=now,
+                )
+                .returning(SkillIndexOutboxRow.id)
+                .execution_options(synchronize_session=False)
+            )
+            claimed_ids = set(result.scalars().all())
+            events = [
+                OutboxEvent(
+                    id=row.id,
+                    op=row.op,
+                    projection_key=row.projection_key,
+                    scope=row.scope,
+                    owner_user_id=row.owner_user_id,
+                    skill_id=row.skill_id,
+                    version_id=row.version_id,
+                    payload=dict(row.payload_json or {}),
+                    attempts=attempts[row.id] + 1,
+                )
+                for row in candidates
+                if row.id in claimed_ids
+            ]
+            await self._commit(session, "projection outbox claim conflicts")
+            return events
+
+    async def finish_outbox(self, event_id: str) -> None:
+        now = _now()
+        async with self._sf() as session:
+            row = await session.get(SkillIndexOutboxRow, event_id)
+            if row is None:
+                return
+            row.status = "done"
+            row.updated_at = now
+            await self._commit(session, f"projection outbox event {event_id!r} conflicts")
+
+    async def retry_outbox(
+        self, event_id: str, error: str, delay_seconds: int
+    ) -> None:
+        now = _now()
+        # A retry is always scheduled strictly in the future so an immediate
+        # claim cannot spin on the same failed event.
+        next_attempt_at = now + timedelta(seconds=max(1, int(delay_seconds)))
+        async with self._sf() as session:
+            row = await session.get(SkillIndexOutboxRow, event_id)
+            if row is None:
+                return
+            row.status = "pending"
+            row.last_error = error
+            row.next_attempt_at = next_attempt_at
+            row.updated_at = now
+            await self._commit(session, f"projection outbox event {event_id!r} conflicts")
+
+    async def pending_outbox_count(self) -> int:
+        async with self._sf() as session:
+            count = await session.scalar(
+                select(func.count())
+                .select_from(SkillIndexOutboxRow)
+                .where(SkillIndexOutboxRow.status == "pending")
+            )
+            return int(count or 0)
+
+    # ------------------------------------------------------------------
     # visibility, projection confirmation, and audit
     # ------------------------------------------------------------------
 
@@ -1195,6 +1478,7 @@ class SqlSkillStore:
         payload: dict,
         now: datetime,
     ) -> None:
+        _validate_outbox_payload(payload)
         session.add(
             SkillIndexOutboxRow(
                 op=op,
@@ -1213,4 +1497,4 @@ class SqlSkillStore:
         )
 
 
-__all__ = ["SqlSkillStore"]
+__all__ = ["OutboxEvent", "SqlSkillStore"]
