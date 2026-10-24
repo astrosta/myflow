@@ -24,7 +24,7 @@ from agentkit.skills.domain import (
     StagedFileInfo,
 )
 from agentkit.skills.package import render_skill_md
-from backend.app.gateway import deps
+from backend.app.gateway import deps, skills_catalog
 from backend.app.gateway.app import install_error_handlers, install_middleware
 from backend.app.gateway.auth import AuthSettings
 from backend.app.gateway.routers import skill_drafts, skills
@@ -451,6 +451,65 @@ def test_upload_draft_files_stages_multipart_attachments(
 
     assert response.status_code == 200
     assert [file["path"] for file in response.json()["files"]] == ["SKILL.md", "scripts/run.sh"]
+
+
+def test_save_and_delete_refresh_the_catalog_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+    _create(client)
+    calls: list[str] = []
+
+    async def refresh() -> None:
+        calls.append("refresh")
+
+    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
+
+    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
+    assert calls == ["refresh"]
+    assert client.delete("/api/skills/skill-1").status_code == 204
+    assert calls == ["refresh", "refresh"]
+
+
+def test_submit_and_withdraw_do_not_refresh_the_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+    _create(client)
+    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
+    calls: list[str] = []
+
+    async def refresh() -> None:
+        calls.append("refresh")
+
+    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
+
+    assert client.post("/api/skills/skill-1/submit").status_code == 200
+    assert client.post("/api/skills/skill-1/withdraw").status_code == 200
+    # Pending state lives in PostgreSQL and is read straight from the store, so
+    # rebuilding the snapshot and mount trees here would be pure overhead.
+    assert calls == []
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_mine_omits_private_container_file_when_mounts_are_unsupported(
+    monkeypatch: pytest.MonkeyPatch, supported: bool
+) -> None:
+    service = FakeAuthorService()
+    client, identity = _client(monkeypatch, service)
+    _create(client)
+    identity.as_(READ, user_id="alice")
+    monkeypatch.setattr(
+        skills_catalog, "_private_mounts_supported", lambda: supported
+    )
+
+    rows = client.get("/api/skills/mine").json()["skills"]
+
+    assert rows[0]["container_file"] == (
+        "/mnt/skills/private/alice-tools/SKILL.md" if supported else None
+    )
 
 
 def test_route_order_keeps_mine_before_skill_id_routes() -> None:

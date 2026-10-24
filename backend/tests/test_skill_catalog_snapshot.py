@@ -464,3 +464,23 @@ def test_snapshot_visible_for_is_stable_and_returns_private_before_find(
 
     assert [skill.skill_id for skill in first] == [skill.skill_id for skill in second]
     assert [skill.skill_id for skill in first] == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_uses_the_configured_container_root(tmp_path: Path) -> None:
+    public = _public("s2", "beta")
+    private = _private("s1", "alpha")
+    content = FakeContent(tmp_path / "cache")
+    _materialize(content, COMMIT_PUBLIC, public.release.skill_path)  # type: ignore[union-attr]
+    _materialize(content, COMMIT_PRIVATE, private.version.skill_path)
+
+    snapshot = await SkillCatalogService(  # type: ignore[arg-type]
+        FakeStore([public, private]), content, "/opt/skills"
+    ).refresh()
+
+    assert snapshot.public[0].container_path == "/opt/skills"
+    assert snapshot.public[0].container_file == "/opt/skills/public/beta/SKILL.md"
+    assert (
+        snapshot.private_by_owner["u1"][0].container_file
+        == "/opt/skills/private/alpha/SKILL.md"
+    )

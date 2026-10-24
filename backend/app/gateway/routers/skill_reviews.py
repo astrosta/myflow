@@ -22,6 +22,7 @@ from agentkit.skills.domain import (
     SkillReleaseRecord,
     SkillSubmissionRecord,
 )
+from backend.app.gateway import skills_catalog
 from backend.app.gateway.deps import get_skill_review_service, require_scope
 from backend.app.gateway.errors import SkillConflictAPI, SkillPackageInvalid
 from backend.app.gateway.models.skills import (
@@ -161,6 +162,7 @@ async def approve_review(
             submission_id=submission_id,
         )
     )
+    await skills_catalog.refresh_skill_runtime()
     return _release(release)
 
 
@@ -180,6 +182,7 @@ async def reject_review(
             reason=body.reason,
         )
     )
+    await skills_catalog.refresh_skill_runtime()
     return _submission(submission)
 
 
@@ -195,6 +198,7 @@ async def unpublish_skill(
             skill_id=skill_id,
         )
     )
+    await skills_catalog.refresh_skill_runtime()
     return UnpublishResponse(skill_id=skill_id)
 
 
@@ -216,6 +220,7 @@ async def activate_release(
             release_id=body.release_id,
         )
     )
+    await skills_catalog.refresh_skill_runtime()
     return Response(status_code=http_status.HTTP_204_NO_CONTENT)
 
 

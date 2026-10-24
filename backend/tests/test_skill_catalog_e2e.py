@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -27,6 +29,7 @@ from agentkit.config.skills_config import (
 )
 from agentkit.persistence.schema import Base, SkillSettingsRow
 from agentkit.skills.author import SkillAuthorService
+from agentkit.skills.catalog import SkillCatalogService
 from agentkit.skills.content import SkillContentStore
 from agentkit.skills.domain import PackageManifest, StagedFile
 from agentkit.skills.git import SkillGitRepository
@@ -36,6 +39,17 @@ from agentkit.skills.projection import ProjectionHit, ProjectionRow
 from agentkit.skills.review import SkillReviewService
 from agentkit.skills.search import SkillSearchService
 from agentkit.skills.store.sql import SqlSkillStore
+from backend.app.gateway import deps
+from backend.app.gateway.app import install_error_handlers, install_middleware
+from backend.app.gateway.auth import AuthSettings
+from backend.app.gateway.routers import skill_drafts, skills
+from backend.app.gateway.run_models import CallerKind, RunCaller
+from backend.app.gateway.skills_catalog import (
+    SkillRuntime,
+    configure_skill_runtime,
+    reset_skill_runtime,
+)
+from fakes.skill_tree import write_app_config
 
 LIMITS = {"max_files": 20, "max_file_bytes": 4096, "max_package_bytes": 16384}
 
@@ -131,6 +145,9 @@ class Harness:
     review: SkillReviewService
     outbox: SkillIndexOutboxWorker
     search: SkillSearchService
+    content: SkillContentStore
+    git: SkillGitRepository
+    catalog: SkillCatalogService
     projection: FakeProjection = field(default_factory=FakeProjection)
     engine: Any = None
 
@@ -169,6 +186,9 @@ async def build_harness(tmp_path: Path) -> Harness:
         review=SkillReviewService(store, git, content, SkillReviewConfig()),
         outbox=SkillIndexOutboxWorker(store, content, embedder, projection, poll_seconds=1),
         search=SkillSearchService(store, projection, content, embedder, search_config),
+        content=content,
+        git=git,
+        catalog=SkillCatalogService(store, content),
         projection=projection,
         engine=engine,
     )
@@ -216,6 +236,73 @@ async def test_author_private_search_then_approve_then_other_user_search(tmp_pat
         assert other.hits[0].skill.name == "pdf-tools"
         assert "Read the PDF" in other.hits[0].body
     finally:
+        await harness.engine.dispose()
+
+
+
+
+@pytest.mark.asyncio
+async def test_save_and_delete_refresh_the_http_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = await build_harness(tmp_path)
+    monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(tmp_path / "skills_prefs.json"))
+    config_path = write_app_config(
+        tmp_path,
+        source="git",
+        git={"repository": (tmp_path / "remote.git").as_posix()},
+    )
+    monkeypatch.setenv("MYFLOW_CONFIG_PATH", str(config_path))
+
+    runtime = SkillRuntime(
+        store=harness.store,
+        git=harness.git,
+        content=harness.content,
+        author=harness.author,
+        review=harness.review,
+        search=harness.search,
+        catalog=harness.catalog,
+        outbox=harness.outbox,
+    )
+    configure_skill_runtime(runtime)
+    application = FastAPI(redirect_slashes=False)
+    install_middleware(application, auth_settings=AuthSettings.disabled())
+    install_error_handlers(application)
+    application.state.skill_runtime = runtime
+    application.state.skill_author_service = harness.author
+    application.include_router(skill_drafts.router, prefix="/api")
+    application.include_router(skills.router, prefix="/api")
+    monkeypatch.setattr(
+        deps,
+        "caller_from_request",
+        lambda request: RunCaller(
+            kind=CallerKind.HTTP,
+            user_id="u1",
+            scopes=frozenset({"skills:read", "skills:write"}),
+        ),
+    )
+    client = TestClient(application, raise_server_exceptions=False)
+    try:
+        created = client.post(
+            "/api/skills", json={"name": "pdf-tools", "description": "PDF"}
+        )
+        assert created.status_code == 201, created.text
+        skill_id = created.json()["id"]
+        assert client.put(
+            f"/api/skills/{skill_id}/draft/file",
+            json={"path": "SKILL.md", "content": valid_skill_bytes("pdf-tools").decode()},
+        ).status_code == 200
+
+        assert client.post(f"/api/skills/{skill_id}/draft/save").status_code == 200
+        rows = client.get("/api/skills").json()["skills"]
+        assert [(row["skill_id"], row["scope"]) for row in rows] == [(skill_id, "private")]
+        assert rows[0]["container_file"] == "/mnt/skills/private/pdf-tools/SKILL.md"
+
+        assert client.delete(f"/api/skills/{skill_id}").status_code == 204
+        assert client.get("/api/skills").json()["skills"] == []
+    finally:
+        reset_skill_runtime()
         await harness.engine.dispose()
 
 

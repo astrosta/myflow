@@ -9,6 +9,7 @@ PostgreSQL, or Git repository is required.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,9 +19,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agentkit.config import get_app_config
 from agentkit.config.skills_prefs import read_user_skill_prefs
+from agentkit.sandbox.local.local_sandbox_provider import LocalSandboxProvider
+from agentkit.sandbox.security import find_path_mapping
 from agentkit.skills.catalog import SkillSnapshot, set_skill_snapshot
 from agentkit.skills.domain import SkillRecord, SkillScope
+from agentkit.skills.prompt import build_skills_section
+from agentkit.skills.storage import SkillRegistry
 from agentkit.skills.types import Skill, SkillCategory
 from backend.app.gateway import deps
 from backend.app.gateway.app import install_error_handlers, install_middleware
@@ -129,6 +135,7 @@ def _skill(
     commit: str = PUBLIC_COMMIT,
     path: str | None = None,
     enabled: bool = True,
+    container_path: str = "/mnt/skills",
 ) -> Skill:
     return Skill(
         name=name,
@@ -146,6 +153,7 @@ def _skill(
         skill_version=skill_version,
         git_commit=commit,
         repo_path=path or f"public/{name}/SKILL.md",
+        container_path=container_path,
     )
 
 
@@ -170,11 +178,21 @@ BOB_PRIVATE = _skill(
 )
 
 
-def _snapshot(*, public: tuple[Skill, ...] | None = None) -> SkillSnapshot:
+def _snapshot(
+    *,
+    public: tuple[Skill, ...] | None = None,
+    container_path: str = "/mnt/skills",
+) -> SkillSnapshot:
+    def at_root(skill: Skill) -> Skill:
+        return replace(skill, container_path=container_path)
+
     return SkillSnapshot(
         epoch="epoch-1",
-        public=public if public is not None else (PUBLIC,),
-        private_by_owner={"alice": (ALICE_PRIVATE,), "bob": (BOB_PRIVATE,)},
+        public=tuple(at_root(skill) for skill in (public if public is not None else (PUBLIC,))),
+        private_by_owner={
+            "alice": (at_root(ALICE_PRIVATE),),
+            "bob": (at_root(BOB_PRIVATE),),
+        },
     )
 
 
@@ -597,7 +615,7 @@ def test_container_file_uses_the_configured_container_path(
         git={"repository": "https://example.test/s.git"},
         container_path="/opt/skills",
     )
-    runtime = _runtime(_snapshot())
+    runtime = _runtime(_snapshot(container_path="/opt/skills"))
     set_skill_snapshot(runtime.catalog.snapshot)
     client = _client(monkeypatch, runtime=runtime)
 
@@ -605,6 +623,48 @@ def test_container_file_uses_the_configured_container_path(
 
     assert rows["shared"]["container_file"] == "/opt/skills/public/shared/SKILL.md"
     assert rows["alice-tools"]["container_file"] == "/opt/skills/private/alice-tools/SKILL.md"
+
+    config = get_app_config().skills
+    registry = SkillRegistry(
+        config=config, user_id="alice", snapshot=runtime.catalog.snapshot
+    )
+    prompt = build_skills_section(config=config, registry=registry)
+    assert "/opt/skills/public" in prompt
+    assert "/opt/skills/private" in prompt
+
+    provider = LocalSandboxProvider(cache_dir=tmp_path / "cache")
+    sandbox = provider.get(provider.acquire("thread-a", user_id="alice"))
+    assert sandbox is not None
+    public = find_path_mapping("/opt/skills/public", sandbox.path_mappings)
+    private = find_path_mapping("/opt/skills/private", sandbox.path_mappings)
+    assert public is not None and Path(public.local_path).parts[-2:] == ("active", "public")
+    assert private is not None and Path(private.local_path).parts[-3:] == (
+        "active",
+        "users",
+        "alice",
+    )
+    # The row's container_file resolves under the exact same mount.
+    row = rows["alice-tools"]["container_file"]
+    assert find_path_mapping(row.rsplit("/SKILL.md", 1)[0], sandbox.path_mappings) is private
+
+
+def test_default_container_path_still_yields_mnt_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"})
+    runtime = _runtime(_snapshot())
+    set_skill_snapshot(runtime.catalog.snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+
+    rows = {item["name"]: item for item in client.get("/api/skills").json()["skills"]}
+
+    assert rows["shared"]["container_file"] == "/mnt/skills/public/shared/SKILL.md"
+    assert rows["alice-tools"]["container_file"] == "/mnt/skills/private/alice-tools/SKILL.md"
+    provider = LocalSandboxProvider(cache_dir=tmp_path / "cache")
+    sandbox = provider.get(provider.acquire("thread-a", user_id="alice"))
+    assert sandbox is not None
+    assert find_path_mapping("/mnt/skills/public", sandbox.path_mappings) is not None
+    assert find_path_mapping("/mnt/skills/private", sandbox.path_mappings) is not None
 
 
 @dataclass
@@ -673,3 +733,59 @@ def test_git_mode_without_a_runtime_refuses_to_reload(
     assert response.status_code == 503
     assert response.json()["code"] == "skill_runtime_unavailable"
     assert response.json().get("reloaded") is not True
+
+
+# ---------------------------------------------------------------------------
+# mutation refresh helper (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_skill_runtime_noops_for_filesystem_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(skills_catalog, "_skill_source", lambda: "filesystem")
+    monkeypatch.setattr(
+        skills_catalog,
+        "get_skill_runtime",
+        lambda: (_ for _ in ()).throw(AssertionError("runtime must not be read")),
+    )
+
+    await skills_catalog.refresh_skill_runtime()
+
+
+@pytest.mark.asyncio
+async def test_refresh_skill_runtime_refreshes_and_clears_prompt_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(SkillSnapshot("e", (), {}))
+    cleared: list[str] = []
+    monkeypatch.setattr(skills_catalog, "_skill_source", lambda: "git")
+    monkeypatch.setattr(skills_catalog, "get_skill_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        skills_catalog, "clear_skill_prompt_cache", lambda: cleared.append("cleared")
+    )
+
+    await skills_catalog.refresh_skill_runtime()
+
+    assert runtime.catalog.refresh_calls == 1
+    assert cleared == ["cleared"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_skill_runtime_logs_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class BrokenCatalog:
+        async def refresh(self) -> SkillSnapshot:
+            raise RuntimeError("snapshot database is gone")
+
+    runtime = _runtime(SkillSnapshot("e", (), {}))
+    runtime.catalog = BrokenCatalog()
+    monkeypatch.setattr(skills_catalog, "_skill_source", lambda: "git")
+    monkeypatch.setattr(skills_catalog, "get_skill_runtime", lambda: runtime)
+    caplog.set_level(logging.WARNING, logger="backend.app.gateway.skills_catalog")
+
+    await skills_catalog.refresh_skill_runtime()
+
+    assert "refresh failed" in caplog.text

@@ -206,6 +206,27 @@ def reset_skill_runtime() -> None:
     set_skill_snapshot(SkillSnapshot(epoch="", public=(), private_by_owner={}))
 
 
+async def refresh_skill_runtime() -> None:
+    """Rebuild the catalog after a committed mutation, without ever raising.
+
+    The snapshot and mount trees are derived state: a failed refresh must not
+    turn an already-committed save or review decision into an HTTP error.  The
+    filesystem source keeps reading disk per request, so it has nothing to
+    invalidate here.
+    """
+    try:
+        if _skill_source() != GIT_SOURCE:
+            return
+        runtime = get_skill_runtime()
+        if runtime is None:
+            logger.warning("Skill runtime is not installed; skipping catalog refresh")
+            return
+        await runtime.refresh()
+        clear_skill_prompt_cache()
+    except Exception as exc:  # noqa: BLE001 - committed writes must not become 500s
+        logger.warning("Skill catalog refresh failed after a committed mutation: %s", exc)
+
+
 def runtime_for_request(request: Any) -> SkillRuntime | None:
     """app.state first (lifespan-owned), then the process registry (tests/embedding)."""
     state = getattr(getattr(request, "app", None), "state", None)
@@ -236,7 +257,7 @@ def build_skill_runtime(
     content = SkillContentStore(cache_dir, git)
     author = SkillAuthorService(store, git, content, skills.creation)
     review = SkillReviewService(store, git, content, skills.review)
-    catalog = SkillCatalogService(store, content)
+    catalog = SkillCatalogService(store, content, skills.container_path)
 
     search = None
     outbox = None
@@ -381,14 +402,6 @@ def _skill_source() -> str:
     return get_app_config().skills.source
 
 
-def _configured_container_file(skill: Skill) -> str:
-    """容器路径来自 skills.container_path，不是写死的 /mnt/skills。"""
-    root = get_app_config().skills.container_path.rstrip("/") or "/"
-    scope = _scope_value(skill.scope)
-    directory = skill.relative_path.as_posix()
-    return f"{root}/{scope}/{directory}/SKILL.md" if scope else skill.container_file
-
-
 def _private_mounts_supported() -> bool:
     """Per-user private mounts are a sandbox-provider capability (Task 14)."""
     try:
@@ -438,11 +451,11 @@ def _catalog_response(
     if scope == "private":
         category = "custom"
         global_enabled = None
-        container_file = _configured_container_file(skill) if _private_mounts_supported() else None
+        container_file = skill.container_file if _private_mounts_supported() else None
     else:
         category = "public"
         global_enabled = skill.enabled if include_global else None
-        container_file = _configured_container_file(skill)
+        container_file = skill.container_file
     return SkillResponse(
         name=skill.name,
         description=skill.description,

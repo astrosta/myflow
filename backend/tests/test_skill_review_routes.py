@@ -18,7 +18,7 @@ from agentkit.skills.domain import (
     SkillSubmissionRecord,
     StagedFileInfo,
 )
-from backend.app.gateway import deps
+from backend.app.gateway import deps, skills_catalog
 from backend.app.gateway.app import install_error_handlers, install_middleware
 from backend.app.gateway.auth import AuthSettings
 from backend.app.gateway.routers import skill_reviews
@@ -411,6 +411,57 @@ def test_activate_maps_skill_conflict_to_409(monkeypatch: pytest.MonkeyPatch) ->
 
     assert response.status_code == 409
     assert response.json()["code"] == "skill_conflict"
+
+
+def test_every_state_changing_review_route_refreshes_the_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeReviewService()
+    client, _identity = _client(monkeypatch, service)
+    calls: list[str] = []
+
+    async def refresh() -> None:
+        calls.append("refresh")
+
+    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
+
+    assert client.post(
+        "/api/admin/skills/reviews/submission-1/approve"
+    ).status_code == 200
+    assert client.post(
+        "/api/admin/skills/reviews/submission-1/reject",
+        json={"reason": "needs a clearer procedure"},
+    ).status_code == 200
+    assert client.post("/api/admin/skills/skill-1/unpublish").status_code == 200
+    assert client.post(
+        "/api/admin/skills/skill-1/activate", json={"release_id": "release-1"}
+    ).status_code == 204
+    assert calls == ["refresh", "refresh", "refresh", "refresh"]
+
+
+def test_a_failed_refresh_does_not_fail_a_committed_approval(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    service = FakeReviewService()
+    client, _identity = _client(monkeypatch, service)
+    real_refresh = skills_catalog.refresh_skill_runtime
+
+    class BrokenRuntime:
+        async def refresh(self) -> None:
+            raise RuntimeError("database went away after commit")
+
+    async def failing() -> None:
+        monkeypatch.setattr(skills_catalog, "_skill_source", lambda: "git")
+        monkeypatch.setattr(skills_catalog, "get_skill_runtime", lambda: BrokenRuntime())
+        await real_refresh()
+
+    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", failing)
+    caplog.set_level("WARNING", logger="backend.app.gateway.skills_catalog")
+
+    response = client.post("/api/admin/skills/reviews/submission-1/approve")
+
+    assert response.status_code == 200
+    assert "refresh failed" in caplog.text
 
 
 def test_reviews_are_declared_before_generic_admin_skill_routes() -> None:

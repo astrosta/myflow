@@ -168,8 +168,10 @@ SOP 固定 `SKILL.md`"的约定在块前说一次，路径可推），
 `top_k`），默认只有本地通道；`skills.search.embedding` / `rerank` 不填地址就不发请求，
 失败也只降级（退回 BM25 / 融合顺序）并在 `retrieval.warnings` 里说明。加载即激活：
 结果里的 `path` 和 `read_file` 读 SKILL.md 走同一本 `skill_context` 台账。
-技能是**两层开关**：全局 `extensions_config.json` 的 `skills.<name>.enabled`（admin）与个人
-`skills_prefs.json` 的 `{user_id: {name: bool}}`（任何登录用户），有效状态 = 两者相与。
+技能是**两层开关**：`skills.source: git` 时全局开关写 PostgreSQL 的 `skill_settings`
+（按内部 `skill_id`，admin），个人偏好仍写 `skills_prefs.json` 的
+`{user_id: {skill_id: bool}}`（任何登录用户），有效状态 = 两者相与。旧的
+`extensions_config.json` 技能开关与按名字的偏好用 `backend/scripts/migrate_skill_state.py` 迁移。
 
 ## 认证（M9 §2）
 
@@ -337,9 +339,17 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `GET`/`PATCH` | `/api/mcp/config` | 读 MCP 配置（打码成 `****`）/ 启停一台已有服务器（`admin`） |
 | `POST` | `/api/mcp/cache/reset` | 清本进程的 MCP 工具缓存（`admin`） |
 | `GET` | `/api/skills` | 技能目录，`enabled` 是**有效状态**（`skills:read`；`?scope=global` 仅 `admin`） |
-| `PUT` | `/api/skills/{name}/preference` | 开关"我用不用"（任何登录用户，只写 `skills_prefs.json`） |
-| `PATCH` | `/api/skills/{name}` | 全局开关（`admin`，写 `extensions_config.json`） |
-| `POST` | `/api/skills/reload` | 清本进程的技能 prompt 缓存（`admin`） |
+| `GET` | `/api/skills/mine` | 当前用户的私有草稿列表（`skills:read`） |
+| `POST` | `/api/skills` | 新建私有草稿（`skills:write`） |
+| `POST` | `/api/skills/{skill_id}/draft/save` | 保存草稿版本并刷新目录快照（`skills:write`） |
+| `POST` | `/api/skills/{skill_id}/submit` / `withdraw` | 提交/撤回审核（`skills:write`） |
+| `DELETE` | `/api/skills/{skill_id}` | 删除私有草稿并刷新目录快照（`skills:write`） |
+| `PUT` | `/api/skills/{skill_id}/preference` | 开关"我用不用"（任何登录用户，只写 `skills_prefs.json`，按 `skill_id`） |
+| `PATCH` | `/api/skills/{skill_id}` | 全局开关（`admin`，`skills.source: git` 时写 PostgreSQL 的 `skill_settings`） |
+| `POST` | `/api/skills/reload` | 重建本进程的目录快照与挂载树（`admin`） |
+| `GET` | `/api/admin/skills/reviews` | 审核队列（`admin`） |
+| `POST` | `/api/admin/skills/reviews/{submission_id}/approve` / `reject` | 批准/驳回提交（`admin`） |
+| `POST` | `/api/admin/skills/{skill_id}/unpublish` / `activate` | 下架/切换公共激活版本（`admin`） |
 | `GET` | `/api/v1/auth/setup-status` | 库里有没有 admin（公开） |
 | `POST` | `/api/v1/auth/initialize` | 建第一个 admin（公开，且只在零 admin 时；要 email + username + password） |
 | `POST` | `/api/v1/auth/login/local` | 本地登录（公开，响应体不含 token）。`identifier` = **邮箱或用户名**，旧的 `email` 字段名仍接受 |
@@ -350,8 +360,8 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `PATCH` | `/api/v1/auth/me` | 改**自己**的用户名（body `{"username": ...}` → `UserResponse`；**仅会话**）。不动令牌、不换桶 |
 | `POST` | `/api/v1/auth/change-password` | 改密 = 撤销所有会话（**仅会话**） |
 
-M7 **没有创建类路由**：`PUT /api/mcp/config`（整份替换 = 新建 + 删除）和 `POST /api/skills`（新建/上传技能）
-都返回 404/405 —— 创建能力留给后续阶段 + 业务管理员，路由不存在比 403 更诚实。
+MCP **没有创建类路由**：`PUT /api/mcp/config`（整份替换 = 新建 + 删除）返回 404/405。
+技能创作与审核路由见上表（`POST /api/skills`、`/api/skills/mine`、`/api/admin/skills/reviews`）。
 
 浏览器应走前端同源 `/api`，不要直接跨源打 8001（开发时 Next rewrite，生产时 nginx）。
 

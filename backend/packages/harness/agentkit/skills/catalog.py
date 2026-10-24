@@ -18,6 +18,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from agentkit.config.skills_config import DEFAULT_SKILLS_CONTAINER_PATH
 from agentkit.skills import prefs as skill_prefs
 from agentkit.skills.domain import SkillScope, VisibleSkill
 from agentkit.skills.package import validate_skill_path
@@ -166,6 +167,7 @@ def _snapshot_skill(
     visible: VisibleSkill,
     *,
     content_root: Path,
+    container_path: str,
 ) -> Skill | None:
     """Bind one active row to its host cache path without reading the body."""
     commit = _commit_for(visible)
@@ -189,15 +191,22 @@ def _snapshot_skill(
         skill_dir=cache_file.parent,
         skill_file=cache_file,
         relative_path=Path(visible.skill.name),
+        container_path=container_path,
     )
 
 
 class SkillCatalogService:
     """Build and publish immutable catalog snapshots from PostgreSQL + Git cache."""
 
-    def __init__(self, store: SqlSkillStore, content: SkillContentStore) -> None:
+    def __init__(
+        self,
+        store: SqlSkillStore,
+        content: SkillContentStore,
+        container_path: str = DEFAULT_SKILLS_CONTAINER_PATH,
+    ) -> None:
         self._store = store
         self._content = content
+        self._container_path = container_path.rstrip("/") or container_path
 
     async def refresh(self) -> SkillSnapshot:
         """Read every active pointer and publish the next immutable generation.
@@ -229,7 +238,11 @@ class SkillCatalogService:
                 )
                 continue
 
-            skill = _snapshot_skill(visible, content_root=content_root)
+            skill = _snapshot_skill(
+                visible,
+                content_root=content_root,
+                container_path=self._container_path,
+            )
             if skill is None:
                 continue
             if visible.scope is SkillScope.PUBLIC:

@@ -28,6 +28,7 @@ from agentkit.skills.domain import (
 )
 from agentkit.skills.package import validate_skill_path
 from agentkit.skills.parser import SkillParseError, parse_skill_text
+from backend.app.gateway import skills_catalog
 from backend.app.gateway.deps import get_skill_author_service, require_scope
 from backend.app.gateway.errors import SkillConflictAPI, SkillNotFound, SkillPackageInvalid
 from backend.app.gateway.models.skills import (
@@ -187,7 +188,9 @@ async def _list_item(
         status=pending or "draft",
         enabled=True,
         global_enabled=None,
-        container_file=_container_file(name),
+        container_file=(
+            _container_file(name) if skills_catalog._private_mounts_supported() else None
+        ),
     )
 
 
@@ -416,6 +419,7 @@ async def save_draft(
     version = await _invoke(
         service.save(owner_user_id=caller.user_id or "", skill_id=skill_id)
     )
+    await skills_catalog.refresh_skill_runtime()
     return SaveResponse(version=_version(version))
 
 
@@ -429,6 +433,8 @@ async def submit_skill(
     submission = await _invoke(
         service.submit(owner_user_id=caller.user_id or "", skill_id=skill_id)
     )
+    # Pending state is read from PostgreSQL by the routes, so the snapshot and
+    # mount trees do not change here.  A full refresh would be pure overhead.
     return _submission(submission)
 
 
@@ -442,6 +448,7 @@ async def withdraw_skill(
     submission = await _invoke(
         service.withdraw(owner_user_id=caller.user_id or "", skill_id=skill_id)
     )
+    # Same as submit: only pending state changes, and that lives in PostgreSQL.
     return _submission(submission)
 
 
@@ -468,6 +475,7 @@ async def delete_skill(
     await _invoke(
         service.delete_draft(owner_user_id=caller.user_id or "", skill_id=skill_id)
     )
+    await skills_catalog.refresh_skill_runtime()
     return Response(status_code=http_status.HTTP_204_NO_CONTENT)
 
 

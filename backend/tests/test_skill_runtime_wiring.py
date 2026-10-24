@@ -382,7 +382,7 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
             seen.calls.append(("review", (review,)))
 
     class Catalog:
-        def __init__(self, store: Any, content: Any) -> None:
+        def __init__(self, store: Any, content: Any, container_path: str) -> None:
             seen.calls.append(("catalog", None))
 
     class Embedder:

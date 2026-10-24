@@ -414,3 +414,47 @@ def test_operator_mounts_cannot_reintroduce_the_whole_skill_cache(
     assert _mapping(sandbox, "/mnt/skills/private").local_path == str(
         cache / "active" / "users" / "user-a"
     )
+
+
+
+def test_operator_mounts_cannot_shadow_a_configured_skill_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache = tmp_path / "cache"
+    safe_mount = tmp_path / "safe"
+
+    def fake_flag(name: str, default, config=None):
+        if name == "mounts":
+            return [
+                {"container_path": "/opt/skills", "local_path": str(cache)},
+                {
+                    "container_path": "/opt/skills/private",
+                    "local_path": str(cache / "active" / "users"),
+                },
+                {"container_path": "/mnt/safe", "local_path": str(safe_mount)},
+            ]
+        return default
+
+    monkeypatch.setattr(
+        "agentkit.sandbox.local.local_sandbox_provider.sandbox_flag", fake_flag
+    )
+    monkeypatch.setattr(
+        "agentkit.sandbox.local.local_sandbox_provider._skills_container_root",
+        lambda: "/opt/skills",
+    )
+    provider = LocalSandboxProvider(cache_dir=cache)
+    sandbox = provider.get(provider.acquire("thread-a", user_id="user-a"))
+    assert sandbox is not None
+
+    containers = {mapping.container_path for mapping in sandbox.path_mappings}
+    assert "/mnt/safe" in containers
+    assert "/opt/skills" not in containers
+    assert _mapping(sandbox, "/opt/skills/private").local_path != str(
+        cache / "active" / "users"
+    )
+    assert _mapping(sandbox, "/opt/skills/public").local_path == str(
+        cache / "active" / "public"
+    )
+    assert _mapping(sandbox, "/opt/skills/private").local_path == str(
+        cache / "active" / "users" / "user-a"
+    )

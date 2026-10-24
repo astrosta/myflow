@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agentkit.config import get_app_config
 from agentkit.config.runtime_paths import resolve_path, runtime_home
+from agentkit.config.skills_config import DEFAULT_SKILLS_CONTAINER_PATH
 from agentkit.sandbox.local.local_sandbox import LocalSandbox
 from agentkit.sandbox.sandbox_provider import SandboxProvider
 from agentkit.sandbox.security import PathMapping, is_host_bash_allowed, sandbox_flag
@@ -16,8 +17,6 @@ from agentkit.utils import validate_user_id
 _DEFAULT_USER_ID = "default"
 _MAX_CACHED_THREADS = 256
 _USER_DATA = "/mnt/user-data"
-_PUBLIC_SKILLS = "/mnt/skills/public"
-_PRIVATE_SKILLS = "/mnt/skills/private"
 
 
 class LocalSandboxProvider(SandboxProvider):
@@ -37,7 +36,12 @@ class LocalSandboxProvider(SandboxProvider):
         self._skills_cache_dir = (
             resolve_path(cache_dir) if cache_dir is not None else _skills_cache_dir()
         )
-        self._static_mappings = _static_mappings(self._skills_cache_dir)
+        self._skills_root = _skills_container_root()
+        self._public_skills = f"{self._skills_root}/public"
+        self._private_skills = f"{self._skills_root}/private"
+        self._static_mappings = _static_mappings(
+            self._skills_cache_dir, container_root=self._skills_root
+        )
 
     @property
     def supports_agent_skill_isolation(self) -> bool:
@@ -132,7 +136,7 @@ class LocalSandboxProvider(SandboxProvider):
             # it to that user's own active tree.  Never add a mount for the cache
             # root or for active/users itself.
             PathMapping(
-                _PRIVATE_SKILLS,
+                self._private_skills,
                 str(self._skills_cache_dir / "active" / "users" / user_id),
                 read_only=True,
             ),
@@ -168,11 +172,23 @@ def _skills_cache_dir() -> Path:
     return resolve_path(raw)
 
 
-def _static_mappings(skills_cache_dir: Path) -> list[PathMapping]:
+def _skills_container_root() -> str:
+    """Configured container root; the default is only a fallback for unreadable config."""
+    try:
+        raw = get_app_config().skills.container_path
+    except Exception:  # unit tests may not have a readable app config
+        return DEFAULT_SKILLS_CONTAINER_PATH
+    return raw.rstrip("/") or DEFAULT_SKILLS_CONTAINER_PATH
+
+
+def _static_mappings(
+    skills_cache_dir: Path, *, container_root: str = DEFAULT_SKILLS_CONTAINER_PATH
+) -> list[PathMapping]:
     """Process-wide mounts only. Never bind a user id here."""
+    root = container_root.rstrip("/") or "/"
     mappings: list[PathMapping] = [
         PathMapping(
-            _PUBLIC_SKILLS,
+            f"{root}/public",
             str(skills_cache_dir / "active" / "public"),
             read_only=True,
         ),
@@ -192,7 +208,7 @@ def _static_mappings(skills_cache_dir: Path) -> list[PathMapping]:
             # Operator mounts must never reintroduce the process-wide skill
             # cache (or its active/users subtree) that this provider replaced
             # with one public mount plus a per-sandbox private mount.
-            if container_text == "/mnt/skills" or container_text.startswith("/mnt/skills/"):
+            if container_text == root or container_text.startswith(f"{root}/"):
                 continue
             if local_path == cache_root or local_path.is_relative_to(cache_root):
                 continue
