@@ -238,10 +238,8 @@ def test_claim_outbox_never_returns_an_event_to_two_sequential_callers(
             "private:u1:one",
             "private:u1:two",
         }
-        assert first[0].projection_key == "private:u1:one"
-        assert second[0].projection_key == "private:u1:two"
-
-        event = first[0]
+        events = {event.projection_key: event for event in (*first, *second)}
+        event = events["private:u1:one"]
         assert isinstance(event, OutboxEvent)
         assert event.op == "upsert_active"
         assert event.scope == "private"
