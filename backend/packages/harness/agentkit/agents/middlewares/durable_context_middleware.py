@@ -7,12 +7,16 @@ import json
 import logging
 import posixpath
 from collections.abc import Awaitable, Callable, Collection, Mapping
+from typing import TYPE_CHECKING
 
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.skills.loader import clip_body, read_skill_body
 from agentkit.skills.parser import SkillParseError, parse_skill_text
 from agentkit.skills.storage import SkillRegistry
 from agentkit.skills.types import SKILL_FILE_NAME
+
+if TYPE_CHECKING:
+    from agentkit.skills.catalog import SkillSnapshot
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -227,6 +231,7 @@ def _render_skills(
     config: SkillsConfig | None = None,
     user_id: str | None = None,
     messages: list | None = None,
+    snapshot: "SkillSnapshot | None" = None,
 ) -> str:
     """`<active_skills>`：已激活技能的名字、描述 + **核心 SOP（正文）**。
 
@@ -244,7 +249,7 @@ def _render_skills(
 
     settings = config.active_context if config is not None else None
     with_body = settings is not None and settings.enabled
-    index = _skill_index(config, user_id) if with_body else {}
+    index = _skill_index(config, user_id, snapshot=snapshot) if with_body else {}
     visible_paths = (
         _paths_still_in_context(messages or [], [str(entry.get("path") or "") for entry in entries])
         if with_body and settings is not None and settings.skip_bodies_still_in_context
@@ -274,12 +279,19 @@ def _render_skills(
     return "\n".join(lines)
 
 
-def _skill_index(config: SkillsConfig | None, user_id: str | None) -> dict:
+def _skill_index(
+    config: SkillsConfig | None,
+    user_id: str | None,
+    *,
+    snapshot: "SkillSnapshot | None" = None,
+) -> dict:
     """容器路径 → 技能。**按当前用户重算**：用户自己关掉的技能不该被重新投影回上下文。"""
-    if config is None:
+    if config is None and snapshot is None:
         return {}
     try:
-        return SkillRegistry(config=config, user_id=user_id).index_by_container_file()
+        return SkillRegistry(
+            config=config, user_id=user_id, snapshot=snapshot
+        ).index_by_container_file()
     except Exception:  # 注册表读不出来：只丢正文，名字那一行仍然保留
         logger.exception("Skill registry unavailable; rendering active skills without bodies")
         return {}
@@ -337,12 +349,16 @@ class DurableContextMiddleware(AgentMiddleware[AgentState]):
         skill_loader_tool_names: Collection[str] | None = None,
         skills_config: SkillsConfig | None = None,
         user_id: str | None = None,
+        snapshot: "SkillSnapshot | None" = None,
     ) -> None:
         super().__init__()
         self._skills_root = posixpath.normpath(skills_container_path or DEFAULT_SKILLS_CONTAINER_PATH)
         # <active_skills> 的正文要现读技能树，所以这里需要一份 skills 配置（拿不到就只渲染名字）
         self._skills_config = skills_config
         self._user_id = user_id
+        # With a catalog snapshot, bodies come from the immutable generation the
+        # ledger path was captured from; legacy filesystem mode keeps its scanner.
+        self._snapshot = snapshot
         self._skill_read_tool_names = frozenset(skill_file_read_tool_names or ("read_file", "read", "view", "cat"))
         self._skill_loader_tool_names = frozenset(
             skill_loader_tool_names or DEFAULT_SKILL_LOADER_TOOL_NAMES
@@ -420,6 +436,7 @@ class DurableContextMiddleware(AgentMiddleware[AgentState]):
                 config=self._skills_config,
                 user_id=self._runtime_user_id(runtime),
                 messages=list(request.messages or []),
+                snapshot=self._snapshot,
             ),
         )
         if not data_block:

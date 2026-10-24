@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from pathlib import Path
 
-from agentkit.config.runtime_paths import runtime_home
+from agentkit.config import get_app_config
+from agentkit.config.runtime_paths import resolve_path, runtime_home
 from agentkit.sandbox.local.local_sandbox import LocalSandbox
 from agentkit.sandbox.sandbox_provider import SandboxProvider
 from agentkit.sandbox.security import PathMapping, is_host_bash_allowed, sandbox_flag
@@ -14,6 +16,8 @@ from agentkit.utils import validate_user_id
 _DEFAULT_USER_ID = "default"
 _MAX_CACHED_THREADS = 256
 _USER_DATA = "/mnt/user-data"
+_PUBLIC_SKILLS = "/mnt/skills/public"
+_PRIVATE_SKILLS = "/mnt/skills/private"
 
 
 class LocalSandboxProvider(SandboxProvider):
@@ -24,18 +28,26 @@ class LocalSandboxProvider(SandboxProvider):
     The thread cache cap is a local detail: evicting a remote sandbox must release it.
     """
 
-    def __init__(self, **kwargs: object) -> None:
+    def __init__(self, *, cache_dir: str | Path | None = None, **kwargs: object) -> None:
         del kwargs
         self._lock = threading.Lock()
         self._thread_sandboxes: OrderedDict[tuple[str, str], LocalSandbox] = OrderedDict()
         self._max_cached_threads = _MAX_CACHED_THREADS
         self._generic: LocalSandbox | None = None
-        self._static_mappings = _static_mappings()
+        self._skills_cache_dir = (
+            resolve_path(cache_dir) if cache_dir is not None else _skills_cache_dir()
+        )
+        self._static_mappings = _static_mappings(self._skills_cache_dir)
 
     @property
     def supports_agent_skill_isolation(self) -> bool:
         """False while host bash can bypass path mappings."""
         return not is_host_bash_allowed()
+
+    @property
+    def supports_per_user_skill_mounts(self) -> bool:
+        """This provider builds the private mount from the sandbox's owner id."""
+        return True
 
     def acquire(self, thread_id: str | None = None, *, user_id: str | None = None) -> str:
         user = validate_user_id(user_id or _DEFAULT_USER_ID)
@@ -115,6 +127,15 @@ class LocalSandboxProvider(SandboxProvider):
             (root / name).mkdir(parents=True, exist_ok=True)
         mappings = [
             *self._static_mappings,
+            # Public skills are one process-wide read-only tree.  Private skills
+            # use the same container path for every user, but each sandbox binds
+            # it to that user's own active tree.  Never add a mount for the cache
+            # root or for active/users itself.
+            PathMapping(
+                _PRIVATE_SKILLS,
+                str(self._skills_cache_dir / "active" / "users" / user_id),
+                read_only=True,
+            ),
             PathMapping(_USER_DATA, str(root)),
             PathMapping(f"{_USER_DATA}/workspace", str(root / "workspace")),
             PathMapping(f"{_USER_DATA}/uploads", str(root / "uploads")),
@@ -138,13 +159,27 @@ def _key_from_sandbox_id(sandbox_id: str) -> tuple[str, str] | None:
     return (user_id, thread_id)
 
 
-def _static_mappings() -> list[PathMapping]:
+def _skills_cache_dir() -> Path:
+    """Host cache that SkillContentStore materializes active trees under."""
+    try:
+        raw = get_app_config().skills.git.cache_dir
+    except Exception:  # unit tests may not have a readable app config
+        return runtime_home() / "skills"
+    return resolve_path(raw)
+
+
+def _static_mappings(skills_cache_dir: Path) -> list[PathMapping]:
     """Process-wide mounts only. Never bind a user id here."""
     mappings: list[PathMapping] = [
-        PathMapping("/mnt/skills", str(runtime_home() / "skills"), read_only=True),
+        PathMapping(
+            _PUBLIC_SKILLS,
+            str(skills_cache_dir / "active" / "public"),
+            read_only=True,
+        ),
     ]
     raw = sandbox_flag("mounts", []) or []
     if isinstance(raw, list):
+        cache_root = skills_cache_dir.resolve()
         for item in raw:
             if not isinstance(item, dict):
                 continue
@@ -152,7 +187,20 @@ def _static_mappings() -> list[PathMapping]:
             local = item.get("local_path")
             if not container or not local:
                 continue
+            container_text = str(container).rstrip("/")
+            local_path = Path(str(local)).resolve()
+            # Operator mounts must never reintroduce the process-wide skill
+            # cache (or its active/users subtree) that this provider replaced
+            # with one public mount plus a per-sandbox private mount.
+            if container_text == "/mnt/skills" or container_text.startswith("/mnt/skills/"):
+                continue
+            if local_path == cache_root or local_path.is_relative_to(cache_root):
+                continue
             mappings.append(
-                PathMapping(str(container), str(local), read_only=bool(item.get("read_only", False)))
+                PathMapping(
+                    container_text,
+                    str(local_path),
+                    read_only=bool(item.get("read_only", False)),
+                )
             )
     return mappings

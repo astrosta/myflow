@@ -14,6 +14,7 @@ import html
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -38,6 +39,9 @@ from agentkit.skills.storage import SkillRegistry, validate_skill_file_path
 from agentkit.skills.types import Skill, SkillPathError
 from agentkit.utils.messages import get_original_user_content_text
 
+if TYPE_CHECKING:
+    from agentkit.skills.catalog import SkillSnapshot
+
 logger = logging.getLogger(__name__)
 
 #: M4 的 middleware:{tag} 归因（tag ≤ 21 字符）。
@@ -52,11 +56,12 @@ class SkillActivationMiddleware(AgentMiddleware[AgentState]):
     def __init__(
         self,
         *,
-        skills_config: SkillsConfig,
+        skills_config: SkillsConfig | None = None,
         user_id: str | None = None,
         available_skills: frozenset[str] | None = None,
         owner_token: str | None = None,
         prefs_path: Path | None = None,
+        snapshot: "SkillSnapshot | None" = None,
     ) -> None:
         super().__init__()
         self._config = skills_config
@@ -64,6 +69,10 @@ class SkillActivationMiddleware(AgentMiddleware[AgentState]):
         self._available_skills = available_skills
         self._owner_token = owner_token or new_owner_token()
         self._prefs_path = prefs_path
+        # A snapshot is an immutable catalog generation.  When present, slash
+        # resolution never rescans the filesystem; Skill.skill_file is the
+        # authoritative body path prepared by the catalog service.
+        self._snapshot = snapshot
 
     @property
     def owner_token(self) -> str:
@@ -87,6 +96,7 @@ class SkillActivationMiddleware(AgentMiddleware[AgentState]):
             user_id=user_id,
             available_skills=self._available_skills,
             prefs_path=self._prefs_path,
+            snapshot=self._snapshot,
         )
 
     def _read_body(self, skill: Skill) -> str | None:

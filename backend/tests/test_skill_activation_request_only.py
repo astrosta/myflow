@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,9 @@ from agentkit.agents.middlewares.skill_activation_middleware import (
 from agentkit.agents.middlewares.skill_tool_policy_middleware import SkillToolPolicyMiddleware
 from agentkit.agents.thread_state import ThreadState
 from agentkit.runtime.secret_context import SLASH_SKILL_SOURCE_CONTEXT_KEY, read_secret_context
+from agentkit.skills.catalog import SkillSnapshot
+from agentkit.skills.domain import SkillScope
+from agentkit.skills.types import Skill, SkillCategory
 from fakes.chat_model import FakeChatModel
 from fakes.skill_tree import skills_config, write_skill
 
@@ -192,3 +196,61 @@ def test_the_audit_tag_is_logged_on_activation(tmp_path, caplog):
         )
 
     assert any(SKILL_ACTIVATION_AUDIT_TAG in record.getMessage() for record in caplog.records)
+
+
+def test_a_snapshot_activation_never_rescans_the_filesystem(tmp_path, monkeypatch):
+    """The catalog generation is authoritative: slash reads its Skill.skill_file."""
+    from agentkit.agents.middlewares import skill_activation_middleware as module
+
+    host_file = (
+        tmp_path
+        / "cache"
+        / "commits"
+        / "private"
+        / "private"
+        / "secret"
+        / "SKILL.md"
+    )
+    host_file.parent.mkdir(parents=True)
+    host_file.write_text(
+        f"---\nname: secret\ndescription: private skill\n---\n{BODY_MARKER}\n",
+        encoding="utf-8",
+    )
+    skill = Skill(
+        name="secret",
+        description="private skill",
+        license=None,
+        skill_dir=host_file.parent,
+        skill_file=host_file,
+        relative_path=Path("secret"),
+        category=SkillCategory.CUSTOM,
+        enabled=True,
+        scope=SkillScope.PRIVATE,
+        owner_user_id="u1",
+        skill_id="s-secret",
+    )
+    snapshot = SkillSnapshot("e14", (), {"u1": (skill,)})
+    activation = SkillActivationMiddleware(
+        skills_config=skills_config(tmp_path), user_id="u1", snapshot=snapshot
+    )
+
+    def forbidden_scan(*args, **kwargs):
+        raise AssertionError("the filesystem scanner must not run for a snapshot")
+
+    monkeypatch.setattr(module, "validate_skill_file_path", lambda candidate: candidate.skill_file)
+    monkeypatch.setattr("agentkit.skills.storage.load_skills", forbidden_scan)
+    context: dict = {"user_id": "u1"}
+    seen: dict = {}
+
+    def handler(request: ModelRequest):
+        seen["request"] = request
+        return "ok"
+
+    activation.wrap_model_call(
+        _request([HumanMessage(content="/secret go", id="m1")], context), handler
+    )
+
+    assert any(BODY_MARKER in str(message.content) for message in seen["request"].messages)
+    assert read_secret_context(
+        context, SLASH_SKILL_SOURCE_CONTEXT_KEY, token=activation.owner_token
+    ) == "/mnt/skills/private/secret/SKILL.md"

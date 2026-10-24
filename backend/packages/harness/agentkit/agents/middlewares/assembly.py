@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.runnables import RunnableConfig
@@ -33,9 +34,27 @@ from agentkit.agents.middlewares.uploads_middleware import UploadsMiddleware
 from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.secret_context import new_owner_token
 from agentkit.agents.middlewares.sandbox_middleware import SandboxMiddleware
+from agentkit.skills import catalog as skill_catalog
 from agentkit.subagents.policy import SubagentPolicy
 
+if TYPE_CHECKING:
+    from agentkit.skills.catalog import SkillSnapshot
+
 logger = logging.getLogger(__name__)
+
+
+def _catalog_snapshot(app_config: AppConfig) -> "SkillSnapshot | None":
+    """Snapshot governing this chain, or None when the legacy scanner applies.
+
+    Git deployments always use the published generation, even when it is empty:
+    an empty catalog is fail-closed, never a reason to scan a mutable directory.
+    Filesystem mode keeps its scanner unless a snapshot was actually published
+    in-process (useful for tests and migration).
+    """
+    snapshot = skill_catalog.get_skill_snapshot()
+    if app_config.skills.source == "git" or snapshot.epoch:
+        return snapshot
+    return None
 
 
 def build_skill_middlewares(
@@ -43,6 +62,7 @@ def build_skill_middlewares(
     *,
     user_id: str | None = None,
     available_skills: frozenset[str] | None = None,
+    snapshot: "SkillSnapshot | None" = None,
 ) -> tuple[SkillActivationMiddleware, SkillToolPolicyMiddleware]:
     """Activation 与 Policy 共用**同一个** owner token：只有这一对能读 slash 源路径（§3.6）。
 
@@ -50,17 +70,20 @@ def build_skill_middlewares(
     （网关的 context 是权威来源，M6 §4.1）。
     """
     token = new_owner_token()
+    resolved_snapshot = _catalog_snapshot(app_config) if snapshot is None else snapshot
     activation = SkillActivationMiddleware(
         skills_config=app_config.skills,
         user_id=user_id,
         available_skills=available_skills,
         owner_token=token,
+        snapshot=resolved_snapshot,
     )
     policy = SkillToolPolicyMiddleware(
         skills_config=app_config.skills,
         owner_token=token,
         user_id=user_id,
         available_skills=available_skills,
+        snapshot=resolved_snapshot,
     )
     return activation, policy
 
@@ -114,9 +137,16 @@ def build_middlewares(
     chain.append(DynamicContextMiddleware(app_config=resolved))
 
     # 顺序硬约束（§3.9）：Activation 紧挨 Policy 紧挨 DurableContext。
-    # 中间插别的会让共享的 owner token 或 skill_context 对不上。
+    # 中间插别的会让共享的 owner token 或 skill_context 对不上。三者固定同一
+    # 个快照代，避免组装期间 refresh 发布新代导致路径与正文来自不同来源。
+    snapshot = _catalog_snapshot(resolved)
     chain.extend(
-        build_skill_middlewares(resolved, user_id=user_id, available_skills=available_skills)
+        build_skill_middlewares(
+            resolved,
+            user_id=user_id,
+            available_skills=available_skills,
+            snapshot=snapshot,
+        )
     )
     chain.append(
         DurableContextMiddleware(
@@ -125,6 +155,7 @@ def build_middlewares(
             # <active_skills> 的正文靠它现读技能树：台账里只有 path，没有正文
             skills_config=resolved.skills,
             user_id=user_id,
+            snapshot=snapshot,
         )
     )
     if resolved.summarization.enabled:

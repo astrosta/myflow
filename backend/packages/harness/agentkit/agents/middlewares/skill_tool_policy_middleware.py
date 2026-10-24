@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -39,6 +39,9 @@ from agentkit.skills.tool_policy import (
 )
 from agentkit.skills.types import Skill
 
+if TYPE_CHECKING:
+    from agentkit.skills.catalog import SkillSnapshot
+
 logger = logging.getLogger(__name__)
 
 POLICY_HINT = "请改用其他工具，或者请用户激活一个声明了该工具的技能。"
@@ -50,11 +53,12 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
     def __init__(
         self,
         *,
-        skills_config: SkillsConfig,
+        skills_config: SkillsConfig | None = None,
         owner_token: str,
         user_id: str | None = None,
         available_skills: frozenset[str] | None = None,
         prefs_path: Path | None = None,
+        snapshot: "SkillSnapshot | None" = None,
     ) -> None:
         super().__init__()
         self._config = skills_config
@@ -62,6 +66,10 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
         self._user_id = user_id
         self._available_skills = available_skills
         self._prefs_path = prefs_path
+        # The snapshot carries the exact container_file used by both slash
+        # activation and autonomous skill capture; the policy must index that
+        # same generation rather than rescanning a mutable filesystem tree.
+        self._snapshot = snapshot
 
     # ---- 现场解析 ----------------------------------------------------------
 
@@ -80,6 +88,7 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
             user_id=self._runtime_user_id(runtime),
             available_skills=self._available_skills,
             prefs_path=self._prefs_path,
+            snapshot=self._snapshot,
         )
         return registry.index_by_container_file()
 
