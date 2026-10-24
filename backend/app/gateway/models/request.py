@@ -165,7 +165,7 @@ class SkillPreferenceRequest(BaseModel):
 # Knowledge base
 # ---------------------------------------------------------------------------
 
-KnowledgeTypeLiteral = Literal["technical", "operations", "faq", "security", "api"]
+KnowledgeTypeLiteral = Literal["technical", "operations", "faq", "security", "api", "legal"]
 
 
 class KnowledgeBaseCreateRequest(BaseModel):

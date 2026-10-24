@@ -6,7 +6,8 @@
 1. 只列**对当前用户有效启用**、且在 agent 白名单里的技能，从 live registry 现算。
 2. 排序稳定 (category, name)：加一个技能只该多出它自己那一行，否则前缀缓存在第一处变动起全失效。
 3. 只截断描述（config.index_description_max_chars），其余字段根本不进索引。
-4. dir= 是**容器路径**，不是宿主路径。
+4. **根目录只写一次**：块里不放每个技能的路径（几十条技能就是几十份重复前缀），
+   根目录 + "目录名即技能名 + 固定 SKILL.md" 的约定放在块前面的说明里，路径可推。
 5. 需要密钥的技能必须标出来，否则模型会去激活一个注定失败的技能。
 
 0 个技能 → 整个块不出现（不留空标签给模型猜）。name/description 都 html.escape：
@@ -30,12 +31,44 @@ logger = logging.getLogger(__name__)
 
 SKILL_INDEX_HEADER, SKILL_INDEX_FOOTER = "<available_skills>", "</available_skills>"
 
+#: 索引前面的两句话。只说明"**技能放在哪**"和"**你在看什么**"，不说明"什么时候去读"——
+#: 后者是工具 description 的职责（两套契约会漂）。三条取舍：
+#: 1. **根目录写一次，不是每行写一遍**：`dir=` 曾经跟在每一行后面，几十个技能就是几十份重复前缀；
+#:    给根目录 + 两条固定约定（目录名即技能名、SOP 固定叫 SKILL.md），路径照样可推，token 只花一次。
+#: 2. **"索引不是正文"必须说**：两个标签都叫 skills，模型把索引那行当正文就会凭 120 字描述硬猜。
+#: 3. **静态**：跟着索引一起进 LRU 缓存，不随每轮变化打穿前缀缓存。
+SKILL_ROOT_CONVENTION = (
+    "技能根目录 `{root}`：每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的 "
+    "`SKILL.md`，即 `{root}/<category>/<技能名>/SKILL.md`（category 是 public 或 custom，"
+    "写在索引行的方括号里；同名时 custom 覆盖 public）。"
+)
+SKILL_INDEX_PREAMBLE = (
+    "下面是技能索引 `<available_skills>`：每个已启用技能一行，只有名字、类别和截断描述"
+    "（需要密钥的会标出来），**不含正文**。已加载技能的名字与正文在持久上下文的 "
+    "`<active_skills>` 里。"
+)
+
 _CACHE_MAX_ENTRIES = 32
 _index_cache: "OrderedDict[str, str]" = OrderedDict()
 
 
+def _entry_marker(skill: Skill) -> tuple[str, str]:
+    """`(名字后缀, 行尾补充)`。目录名与 frontmatter 的 name 不一致时**直接给路径**：
+
+    那种技能按"目录名即技能名"的约定会推到一个错路径，与其让模型 read_file 撞 404，
+    不如在索引行里多花一次 `dir=`。
+    """
+    if skill.relative_path.as_posix() == skill.name:
+        return f" [{skill.category.value}]", ""
+    return "", f" | dir={skill.container_dir}"
+
+
 def render_skill_index(skills: Sequence[Skill], *, max_description_chars: int) -> str:
-    """技能为 0 时返回空串。每行：- <name>: <描述截断> [| 需密钥 A, B] | dir=<容器路径>"""
+    """技能为 0 时返回空串。每行：- <name> [<category>]: <描述截断> [| 需密钥 A, B]
+
+    路径**不在行里**：根目录与"目录名即技能名 + SKILL.md"的约定在块前面的说明里（见
+    `SKILL_ROOT_CONVENTION`）。唯一例外是目录名和 name 对不上——那种技能直接给 `dir=`。
+    """
     if not skills:
         return ""
     lines = [SKILL_INDEX_HEADER]
@@ -46,8 +79,9 @@ def render_skill_index(skills: Sequence[Skill], *, max_description_chars: int) -
             if skill.required_secrets
             else ""
         )
+        name_suffix, tail = _entry_marker(skill)
         lines.append(
-            f"- {html.escape(skill.name)}: {html.escape(description)}{secrets} | dir={skill.container_dir}"
+            f"- {html.escape(skill.name)}{name_suffix}: {html.escape(description)}{secrets}{tail}"
         )
     lines.append(SKILL_INDEX_FOOTER)
     return "\n".join(lines)
@@ -74,7 +108,12 @@ def build_skills_section(
     if cached is not None:
         _index_cache.move_to_end(key)
         return cached
-    section = render_skill_index(skills, max_description_chars=config.index_description_max_chars)
+    index = render_skill_index(skills, max_description_chars=config.index_description_max_chars)
+    section = (
+        f"{SKILL_ROOT_CONVENTION.format(root=config.container_path)}\n{SKILL_INDEX_PREAMBLE}\n\n{index}"
+        if index
+        else ""
+    )
     _index_cache[key] = section
     while len(_index_cache) > _CACHE_MAX_ENTRIES:
         _index_cache.popitem(last=False)

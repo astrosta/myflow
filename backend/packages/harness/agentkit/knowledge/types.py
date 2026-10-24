@@ -11,6 +11,7 @@ class KnowledgeBaseType(StrEnum):
     FAQ = "faq"
     SECURITY = "security"
     API = "api"
+    LEGAL = "legal"
 
 
 KNOWLEDGE_BASE_TYPES: tuple[KnowledgeBaseType, ...] = tuple(KnowledgeBaseType)
@@ -21,6 +22,7 @@ TYPE_LABELS: dict[KnowledgeBaseType, str] = {
     KnowledgeBaseType.FAQ: "FAQ 类文档",
     KnowledgeBaseType.SECURITY: "安全合规文档",
     KnowledgeBaseType.API: "API 参考文档",
+    KnowledgeBaseType.LEGAL: "法律法规",
 }
 
 TYPE_DESCRIPTIONS: dict[KnowledgeBaseType, str] = {
@@ -29,6 +31,7 @@ TYPE_DESCRIPTIONS: dict[KnowledgeBaseType, str] = {
     KnowledgeBaseType.FAQ: "常见问题与回答；一问一答为一个分片。",
     KnowledgeBaseType.SECURITY: "安全要求、合规条款与审计证据；按条款切分。",
     KnowledgeBaseType.API: "接口、函数和类参考；按接口/符号切分，参数与示例跟随接口。",
+    KnowledgeBaseType.LEGAL: "法律、行政法规、部门规章与标准条文；按条/款切分，条款号写入章节。",
 }
 
 TYPE_STRATEGIES: dict[KnowledgeBaseType, str] = {
@@ -37,6 +40,7 @@ TYPE_STRATEGIES: dict[KnowledgeBaseType, str] = {
     KnowledgeBaseType.FAQ: "qa_pair",
     KnowledgeBaseType.SECURITY: "clause",
     KnowledgeBaseType.API: "api_reference",
+    KnowledgeBaseType.LEGAL: "legal_clause",
 }
 
 TYPE_STRATEGY_OPTIONS = tuple(TYPE_STRATEGIES.values())

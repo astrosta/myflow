@@ -36,18 +36,20 @@ const COMPONENTS: Components = {
 
 export interface MarkdownProps {
   text: string;
-  /** 还在流式追加，末尾挂一个光标 */
-  streaming?: boolean;
   className?: string;
 }
 
-export const Markdown = memo(function Markdown({ text, streaming = false, className }: MarkdownProps) {
+/**
+ * 正文渲染。**不挂流式光标**：逐 token 追加时那个闪烁方块会一直贴在文字末尾，
+ * 分辨率低的时候比正文还显眼；"还在写"这件事由步骤面板的"处理中…"和思考行的
+ * 呼吸动画表达就够了。
+ */
+export const Markdown = memo(function Markdown({ text, className }: MarkdownProps) {
   return (
     <div className={cn("md-body", className)}>
       <ReactMarkdown components={COMPONENTS} remarkPlugins={REMARK_PLUGINS}>
         {text}
       </ReactMarkdown>
-      {streaming ? <span aria-hidden className="streaming-caret" /> : null}
     </div>
   );
 });

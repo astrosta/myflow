@@ -299,8 +299,8 @@ def make_auth_app(
     # 管理类路由（`require_scope("admin")`）也要在场：PAT 永不带 admin（§2.15）靠它验证。
     application.include_router(mcp.router, prefix="/api")
     if business_routes:
-        application.include_router(threads.router)
-        application.include_router(thread_runs.router)
+        application.include_router(threads.router, prefix="/api")
+        application.include_router(thread_runs.router, prefix="/api")
 
     @application.get("/api/probe")
     def probe(request: Request) -> dict[str, Any]:

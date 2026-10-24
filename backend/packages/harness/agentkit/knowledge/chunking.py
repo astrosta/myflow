@@ -24,6 +24,20 @@ _CLAUSE_RE = re.compile(
     r"(?m)^(?=\s*(?:第[一二三四五六七八九十百千万0-9]+条|Article\s+\d+|§\s*\d+|条款\s*\d+))",
     re.IGNORECASE,
 )
+# 法律法规比安全合规多两类边界：
+#   1. 款/项 “（一）”“(1)”——挂在所属“条”下面，不能单独成 chunk，但要在条内断开；
+#   2. 编/章/节/分编 的标题行（法律文件的层级比普通文档深）。
+# 条本身的识别沿用 _CLAUSE_RE 的写法，另外补 “第X条之一” 这种修订后的条号。
+_LEGAL_CLAUSE_RE = re.compile(
+    r"(?m)^(?=\s*(?:第[一二三四五六七八九十百千万0-9]+条(?:之[一二三四五六七八九十]+)?"
+    r"|Article\s+\d+(?:[.-]\d+)*|§\s*\d+(?:\.\d+)*|条款\s*\d+|\d+\.\d+(?:\.\d+)*\s))",
+    re.IGNORECASE,
+)
+_LEGAL_ARTICLE_RE = re.compile(
+    r"^\s*(第[一二三四五六七八九十百千万0-9]+条(?:之[一二三四五六七八九十]+)?|Article\s+\d+(?:[.-]\d+)*"
+    r"|§\s*\d+(?:\.\d+)*|条款\s*\d+|[0-9]+(?:\.[0-9]+)+)",
+    re.IGNORECASE,
+)
 _STEP_RE = re.compile(
     r"^\s*(?:步骤\s*[一二三四五六七八九十百0-9]+|(?:Step)\s*\d+|\d+\s*[.、)])\s*",
     re.IGNORECASE,
@@ -291,6 +305,31 @@ def _security_clauses(sections: list[_Section], fallback: str) -> list[tuple[str
     return output
 
 
+def _legal_clauses(sections: list[_Section], fallback: str) -> list[tuple[str, str]]:
+    """法律文件按“条”切分；标题里的“第X章/第X节”保留在 section 前面。
+
+    和法律文本打交道的检索问题是“某一条怎么规定的”，所以条是最小单位：
+    把相邻两条拼进一个 chunk 会让引用失准。条内的款/项不单独成 chunk，
+    只在超长时按通用规则切分，并重复条号。
+    """
+
+    source = sections or [_Section((), fallback)]
+    output: list[tuple[str, str]] = []
+    for section in source:
+        parts = [part for part in _LEGAL_CLAUSE_RE.split(section.body) if part.strip()]
+        if len(parts) <= 1:
+            if section.body.strip():
+                output.append((section.title, section.body.strip()))
+            continue
+        for part in parts:
+            body = part.strip()
+            match = _LEGAL_ARTICLE_RE.match(body)
+            # 条款号进 section：引用时“《XX法》第三条”比“第三章某段”有用得多
+            label = match.group(1)[:40] if match else body.split("\n", 1)[0][:80]
+            output.append((f"{section.title} / {label}".strip(" /"), body))
+    return output
+
+
 def _api_sections(sections: list[_Section], fallback: str) -> list[_Section]:
     source = sections or [_Section((), fallback)]
     result = [section for section in source if section.body.strip() and _API_RE.search(section.title + "\n" + section.body)]
@@ -342,6 +381,13 @@ def chunk_document(
         clauses = _security_clauses(sections, text)
         if clauses:
             for section, clause_text in clauses:
+                raw_chunks.extend(_pack(clause_text, section, max_tokens, overlap, separators, counter))
+        else:
+            raw_chunks.extend(_pack(text, "", max_tokens, overlap, separators, counter))
+    elif resolved_type is KnowledgeBaseType.LEGAL:
+        legal_clauses = _legal_clauses(sections, text)
+        if legal_clauses:
+            for section, clause_text in legal_clauses:
                 raw_chunks.extend(_pack(clause_text, section, max_tokens, overlap, separators, counter))
         else:
             raw_chunks.extend(_pack(text, "", max_tokens, overlap, separators, counter))

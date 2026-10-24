@@ -8,7 +8,13 @@ import { apiFetch, apiUrl } from "./base";
  * 决定提示，detail 只作为人读的补充。
  */
 
-export type KnowledgeBaseType = "technical" | "operations" | "faq" | "security" | "api";
+export type KnowledgeBaseType =
+  | "technical"
+  | "operations"
+  | "faq"
+  | "security"
+  | "api"
+  | "legal";
 
 export interface KnowledgeTypeMeta {
   value: KnowledgeBaseType;
@@ -22,6 +28,11 @@ export const KNOWLEDGE_TYPES: readonly KnowledgeTypeMeta[] = [
   { value: "faq", label: "FAQ 类文档", description: "常见问题与回答；一问一答为一个分片。" },
   { value: "security", label: "安全合规文档", description: "安全要求、合规条款与审计证据；按条款切分。" },
   { value: "api", label: "API 参考文档", description: "接口、参数、返回值和示例；按接口/符号切分。" },
+  {
+    value: "legal",
+    label: "法律法规",
+    description: "法律、法规与规章条文；按“第X条”切分，条号写入章节。",
+  },
 ];
 
 export interface KnowledgeTypeStatus {

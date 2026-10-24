@@ -10,6 +10,12 @@ import { cn, formatTimestamp } from "@/lib/utils";
  *
  * 侧栏不自己取数，是因为"列表怎么来的"（分页、失效、乐观插入）属于
  * 服务端状态，应该由 TanStack Query 在容器里管；这里只负责画出来。
+ *
+ * 版面从上到下：品牌行 → 新对话 → 知识库 → **最近对话**（历史会话）。
+ * 历史会话挂在一个带标题的分区下面，而不是直接铺在导航里——它和上面两个
+ * 是不同性质的东西：上面是"去哪"，下面是"回过哪"，中间没有分隔就读成一串
+ * 同级的按钮。标题始终渲染（空列表也一样），免得列表加载完再冒出一行字、
+ * 把下面的会话整体往下推。
  */
 const NEW_CHAT_CLASS =
   "flex h-9 w-full items-center justify-center rounded-md border border-neutral-300 bg-white text-xs font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900";
@@ -45,7 +51,7 @@ export function Sidebar({
 }: SidebarProps) {
   return (
     <aside
-      aria-label="会话列表"
+      aria-label="工作区导航"
       className={cn("flex h-full w-64 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50", className)}
     >
       <div className="flex items-center gap-2 px-3 py-3">
@@ -91,7 +97,20 @@ export function Sidebar({
         </Link>
       </div>
 
-      <nav className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+      <nav aria-label="最近对话" className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+        <h2 className="flex items-baseline gap-1.5 px-2 pb-1.5 text-[11px] font-medium text-neutral-400">
+          最近对话
+          {/**
+           * 条数用 aria-hidden 挂在标题后面：读屏念一遍导航名就够了，
+           * "最近对话 12" 只是给眼睛看的密度提示。
+           */}
+          {threads.length ? (
+            <span aria-hidden className="text-neutral-300">
+              {threads.length}
+            </span>
+          ) : null}
+        </h2>
+
         {loading && threads.length === 0 ? (
           <div className="space-y-2 px-1" aria-hidden>
             <Skeleton className="h-9 w-full" />

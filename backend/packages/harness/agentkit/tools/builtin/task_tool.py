@@ -152,7 +152,7 @@ def make_task_tool(
 
     @tool(TASK_TOOL_NAME, parse_docstring=True)
     async def task_tool(
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[Any, Any],
         prompt: str,
         subagent_type: str,
         tool_call_id: Annotated[str, InjectedToolCallId],

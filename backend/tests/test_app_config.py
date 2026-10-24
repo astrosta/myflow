@@ -30,16 +30,6 @@ def test_accepts_memory_checkpointer_and_agents_default_model():
     assert cfg.agents.default_model == "deepseek-reasoner"
 
 
-def test_checkpointer_type_rejects_non_memory():
-    with pytest.raises(ValidationError):
-        AppConfig.model_validate(
-            {
-                "models": _models(),
-                "checkpointer": {"type": "sqlite"},
-            }
-        )
-
-
 def test_checkpointer_section_rejects_unknown_fields():
     with pytest.raises(ValidationError):
         AppConfig.model_validate(

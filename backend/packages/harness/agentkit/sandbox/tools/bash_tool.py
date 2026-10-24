@@ -6,6 +6,7 @@ M8 §11.3：这条路径走 ``run_sync_tool_after_async_init`` —— 长的 she
 
 from __future__ import annotations
 
+from typing import Any
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
@@ -18,7 +19,7 @@ from agentkit.sandbox.runtime import ensure_sandbox_initialized, run_sync_tool_a
 @tool("bash")
 async def bash_tool(
     command: str,
-    runtime: ToolRuntime,
+    runtime: ToolRuntime[Any, Any],
     timeout: float | None = None,
     description: str = "",
 ) -> str:
@@ -41,7 +42,7 @@ async def bash_tool(
         return f"Error: {mask_host_paths(str(exc))}"
 
 
-def _run_command(runtime: ToolRuntime, command: str, timeout: float | None) -> str:
+def _run_command(runtime: ToolRuntime[Any, Any], command: str, timeout: float | None) -> str:
     """同步体：``to_thread`` 里跑的就是它（所以它只碰沙箱，不碰事件循环）。"""
     sandbox = ensure_sandbox_initialized(runtime)
     output = sandbox.execute_command_in_scope(

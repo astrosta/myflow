@@ -208,6 +208,36 @@ describe("乐观消息永远在最后（§4.4）", () => {
     expect(ids(mergeMessages({ history, optimistic }))).toEqual(["h1", "local"]);
   });
 
+  it("确认还没到、本轮的步骤先到时，提问排在步骤**前面**", () => {
+    // 线上表现：思考过程和工具调用显示在了用户提问的上方。
+    const history: ChatMessage[] = [];
+    const stream = [msg("step-1", null, { run_id: "run-1" })];
+    const optimistic = [msg("local", null, { type: "human", optimistic: true, run_id: "run-1" })];
+    const turnBaseline = {
+      humanKey: "local",
+      keys: new Set<string>(),
+      localRunId: "run-1",
+    };
+
+    const result = mergeMessages({ history, stream, optimistic, turnBaseline });
+
+    expect(ids(result)).toEqual(["local", "step-1"]);
+  });
+
+  it("别的 run 的步骤不会被插到提问后面（重连回来的不算本轮）", () => {
+    const stream = [msg("other-run-step", null, { run_id: "run-old" })];
+    const optimistic = [msg("local", null, { type: "human", optimistic: true })];
+    const turnBaseline = {
+      humanKey: "local",
+      keys: new Set<string>(),
+      localRunId: "run-1",
+    };
+
+    const result = mergeMessages({ stream, optimistic, turnBaseline });
+
+    expect(ids(result)).toEqual(["other-run-step", "local"]);
+  });
+
   it("服务端确认之后不会出现两条：乐观副本按身份被去掉", () => {
     // 提交时客户端发了 id=X，M6 的动态上下文中间件把它改名成 X__user
     const optimistic = [msg("X", null, { type: "human", optimistic: true, content: "你好" })];

@@ -97,3 +97,7 @@ def test_tool_schema_names_type_and_usage_docstring() -> None:
     assert "knowledge_base_type" in tool.args_schema.model_fields
     assert "keyword_query" in tool.args_schema.model_fields
     assert "keyword_query" in (tool.description or "")
+    # 法律法规是独立类型，且要和 security（内部合规）分开说明
+    assert "legal" in (tool.description or "")
+    assert "法律法规" in (tool.description or "")
+    assert "外部" in (tool.description or "")

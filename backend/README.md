@@ -56,30 +56,43 @@ uv run --env-file .env --with uvicorn \
 
 ### 模型与推理等级（输入框里的两个选择）
 
-输入框右下角的模型 / 推理等级选择**只读 `models` 段**，没有第二份清单：
+**列表来自厂商**：`GET /api/models` 会带着 `models[].api_key` 去调每个 provider 的
+`GET {base_url}/models`（OpenAI 兼容，DeepSeek 也支持），把返回的 id 映射回 `models[]`：
+
+- 和 `models[].model` 相同的 id → 沿用该条目的 `name`（`context.model_name` 用它）；
+- 厂商新报出来的 id → `<name>@<vendor-id>`，网关复用该条目的 use/base_url/api_key，
+  只把 provider 侧模型名换掉（`model_overrides={"model": vendor_id}`）；
+- 厂商不可达（没网/没 key/限流）→ 该 provider 回退到配置里的那一条，
+  原因写进响应的 `vendor_errors`，输入框不会空掉；结果缓存 5 分钟。
 
 ```yaml
 models:
   - name: deepseek-v4-flash        # 唯一标识：/api/models 的 name，也是 context.model_name
     display_name: Flash            # 只给人看
+    provider: DeepSeek             # 列表上方那行小字；不写就从 use 推导（langchain_deepseek → DeepSeek）
     supports_reasoning_effort: true
-    reasoning_efforts:             # id 原样发给 provider，label/description 只给前端
+    reasoning_efforts:             # 显示名原样用（不改大小写）；不写就从厂商集成自带的 model profile 取 id
       - id: low
-        label: 低
-        description: 快速响应
+        label: Low
       - id: medium
-        label: 中
-        default: true              # 标了才会被预选；不标 = “默认（不指定）”
+        label: Medium
+        default: true              # 标了才会被预选；不标 = 输入框里的 “Off”
 ```
 
-- `GET /api/models` 返回 `models[]`（含每个模型自己的 `reasoning_efforts` 与
-  `default_reasoning_effort`）与 `default_model`（`agents.default_model`，缺省 `models[0]`）；
+- 推理等级**没有标准的厂商 HTTP 端点**：先用配置里的 `reasoning_efforts`（只写 id 与显示名，
+  不写解释性描述），没写就用厂商集成自带的 model profile（`reasoning_effort_levels`，如
+  `gpt-5` 的 `minimal/low/medium/high`，id 原样显示），都没有则这一行不显示；
+- 输入框的等级列表第一项固定是 `Off`（= 不下发 `reasoning_effort`，用 provider 默认），
+  所以配置里不需要（也不应该）列一个"没有等级"的候选项；
+- 响应字段：`models[]`（`name/model/provider/display_name/reasoning_efforts/
+  default_reasoning_effort/source/available`）、`default_model`（`agents.default_model`，
+  缺省 `models[0]`）、`default_reasoning_effort`、`vendor_errors`；
 - 前端把选择塞进 `runs.create` 的 `context.model_name` / `context.reasoning_effort`；
-- 网关按同一份配置校验：模型不在 `models[].name` 里 → 400 `model_not_allowed`；
-  等级不是该模型公布的候选 → 422 `invalid_run_request`（不会静默忽略）；
+- 网关校验：`<name>` 不在 `models[]` 里、或 `<name>@<vendor-id>` 的 vendor id 非法 →
+  400 `model_not_allowed`；等级不是该模型公布的候选 → 422 `invalid_run_request`；
 - 装配时 `assemble_agent` 再做一次协商（等级过期的旧客户端回退 provider 默认），
   最终由 `create_chat_model(..., reasoning_effort=…)` 传给模型；模型不支持就整体丢弃；
-- `reasoning_efforts` 是**元数据**：不会被当成模型构造参数转发出去。
+- `provider` / `reasoning_efforts` 是**元数据**：不会被当成模型构造参数转发出去。
 
 ### 持久记忆（M10 §2）
 
@@ -143,8 +156,18 @@ stdio 服务器是**有状态子进程**：会话按 `(server, user_id:thread_id
 打一次 `POST /api/mcp/cache/reset` 让本进程立刻换掉旧会话。
 
 技能目录默认是项目根下的 `skills/{public,custom}/<name>/SKILL.md`（`config.yaml` 的 `skills.path` 可改）。
-模型看到的是系统提示词尾部的 `<available_skills>` 索引（每技能一行，描述截断到 `index_description_max_chars`），
-正文一律按需 `read_file` 或 `/skill-name` 注入 —— 没有"全量注入"模式开关。
+模型看到的是系统提示词尾部的 `<available_skills>` 索引（每技能一行 `name [category]: 截断描述`，
+描述截断到 `index_description_max_chars`；根目录 `skills.container_path` 与"目录名即技能名、
+SOP 固定 `SKILL.md`"的约定在块前说一次，路径可推），
+正文一律按需：`read_file` 读 SKILL.md、`search_and_load_skills` 按任务意图检索加载，
+或 `/skill-name` 注入 —— 没有"全量注入"模式开关。
+已激活的技能由 `<active_skills>`（在 `<durable_context_data>` 里）投影：名字、描述、目录，
+外加**核心 SOP 正文**。正文不进 state，每次投影按 `skill_context` 台账里的 path 现读，
+预算见 `skills.active_context`；正文还在消息里时默认不重复写（压缩之后它才是唯一副本）。
+`search_and_load_skills` 是两段式（本地 BM25 召回 `skills.search.candidate_k` → 可选精排
+`top_k`），默认只有本地通道；`skills.search.embedding` / `rerank` 不填地址就不发请求，
+失败也只降级（退回 BM25 / 融合顺序）并在 `retrieval.warnings` 里说明。加载即激活：
+结果里的 `path` 和 `read_file` 读 SKILL.md 走同一本 `skill_context` 台账。
 技能是**两层开关**：全局 `extensions_config.json` 的 `skills.<name>.enabled`（admin）与个人
 `skills_prefs.json` 的 `{user_id: {name: bool}}`（任何登录用户），有效状态 = 两者相与。
 
@@ -293,7 +316,10 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 
 ## 主要路由
 
-都挂在 `/api`：
+都挂在 `/api`。约定：**router 只声明资源段**（`/threads`、`/models`、`/uploads`…），
+`/api` 统一在 `create_app()` 的 `include_router(..., prefix="/api")` 里加；
+少加一处就是整组接口 404（`test_m3_routes::test_route_inventory_matches_m3` 会当场抓住）。
+
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
@@ -304,6 +330,8 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `POST` | `/api/threads/{id}/runs/wait` | 创建 run 并阻塞到结束 |
 | `GET` | `/api/threads/{id}/runs/{run_id}/join` | 旁观已有 run（断开不取消） |
 | `POST` | `/api/threads/{id}/runs/{run_id}/cancel` | 取消 |
+| `GET` | `/api/models` | 模型目录（`models[]` + `reasoning_efforts` + `default_model`），输入框的模型/推理等级下拉读它 |
+| `GET` | `/api/models/{model_name}` | 单个模型（`models:read`） |
 | `POST` | `/api/threads/{id}/uploads` | 上传 |
 | `GET` | `/api/threads/{id}/artifacts/...` | 产物 |
 | `GET`/`PATCH` | `/api/mcp/config` | 读 MCP 配置（打码成 `****`）/ 启停一台已有服务器（`admin`） |
@@ -350,9 +378,13 @@ uv sync --all-packages --all-extras
 Qwen3-Embedding-8B（4096 维）→ Milvus。元数据与文档状态共用主数据库；文档数
 `document_count` 和当前活跃分片数 `chunk_count` 在知识库行上原子维护。
 
-创建知识库时必须选择类型（类型不可改）：技术文档、运维手册、FAQ、安全合规、
-API 参考。默认 token 档位：技术/运维/安全 512/64，FAQ 384/0，API 768/0；
+创建知识库时必须选择类型（类型不可改）：技术文档、运维手册、FAQ、安全合规、API 参考、
+法律法规（`legal`）。默认 token 档位：技术/运维/安全/法律 512/64，FAQ 384/0，API 768/0；
 硬上界 1024 token。分片和查询都走 Qwen3 tokenizer，不可用时会明确回退近似计数。
+
+`security` 与 `legal` 是两种东西：前者是**内部**安全/合规要求与控制项，后者是**外部**
+法规原文；`legal_clause` 策略按 `第X条（之N）/ Article N / § N / 条款 N` 切分，
+一条一个分片，条号写进 `section`，引用能直接落到“《XX 办法》第十二条”。
 
 Agent 自动获得只读 `knowledge_search` 工具。工具把 `knowledge_base_type` 作为参数，
 由模型按问题语义路由；服务端始终按 `user_id` 过滤，模型不能传身份。首版入库任务

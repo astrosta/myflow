@@ -24,15 +24,20 @@ import {
 } from "../messages/history";
 import { messageKey } from "../messages/identity";
 import { mergeMessages, type TurnBaseline } from "../messages/order";
+import type { RunContext } from "../models/selection";
 import type { ChatMessage, ThreadState } from "../types";
 import type { ChatController } from "./chat-controller";
 import { foldUpdateFrame, isRelevantUpdateFrame } from "./stream-state";
-import { createOptimisticHumanMessage, createTurnBaseline } from "./turn-baseline";
+import {
+  createOptimisticHumanMessage,
+  createTurnBaseline,
+  reconcileOptimistic,
+} from "./turn-baseline";
 
 export const DEFAULT_ASSISTANT_ID = "lead_agent";
 
 /** 没有模型选择时的空装配上下文（常量引用，避免每次渲染都新建对象） */
-const EMPTY_RUN_CONTEXT: Record<string, string> = {};
+const EMPTY_RUN_CONTEXT: RunContext = {};
 
 /**
  * 停止之后安排一次跟进刷新的延迟（§5.1）。
@@ -63,7 +68,7 @@ export interface UseChatOptions {
    * 并会按 config.yaml 的模型白名单与推理等级再校验一次。空对象就是"不选"，
    * 服务端用 agents.default_model 与 provider 默认等级。
    */
-  runContext?: Record<string, string>;
+  runContext?: RunContext;
 }
 
 /**
@@ -104,8 +109,14 @@ export function useChat({
   const hasThread = effectiveThreadId !== null;
   const client = useMemo(() => getApiClient(), []);
 
-  /** §3.1：主聊天流**强制**成增量模式。请求层还会再覆盖一次 body（见 client.ts） */
-  const streamModes = useMemo(() => sanitizeChatStreamModes(null), []);
+  /**
+   * §3.1：主聊天流**强制**成增量模式。请求层还会再覆盖一次 body（见 client.ts）。
+   *
+   * `messages-tuple` 显式写出来：token 级的正文/思考增量只从它来（`values` 只在节点
+   * 结束时给整份状态，等于没有流式）。`sanitizeChatStreamModes` 保证增量模式集永远
+   * 含它，这里写出来是让"我们确实订阅了 messages-tuple"在代码里可读。
+   */
+  const streamModes = useMemo(() => sanitizeChatStreamModes(["messages-tuple"]), []);
 
   /** 提交时要带的装配上下文。上层已用 useMemo 固定引用，这里只补个空对象兜底 */
   const runContextValue = runContext ?? EMPTY_RUN_CONTEXT;
@@ -253,26 +264,20 @@ export function useChat({
   }, [effectiveThreadId, client, queryClient]);
 
   /**
-   * 乐观消息什么时候该消失。
+   * 乐观消息的处置（三种状态都写进 `reconcileOptimistic`）：
    *
-   * **不能按 id 判。** SDK 会把它自己那份人类消息放进 `stream.messages`，
-   * 而那份的 id 是 SDK 重新生成的（实测 ids 分别是 `human-1` 和客户端给的
-   * `local-xxx`），我们传进去的 id 并不会原样出现在流里。
+   * **不能只按 id 判。** 服务端可能把我们提交的那条换成新 id（`local-xxx` →
+   * `human-1` 或一个 uuid + `__user`），这时按 id 既认不出"已被确认"，也去不掉重复。
+   * 所以：
    *
-   * 可靠的信号是**基线**：提交那一刻屏幕上已有的身份集合。提交之后
-   * 流里冒出来的、不在基线里的人类消息，就是我们刚发的那条。
-   *
-   * 不做这一步的后果不只是"消息重了一条"：多出来的那条人类消息会把
-   * 正在流的 AI 消息挤进**上一轮**，于是它被当成终态答案而不是"处理中"，
-   * 步骤面板整条都不出现。
+   * - 服务端已经把同样正文的提问发回来 → 去掉乐观副本（否则提问显示两遍）；
+   * - 已经开始出步骤、但提问还没回来 → 保留这条，只摘掉"发送中…"（问题不能消失）；
+   * - 什么反应都还没有 → 原样保留，"发送中…"继续显示。
    */
-  const optimisticConfirmed = useMemo(() => {
-    if (!optimistic.length) return false;
-    const baselineKeys = turnBaseline?.keys;
-    return streamMessages.some(
-      (message) => message.type === "human" && !baselineKeys?.has(messageKey(message)),
-    );
-  }, [optimistic.length, streamMessages, turnBaseline]);
+  const optimisticState = useMemo(
+    () => reconcileOptimistic(optimistic, streamMessages, turnBaseline),
+    [optimistic, streamMessages, turnBaseline],
+  );
 
   // ---- 合并 + 分组 ----
   const messages = useMemo(
@@ -280,11 +285,11 @@ export function useChat({
       mergeMessages({
         history,
         stream: streamMessages,
-        optimistic: optimisticConfirmed ? [] : optimistic,
+        optimistic: optimisticState.messages,
         loadedFloorSeq: floorSeq,
         turnBaseline,
       }),
-    [history, streamMessages, optimistic, optimisticConfirmed, floorSeq, turnBaseline],
+    [history, streamMessages, optimisticState, floorSeq, turnBaseline],
   );
 
   const groups = useMemo(

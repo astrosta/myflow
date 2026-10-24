@@ -3,7 +3,7 @@ import pytest
 from agentkit.runtime.stream_modes import (
     UnsupportedStreamModeError,
     normalize_stream_modes,
-    to_internal_stream_modes,
+    to_langgraph_stream_modes,
 )
 
 
@@ -31,10 +31,12 @@ def test_internal_messages_name_is_rejected() -> None:
 
 
 def test_unsupported_mode_is_not_replaced_with_values() -> None:
+    # 例子要挑**真的不支持**的名字：debug / tasks / checkpoints 现在都在
+    # RunStreamMode 里，拿它们当反例会随契约变化而失效。
     with pytest.raises(UnsupportedStreamModeError):
-        normalize_stream_modes(["values", "debug"])
+        normalize_stream_modes(["values", "nonsense"])
 
 
 def test_messages_tuple_maps_to_internal_messages() -> None:
     public = normalize_stream_modes(["messages-tuple", "values", "updates", "custom"])
-    assert to_internal_stream_modes(public) == ["messages", "values", "updates", "custom"]
+    assert to_langgraph_stream_modes(public) == ["messages", "values", "updates", "custom"]

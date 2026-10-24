@@ -32,6 +32,7 @@ def _config(**chunking: object) -> KnowledgeBaseConfig:
             "faq": {"chunk_size_tokens": 100, "chunk_overlap_tokens": 0},
             "security": {"chunk_size_tokens": 100, "chunk_overlap_tokens": 10},
             "api": {"chunk_size_tokens": 120, "chunk_overlap_tokens": 0},
+            "legal": {"chunk_size_tokens": 100, "chunk_overlap_tokens": 10},
         }
     }
     configured.update(chunking)
@@ -126,6 +127,40 @@ def test_security_chunks_do_not_merge_clauses() -> None:
     assert "第1条" in chunks[0].section
     assert "第2条" in chunks[1].section
     assert "第1条" not in chunks[1].content and "第2条" not in chunks[0].content
+
+
+def test_legal_chunks_split_by_article_and_keep_the_chapter_path() -> None:
+    text = (
+        "# 某某管理办法\n\n"
+        "## 第一章 总则\n\n"
+        "第一条 为了规范某某管理，制定本办法。\n\n"
+        "第二条 在境内从事某某活动的单位，适用本办法。\n\n"
+        "## 第三章 监督管理\n\n"
+        "第十二条之一 监督检查人员应当出示证件。\n\n"
+        "Article 20 Any operator shall keep records for three years.\n"
+    )
+    chunks = chunk_document(
+        text, KnowledgeBaseType.LEGAL, _config(), token_counter=CharCounter()
+    )
+
+    assert len(chunks) == 4
+    # 条号进 section：引用要能落到“第几条”
+    assert "第一章 总则" in chunks[0].section and "第一条" in chunks[0].section
+    assert "第二条" in chunks[1].section
+    assert "第三章 监督管理" in chunks[2].section and "第十二条之一" in chunks[2].section
+    assert "Article 20" in chunks[3].section
+    # 不跨条合并
+    assert "第二条" not in chunks[0].content
+    assert "第一条" not in chunks[1].content
+
+
+def test_legal_without_clause_markers_falls_back_to_plain_packing() -> None:
+    text = "这是一段没有条号的法规说明，仍然要能被切出来而不是丢掉。"
+    chunks = chunk_document(
+        text, KnowledgeBaseType.LEGAL, _config(), token_counter=CharCounter()
+    )
+    assert len(chunks) == 1
+    assert "没有条号" in chunks[0].content
 
 
 def test_api_reference_keeps_endpoint_symbols_separate() -> None:

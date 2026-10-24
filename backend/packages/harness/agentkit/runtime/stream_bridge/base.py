@@ -55,6 +55,9 @@ class StreamBridge(abc.ABC):
         and the first publish. An already reclaimed run answers with END at once.
         """ 
 
+    async def aclose(self) -> None:
+        """进程退出时放开连接池。默认无事可做；只关自己建的资源。"""
+
     @abc.abstractmethod
     async def cleanup(self, run_id: str, *, delay: float = 0) -> None:
         """Release resources associated with *run_id*.

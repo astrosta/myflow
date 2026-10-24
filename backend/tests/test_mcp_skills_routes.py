@@ -321,9 +321,13 @@ def test_the_skill_list_shares_one_scan_with_the_model_index(config_path, monkey
     from agentkit.skills.prompt import build_skills_section
 
     listed = [item["name"] for item in _client(monkeypatch, SKILLS_READ).get("/api/skills").json()["skills"]]
+    section = build_skills_section(config=get_app_config().skills)
+    # 索引前面有一行说明（"这是索引，不是正文"），只取 <available_skills> 块里的条目
+    block = section[section.index("<available_skills>") : section.index("</available_skills>")]
     indexed = [
-        line.split(":")[0].removeprefix("- ")
-        for line in build_skills_section(config=get_app_config().skills).splitlines()[1:-1]
+        line[2:].split(" [")[0].split(":")[0]
+        for line in block.splitlines()
+        if line.startswith("- ")
     ]
 
     assert listed == sorted(indexed) == ["bar", "foo"]

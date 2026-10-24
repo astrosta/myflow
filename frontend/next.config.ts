@@ -20,6 +20,19 @@ const nextConfig: NextConfig = {
    * 本地 `next dev` / `next build` 的行为不变。
    */
   output: "standalone",
+  /**
+   * **必须关掉，否则开发期 SSE 不流式。**
+   *
+   * Next 的压缩层会给响应套 gzip；`text/event-stream` 没有 content-length，
+   * 压缩流要攒够一块才 flush，于是 `/api/*` rewrite 把整条 SSE 压在手里，
+   * 浏览器的表现是"一直转圈，答案最后一次性出现"。实测（300ms 一帧的慢速模型）：
+   *   compress: true  → 14 帧全部在 run 结束那一刻到达（3.66s 一整坨）
+   *   compress: false → 每 0.3s 到一帧，逐 token 渲染
+   * 网关那边设的 `X-Accel-Buffering: no` 只管 nginx，管不到 Next 自己。
+   * 生产压缩由 nginx 负责（`docker/nginx.conf` 的 gzip_types 故意不含
+   * `text/event-stream`），所以这里关掉不会让生产多传字节。
+   */
+  compress: false,
   reactStrictMode: true,
   poweredByHeader: false,
   /**

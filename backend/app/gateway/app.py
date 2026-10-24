@@ -136,6 +136,7 @@ async def lifespan(app: FastAPI):
                     timeout = app_config.runs.shutdown_timeout_seconds
                     await services.run_manager.shutdown(timeout=timeout if timeout is not None else 10.0)
                     cancel_detached()
+                    await services.bridge.aclose()  # 最后放掉桥的连接池（Redis 后端才有事可做）
     finally:
         await close_engine()
 
@@ -175,11 +176,13 @@ def create_app() -> FastAPI:
     )
     install_middleware(application)
     install_error_handlers(application)
-    application.include_router(threads.router)
-    application.include_router(thread_runs.router)
-    application.include_router(models.router)
-    application.include_router(uploads.router)
-    application.include_router(artifacts.router)
+    # 统一约定：router 只声明资源段（/threads、/models、/uploads…），/api 在这里加。
+    # 少加一个就是 404 —— 浏览器请求的是 /api/models、/api/threads/{id}/uploads。
+    application.include_router(threads.router, prefix="/api")
+    application.include_router(thread_runs.router, prefix="/api")
+    application.include_router(models.router, prefix="/api")
+    application.include_router(uploads.router, prefix="/api")
+    application.include_router(artifacts.router, prefix="/api")
     # M7 §2.4：两个 router 各自 prefix，/api 加在这里。
     application.include_router(mcp.router, prefix="/api")
     application.include_router(skills.router, prefix="/api")

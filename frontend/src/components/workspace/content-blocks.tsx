@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 
 import { Markdown } from "./markdown";
 import { ThinkingBlock } from "./thinking-block";
-import { ToolCallCard } from "./tool-call-card";
+import { ToolCallRow } from "./tool-call-row";
 
 /**
  * 按序渲染一条消息的 blocks（M5 §6.1 / §6.2）。
@@ -28,22 +28,30 @@ export function ContentBlocks({ blocks, streaming = false, className }: ContentB
     <div className={cn("flex flex-col gap-3", className)}>
       {blocks.map((block, index) => {
         if (block.kind === "thinking") {
-          return <ThinkingBlock key={block.id} text={block.text} />;
+          // 思考块是"当前还在想"的标志：只有它排在最后一块时才在跑（答案一开始写，
+          // 思考就结束了）——和文本块上那个光标用的是同一套判断。
+          return (
+            <ThinkingBlock
+              key={block.id}
+              running={streaming && index === blocks.length - 1}
+              text={block.text}
+            />
+          );
         }
         if (block.kind === "text") {
-          // 光标只挂在最后一块上：中间那些文本块已经"说完"了
+          // 正文不挂光标（Markdown 自己也不支持）：流式追加时末尾不再有闪烁方块
           return (
             <Markdown
               key={block.id}
-              streaming={streaming && index === blocks.length - 1}
               text={block.text}
             />
           );
         }
         return (
-          <div className="flex flex-col gap-2" key={block.id}>
+          // 工具行和思考行同一形制（一行 + 点开看细节）：行距按行算，不再按卡片算
+          <div className="flex flex-col gap-1.5" key={block.id}>
             {block.calls.map((call) => (
-              <ToolCallCard call={call} key={call.id} />
+              <ToolCallRow call={call} key={call.id} />
             ))}
           </div>
         );

@@ -128,4 +128,4 @@ pnpm e2e           # Playwright；e2e 拦截网络，不依赖真实网关
 | 点发送没请求 | 确认 `GATEWAY_INTERNAL_URL` 指向已启动的 8001；开发 rewrite 是否生效 |
 | 白屏、静态资源 404 | `build` 后跑过 `dev`：删 `.next` 再 `pnpm build` |
 | `EADDRINUSE :3000` | 换端口，或按 PID `taskkill` 掉占用进程 |
-| SSE 不流式 | 生产 nginx 不能 gzip `text/event-stream`，且 `proxy_buffering off` |
+| SSE 不流式 | **开发**：`next.config.ts` 的 `compress` 必须是 `false`；改成 `true` 后 Next 的 gzip 会攒住 `text/event-stream`（实测 14 帧全压在 run 结束那一刻到达），改完要重启 `pnpm dev`。**生产**：nginx 的 `gzip_types` 不能含 `text/event-stream`，且 `/api` 要 `proxy_buffering off` |

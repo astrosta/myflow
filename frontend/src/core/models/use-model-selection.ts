@@ -12,6 +12,7 @@ import {
   resolveEffort,
   resolveModel,
   type ModelSelection,
+  type RunContext,
 } from "./selection";
 
 /**
@@ -28,9 +29,11 @@ export interface ModelSelectionController {
   effortId: string | null;
   effortLabel: string;
   selection: ModelSelection;
-  runContext: Record<string, string>;
+  runContext: RunContext;
   loading: boolean;
   error: string | null;
+  /** 哪些厂商的 /models 没拉到：只影响列表来源，不影响可用性 */
+  vendorErrors: string[];
   selectModel: (name: string) => void;
   selectEffort: (id: string | null) => void;
 }
@@ -67,8 +70,13 @@ export function useModelSelection(): ModelSelectionController {
   }, []);
 
   const selection = useMemo<ModelSelection>(
-    () => ({ modelName: current?.name ?? null, effortId }),
-    [current?.name, effortId],
+    () => ({
+      modelName: current?.name ?? null,
+      effortId,
+      // 模型支持思考就开：后端会再按 supports_thinking 协商，这里不猜能力
+      thinkingEnabled: current?.supports_thinking === true,
+    }),
+    [current?.name, current?.supports_thinking, effortId],
   );
 
   return {
@@ -82,6 +90,7 @@ export function useModelSelection(): ModelSelectionController {
     runContext: buildRunContext(selection),
     loading: query.isLoading,
     error: query.error instanceof Error ? query.error.message : null,
+    vendorErrors: query.data?.vendor_errors ?? [],
     selectModel,
     selectEffort,
   };

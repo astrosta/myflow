@@ -58,7 +58,7 @@ agentkit/skills/
 ├── tool_policy.py             ★  # union / ALWAYS_AVAILABLE
 ├── storage.py                    # load_skills() 扫描
 ├── prefs.py                      ★  # effective_enabled / 个人偏好落盘
-├── catalog.py / describe.py      # describe_skill：L1 元数据（始终启用）
+├── router.py / loader.py         # search_and_load_skills：按意图检索 + 正文预算
 └── prompt.py                     # <available_skills> 索引渲染（唯一形态）
 
 agentkit/mcp/
@@ -819,19 +819,99 @@ def _is_usable_entry(entry: Path, skill_file: Path, root: Path) -> bool:
 
 ### 3.5 渐进式加载：唯一路径
 
-**技能永远按三级渐进加载，没有第二种模式、没有开关。** 模型看到的东西从少到多，
+**技能永远按两级渐进加载，没有第二种模式、没有开关。** 模型看到的东西从少到多，
 每一级都要付一次显式动作：
 
 
-| 级别      | 在哪                                              | 内容                                                                        | 怎么进入下一级                                  |
+| 级别      | 在哪                                              | 内容                                                                        | 怎么进入正文                                  |
 | ------- | ----------------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------- |
-| **L0 索引** | 系统提示词的 `<available_skills>` 尾部（同一份提示词里唯一提到技能的地方） | 每个技能**一行**：`name`、截断描述、需不需要密钥、`dir=`                                 | 模型读了这一行                                  |
-| **L1 元数据** | `describe_skill` 的工具结果                         | 完整 description、`allowed-tools`、`argument-hint`、`required-secrets`（含 optional）、license、容器路径 | 模型判断"要不要真的用它"                            |
-| **L2 正文** | `read_file` 读 `SKILL.md`（slash 激活则由中间件注入）      | SKILL.md 全文                                                              | 进入对话或工具结果，同时被 §3.10 捕获为 `skill_context` |
+| **L0 索引** | 系统提示词的 `<available_skills>` 尾部（同一份提示词里唯一提到技能的地方） | 每个技能**一行**：`name`、截断描述、需不需要密钥、`dir=`                                 | 模型读了这一行，决定读不读正文                         |
+| **L1 正文** | `read_file` 读 `SKILL.md` / `search_and_load_skills` 按意图加载（slash 激活则由中间件注入）      | SKILL.md 全文（已激活技能的核心 SOP 会同时投影进 `<active_skills>`，见 §3.5.2） | 进入对话或工具结果，同时被 §3.10 捕获为 `skill_context` |
 
 
-**正文永远不会"预加载"进提示词。** L2 只有两个入口：模型自己 `read_file`（自主激活，§3.6），
+**正文永远不会"预加载"进提示词。** 正文有三个入口，全部是模型/用户的显式动作：
+模型自己 `read_file`（自主激活，§3.6）、`search_and_load_skills` 按任务意图检索加载（§3.5.1），
 或用户 `/skill-name`（slash 激活，由 `SkillActivationMiddleware` 注入隐藏 HumanMessage）。
+
+**没有中间的"元数据层"。** 早期版本的 L1 是 `describe_skill`（只返回元数据、不返回正文），
+在 `search_and_load_skills` 落地后删除——它独有的字段没有一个能改变模型的动作，
+理由与"什么情况下该加回来"写在 §3.5 末尾。
+
+#### 3.5.1 `search_and_load_skills`：技能多到读不完时的那一跳
+
+索引只给"名字 + 一行描述"。技能几十个时，模型要么挑错、要么逐个 `read_file` 试——
+每一次试错都是一段正文进上下文。`search_and_load_skills` 把这一步变成一次检索：
+
+```text
+task_query:     自包含的任务意图（禁代词，带技术栈/协议/报错/目标产出）
+domain_keywords: 1~4 个预期出现在正文里的名词、命令、库名
+        ↓  召回 candidate_k（默认 20）→ 融合 → 精排 top_k（默认 3）
+skills[]: name / description / dir / path / score / channels / body
+```
+
+四条约束：
+
+1. **仍然是按需**。正文只在模型显式调用时进入上下文，和 `read_file` 同一条纪律；
+   它省掉的是"猜哪个 SKILL.md 值得读"的那几轮，不是"读正文"这个动作。
+2. **加载即激活**。结果里的 `path` 被 §3.10 的捕获认成 `skill_context`（和 `read_file` 走
+   同一本账），于是该技能声明的 `allowed-tools` 同时生效——否则模型拿着 SOP 却被策略挡住。
+3. **两段式，但第二阶段可以是空的**。默认只有本地 BM25（中文按二元组，不依赖分词器与外部服务）；
+   `embedding` 与 `rerank` 要显式配地址才开，且**失败只降级不失败**：向量通道挂了退回 BM25，
+   精排挂了退回融合顺序，两种情况都在 `retrieval.warnings` 里写明。
+4. **预算有界**。单个技能正文 `max_body_chars`、一次加载总量 `max_context_chars`；
+   `body_truncated=true` 时正文里带截断标记并给出 `path`，模型可以再 `read_file` 读后半段。
+
+**它不负责"确认技能存在"。** 那是索引的活：索引已经给了名字、截断描述、所需密钥和 `dir=`。
+曾经还有一个只返回元数据的 `describe_skill`（allowed-tools / argument-hint / license / category），
+在 `search_and_load_skills` 落地之后被删掉了：
+那些字段全是**策略与用户侧**信息（工具被挡由中间件返回可恢复错误，`argument-hint` 是 slash
+的用户用法），模型拿到也改变不了任何动作；而它每个请求都要带一份 tool schema，
+并且与索引、与检索结果三处重复描述同一个技能。详见 §3.5 末尾。
+
+#### 3.5.2 两个块的分工：`<available_skills>` 与 `<active_skills>`
+
+技能在模型眼里只有两个载体，职责不重叠：
+
+| 块 | 在哪 | 内容 | 什么时候有 |
+|---|---|---|---|
+| `<available_skills>` | **静态**系统提示词尾部（`skills/prompt.py`） | 全量有效启用技能，每行 `name [category]: 截断描述 [\| 需密钥]`；根目录与命名约定写在块前面 | 至少有一个技能 |
+| `<active_skills>` | `<durable_context_data>` 里的运行时投影（`durable_context_middleware._render_skills`） | 已激活技能的 `name: 描述 \| dir=`，**外加核心 SOP（正文）** | 台账 `skill_context` 非空 |
+
+`<active_skills>` 的四条实现约束：
+
+1. **正文不进 state**。台账只记 `{name, path, description}`；正文每次投影时按 `path`
+   **现读技能树**（`loader.read_skill_body`），受 `skills.active_context.max_body_chars` /
+   `max_context_chars` 约束。把正文写进 state 会让每个 checkpoint 都拖着一份 SOP。
+2. **正文还在消息里就不重复写**（`skip_bodies_still_in_context`，默认开）。工具结果的 JSON
+   里本来就有那份正文；这段真正的价值是**上下文被压缩之后**——消息没了、台账还在，
+   它就成了技能正文唯一的副本。关掉这一项等于每轮双份 token。
+3. **按当前用户重算**：投影走 `SkillRegistry.visible()`，用户自己关掉的技能不再补正文
+   （名字那一行留着，那是已经发生过的事实）。
+4. **读不出来只丢正文**：技能文件被删、坏了，或注册表整体不可用，都只退化成一行名字，
+   不让整轮模型调用失败。
+
+**为什么不把这些写进系统提示词。** 系统提示词是静态的：`<active_skills>` 每一轮都可能变，
+写进去等于每轮重写前缀、打穿前缀缓存（M6 §4.4）。`<durable_context_data>` 是同一份数据的
+动态投影，模型每轮都看得到，语义上没有区别。
+
+**提示词里只写"技能放在哪"和"你在看什么"，不写"什么时候去读"。** 三个理由：
+
+1. 两个标签都叫 skills，光凭标签名区分"目录"和"已加载正文"不可靠：模型一旦把索引那行当成
+   正文，就会拿 120 字描述硬猜（错答案），或者去重读已经加载过的技能（白烧一轮）。所以索引
+   前面固定说一句"这是索引、**不含正文**、正文在 `<active_skills>` 里"（`SKILL_INDEX_PREAMBLE`）。
+2. 索引行里不放 `dir=`：几十行就是几十份重复前缀。**根目录**和两条命名约定
+   （目录名即技能名、SOP 固定 `SKILL.md`）在块前面说一次即可（`SKILL_ROOT_CONVENTION`），
+   路径变成 `{root}/<category>/<name>/SKILL.md`，可推。
+3. 两段都是**静态**的：跟着索引一起进 LRU 缓存，不随每轮变化打穿前缀缓存。
+
+**为什么不写一段 `<skill_routing_protocol>`。** 曾经写过一版"什么时候检索、什么时候不要检索"
+的协议，后来删掉了：它和 `search_and_load_skills` 的 tool description 说的是同一件事，
+两处措辞一旦漂移就是两套契约（`task` 的 design 原则同款）。
+"空结果别再换措辞重试"这类硬约束留在**工具结果**里说——那是模型真正会读到它的时刻。
+路由判断的措辞只维护在 `search_and_load_skills` 的 docstring（WHEN TO USE / WHEN NOT TO USE）。
+
+两者的边界可以一句话概括：**格式说明只有一份**（跟着索引缓存），**路由策略也只有一份**
+（tool description）。缺了前者，模型看不懂两个块的区别；重复了后者，就是两套契约。
 
 #### 索引长什么样
 
@@ -843,7 +923,8 @@ SKILL_INDEX_HEADER, SKILL_INDEX_FOOTER = "<available_skills>", "</available_skil
 def render_skill_index(skills: Sequence[Skill], *, max_description_chars: int) -> str:
     """技能为 0 时返回空串：整个块不出现（不要留一个空标签给模型猜）。
 
-    每行: - <name>: <描述截断> [| 需密钥 A, B] | dir=<容器路径>
+    每行: - <name> [<category>]: <描述截断> [| 需密钥 A, B]
+          目录名与 name 不一致时才退化成 `| dir=<容器路径>`
     排序: (category, name) —— 稳定的顺序，加技能只影响它自己那一行。
     """
     if not skills:
@@ -855,21 +936,35 @@ def render_skill_index(skills: Sequence[Skill], *, max_description_chars: int) -
             " | 需密钥 " + ", ".join(item.name for item in skill.required_secrets)
             if skill.required_secrets else ""
         )
+        name_suffix, tail = _entry_marker(skill)
         lines.append(
-            f"- {html.escape(skill.name)}: {html.escape(description)}{secrets} | dir={skill.container_dir}"
+            f"- {html.escape(skill.name)}{name_suffix}: {html.escape(description)}{secrets}{tail}"
         )
     lines.append(SKILL_INDEX_FOOTER)
     return "\n".join(lines)
 ```
 
-渲染出来是这样（技能少的时候它就是提示词里唯一变动的部分）：
+渲染出来是这样（技能少的时候它就是提示词里唯一变动的部分）。**路径不在行里**：
+根目录和两条命名约定写在块前面，一次说清，路径可推：
 
 ```text
+技能根目录 `/mnt/skills`：每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的
+`SKILL.md`，即 `/mnt/skills/<category>/<技能名>/SKILL.md`（category 是 public 或 custom……
+同名时 custom 覆盖 public）。
+下面是技能索引 `<available_skills>`：每个已启用技能一行，只有名字、类别和截断描述
+（需要密钥的会标出来），**不含正文**。已加载技能的名字与正文在持久上下文的 `<active_skills>` 里。
+
 <available_skills>
-- csv-tools: 处理 CSV，按列聚合 | 需密钥 CSV_API_KEY | dir=/mnt/skills/custom/csv-tools
-- pdf-processing: Handle PDF documents efficiently | dir=/mnt/skills/public/pdf-processing
+- csv-tools [custom]: 处理 CSV，按列聚合 | 需密钥 CSV_API_KEY
+- pdf-processing [public]: Handle PDF documents efficiently
 </available_skills>
 ```
+
+**为什么把 `dir=` 从每一行挪到块前面**：几十个技能就是几十份重复的路径前缀，而路径本来就
+是可推的（根目录 + 目录名即技能名 + 固定 `SKILL.md`）。代价是模型必须做一次字符串拼装——
+这比每行多 40 个 token 便宜。**唯一例外**：目录名和 frontmatter 的 `name` 不一致的技能
+（`load_skills` 会 warning 并以 frontmatter 为准），那种行退化成 `| dir=<容器路径>`，
+否则模型会按约定推到一个不存在的路径，`read_file` 撞 404 白烧一轮。
 
 **索引的五条规则**：
 
@@ -880,39 +975,37 @@ def render_skill_index(skills: Sequence[Skill], *, max_description_chars: int) -
 2. **排序稳定**（`category, name`）。按扫描顺序或 mtime 排，会让"加一个技能"改变后面所有行的
    位置，前缀缓存从第一处变动起全部失效。
 3. **只截断描述**（`skills.index_description_max_chars`，默认 120），其余字段**根本不进索引**：
-   `allowed-tools` / `argument-hint` / license 属于 L1，正文属于 L2。
+   `allowed-tools` / `argument-hint` / license 都不进——前两个是策略与 slash 的用法，
+   license 对模型没有意义。模型需要的是"有没有、要不要密钥、目录在哪"，以及正文。
 4. **`dir=` 是容器路径**（`/mnt/skills/{public|custom}/<relative>`），不是宿主路径——
-   模型据此一步 `read_file`，不必先 `describe_skill`。
+   模型据此一步 `read_file`，不必先检索。
 5. **需要密钥的技能必须标出来**。不标，模型会去激活一个注定失败的技能，用户看到的是"技能坏了"。
 
 name / description 都 `html.escape`：技能描述里可以塞 `<system-reminder>` 伪造框架标签
 （M6 清的是用户输入，系统提示词由我们自己拼，但技能作者写的内容同样不可信）。
 
-#### `describe_skill`：只给元数据，不给正文
+#### 为什么删掉 L1 元数据工具（原 `describe_skill`）
 
-```python
-# agentkit/skills/describe.py
-def describe_payload(skill: Skill) -> dict:
-    """L1：完整元数据 —— 决定"要不要用"所需要的一切，唯独没有正文。"""
-    return {
-        "name": skill.name,
-        "description": skill.description,                       # 完整，不截断
-        "allowed_tools": None if skill.allowed_tools is None else list(skill.allowed_tools),
-        "argument_hint": skill.argument_hint,
-        "required_secrets": [{"name": s.name, "optional": s.optional} for s in skill.required_secrets],
-        "license": skill.license,
-        "dir": skill.container_dir,
-        "category": skill.category.value,
-    }
-```
+早期设计有三级：索引（L0）→ 元数据（L1，`describe_skill`）→ 正文（L2）。L1 返回完整
+description、`allowed-tools`、`argument-hint`、`required-secrets`、license、容器路径。
+`search_and_load_skills` 落地之后它被删掉了，理由三条：
 
-**为什么 L1 不返回正文**：正文进工具结果就会进 checkpoint 和后续每一次模型调用，
-等于绕开 L2 的"按需"。要正文就 `read_file`——那条路径同时完成激活（§3.10）。
+1. **独有字段没有一个能改变模型的动作。** `allowed-tools` 是**策略输入**（工具被挡时中间件
+   返回可恢复错误并提示换工具，模型不需要事先知道）；`argument-hint` 是 slash 的用户用法；
+   license / category 对模型无意义。真正影响"会不会白激活"的 `required-secrets` 已经在索引里。
+2. **信息三处重复。** 索引给名字 + 截断描述 + 密钥 + `dir=`，检索给完整描述 + 正文 + `path`，
+   L1 在中间再说一遍同一批字段——三处措辞漂移就是三套契约。
+3. **每个请求都要带一份 tool schema。** 工具描述本身就是上下文预算，而它的 WHEN/WHEN NOT
+   与检索工具高度重叠。
+
+**什么情况下该把它加回来**：如果以后工具策略演进成"不同技能挂不同工具集、选错技能会做不成事"，
+那 `allowed-tools` 就变成了**决策依据**——那时应该把它放进**索引那一行**，而不是再造一个
+元数据工具。
 
 #### 为什么删掉 `skills.deferred_discovery` 开关
 
 1. **旧的两个模式差别比看上去小。** 所谓"全量注入"也只放元数据，正文本来就要 `read_file`；
-   两者真正的差别只是"元数据什么时候进上下文"，而这件事 L1 + L2 已经覆盖了。
+   两者真正的差别只是"元数据什么时候进上下文"，而索引那一行已经覆盖了。
    留开关等于留两套渲染、两套提示词契约、两套测试。
 2. **元数据无界增长。** 全量形态下每加一个技能就多出 allowed-tools / argument-hint / license /
    路径，把 M6 §4.4 要求的"静态系统提示词"反复打穿。索引是它的**有界**版本：每技能一行，
@@ -996,7 +1089,9 @@ Activation 和 Policy 这一对。slash 源路径写在 `runtime.secret_context`
 
 ```python
 # agentkit/skills/tool_policy.py
-ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES = frozenset({"describe_skill", "read_file", "tool_search"})
+ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES = frozenset(
+    {"read_file", "tool_search", "search_and_load_skills"}
+)
 
 
 def compute_allowed_tools(
@@ -1048,7 +1143,7 @@ class SkillToolPolicyMiddleware(AgentMiddleware):
 ```
 
 - **`baseline` 是"配置工具 + 内置工具"的名字集合**（M2 `collect_tools` 的产物），
-  框架工具（`describe_skill` / `read_file` / `tool_search`）永远并上去。
+  框架工具（`read_file` / `tool_search` / `search_and_load_skills`）永远并上去。
 - **决策写进 `secret_context` 且带 owner token**：同一轮的 tool_call 可以复用它，
   但伪造的、过期的、别人写的都会被拒（§3.6 的 token 机制）。
 - **`awrap_tool_call` 短路时返回一条错误 ToolMessage，而不是抛异常**：模型看到的是
@@ -1080,9 +1175,9 @@ class SkillToolPolicyMiddleware(AgentMiddleware):
 
 ```python
 ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES = frozenset({
-    "describe_skill",
     "read_file",
     "tool_search",
+    "search_and_load_skills",   # 和 read_file 同级：都只是"把某个 SKILL.md 读进上下文"
 })
 ```
 
@@ -1125,12 +1220,17 @@ context 副本里看不到。
 
 ### 3.10 DurableContext 捕获技能引用
 
-M6 已有通道。M7 把捕获补全：`read_file` / `read` / `view` / `cat`（配置
-`summarization.skill_file_read_tool_names`）的结果，路径在
-`container_path` 下且 basename 是 `SKILL.md`，抽出
-`{name, path, description}` 写入 `ThreadState.skill_context`。
-description 截断（M1 的 `_SKILL_DESCRIPTION_MAX_CHARS`）。**不要把正文放进
-state**——那是 slash 注入的事，而且会让 checkpoint 膨胀。
+M6 已有通道。M7 把捕获补全：两条来源，都抽出 `{name, path, description}` 写入
+`ThreadState.skill_context`——描述截断（M1 的 `_SKILL_DESCRIPTION_MAX_CHARS`），
+**不要把正文放进 state**，它会让 checkpoint 膨胀：
+
+1. `read_file` / `read` / `view` / `cat`（配置 `summarization.skill_file_read_tool_names`）
+   的结果，路径在 `container_path` 下且 basename 是 `SKILL.md`——路径在**调用参数**里；
+2. `search_and_load_skills` 的结果 JSON——路径在**结果**里（`skills[].path`），照样过
+   `_container_skill_path` 校验。加载即激活，所以它和 read_file 走同一本账。
+
+投影时（`_render_skills`）再从技能树现读正文，装进 `<active_skills>`，受
+`skills.active_context` 的预算约束，并且**正文还在消息里就不重复写**（§3.5.2）。
 
 `review_skill_package`（以后）的结果**不得**带 `skill_context_entry` 标记，
 避免"审一下"变成激活。
@@ -1601,7 +1701,7 @@ def build_server_params(server: McpServerConfig, *, user_id: str | None, thread_
 本次可见 = 基线工具（配置 + 内置）
          ∪ catalog.resolve(promoted)          # 提升过的 MCP 工具（幽灵名字自动消失）
          ∩ 技能策略允许集合                      # §3.8：发现 ≠ 可用
-         ∪ ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES  # describe_skill / read_file / tool_search
+         ∪ ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES  # read_file / tool_search / search_and_load_skills
 ```
 
 **`promoted` 存名字，不存 schema。** schema 永远从**当前** catalog 取：
@@ -1908,10 +2008,13 @@ class McpRoutingMiddleware(AgentMiddleware):
 | `test_skill_loading.py` | 嵌套 `SKILL.md` 不注册；一级符号链接目录可用；深层逃逸被拒；UTF-8 中文；custom 盖 public |
 | `test_skill_scope_layers.py` | `effective = global and pref`；全局关掉后用户打不开（preference=true 也无效）；个人关掉后索引里没有它、slash 也不算激活；两层各用各的锁，互不阻塞；两个用户各自开关互不影响；prefs 并发写不丢 |
 | `test_skill_index.py` | 索引只列已启用且在白名单里的技能；排序稳定（加技能只追加自己那一行）；描述截断到上限；`dir=` 是容器路径不是宿主路径；需密钥的技能被标出；registry 加载失败 → 索引为空（fail-closed）；name/description 被 HTML 转义；0 技能 → 整个块不出现 |
-| `test_skill_progressive.py` | L0 里**没有**正文、没有 `allowed-tools`；`describe_skill` 返回元数据但**没有 body**（正文只能经 `read_file` 或 slash 注入进入对话）；catalog 三种形态（`select:` 无上限 / 自由文本 ≤5 / 非法 regex 退化成字面子串） |
+| `test_skill_progressive.py` | L0 索引里**没有**正文、没有 `allowed-tools` / `argument-hint` / license；工具集里只有按需加载工具、没有元数据工具（L1 已被删除） |
 | `test_skill_parser.py` | `Bash`→`bash`；未知名保持；未闭合括号炸；畸形 required-secrets 丢掉技能仍加载 |
 | `test_slash_skill_contract.py` | 与 `contracts/slash_skill_contract.json` 双向钉死；前导空白/保留命令拒绝 |
 | `test_skill_policy.py` | 被动启用不收紧；slash 支配；并集；空声明不拆别人的限制；`task` 不豁免；框架工具始终可用；`tool_search` 提升的业务工具仍要声明 |
+| `test_skill_search_router.py` | 中文二元组分词；BM25 把正文命中排第一；`domain_keywords` 能把查询词没提到的技能拉进来并加权原有命中；`top_k` / `min_score` 截断；向量通道单独驱动顺序、挂掉退回 BM25；精排重排与失败回退；文件消失的技能被跳过 |
+| `test_search_and_load_skills_tool.py` | 返回正文 + 容器路径（frontmatter 不重复）；正文预算截断并标记；空查询/空技能树/工具关闭三种措辞；用户关掉的技能不加载；只在 `skills.search.enabled` 时注册；在真实 `create_agent` 循环里跑通；路由协议只在工具启用时出现，且只引用真实渲染的块 |
+| `test_durable_context.py`（新增用例） | `search_and_load_skills` 的结果 JSON 被捕获成 `skill_context`（只留 name/path/description，**正文不进 state**）；越界路径与 `README.md` 一律忽略；没配成加载工具的工具结果不算激活；`<active_skills>` 在正文已不在消息里时补正文、仍在消息里时不重复写、预算截断并标注、`active_context.enabled=false` 只留名字行、用户关掉的技能不补正文、技能文件消失只退化成一行 |
 | `test_skill_policy_fail_closed.py` | 注册表失败 → 只剩框架工具；伪造 slash 路径无 token → 当无 |
 | `test_skill_activation_request_only.py` | SKILL.md 注入不出现在 checkpoint；同一 slash 本 run 只读盘一次 |
 | `test_mcp_tool_prefix.py` | 同名不冲突；关前缀后源路由仍按 server 元数据 |
@@ -1946,6 +2049,10 @@ caplog 文本里。
 - [ ] 新建 `skills/public/foo/SKILL.md`（中文正文），Windows 上模型能发现
 - [ ] `/foo task` 激活后该技能 `allowed-tools` 生效；未 slash 的启用技能不收紧工具集
 - [ ] 受限 slash 下 `read_file` 另一个更宽的 SKILL.md，工具集不扩大
+- [ ] 技能树里放 20 个以上技能，用一句自包含的任务意图调 `search_and_load_skills`：
+      第一条命中就是该用的那个，正文里带 `path`；同一意图第二次调用不重复加载
+- [ ] 把 `skills.search.embedding.enabled`/`rerank.enabled` 打开但指向一个不存在的端口：
+      检索照常出结果（退回 BM25 / 融合顺序），`retrieval.warnings` 写明降级原因
 - [ ] 故意带换行的 MCP 凭据，错误信息里没有凭据内容
 - [ ] stdio 服务器被 kill，下一次调用报错但不影响其它 thread 会话，再下一次自动重建
 - [ ] 客户端 POST 的 `context.secrets` 不出现在 `GET /runs/{id}` 的 kwargs 里

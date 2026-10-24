@@ -78,17 +78,25 @@ class ModelResponse(BaseModel):
     model: str
     display_name: str | None = None
     description: str | None = None
+    #: 厂商展示名：输入框里模型列表上方的那行小字（config 的 provider，或从 use 推导）
+    provider: str = ""
     supports_thinking: bool
     supports_reasoning_effort: bool
     supports_vision: bool
     context_window: int | None = None
     reasoning_efforts: list[ReasoningEffortResponse] = []
     default_reasoning_effort: str | None = None
+    #: config = 配置里写死的条目；vendor = 厂商 /models 报出来、复用了同一份 provider 配置
+    source: str = "config"
+    available: bool = True
 
 
 class ModelsListResponse(BaseModel):
     models: list[ModelResponse]
     default_model: str | None = None
+    default_reasoning_effort: str | None = None
+    #: 厂商目录拉取失败的原因（只影响列表来源，不影响可用性）
+    vendor_errors: list[str] = []
 
 
 class UploadedFileInfo(BaseModel):
@@ -216,20 +224,43 @@ def message_to_wire(event: Mapping[str, Any]) -> MessageResponse:
 
 
 def model_to_wire(cfg: ModelConfig) -> ModelResponse:
-    """Copy the public whitelist. model_dump() would leak api_key and provider settings."""
+    """只拷白名单字段；model_dump() 会把 api_key 和 provider 设置一起漏出去。"""
+    from agentkit.models.catalog import provider_label
+
     data = {key: getattr(cfg, key) for key in _MODEL_WIRE_FIELDS}
-    # 推理等级来自配置，前端只展示、不回填：id 是发给 provider 的取值。
-    data["reasoning_efforts"] = [
-        {
-            "id": option.id,
-            "label": option.display,
-            "description": option.description,
-            "default": option.default,
-        }
-        for option in cfg.reasoning_efforts
-    ]
+    data["provider"] = provider_label(cfg)
+    data["reasoning_efforts"] = [effort_to_wire(option) for option in cfg.reasoning_efforts]
     data["default_reasoning_effort"] = cfg.default_reasoning_effort
     return ModelResponse.model_validate(data)
+
+
+def catalog_model_to_wire(model: Any) -> ModelResponse:
+    """厂商目录条目（含厂商新报出来的模型）转 wire。"""
+
+    return ModelResponse(
+        name=model.name,
+        model=model.model,
+        display_name=model.display_name,
+        description=model.description,
+        provider=model.provider,
+        supports_thinking=model.supports_thinking,
+        supports_reasoning_effort=model.supports_reasoning_effort,
+        supports_vision=model.supports_vision,
+        context_window=model.context_window,
+        reasoning_efforts=[effort_to_wire(option) for option in model.reasoning_efforts],
+        default_reasoning_effort=model.default_reasoning_effort,
+        source=model.source,
+        available=model.available,
+    )
+
+
+def effort_to_wire(option: Any) -> dict[str, Any]:
+    return {
+        "id": option.id,
+        "label": option.display,
+        "description": option.description,
+        "default": option.default,
+    }
 
 
 def _wire_time(value: Any) -> str | None:

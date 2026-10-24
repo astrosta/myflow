@@ -13,6 +13,8 @@ import type { ModelCatalog, ModelInfo, ReasoningEffort } from "../api/models";
 export interface ModelSelection {
   modelName: string | null;
   effortId: string | null;
+  /** 是否让模型输出思考过程：模型支持就开（网关会再按 supports_thinking 协商一次） */
+  thinkingEnabled?: boolean;
 }
 
 export function resolveModel(
@@ -40,18 +42,42 @@ export function resolveEffort(model: ModelInfo | null, storedId: string | null):
   return model?.default_reasoning_effort ?? null;
 }
 
+export interface ProviderGroup {
+  provider: string;
+  models: ModelInfo[];
+}
+
+/** 按厂商分组：上拉框先显示厂商小字，再列这一家的模型（多厂商时不会混在一起）。 */
+export function groupByProvider(models: ModelInfo[]): ProviderGroup[] {
+  const groups: ProviderGroup[] = [];
+  for (const model of models) {
+    const provider = model.provider?.trim() || "其他";
+    const existing = groups.find((group) => group.provider === provider);
+    if (existing) existing.models.push(model);
+    else groups.push({ provider, models: [model] });
+  }
+  return groups;
+}
+
+/** Off = 不指定等级（交给服务端与 provider 的默认值）；其余等级名原样显示。 */
 export function effortLabel(model: ModelInfo | null, effortId: string | null): string {
-  if (!effortId) return "默认";
+  if (!effortId) return "Off";
   return effortOptions(model).find((item) => item.id === effortId)?.label ?? effortId;
 }
+
+export type RunContext = Record<string, string | boolean>;
 
 /**
  * 交给网关的装配上下文。**空值不下发**：网关会把 null 当成“显式选择”去校验，
  * 而“没选”本来就该走服务端默认。
+ *
+ * `thinking_enabled` 是 bool（网关按类型校验），只有模型支持思考时才下发——
+ * 不开就是真的不要思考内容，前端也不该假装有。
  */
-export function buildRunContext(selection: ModelSelection): Record<string, string> {
-  const context: Record<string, string> = {};
+export function buildRunContext(selection: ModelSelection): RunContext {
+  const context: RunContext = {};
   if (selection.modelName) context.model_name = selection.modelName;
   if (selection.effortId) context.reasoning_effort = selection.effortId;
+  if (selection.thinkingEnabled) context.thinking_enabled = true;
   return context;
 }

@@ -9,15 +9,17 @@ import {
 } from "./knowledge";
 
 describe("knowledge base wire labels", () => {
-  it("exposes exactly the five backend types", () => {
+  it("exposes exactly the six backend types", () => {
     expect(KNOWLEDGE_TYPES.map((item) => item.value)).toEqual([
       "technical",
       "operations",
       "faq",
       "security",
       "api",
+      "legal",
     ]);
     expect(knowledgeTypeLabel("operations")).toBe("运维手册");
+    expect(knowledgeTypeLabel("legal")).toBe("法律法规");
     expect(knowledgeTypeLabel("unknown")).toBe("unknown");
   });
 

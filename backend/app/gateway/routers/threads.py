@@ -49,7 +49,7 @@ from backend.app.gateway.services import ThreadNotFound, compact_thread_context,
 from backend.app.gateway.state_reader import read_thread_state
 from backend.app.gateway.thread_access import require_visible_thread
 
-router = APIRouter(prefix="/api/threads", tags=["threads"])
+router = APIRouter(prefix="/threads", tags=["threads"])
 
 
 def _owner(caller: RunCaller) -> str:

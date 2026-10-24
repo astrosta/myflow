@@ -122,6 +122,9 @@ def build_middlewares(
         DurableContextMiddleware(
             skills_container_path=resolved.skills.container_path,
             skill_file_read_tool_names=resolved.summarization.skill_file_read_tool_names,
+            # <active_skills> 的正文靠它现读技能树：台账里只有 path，没有正文
+            skills_config=resolved.skills,
+            user_id=user_id,
         )
     )
     if resolved.summarization.enabled:
@@ -150,7 +153,9 @@ def build_middlewares(
     chain.append(TitleMiddleware(app_config=resolved))
     # M10 §2.6.1 / §2.8.1：画像注入与轮次入队。after_model 反序，所以它在 Title 之后注册、
     # 在 Title 之前跑——标题生成失败不影响记忆入队。
-    chain.append(MemoryMiddleware(config=resolved, user_id=user_id))
+    # 注意参数类型：它吃的是 MemoryConfig（`resolved.memory`），不是整个 AppConfig——
+    # 传错就是 `'AppConfig' object has no attribute 'enabled'`，一发送就炸。
+    chain.append(MemoryMiddleware(config=resolved.memory, user_id=user_id))
     # 输出侧脱敏最后注册：after_model 反序，因此它在 Memory/Title 之前跑，模型
     # 写回的 AI 文本和 tool_calls 参数先变成 handle，Memory 再看到脱敏/去 handle 视图。
     chain.append(PIIOutputMiddleware(app_config=resolved))

@@ -7,10 +7,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import inspect
+import re
+from contextlib import suppress
 from typing import Any, AsyncIterable, Callable, Mapping, Awaitable
 from dataclasses import asdict, dataclass
 
 
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Overwrite
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
@@ -213,10 +216,25 @@ def _call_agent_factory(factory: AgentFactory, run_config:dict, *, app_config, c
 
 _PUBLIC_ERROR_MAX_CHARS = 2000
 
+#: 递归上限的原话里带一个英文文档链接，对用户没有任何用。
+#: 这类失败的真实含义是"模型在一轮里反复调用工具，没收敛"，要直接说出来。
+_RECURSION_HINT = (
+    "模型在 {limit} 步内没有收敛（通常是一轮里反复调用同一个工具），已中止本次运行。"
+    "把任务拆小、补充更明确的上下文，或者换个模型/关掉思考后重试。"
+)
+
 def _public_error(exc: BaseException) -> str:
     """会进 runs.error、error 帧，并被 API 回显：只要类型名和截断后的消息，不带 traceback。"""
+    if isinstance(exc, GraphRecursionError):
+        limit = getattr(exc, "limit", None) or _recursion_limit_from(str(exc))
+        return f"{type(exc).__name__}: " + _RECURSION_HINT.format(limit=limit or "N")
     message = str(exc).strip() or type(exc).__name__
     return f"{type(exc).__name__}: {message[:_PUBLIC_ERROR_MAX_CHARS]}"
+
+
+def _recursion_limit_from(message: str) -> int | None:
+    match = re.search(r"Recursion limit of (\d+)", message)
+    return int(match.group(1)) if match else None
 
 async def _finalize(
     bridge: StreamBridge,

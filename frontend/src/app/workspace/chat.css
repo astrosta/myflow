@@ -25,31 +25,11 @@
   }
 }
 
-/* 流式光标。之所以只是一个由 CSS 驱动的光标，而不是逐词动画：
-   流式追加会让整块重新解析，逐词 span 会整体重放动画，表现为文字闪烁（§6.4）。 */
-.streaming-caret {
-  display: inline-block;
-  width: 2px;
-  height: 1em;
-  margin-left: 2px;
-  vertical-align: -0.15em;
-  background-color: currentColor;
-  animation: streaming-caret-blink 1s steps(2, start) infinite;
-}
-
-@keyframes streaming-caret-blink {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0;
-  }
-}
-
+/* 注意：**没有流式光标**。逐 token 追加时那个闪烁方块会一直贴在正文末尾，
+   比正文本身还显眼；"还在写"由步骤面板的「处理中…」和思考行的呼吸动画表达。
+   §6.5 也只允许 react-markdown 自己增量重渲染，不做逐词动画。 */
 @media (prefers-reduced-motion: reduce) {
-  .stream-pulse,
-  .streaming-caret {
+  .stream-pulse {
     animation: none;
   }
 }

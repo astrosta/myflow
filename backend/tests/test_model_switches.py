@@ -37,6 +37,26 @@ def test_model_whitelist_is_the_configured_catalog() -> None:
         _check_model_allowed("ghost", config)
 
 
+def test_vendor_qualified_names_are_allowed_when_the_entry_exists() -> None:
+    config = _config()
+    # 厂商目录里新报出来的模型：复用 flash 那条配置，只换 vendor 侧模型名
+    assert _check_model_allowed("flash@deepseek-reasoner", config) == "flash@deepseek-reasoner"
+    with pytest.raises(ModelNotAllowed):
+        _check_model_allowed("ghost@deepseek-reasoner", config)
+    with pytest.raises(ModelNotAllowed):
+        _check_model_allowed("flash@bad id", config)
+    with pytest.raises(ModelNotAllowed):
+        _check_model_allowed("flash@", config)
+
+
+def test_vendor_qualified_names_keep_the_entry_config() -> None:
+    config = _config()
+    # 等级按 `<name>` 那条配置校验，和裸名字完全一致
+    assert _check_reasoning_effort("high", "flash@deepseek-reasoner", config) == "high"
+    with pytest.raises(RunRequestInvalid):
+        _check_reasoning_effort("medium", "flash@deepseek-reasoner", config)
+
+
 def test_effective_model_falls_back_like_the_agent_assembly() -> None:
     assert _effective_model_name("flash", _config()) == "flash"
     assert _effective_model_name(None, _config()) == "plain"

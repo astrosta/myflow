@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 
 import type { ModelControlProps } from "@/components/workspace/composer";
+import type { RunContext } from "@/core/models/selection";
 import { useModelSelection } from "@/core/models/use-model-selection";
 import { useChat } from "@/core/threads/use-chat";
 
@@ -48,6 +49,7 @@ export function ChatRoute({ threadId }: { threadId: string | null }) {
     effortLabel: modelSelection.effortLabel,
     loading: modelSelection.loading,
     error: modelSelection.error,
+    vendorErrors: modelSelection.vendorErrors,
     onSelectModel: modelSelection.selectModel,
     onSelectEffort: modelSelection.selectEffort,
   };
@@ -68,7 +70,7 @@ function ChatSession({
 }: {
   threadId: string | null;
   modelControl: ModelControlProps;
-  runContext: Record<string, string>;
+  runContext: RunContext;
 }) {
   const { reportThreadCreated, setActiveThreadId } = useChatSession();
 

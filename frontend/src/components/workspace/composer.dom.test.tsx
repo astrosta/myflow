@@ -85,20 +85,23 @@ describe("模型 / 推理等级选择条", () => {
       {
         name: "flash",
         model: "deepseek-v4-flash",
+        provider: "DeepSeek",
         display_name: "Flash",
         description: null,
         supports_thinking: true,
         supports_reasoning_effort: true,
         supports_vision: false,
         context_window: null,
-        reasoning_efforts: [{ id: "low", label: "低", description: null, default: false }],
+        reasoning_efforts: [{ id: "low", label: "Low", description: null, default: false }],
         default_reasoning_effort: null,
+        source: "vendor",
+        available: true,
       },
     ],
     current: null,
     effortOptions: [],
     effortId: null,
-    effortLabel: "默认",
+    effortLabel: "Off",
     onSelectEffort: () => {},
     onSelectModel: () => {},
   };
@@ -123,6 +126,42 @@ describe("模型 / 推理等级选择条", () => {
     const { view } = setup({ modelControl, streaming: true, onStop: () => {} });
     const stop = view.getByRole("button", { name: "停止" });
     expect(stop.parentElement).toBe(view.getByRole("button", { name: /选择模型/ }).parentElement?.parentElement);
+  });
+});
+
+describe("提交后的输入框", () => {
+  it("**发出时就清空**，不等 onSubmit resolve", async () => {
+    // TS 看不见执行器里的赋值，用一个容器接住 resolve
+    const pending: { release?: () => void } = {};
+    const onSubmit = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          pending.release = resolve;
+        }),
+    );
+    const { view, textbox } = setup({ onSubmit });
+    fireEvent.change(textbox, { target: { value: "你好" } });
+    fireEvent.click(view.getByRole("button", { name: "发送" }));
+
+    // 流式提交的 promise 要等整轮结束才 resolve：不能等它
+    await vi.waitFor(() => {
+      expect((textbox as HTMLTextAreaElement).value).toBe("");
+    });
+    pending.release?.();
+  });
+
+  it("提交失败时把内容放回输入框", async () => {
+    const onSubmit = vi.fn(async () => {
+      throw new Error("网关 409");
+    });
+    const { view, textbox } = setup({ onSubmit });
+    fireEvent.change(textbox, { target: { value: "你好" } });
+    fireEvent.click(view.getByRole("button", { name: "发送" }));
+
+    await vi.waitFor(() => {
+      expect((textbox as HTMLTextAreaElement).value).toBe("你好");
+    });
+    expect(view.getByRole("alert").textContent).toContain("网关 409");
   });
 });
 

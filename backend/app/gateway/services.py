@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import logging
 import json
+import re
 from contextlib import asynccontextmanager
 from typing import Any, ClassVar
 
@@ -27,6 +28,7 @@ from agentkit.subagents.status_contract import SUBAGENT_TOOL_MESSAGE_KEYS
 from agentkit.privacy import PIIRedactor, PIIVault, redact_raw_input
 from agentkit.utils.messages import ORIGINAL_USER_CONTENT_KEY
 from agentkit.config import AppConfig, get_app_config
+from agentkit.models.catalog import VENDOR_SEPARATOR, split_model_name
 from agentkit.runtime.context import RunContext
 from agentkit.runtime.secret_context import REDACTED_CONTEXT_KEYS, REQUEST_SECRETS_KEY
 from agentkit.runtime.runs import (
@@ -57,6 +59,8 @@ from .deps import RunServices
 from .run_models import RunCaller, RunCreateRequest, RunLaunch
 
 logger = logging.getLogger(__name__)
+#: 厂商侧模型 id 的字符集（`deepseek-chat`、`gpt-4o-mini`、`claude-3-5-sonnet`…）。
+_VENDOR_MODEL_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 _CLIENT_INPUT_CHANNELS = frozenset({"messages"})
 _CLIENT_MESSAGE_TYPES = frozenset({"human"})
 
@@ -301,16 +305,24 @@ def _normalize_stream_modes(raw: str | list[str] | None) -> list[str]:
         raise RunRequestInvalid(str(exc)) from exc
 
 def _check_model_allowed(model_name: str | None, app_config: AppConfig) -> str| None:
-    """白名单就是 config.yaml 里的 `models[].name`。
+    """白名单 = config.yaml 的 `models[].name`，或厂商目录里的 `<name>@<vendor-id>`。
+
+    后者是 `/api/models` 从厂商 `/models` 拉到的新模型：它没有独立配置，
+    复用 `<name>` 那条的 use/base_url/api_key，只把 vendor 侧模型名换掉。
 
     以前这里读 `app_config.model_config.allowed_models`：那是 Pydantic 的配置字典，
     根本没有这个属性——客户端一旦真传 `model_name` 就是 AttributeError 500。
     """
     if model_name is None:
         return None
-    if app_config.get_model_config(model_name) is not None:
-        return model_name
-    raise ModelNotAllowed(f"Model {model_name} is not allowed")
+    entry, vendor = split_model_name(model_name)
+    if app_config.get_model_config(entry) is None:
+        raise ModelNotAllowed(f"Model {model_name} is not allowed")
+    if VENDOR_SEPARATOR in model_name:
+        # `flash@` 这种空 vendor id 是坏输入，别悄悄当成裸模型名
+        if not vendor or not _VENDOR_MODEL_ID.fullmatch(vendor):
+            raise ModelNotAllowed(f"Model {model_name} is not allowed")
+    return model_name
 
 
 def _effective_model_name(model_name: str | None, app_config: AppConfig) -> str | None:
@@ -326,12 +338,13 @@ def _effective_model_name(model_name: str | None, app_config: AppConfig) -> str 
 def _check_reasoning_effort(
     reasoning_effort: str | None, model_name: str | None, app_config: AppConfig
 ) -> str | None:
-    """只接受目标模型在配置里公布的等级：前端下拉和这里读的是同一份配置。"""
+    """只接受目标模型公布的等级：配置里的候选，或厂商 profile 报出来的候选。"""
 
     if reasoning_effort is None:
         return None
     effective = _effective_model_name(model_name, app_config)
-    model_config = app_config.get_model_config(effective) if effective else None
+    entry, _vendor = split_model_name(effective) if effective else (None, None)
+    model_config = app_config.get_model_config(entry) if entry else None
     if model_config is None:
         raise RunRequestInvalid(f"Cannot resolve reasoning effort for model {effective!r}")
     if not model_config.supports_reasoning_effort:

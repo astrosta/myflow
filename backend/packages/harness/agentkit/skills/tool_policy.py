@@ -23,7 +23,12 @@ from agentkit.skills.types import Skill
 
 #: 最严格的技能策略下也始终可用的**发现基础设施**（§3.8）。
 #: task **不在**这里：否则受限技能可以通过委派绕过自己的策略。
-ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES = frozenset({"describe_skill", "read_file", "tool_search"})
+#: search_and_load_skills 和 read_file 同级：两者都只是"把某个 SKILL.md 读进上下文"，
+#: 不同的是它一次按意图挑最相关的几个，而不是逐个试。技能没有别的"元数据工具"了——
+#: 索引已经给了名字/描述/所需密钥/目录，剩下的信息只在正文里。
+ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES = frozenset(
+    {"read_file", "tool_search", "search_and_load_skills"}
+)
 
 DECISION_VERSION = 1
 

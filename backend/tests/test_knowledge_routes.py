@@ -116,7 +116,7 @@ def test_status_works_even_when_disabled() -> None:
     assert response.json()["enabled"] is False
     assert response.json()["embedding_dimensions"] == 4096
     assert {item["value"] for item in response.json()["types"]} == {
-        "technical", "operations", "faq", "security", "api"
+        "technical", "operations", "faq", "security", "api", "legal"
     }
 
 

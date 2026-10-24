@@ -39,6 +39,10 @@ class ModelConfig(BaseModel):
     )
     display_name: str | None = Field(default=None, description="Human-readable model name")
     description: str | None = Field(default=None, description="Model description")
+    provider: str | None = Field(
+        default=None,
+        description="厂商展示名（模型列表上方的小字）；为空时从 use 推导",
+    )
   #  provider_type: str = Field(default="deepseek", description="The type of the model provider")
     model: str = Field(default="deepseek-v4-flash", description="The model to use")
     base_url: str | None = Field(default="https://api.deepseek.com", description="The base URL for the model provider")

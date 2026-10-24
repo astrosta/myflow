@@ -21,11 +21,17 @@ postgres = [
 knowledge = [
     "agentkit[knowledge]",
 ]
+# M9 §3.6：多 worker / 跨进程直播帧。app 层透传，实际实现在 harness。
+redis = [
+    "agentkit[redis]",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    # Redis 版桥的协议测试跑在 fakeredis 上：不需要真的 Redis 服务，也不进生产依赖
+    "fakeredis>=2.30",
 ]
 
 [tool.uv.sources]

@@ -10,7 +10,7 @@ from agentkit.reflection import resolve_class
 logger = logging.getLogger(__name__)
 
 _METADATA_FIELDS = frozenset({
-    "use", "name", "display_name", "description",
+    "use", "name", "display_name", "description", "provider",
     "supports_thinking", "supports_reasoning_effort", "reasoning_efforts",
     "when_thinking_enabled", "when_thinking_disabled", "thinking",
     "supports_vision", "context_window", "pricing",

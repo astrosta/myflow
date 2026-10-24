@@ -32,6 +32,10 @@ knowledge = [
     "pymilvus>=2.5",
     "transformers>=4.51",
 ]
+# stream_bridge.backend=redis / GATEWAY_WORKERS>1 需要它（可选：没装也能跑 memory 后端）
+redis = [
+    "redis>=5.0",
+]
 
 [build-system]
 requires = ["hatchling"]

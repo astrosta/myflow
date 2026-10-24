@@ -38,7 +38,9 @@ class TokenizerConfig(BaseModel):
 class ChunkTypeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    strategy: Literal["heading_hierarchy", "procedure", "qa_pair", "clause", "api_reference"]
+    strategy: Literal[
+        "heading_hierarchy", "procedure", "qa_pair", "clause", "api_reference", "legal_clause"
+    ]
     chunk_size_tokens: int = Field(ge=16, le=8192)
     chunk_overlap_tokens: int = Field(ge=0, le=4096)
 
@@ -56,6 +58,8 @@ def _default_chunk_types() -> dict[str, ChunkTypeConfig]:
         "faq": ChunkTypeConfig(strategy="qa_pair", chunk_size_tokens=384, chunk_overlap_tokens=0),
         "security": ChunkTypeConfig(strategy="clause", chunk_size_tokens=512, chunk_overlap_tokens=64),
         "api": ChunkTypeConfig(strategy="api_reference", chunk_size_tokens=768, chunk_overlap_tokens=0),
+        # 法律条文：以“条”为边界，条内续写保留上下文；档位与安全合规一致。
+        "legal": ChunkTypeConfig(strategy="legal_clause", chunk_size_tokens=512, chunk_overlap_tokens=64),
     }
 
 

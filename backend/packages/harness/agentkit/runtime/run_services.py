@@ -8,6 +8,7 @@ from agentkit.runtime.context import RunContext
 from agentkit.persistence.events.base import RunEventStore
 from agentkit.runtime.runs.manager import RunManager
 from agentkit.persistence.run.base import RunStore
+from agentkit.persistence.recovery import gateway_worker_count
 from agentkit.runtime.stream_bridge.base import StreamBridge
 from agentkit.runtime.stream_bridge.provider import create_stream_bridge
 
@@ -34,7 +35,9 @@ def build_run_services(
     """Wire the stores created after ``init_engine_from_config``."""
     return RunServices(
         run_manager=RunManager(run_store),
-        bridge=create_stream_bridge(app_config.stream_bridge),  # 进程级单例（§7.5）
+        bridge=create_stream_bridge(  # 进程级单例（§7.5）；多 worker 的门在这里（M9 §3.5）
+            app_config.stream_bridge, gateway_workers=gateway_worker_count()
+        ),
         run_context=RunContext(
             checkpointer=checkpointer,
             thread_store=thread_meta,

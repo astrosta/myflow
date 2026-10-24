@@ -8,7 +8,7 @@ import Link from "next/link";
 const FEATURES = [
   {
     title: "工具调用是可见的",
-    body: "每一次工具调用都会渲染成卡片：工具名、参数、状态、结果一屏看全，不用去翻日志。",
+    body: "每一次工具调用都留一行：工具名、参数摘要、状态一眼扫完，点开就是完整的参数和结果，不用去翻日志。",
   },
   {
     title: "刷新不重跑",
@@ -44,7 +44,7 @@ export default function LandingPage() {
             把一条长任务的 Agent 对话，做成能安心读完的工作区
           </h1>
           <p className="mt-5 max-w-2xl text-base leading-relaxed text-neutral-600">
-            历史与实时流合并成一条顺序正确的对话；思考在答案之上，工具参数和结果都留在卡片里；
+            历史与实时流合并成一条顺序正确的对话；思考在答案之上，工具调用收成可展开的一行；
             中断看得见，恢复也看得见。
           </p>
           <div className="mt-8 flex flex-wrap items-center gap-3">

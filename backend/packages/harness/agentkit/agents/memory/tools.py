@@ -35,7 +35,7 @@ def make_memory_search_tool(manager: MemoryManager | None = None) -> BaseTool:
     @tool(TOOL_NAME)
     async def memory_search(
         query: str,
-        runtime: ToolRuntime = None,
+        runtime: ToolRuntime[Any, Any] = None,
         kinds: list[str] | None = None,
         time_range: tuple[str, str] | None = None,
         limit: int = 8,

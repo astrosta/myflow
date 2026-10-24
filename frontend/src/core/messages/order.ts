@@ -289,7 +289,9 @@ export function mergeMessagesWithDiagnostics(input: MergeInput): {
     const key = messageKey(message);
     if (known.has(key)) continue;
     known.add(key);
-    ordered.push(message);
+    const insertAt = optimisticInsertIndex(ordered, turnBaseline, key);
+    if (insertAt === null) ordered.push(message);
+    else ordered.splice(insertAt, 0, message);
   }
 
   return {
@@ -301,6 +303,35 @@ export function mergeMessagesWithDiagnostics(input: MergeInput): {
       baselineStepsMoved,
     },
   };
+}
+
+/**
+ * 乐观消息该插在哪。`null` = 追加到末尾。
+ *
+ * 只有"这一条就是本轮提交的那条提问、而它的规范副本还没到"时才往前插：
+ * 插在本轮**非基线步骤**的第一条之前，这样思考和工具调用永远在提问下面。
+ */
+function optimisticInsertIndex(
+  ordered: readonly ChatMessage[],
+  baseline: TurnBaseline | null | undefined,
+  key: string,
+): number | null {
+  if (!baseline || key !== baseline.humanKey) return null;
+  if (ordered.some((message) => messageKey(message) === key)) return null;
+
+  for (let index = 0; index < ordered.length; index += 1) {
+    const message = ordered[index]!;
+    if (message.type !== "ai" && message.type !== "tool") continue;
+    if (message.hidden) continue;
+    if (baseline.keys.has(messageKey(message))) continue;
+    const sameRun =
+      baseline.localRunId == null ||
+      message.run_id == null ||
+      message.run_id === baseline.localRunId;
+    if (!sameRun) continue;
+    return index;
+  }
+  return null;
 }
 
 /**

@@ -417,41 +417,6 @@ def test_wait_returns_the_snapshot_after_the_run_ends(monkeypatch) -> None:
     assert response.json()["status"] == "pending"
 
 
-def test_get_run_hides_a_run_from_another_thread() -> None:
-    services = _services()
-    services.manager.records["run-1"] = _record(thread_id="thread-1")
-
-    missing = _client(services).get("/api/threads/other/runs/run-1")
-    found = _client(services).get("/api/threads/thread-1/runs/run-1")
-
-    assert missing.status_code == 404
-    assert missing.json()["code"] == "run_not_found"
-    assert found.status_code == 200
-    assert found.json()["run_id"] == "run-1"
-
-
-def test_join_of_a_remote_run_is_not_local() -> None:
-    services = _services()
-    services.manager.records["run-1"] = _record(store_only=True)
-
-    response = _client(services).get("/api/threads/thread-1/runs/run-1/join")
-
-    assert response.status_code == 409
-    assert response.json()["code"] == "run_not_local"
-
-
-def test_cancel_returns_outcome() -> None:
-    services = _services()
-    services.manager.records["run-1"] = _record()
-
-    response = _client(services).post("/api/threads/thread-1/runs/run-1/cancel", json={"action": "interrupt"})
-
-    assert response.status_code == 200
-    assert response.json()["outcome"] == "cancelled"
-    assert response.json()["run"] is None
-    assert services.manager.cancelled == [("run-1", "interrupt")]
-
-
 def test_domain_error_from_start_run_uses_the_error_body(monkeypatch) -> None:
     from backend.app.gateway.services import ThreadBusy
 

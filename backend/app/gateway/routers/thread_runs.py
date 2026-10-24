@@ -34,7 +34,7 @@ from backend.app.gateway.services import (
 )
 from backend.app.gateway.state_reader import read_run_terminal_state
 
-router = APIRouter(prefix="/api/threads", tags=["runs"])
+router = APIRouter(prefix="/threads", tags=["runs"])
 
 
 @router.post("/{thread_id}/runs/stream")

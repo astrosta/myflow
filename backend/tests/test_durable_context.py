@@ -1,6 +1,7 @@
 """Durable context is projected onto the model request and never written into state."""
 
 import asyncio
+import json
 
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -207,6 +208,78 @@ def test_insert_after_leading_system_messages_does_not_mutate_inputs() -> None:
     assert messages == [system, human]
     assert len(injected) == 1
 
+def test_loaded_skills_are_captured_by_path_only() -> None:
+    """search_and_load_skills 的结果 JSON 也算激活：加载即激活，台账只留 name/path/description。"""
+    import json
+
+    from agentkit.agents.middlewares.durable_context_middleware import extract_skills
+
+    payload = {
+        "skills": [
+            {
+                "name": "pg-multitenant",
+                "path": "/mnt/skills/public/pg-multitenant/SKILL.md",
+                "description": "PostgreSQL 多租户与连接池",
+                "body": "BODY-MARKER " * 50,
+            }
+        ],
+        "retrieval": {"channels": ["keyword"]},
+    }
+    messages = _tool_pair(
+        "search_and_load_skills", "", json.dumps(payload, ensure_ascii=False)
+    )
+
+    entries = extract_skills(
+        messages,
+        skills_root="/mnt/skills",
+        tool_names={"read_file"},
+        loader_tool_names={"search_and_load_skills"},
+    )
+
+    assert entries == [
+        {
+            "name": "pg-multitenant",
+            "path": "/mnt/skills/public/pg-multitenant/SKILL.md",
+            "description": "PostgreSQL 多租户与连接池",
+        }
+    ]
+    assert "BODY-MARKER" not in str(entries)  # 正文不进 state
+
+
+def test_loaded_skill_paths_outside_the_skills_root_are_ignored() -> None:
+    import json
+
+    from agentkit.agents.middlewares.durable_context_middleware import extract_skills
+
+    payload = {
+        "skills": [
+            {"name": "escaped", "path": "/mnt/user-data/workspace/SKILL.md", "description": "x"},
+            {"name": "not-a-skill", "path": "/mnt/skills/public/a/README.md", "description": "y"},
+            {"name": "ok", "path": "/mnt/skills/public/a/SKILL.md", "description": "z"},
+        ]
+    }
+    messages = _tool_pair(
+        "search_and_load_skills", "", json.dumps(payload, ensure_ascii=False)
+    )
+
+    entries = extract_skills(
+        messages,
+        skills_root="/mnt/skills",
+        tool_names={"read_file"},
+        loader_tool_names={"search_and_load_skills"},
+    )
+
+    assert [entry["name"] for entry in entries] == ["ok"]
+
+
+def test_a_tool_that_is_not_configured_as_a_loader_is_not_captured() -> None:
+    from agentkit.agents.middlewares.durable_context_middleware import extract_skills
+
+    messages = _tool_pair("web_fetch", "", '{"skills": [{"path": "/mnt/skills/public/a/SKILL.md"}]}')
+
+    assert extract_skills(messages, skills_root="/mnt/skills", tool_names={"read_file"}) == []
+
+
 def _tool_pair(tool_name: str, path: str, content: str, *, call_id: str = "call-1"):
     """一次 read_file 的 AI tool_call + ToolMessage 对。"""
     call = AIMessage(
@@ -282,6 +355,126 @@ def test_the_capture_hook_writes_skill_context_into_state() -> None:
     assert update["skill_context"][0]["name"] == "pdf-processing"
 
 
+def _active_middleware(tmp_path, *, user_id="u1", **active_overrides):
+    from agentkit.config.skills_config import SkillActiveContextConfig
+    from fakes.skill_tree import skills_config
+
+    config = skills_config(tmp_path)
+    if active_overrides:
+        config.active_context = SkillActiveContextConfig(**active_overrides)
+    return DurableContextMiddleware(
+        skills_container_path="/mnt/skills", skills_config=config, user_id=user_id
+    )
+
+
+def _render_active(middleware, messages, skill_context) -> str:
+    seen: dict = {}
+
+    def handler(request: ModelRequest) -> str:
+        seen["request"] = request
+        return "ok"
+
+    middleware.wrap_model_call(
+        _request(*messages, skill_context=skill_context), handler
+    )
+    return seen["request"].messages[1].content
+
+
+def test_active_skills_carries_the_body_when_the_message_is_gone(tmp_path) -> None:
+    """台账里只有 path，正文每次投影现读：上下文被压缩掉之后，这是正文唯一的副本。"""
+    from fakes.skill_tree import write_skill
+
+    write_skill(tmp_path, "public", "pg-multitenant", body="# 排查\n先查 pg_stat_activity。\n")
+    rendered = _render_active(
+        _active_middleware(tmp_path),
+        [HumanMessage(content="hi", id="u1")],
+        [{"name": "pg-multitenant", "path": "/mnt/skills/public/pg-multitenant/SKILL.md", "description": "多租户"}],
+    )
+
+    assert "<active_skills>" in rendered
+    assert "- pg-multitenant: 多租户 | dir=/mnt/skills/public/pg-multitenant/SKILL.md" in rendered
+    assert "## pg-multitenant 的操作规范" in rendered
+    assert "先查 pg_stat_activity。" in rendered
+
+
+def test_a_body_still_in_the_messages_is_not_repeated(tmp_path) -> None:
+    from fakes.skill_tree import write_skill
+
+    write_skill(tmp_path, "public", "pg-multitenant", body="# 排查\n先查 pg_stat_activity。\n")
+    path = "/mnt/skills/public/pg-multitenant/SKILL.md"
+    tool_result = ToolMessage(
+        content=json.dumps({"skills": [{"name": "pg-multitenant", "path": path, "body": "# 排查"}]}),
+        tool_call_id="call-1",
+        name="search_and_load_skills",
+    )
+
+    rendered = _render_active(
+        _active_middleware(tmp_path),
+        [HumanMessage(content="hi", id="u1"), tool_result],
+        [{"name": "pg-multitenant", "path": path, "description": "多租户"}],
+    )
+
+    assert "- pg-multitenant:" in rendered  # 名字那行照样在
+    assert "先查 pg_stat_activity。" not in rendered  # 正文不重复写
+
+
+def test_the_body_budget_truncates_and_says_so(tmp_path) -> None:
+    from fakes.skill_tree import write_skill
+
+    write_skill(tmp_path, "public", "chatty", body="# 步骤\n" + "细节 " * 400)
+    rendered = _render_active(
+        _active_middleware(tmp_path, max_body_chars=200),
+        [HumanMessage(content="hi", id="u1")],
+        [{"name": "chatty", "path": "/mnt/skills/public/chatty/SKILL.md", "description": "啰嗦"}],
+    )
+
+    assert "正文已截断" in rendered
+    assert len(rendered) < 1200
+
+
+def test_active_context_can_be_switched_off(tmp_path) -> None:
+    from fakes.skill_tree import write_skill
+
+    write_skill(tmp_path, "public", "pdf", body="# 正文\nBODY-MARKER\n")
+    rendered = _render_active(
+        _active_middleware(tmp_path, enabled=False),
+        [HumanMessage(content="hi", id="u1")],
+        [{"name": "pdf", "path": "/mnt/skills/public/pdf/SKILL.md", "description": "PDF"}],
+    )
+
+    assert "- pdf: PDF | dir=/mnt/skills/public/pdf/SKILL.md" in rendered
+    assert "BODY-MARKER" not in rendered
+
+
+def test_a_skill_the_user_switched_off_gets_no_body(tmp_path, monkeypatch) -> None:
+    from agentkit.config.skills_prefs import write_user_skill_pref
+    from fakes.skill_tree import write_skill
+
+    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(tmp_path / "skills_prefs.json"))
+    write_skill(tmp_path, "public", "pdf", body="# 正文\nBODY-MARKER\n")
+    write_user_skill_pref("u1", "pdf", False)
+
+    rendered = _render_active(
+        _active_middleware(tmp_path),
+        [HumanMessage(content="hi", id="u1")],
+        [{"name": "pdf", "path": "/mnt/skills/public/pdf/SKILL.md", "description": "PDF"}],
+    )
+
+    assert "- pdf: PDF | dir=/mnt/skills/public/pdf/SKILL.md" in rendered
+    assert "BODY-MARKER" not in rendered
+
+
+def test_a_vanished_skill_file_still_renders_its_line(tmp_path) -> None:
+    rendered = _render_active(
+        _active_middleware(tmp_path),
+        [HumanMessage(content="hi", id="u1")],
+        [{"name": "gone", "path": "/mnt/skills/public/gone/SKILL.md", "description": "没了"}],
+    )
+
+    assert "- gone: 没了 | dir=/mnt/skills/public/gone/SKILL.md" in rendered
+    assert "操作规范" not in rendered
+
+
 def test_the_projection_renders_skill_refs_escaped() -> None:
     middleware = DurableContextMiddleware()
     state = {
@@ -298,6 +491,6 @@ def test_the_projection_renders_skill_refs_escaped() -> None:
     middleware.wrap_model_call(_request(HumanMessage(content="hi", id="u1"), **state), handler)
 
     rendered = seen["request"].messages[1].content  # [contract, data, human]
-    assert "## 已读取的技能" in rendered
+    assert "<active_skills>" in rendered and "</active_skills>" in rendered
     assert "&lt;b&gt;x&lt;/b&gt;" in rendered
     assert "<b>x</b>" not in rendered

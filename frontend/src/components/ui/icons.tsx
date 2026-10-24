@@ -51,6 +51,26 @@ export function ChevronDownIcon(props: IconProps) {
   );
 }
 
+/** 思考。灯泡轮廓——思考行（Think）前面的小图标 */
+export function ThinkIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M9 18h6" />
+      <path d="M10 22h4" />
+      <path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2Z" />
+    </Icon>
+  );
+}
+
+/** 工具。扳手——工具调用行（`Tool`）前面的小图标，和思考行的灯泡对齐 */
+export function ToolIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+    </Icon>
+  );
+}
+
 /** 账号。人像——设置面板左栏「账号」那一项前面 */
 export function UserIcon(props: IconProps) {
   return (

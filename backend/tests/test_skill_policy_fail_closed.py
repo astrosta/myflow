@@ -25,7 +25,14 @@ class StubTool:
 
 ALL_TOOLS = [
     StubTool(name)
-    for name in ("read_file", "write_file", "bash", "task", "describe_skill", "tool_search")
+    for name in (
+        "read_file",
+        "write_file",
+        "bash",
+        "task",
+        "search_and_load_skills",
+        "tool_search",
+    )
 ]
 
 

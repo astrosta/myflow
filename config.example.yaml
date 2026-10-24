@@ -29,21 +29,24 @@ models:
     model: deepseek-reasoner
     api_key: $DEEPSEEK_API_KEY
     base_url: https://api.deepseek.com   # 是 base_url 不是 api_base（见 §7.4 坑一）
+    provider: DeepSeek                   # 模型列表上方的小字；不写就从 use 推导
     supports_thinking: true
     when_thinking_enabled:
       extra_body:
         thinking: { type: enabled }
-    # 推理等级（可选）：值是发给 provider 的 id，label/description 只给前端看。
-    # 标 default: true 的那档会被 composer 预选；不标就默认“不指定”，不下发该参数。
+    # 模型列表由网关调 GET {base_url}/models 得到（厂商新报的模型也能选，名字是
+    # `<name>@<vendor-id>`）；厂商不可达时回退到上面这一条。
+    # 推理等级（可选）：值是发给 provider 的 id，label 是输入框里的显示名（首字母大写，
+    # 不写解释文字）。整段不写就用厂商集成自带的 profile；输入框里的 "Off" 表示
+    # 不指定（不下发该参数），不需要在这里列出来。标 default: true 的那档会被预选。
     reasoning_efforts:
-      - low
+      - id: low
+        label: Low
       - id: medium
-        label: 中
-        description: 常规任务，速度与质量平衡
+        label: Medium
         default: true
       - id: high
-        label: 高
-        description: 复杂推理与长链路排障，更慢也更贵
+        label: High
 
   # - name: gpt-4o                       # 唯一标识，API 和前端用这个名字选模型
   #   display_name: GPT-4o               # 给人看的，不会传给 provider
@@ -153,10 +156,22 @@ run_events:
   track_token_usage: true  # RunJournal 是否把 usage 累到 RunRow
 
 # 直播帧的桥：进程级单例，lifespan 里建一次（backend 是 startup-only）。
+# 多 worker（GATEWAY_WORKERS>1）必须 backend=redis，否则启动直接拒绝（M9 §3.5）。
 stream_bridge:
-  backend: memory                  # memory | redis（M9）    startup-only
+  backend: memory                  # memory | redis                        startup-only
   queue_maxsize: 256               # 每 run 保留的数据事件数，决定"能重放多久"
-  heartbeat_interval_seconds: 15   # 0 = 关掉心跳（只给嵌入式用）
+  heartbeat_interval_seconds: 15   # 0 = 关掉心跳（只给嵌入式 / IM 直读用）
+
+  # ---- 下面只在 backend=redis 时生效。先装依赖：cd backend && uv sync --extra redis ----
+  redis_url: redis://127.0.0.1:6379/0   # 有密码就换成 $REDIS_URL：环境变量注入，别写进版本库
+  stream_ttl_seconds: 3600         # retained key 的 TTL，每次 publish/end 刷新（泄漏安全网，不是 run 超时）
+  tombstone_ttl_seconds: 300       # cleanup 之后"已回收"保留多久；期间订阅立刻拿到 END
+  key_prefix: myflow:stream        # 三个 key 共享 {run_id} hash tag，集群下同 slot
+  socket_timeout_seconds: 5
+  socket_connect_timeout_seconds: 5
+  health_check_interval_seconds: 30
+  max_connections: 32
+  read_block_seconds: 5            # XREAD BLOCK 的上限；心跳按本地计时，不靠它
 
 # 本地沙箱是路径映射，不是隔离。宿主 bash 默认关闭。
 # sandbox.use 是 startup-only：改了要重启。
@@ -208,13 +223,65 @@ subagent_runtime:
 # ------------------------------------------------------------
 # 技能：宿主上的 skills/public 与 skills/custom，挂进沙箱的 container_path。
 # 模型看到的是系统提示词尾部的 <available_skills> 索引（每技能一行，描述截断）；
-# 正文一律按需 read_file。没有"全量注入"模式开关（M7 §3.5）。
+# 正文一律按需：要么 read_file 读 SKILL.md，要么 search_and_load_skills 按意图检索加载。
+# 没有"全量注入"模式开关（M7 §3.5）。
 # 全局启用开关在 extensions_config.json，个人偏好在 skills_prefs.json。
 # ------------------------------------------------------------
 skills:
   path: skills                  # 相对项目根
   container_path: /mnt/skills   # startup-only：编译进提示词索引与沙箱 mount
   index_description_max_chars: 120
+
+  # 检索加载（search_and_load_skills）：技能多到一个都读不完时，模型按任务意图
+  # 检索并一次加载最相关的几个技能正文。默认只有本地 BM25，不需要任何外部服务；
+  # embedding / rerank 要填地址才开（代码里没有默认端点）。
+  search:
+    enabled: true                 # 关掉后这个工具不注册，技能只能靠索引 + read_file
+    candidate_k: 20               # 召回交给精排的候选数
+    top_k: 3                      # 最终加载几个技能的正文
+    rrf_k: 60                     # 两路召回融合的 RRF k
+    min_score: null               # 融合分数下限（归一化到 1.0），null = 不过滤
+    max_body_chars: 6000          # 单个技能正文预算
+    max_context_chars: 12000      # 一次加载的正文总预算
+
+    keyword:                      # 本地稀疏通道
+      enabled: true
+      bm25_k1: 1.2
+      bm25_b: 0.75
+      keyword_weight: 2.0         # domain_keywords 的分数倍数
+      name_weight: 3.0            # 命中技能名/描述的额外倍数
+
+    embedding:                    # 可选语义召回（bi-encoder）
+      enabled: false              # 打开时 base_url 必填
+      base_url: $EMBEDDING_BASE_URL
+      path: /embeddings
+      api_key: $EMBEDDING_API_KEY
+      model: Qwen/Qwen3-Embedding-8B
+      dimensions: 4096
+      batch_size: 8
+      timeout_seconds: 30
+      max_retries: 1
+      query_instruction: "Given a task description, retrieve the skill whose operating procedure applies"
+
+    rerank:                       # 可选精排（cross-encoder）；失败自动回退融合顺序
+      enabled: false              # 打开时 base_url 与 model 必填
+      protocol: cohere            # cohere | tei
+      base_url: $RERANK_BASE_URL
+      path: /rerank
+      api_key: $RERANK_API_KEY
+      model: Qwen/Qwen3-Reranker-8B
+      max_document_chars: 4000
+      timeout_seconds: 30
+      max_retries: 1
+
+  # <active_skills>：已激活技能的核心 SOP 要不要跟着进持久上下文。
+  # 正文**不进 state**（checkpoint 会膨胀）：每次投影按台账里的 path 现读现用，受这里的预算约束。
+  active_context:
+    enabled: true                 # 关掉只留名字、描述和目录
+    max_body_chars: 4000          # 单个技能正文预算
+    max_context_chars: 8000       # 整块正文总预算
+    skip_bodies_still_in_context: true   # 正文还在消息里就不重复写（压缩之后才会补）
+
 
 # ------------------------------------------------------------
 # 知识库（MinerU + Qwen3-Embedding-8B + Milvus）
@@ -291,6 +358,10 @@ knowledge_base:
         strategy: api_reference
         chunk_size_tokens: 768
         chunk_overlap_tokens: 0
+      legal:                        # 法律法规：按“第X条”切分，条号进 section
+        strategy: legal_clause
+        chunk_size_tokens: 512
+        chunk_overlap_tokens: 64
 
   embedding:
     provider: openai_compatible

@@ -10,7 +10,7 @@ from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 
 class FakeChatModel(BaseChatModel):
@@ -62,6 +62,27 @@ class FakeChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         return self._result()
+
+
+class ReasoningChatModel(FakeChatModel):
+    """先流思考、再流正文：给"思考内容能不能到前端"这条链路用。
+
+    DeepSeek 的思考走 `additional_kwargs["reasoning_content"]`，逐块下发；
+    `AIMessageChunk.__add__` 会把同名字符串拼起来，所以聚合后的消息带完整思考。
+    """
+
+    reasoning: str = "先想一步"
+
+    async def _astream(self, messages: list[BaseMessage], stop: list[str] | None = None,
+                       run_manager: Any = None, **kwargs: Any) -> Any:
+        from langchain_core.messages import AIMessageChunk
+
+        self.calls += 1
+        for piece in (self.reasoning[:2], self.reasoning[2:]):
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(content="", additional_kwargs={"reasoning_content": piece})
+            )
+        yield ChatGenerationChunk(message=AIMessageChunk(content=self.reply))
 
 
 class ScriptedChatModel(FakeChatModel):

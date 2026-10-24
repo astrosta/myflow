@@ -2,12 +2,19 @@ import { describe, expect, it } from "vitest";
 
 import type { ModelCatalog, ModelInfo } from "../api/models";
 import { loadSettings, parseSettings, saveSettings, type StorageLike } from "../settings/store";
-import { buildRunContext, effortLabel, resolveEffort, resolveModel } from "./selection";
+import {
+  buildRunContext,
+  effortLabel,
+  groupByProvider,
+  resolveEffort,
+  resolveModel,
+} from "./selection";
 
 function model(overrides: Partial<ModelInfo> = {}): ModelInfo {
   return {
     name: "flash",
     model: "deepseek-v4-flash",
+    provider: "DeepSeek",
     display_name: null,
     description: null,
     supports_thinking: true,
@@ -16,17 +23,21 @@ function model(overrides: Partial<ModelInfo> = {}): ModelInfo {
     context_window: null,
     reasoning_efforts: [],
     default_reasoning_effort: null,
+    source: "vendor",
+    available: true,
     ...overrides,
   };
 }
 
 const catalog: ModelCatalog = {
   default_model: "flash",
+  default_reasoning_effort: null,
+  vendor_errors: [],
   models: [
     model({
       reasoning_efforts: [
-        { id: "low", label: "低", description: null, default: false },
-        { id: "high", label: "高", description: null, default: false },
+        { id: "low", label: "Low", description: null, default: false },
+        { id: "high", label: "High", description: null, default: false },
       ],
     }),
     model({ name: "plain", supports_reasoning_effort: false }),
@@ -43,7 +54,13 @@ describe("模型回退", () => {
   });
 
   it("没有默认模型时用第一条", () => {
-    expect(resolveModel({ models: catalog.models, default_model: null }, null)?.name).toBe("flash");
+    const withoutDefault: ModelCatalog = {
+      models: catalog.models,
+      default_model: null,
+      default_reasoning_effort: null,
+      vendor_errors: [],
+    };
+    expect(resolveModel(withoutDefault, null)?.name).toBe("flash");
   });
 
   it("目录还没加载时返回 null", () => {
@@ -51,11 +68,28 @@ describe("模型回退", () => {
   });
 });
 
+describe("按厂商分组", () => {
+  it("同厂商的模型归一组，顺序按目录", () => {
+    const groups = groupByProvider([
+      model({ name: "a", provider: "DeepSeek" }),
+      model({ name: "b", provider: "OpenAI" }),
+      model({ name: "c", provider: "DeepSeek" }),
+    ]);
+    expect(groups.map((group) => group.provider)).toEqual(["DeepSeek", "OpenAI"]);
+    expect(groups[0]?.models.map((item) => item.name)).toEqual(["a", "c"]);
+  });
+
+  it("没有厂商名时归到“其他”，不会出现空标题", () => {
+    const groups = groupByProvider([model({ provider: "" })]);
+    expect(groups[0]?.provider).toBe("其他");
+  });
+});
+
 describe("推理等级", () => {
   it("模型没公布候选时永远是 null", () => {
     const plain = catalog.models[1]!;
     expect(resolveEffort(plain, "high")).toBeNull();
-    expect(effortLabel(plain, null)).toBe("默认");
+    expect(effortLabel(plain, null)).toBe("Off");
   });
 
   it("换模型后旧等级失效，回退到该模型自己的默认", () => {
@@ -73,7 +107,7 @@ describe("推理等级", () => {
 
   it("存着的等级仍然有效就保留", () => {
     expect(resolveEffort(catalog.models[0]!, "high")).toBe("high");
-    expect(effortLabel(catalog.models[0]!, "high")).toBe("高");
+    expect(effortLabel(catalog.models[0]!, "high")).toBe("High");
   });
 });
 
@@ -87,6 +121,16 @@ describe("装配上下文", () => {
       model_name: "flash",
       reasoning_effort: "high",
     });
+  });
+
+  it("模型支持思考时下发 thinking_enabled，网关按 bool 校验", () => {
+    expect(buildRunContext({ modelName: "flash", effortId: null, thinkingEnabled: true })).toEqual({
+      model_name: "flash",
+      thinking_enabled: true,
+    });
+    expect(
+      buildRunContext({ modelName: "flash", effortId: null, thinkingEnabled: false }),
+    ).toEqual({ model_name: "flash" });
   });
 });
 

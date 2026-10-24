@@ -17,6 +17,7 @@ from agentkit.agents.leader_agent.runtime_keys import (
 from agentkit.agents.thread_state import ThreadState
 from agentkit.config import AppConfig, get_app_config
 from agentkit.models import create_chat_model
+from agentkit.models.catalog import split_model_name
 from agentkit.runtime.user_context import resolve_runtime_user_id
 from agentkit.tools import get_available_tools
 
@@ -94,12 +95,17 @@ def assemble_agent(
     thinking_enabled = _negotiate_thinking(model_name, thinking_enabled, resolved_config)
     reasoning_effort = _negotiate_reasoning_effort(model_name, requested_effort, resolved_config)
 
+    # `<name>@<vendor-id>`：厂商目录里新冒出来的模型，复用 name 那条配置，只换 provider 侧模型名
+    model_entry, vendor_model = split_model_name(model_name)
+    overrides = {"model": vendor_model} if vendor_model else None
+
     # 建立模型
     model = create_chat_model(
-        name=model_name,
+        name=model_entry,
         thinking_enabled=thinking_enabled,
         reasoning_effort=reasoning_effort,
         app_config=resolved_config,
+        model_overrides=overrides,
         attach_tracing=False,
     )
 
@@ -214,8 +220,10 @@ def _effective_model_name(requested: str | None, app_config: AppConfig) -> str:
     解析不到：告警，回退 agents.default_model。
     default_model 也没有：回退 models[0].name，与模型工厂的缺省规则一致。
     回退之后仍然建不出模型，那是配置错误，让 create_chat_model 抛。"""
-    if requested is not None and app_config.get_model_config(requested) is not None:
-        return requested
+    if requested is not None:
+        entry, _vendor = split_model_name(requested)
+        if app_config.get_model_config(entry) is not None:
+            return requested
     
     if requested is not None:
         logger.warning(f"Model {requested} not found in config, using default model")
@@ -231,7 +239,7 @@ def _effective_model_name(requested: str | None, app_config: AppConfig) -> str:
 def _negotiate_thinking(model_name: str, thinking_enabled: bool, app_config: AppConfig) -> bool:
     if not thinking_enabled:
         return False
-    model_config = app_config.get_model_config(model_name)
+    model_config = app_config.get_model_config(split_model_name(model_name)[0])
     if model_config is None or not model_config.supports_thinking:
         logger.warning(f"Model {model_name} does not support thinking, setting thinking_enabled to False")
         return False
@@ -245,7 +253,7 @@ def _negotiate_reasoning_effort(
 
     if reasoning_effort is None:
         return None
-    model_config = app_config.get_model_config(model_name)
+    model_config = app_config.get_model_config(split_model_name(model_name)[0])
     if model_config is None or not model_config.supports_reasoning_effort:
         logger.warning(f"Model {model_name} does not support reasoning effort, ignoring {reasoning_effort!r}")
         return None

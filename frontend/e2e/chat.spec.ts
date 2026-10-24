@@ -28,7 +28,8 @@ import { expect, test as base, type Page } from "@playwright/test";
  *   button   "停止"                流式时替换掉提交按钮（§5.1）
  *   region   "处理过程"            StepsPanel：流式期间是"处理中…"，结束后是"已完成"
  *   article  "用户消息" / "助手回复"  HumanBubble / AnswerBubble
- *   region   "工具调用 <name>"      ToolCallCard（参数、结果、状态都在里面）
+ *   region   "工具调用 <name>"      ToolCallRow（折叠时一行：工具名 + 参数摘要）
+ *   button   "工具 <name>，<状态>"  ToolCallRow 那一行本身，点开才挂载参数和结果
  *   text     "正在生成…" / "就绪"   StreamStatus
  *   text     "连接中断，正在恢复…"  RecoveryBanner（§5.2，恢复期间才有）
  *
@@ -51,11 +52,10 @@ const UI = {
   messageText: "message-text",
   runStatus: "run-status",
   recoveryNotice: "recovery-notice",
-  toolCard: "tool-card",
-  toolName: "tool-name",
+  toolRow: "tool-row",
+  toolToggle: "tool-toggle",
   toolArgs: "tool-args",
   toolResult: "tool-result",
-  toolStatus: "tool-status",
 } as const;
 
 /* -------------------------------------------------------------------------- */
@@ -614,8 +614,11 @@ const sendButton = (page: Page) => page.getByRole("button", { name: "发送" });
 const stopButton = (page: Page) => page.getByRole("button", { name: "停止" });
 /** StepsPanel：流式期间触发器写"处理中…"，结束后写"已完成" */
 const stepsPanel = (page: Page) => page.getByRole("region", { name: "处理过程" });
-const toolCard = (page: Page, toolName: string) =>
+/** 工具行：折叠时只有一行，参数和结果要点开才挂载（§9 验收清单第一条） */
+const toolRow = (page: Page, toolName: string) =>
   page.getByRole("region", { name: "工具调用 " + toolName });
+const toolToggle = (page: Page, toolName: string) =>
+  page.getByRole("button", { name: new RegExp("工具 " + toolName) });
 const humanBubbles = (page: Page) => page.getByRole("article", { name: "用户消息" });
 const answerBubble = (page: Page) => page.getByRole("article", { name: "助手回复" });
 
@@ -674,7 +677,7 @@ test("发送一条消息：SSE 流式返回，文字逐步出现", async ({ page
   expect(backend.unhandled).toEqual([]);
 });
 
-test("带工具调用的多轮：工具卡片显示参数和结果", async ({ page, backend }) => {
+test("带工具调用的多轮：工具行点开显示参数和结果", async ({ page, backend }) => {
   const args = { path: "notes.txt", content: "hello" };
   backend.setPlan({
     frames: [
@@ -702,13 +705,22 @@ test("带工具调用的多轮：工具卡片显示参数和结果", async ({ pa
   await sendMessage(page, "帮我写个文件");
 
   backend.release("after-tool-call");
-  const card = toolCard(page, "write_file");
-  await expect(card).toBeVisible();
-  // 参数、结果、状态都要看得见（§9 验收清单第一条）
-  await expect(card).toContainText("notes.txt");
-  await expect(card).toContainText("hello");
-  await expect(card).toContainText("成功");
-  await expect(card).toContainText("wrote 11 bytes");
+  const row = toolRow(page, "write_file");
+  const toggle = toolToggle(page, "write_file");
+  await expect(row).toBeVisible();
+
+  // 折叠时一行读完：工具名、参数摘要、状态（状态在无障碍名里，免得占行宽）
+  await expect(page.getByRole("button", { name: "工具 write_file，成功" })).toBeVisible();
+  await expect(toggle).toContainText("write_file");
+  await expect(toggle).toContainText("notes.txt");
+  // 结果还没点开就不进 DOM —— 但点开必须有（§9 验收清单第一条不是"删掉细节"）
+  await expect(row).not.toContainText("wrote 11 bytes");
+
+  await toggle.click();
+  await expect(row).toContainText("参数");
+  await expect(row).toContainText("hello");
+  await expect(row).toContainText("结果");
+  await expect(row).toContainText("wrote 11 bytes");
 
   // §6.1：带 tool_calls 的 AI 消息**同时**有可见正文，那段正文不能被吞掉
   await expect(stepsPanel(page)).toContainText("我先写一个文件。");

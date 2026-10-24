@@ -18,7 +18,7 @@ from agentkit.sandbox.tools import (
     str_replace,
     write_file,
 )
-from agentkit.tools.builtin.describe_skill import describe_skill
+from agentkit.tools.builtin.search_and_load_skills import search_and_load_skills
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +30,8 @@ _HOST_BASH_DISABLED = (
 
 # (group, tool). Config entries with the same .name win because they are added first.
 _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
-    # L1 技能元数据：框架工具，任何策略下都可用（M7 §3.8）
-    ("skills", describe_skill),
+    # 技能的按需加载：框架工具，任何策略下都可用（M7 §3.8）
+    ("skills", search_and_load_skills),
     ("sandbox", read_file),
     ("sandbox", write_file),
     ("sandbox", str_replace),
@@ -137,11 +137,15 @@ def _apply_capability_filters(
     """All capability filters live here. M9 adds non_interactive in this function."""
     bash_allowed = is_host_bash_allowed(app_config)
     vision = _model_supports_vision(app_config, model_name)
+    # 检索加载关掉时工具不出现：模型看不见它就不会调用，比调用后再回一句"已关闭"省一轮
+    skill_search_enabled = bool(getattr(app_config.skills.search, "enabled", True))
     selected: list[BaseTool] = []
     hid_bash = False
     for tool in tools:
         if _is_bash_tool(tool.name) and not bash_allowed:
             hid_bash = True
+            continue
+        if tool.name == "search_and_load_skills" and not skill_search_enabled:
             continue
         if tool.name == "view_image" and not vision:
             continue

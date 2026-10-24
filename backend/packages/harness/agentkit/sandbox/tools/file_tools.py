@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 
+from typing import Any
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
@@ -38,7 +39,7 @@ def _fail(exc: Exception, runtime: ToolRuntime) -> str:
 @tool
 def read_file(
     path: str,
-    runtime: ToolRuntime,
+    runtime: ToolRuntime[Any, Any],
     start_line: int | None = None,
     end_line: int | None = None,
     description: str = "",
@@ -65,7 +66,7 @@ def read_file(
 def write_file(
     path: str,
     content: str,
-    runtime: ToolRuntime,
+    runtime: ToolRuntime[Any, Any],
     append: bool = False,
     description: str = "",
 ) -> str:
@@ -94,7 +95,7 @@ def str_replace(
     path: str,
     old_string: str,
     new_string: str,
-    runtime: ToolRuntime,
+    runtime: ToolRuntime[Any, Any],
     description: str = "",
 ) -> str:
     """替换沙箱文件中一个唯一的子串。
@@ -128,7 +129,7 @@ def str_replace(
 
 
 @tool
-def ls(path: str, runtime: ToolRuntime, description: str = "") -> str:
+def ls(path: str, runtime: ToolRuntime[Any, Any], description: str = "") -> str:
     """以树形列出沙箱目录，最多两层。
 
     Args:
@@ -150,7 +151,7 @@ def ls(path: str, runtime: ToolRuntime, description: str = "") -> str:
 def glob(
     path: str,
     pattern: str,
-    runtime: ToolRuntime,
+    runtime: ToolRuntime[Any, Any],
     include_dirs: bool = False,
     description: str = "",
 ) -> str:
@@ -178,7 +179,7 @@ def glob(
 def grep(
     path: str,
     pattern: str,
-    runtime: ToolRuntime,
+    runtime: ToolRuntime[Any, Any],
     glob: str | None = None,
     literal: bool = False,
     case_sensitive: bool = False,

@@ -66,6 +66,8 @@ export interface ModelControlProps {
   effortLabel: string;
   loading?: boolean;
   error?: string | null;
+  /** 某些厂商的 /models 没拉到（列表已回退到配置） */
+  vendorErrors?: readonly string[];
   disabled?: boolean;
   onSelectModel: (name: string) => void;
   onSelectEffort: (id: string | null) => void;
@@ -91,16 +93,26 @@ export function Composer({
   const canSend = hasText && !submitting && !disabled;
   const isHero = variant === "hero";
 
+  /**
+   * 提交 = **先把输入框清空，再等 onSubmit**。
+   *
+   * onSubmit 走的是 SDK 的 `stream.submit`，它的 promise 要等**整轮 run 结束**（甚至
+   * 更晚）才 resolve；等它再清空，用户会看到自己刚打的字一直留在输入框里，像是
+   * "消息没发出去"。所以先乐观清空，失败再把内容放回去（用户已经重新输入过就不覆盖）。
+   */
   const submit = useCallback(async () => {
     const value = text.trim();
     if (!value || submitting || disabled) return;
+    const pendingFiles = files;
     setSubmitting(true);
     setError(null);
+    setText("");
+    setFiles([]);
     try {
-      await onSubmit(value, files);
-      setText("");
-      setFiles([]);
+      await onSubmit(value, pendingFiles);
     } catch (cause) {
+      setText((current) => (current ? current : value));
+      setFiles((current) => (current.length ? current : pendingFiles));
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setSubmitting(false);
@@ -195,6 +207,7 @@ export function Composer({
                   models={modelControl.models}
                   onSelectEffort={modelControl.onSelectEffort}
                   onSelectModel={modelControl.onSelectModel}
+                  vendorErrors={modelControl.vendorErrors}
                 />
               ) : null}
               {streaming ? (
