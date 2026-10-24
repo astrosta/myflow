@@ -225,9 +225,50 @@ subagent_runtime:
 # 模型看到的是系统提示词尾部的 <available_skills> 索引（每技能一行，描述截断）；
 # 正文一律按需：要么 read_file 读 SKILL.md，要么 search_and_load_skills 按意图检索加载。
 # 没有"全量注入"模式开关（M7 §3.5）。
-# 全局启用开关在 extensions_config.json，个人偏好在 skills_prefs.json。
+# 全局启用开关在 PostgreSQL 的 skill_settings（git 来源），个人偏好仍在 skills_prefs.json；
+# 旧部署用 backend.scripts.migrate_skill_state 迁移（名字 → skill_id）。
 # ------------------------------------------------------------
 skills:
+  # git：生产目录（Git 是唯一内容源，PostgreSQL 拥有身份/版本/审核/发布指针）。
+  # filesystem：仅测试/迁移时扫描本地 skills/ 目录。旧部署用
+  # `python -m backend.scripts.migrate_skill_state` 迁移开关与个人偏好。
+  source: git                 # startup-only：切换来源要重启
+
+  # 私有草稿的配额与包边界（普通用户创作；admin 也受同一套限制）。
+  creation:
+    enabled: true             # 关掉后只有 admin 能创建技能
+    max_drafts_per_user: 20
+    max_pending_submissions_per_user: 5
+    max_package_bytes: 5242880    # 单个技能包（所有文件之和）
+    max_file_bytes: 1048576       # 单个技能文件
+    max_files: 200
+
+  # 服务端技能仓库。凭据只在这里；普通用户永远拿不到。
+  git:
+    repository: $SKILLS_GIT_REPOSITORY   # 代码里没有默认仓库地址
+    public_branch: main
+    draft_ref_prefix: "refs/heads/myflow/drafts"
+    cache_dir: .myflow/skills
+    ssh_key_path: $SKILLS_GIT_SSH_KEY_PATH
+    known_hosts_path: $SKILLS_GIT_KNOWN_HOSTS
+    command_timeout_seconds: 120
+
+  # 公共发布必须走人工审核；管理员可以批准自己的提交。
+  review:
+    require_admin: true
+    allow_self_approval: true
+
+  # Milvus active projection 的 outbox 与对账节奏。
+  index:
+    outbox_poll_seconds: 2
+    reconciliation_interval_minutes: 10
+
+  # 可重建缓存的保留策略；元数据与公共历史永久保留。
+  retention:
+    keep_versions_per_skill: 20
+    cache_ttl_days: 30
+
+
   path: skills                  # 相对项目根
   container_path: /mnt/skills   # startup-only：编译进提示词索引与沙箱 mount
   index_description_max_chars: 120
@@ -397,22 +438,3 @@ knowledge_base:
     rrf_k: 60                       # RRF 融合的 k（与 Milvus RRFRanker 同参数）
     score_threshold: null           # 仅纯向量检索生效；COSINE 常用 0.2~0.4
     max_context_chars: 8000
-
-    # 关键词通道：BM25 稀疏检索，由 Milvus 服务端完成分词与打分。
-    keyword:
-      enabled: true
-      analyzer: chinese             # chinese | english | standard；改后需重建 collection
-      bm25_k1: 1.2
-      bm25_b: 0.75
-
-    # 精排：开关关掉时直接用 RRF 融合顺序。
-    rerank:
-      enabled: false                # 打开时下面的 base_url 与 model 必填
-      protocol: cohere              # cohere | tei（vLLM/Jina/Cohere 走 cohere，TEI 走 tei）
-      base_url: ""                  # 精排服务地址，例如 http://127.0.0.1:8000/rerank 的 host
-      path: /rerank
-      api_key: ""                   # 可写 $RERANK_API_KEY
-      model: Qwen/Qwen3-Reranker-8B
-      max_document_chars: 4000
-      timeout_seconds: 60
-      max_retries: 1
