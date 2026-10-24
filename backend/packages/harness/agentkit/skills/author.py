@@ -14,10 +14,9 @@ import hashlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import func, select, text
 
 from agentkit.config.skills_config import SkillCreationConfig
 from agentkit.skills.content import SkillContentStore
@@ -34,7 +33,7 @@ from agentkit.skills.domain import (
 )
 from agentkit.skills.git import GitCommit, SkillGitRepository
 from agentkit.skills.package import build_package, render_skill_md, validate_skill_path
-from agentkit.skills.store.model import SkillPrivateActiveRow, SkillRow, SkillSubmissionRow
+from agentkit.skills.store.model import SkillRow, SkillSubmissionRow
 from agentkit.skills.store.sql import SqlSkillStore
 from agentkit.skills.types import SKILL_FILE_NAME
 
@@ -287,22 +286,11 @@ class SkillAuthorService:
 
         await self._owned_skill(owner_user_id, skill_id)
         await self._reject_pending(skill_id)
-        await self._store.delete_all_draft_files(skill_id)
-        now = datetime.now(UTC)
-        async with self._store._sf() as session:  # type: ignore[attr-defined]
-            await session.execute(
-                delete(SkillPrivateActiveRow).where(
-                    SkillPrivateActiveRow.skill_id == skill_id,
-                    SkillPrivateActiveRow.owner_user_id == owner_user_id,
-                )
-            )
-            # Soft deletion hides the owner's private draft while leaving every
-            # release row and the public active pointer untouched.
-            skill = await session.get(SkillRow, skill_id)
-            if skill is not None and skill.deleted_at is None:
-                skill.deleted_at = now
-                skill.updated_at = now
-            await session.commit()
+        deleted = await self._store.delete_private_draft(
+            skill_id=skill_id, owner_user_id=owner_user_id, actor=owner_user_id
+        )
+        if not deleted:
+            raise SkillConflict(f"skill {skill_id!r} does not exist")
 
     # ------------------------------------------------------------------
     # internals

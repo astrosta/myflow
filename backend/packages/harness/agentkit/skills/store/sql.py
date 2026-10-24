@@ -1045,6 +1045,66 @@ class SqlSkillStore:
                 session, f"draft files for skill {skill_id!r} could not be deleted"
             )
 
+    async def delete_private_draft(
+        self, *, skill_id: str, owner_user_id: str, actor: str
+    ) -> bool:
+        """Delete one owner's private draft and queue its projection removal.
+
+        A missing or foreign skill is reported as False rather than raising,
+        so callers cannot distinguish another owner's draft from an absent one.
+        Public release rows and the public active pointer are never touched.
+        """
+        now = _now()
+        async with self._sf() as session:
+            skill = await session.scalar(
+                select(SkillRow).where(
+                    SkillRow.id == skill_id,
+                    SkillRow.owner_user_id == owner_user_id,
+                    SkillRow.deleted_at.is_(None),
+                )
+            )
+            if skill is None:
+                return False
+
+            await session.execute(
+                delete(SkillDraftFileRow).where(
+                    SkillDraftFileRow.skill_id == skill_id
+                )
+            )
+            await session.execute(
+                delete(SkillPrivateActiveRow).where(
+                    SkillPrivateActiveRow.skill_id == skill_id,
+                    SkillPrivateActiveRow.owner_user_id == owner_user_id,
+                )
+            )
+
+            skill.deleted_at = now
+            skill.updated_at = now
+
+            self._outbox_row(
+                session,
+                op="delete_active",
+                projection_key=f"private:{owner_user_id}:{skill_id}",
+                scope="private",
+                owner_user_id=owner_user_id,
+                skill_id=skill_id,
+                version_id=None,
+                payload={},
+                now=now,
+            )
+            self._audit_row(
+                session,
+                actor=actor,
+                action="skill.delete",
+                skill_id=skill_id,
+                detail={},
+                now=now,
+            )
+            await self._commit(
+                session, f"private draft for skill {skill_id!r} could not be deleted"
+            )
+            return True
+
     # ------------------------------------------------------------------
     # projection outbox
     # ------------------------------------------------------------------

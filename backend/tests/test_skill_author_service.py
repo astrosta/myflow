@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from agentkit.config.skills_config import SkillCreationConfig
 from agentkit.persistence.schema import (
     Base,
+    SkillAuditEventRow,
     SkillDraftFileRow,
     SkillIndexOutboxRow,
     SkillPrivateActiveRow,
@@ -435,6 +436,67 @@ def test_delete_draft_keeps_public_release(harness: Harness) -> None:
             assert await session.get(SkillReleaseRow, release.id) is not None
             skill_row = await session.get(SkillRow, skill.id)
             assert skill_row is not None and skill_row.deleted_at is not None
+        public = [
+            item
+            for item in await harness.store.visible_for_user("u1")
+            if item.skill.skill_id == skill.id
+        ]
+        assert [item.scope for item in public] == ["public"]
+
+    harness.run(scenario)
+
+
+def test_delete_draft_enqueues_private_delete_outbox(harness: Harness) -> None:
+    async def scenario() -> None:
+        skill = await harness.service.create_draft(
+            owner_user_id="u1", name="pdf-tools", description="Does things"
+        )
+        await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        submission = await harness.service.submit(
+            owner_user_id="u1", skill_id=skill.id
+        )
+        release = await _approve(
+            harness, submission=submission, public_name="pdf-tools"
+        )
+
+        await harness.service.delete_draft(owner_user_id="u1", skill_id=skill.id)
+
+        async with harness.session_factory() as session:
+            assert await session.get(SkillPrivateActiveRow, skill.id) is None
+            assert await session.get(SkillPublicActiveRow, skill.id) is not None
+            assert await session.get(SkillReleaseRow, release.id) is not None
+            rows = (
+                await session.scalars(
+                    select(SkillDraftFileRow).where(
+                        SkillDraftFileRow.skill_id == skill.id
+                    )
+                )
+            ).all()
+            assert rows == []
+            delete_events = (
+                await session.scalars(
+                    select(SkillIndexOutboxRow).where(
+                        SkillIndexOutboxRow.projection_key
+                        == f"private:u1:{skill.id}",
+                        SkillIndexOutboxRow.op == "delete_active",
+                    )
+                )
+            ).all()
+            assert len(delete_events) == 1
+            event = delete_events[0]
+            assert event.scope == "private"
+            assert event.owner_user_id == "u1"
+            assert event.skill_id == skill.id
+            assert event.version_id is None
+            assert event.payload_json == {}
+            audit = await session.scalar(
+                select(SkillAuditEventRow).where(
+                    SkillAuditEventRow.skill_id == skill.id,
+                    SkillAuditEventRow.action == "skill.delete",
+                )
+            )
+            assert audit is not None and audit.actor == "u1"
+
         public = [
             item
             for item in await harness.store.visible_for_user("u1")
