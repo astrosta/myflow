@@ -18,6 +18,19 @@ from agentkit.persistence.base import Base
 from agentkit.persistence.events.model import RunEventRow
 from agentkit.persistence.run.model import RunRow
 from agentkit.persistence.thread_meta.model import ThreadMetaRow
+from agentkit.skills.store.model import (
+    SkillAuditEventRow,
+    SkillDraftFileRow,
+    SkillIndexOutboxRow,
+    SkillPrivateActiveRow,
+    SkillPublicActiveRow,
+    SkillReleaseBatchRow,
+    SkillReleaseRow,
+    SkillRow,
+    SkillSettingsRow,
+    SkillSubmissionRow,
+    SkillVersionRow,
+)
 
 __all__ = [
     "Base",
@@ -25,5 +38,16 @@ __all__ = [
     "KnowledgeDocumentRow",
     "RunEventRow",
     "RunRow",
+    "SkillAuditEventRow",
+    "SkillDraftFileRow",
+    "SkillIndexOutboxRow",
+    "SkillPrivateActiveRow",
+    "SkillPublicActiveRow",
+    "SkillReleaseBatchRow",
+    "SkillReleaseRow",
+    "SkillRow",
+    "SkillSettingsRow",
+    "SkillSubmissionRow",
+    "SkillVersionRow",
     "ThreadMetaRow",
 ]

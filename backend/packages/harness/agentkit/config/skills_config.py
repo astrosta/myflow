@@ -12,7 +12,7 @@ deferred_discovery 被刻意删掉了——两套渲染等于两套提示词契�
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -167,9 +167,90 @@ class SkillActiveContextConfig(BaseModel):
     )
 
 
+class SkillCreationConfig(BaseModel):
+    """普通用户创作私有技能的配额与包边界。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True, description="关闭后只有 admin 能创建技能。")
+    max_drafts_per_user: int = Field(default=20, ge=1, description="每个用户最多保存多少个私有草稿。")
+    max_pending_submissions_per_user: int = Field(
+        default=5, ge=1, description="每个用户同时最多有多少个待审核提交。"
+    )
+    max_package_bytes: int = Field(
+        default=5_242_880, ge=1, description="单个技能包（所有文件之和）的字节上限。"
+    )
+    max_file_bytes: int = Field(default=1_048_576, ge=1, description="单个技能文件的字节上限。")
+    max_files: int = Field(default=200, ge=1, description="单个技能包允许的最大文件数。")
+
+
+class SkillGitConfig(BaseModel):
+    """服务端读写技能仓库的参数。普通用户永远拿不到这里的凭据。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repository: str = Field(default="", description="技能仓库 URL；代码里没有默认服务地址。")
+    public_branch: str = Field(default="main", min_length=1, description="公共技能所在分支。")
+    draft_ref_prefix: str = Field(
+        default="refs/heads/myflow/drafts",
+        min_length=1,
+        description="每个用户一条草稿分支的 ref 前缀。",
+    )
+    cache_dir: str = Field(
+        default=".myflow/skills",
+        min_length=1,
+        description="节点本地的 Git mirror 与 commit 内容缓存目录。",
+    )
+    ssh_key_path: str = Field(default="", description="服务端部署密钥路径；为空表示不配置。")
+    known_hosts_path: str = Field(default="", description="服务端 known_hosts 路径；为空表示不配置。")
+    command_timeout_seconds: int = Field(
+        default=120, ge=1, description="单条 git 子进程的超时时间。"
+    )
+
+
+class SkillReviewConfig(BaseModel):
+    """公共发布的人工审核规则。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    require_admin: bool = Field(default=True, description="公共发布必须经过 admin 审核。")
+    allow_self_approval: bool = Field(default=True, description="是否允许 admin 批准自己的提交。")
+
+
+class SkillIndexConfig(BaseModel):
+    """Milvus active projection 的 outbox 与对账节奏。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outbox_poll_seconds: float = Field(default=2.0, gt=0, description="outbox worker 轮询间隔。")
+    reconciliation_interval_minutes: int = Field(
+        default=10, ge=1, description="active projection 对账任务的运行间隔。"
+    )
+
+
+class SkillRetentionConfig(BaseModel):
+    """可重建缓存的保留策略；元数据和公共历史永久保留。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    keep_versions_per_skill: int = Field(
+        default=20, ge=1, description="每个技能保留多少个最近版本的 commit 内容缓存。"
+    )
+    cache_ttl_days: int = Field(default=30, ge=1, description="未被引用的缓存最长保留天数。")
+
+
 class SkillsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    source: Literal["filesystem", "git"] = Field(
+        default="filesystem",
+        description="技能目录来源。filesystem 仅用于测试/本地调试；生产使用 git。",
+    )
+    creation: SkillCreationConfig = Field(default_factory=SkillCreationConfig)
+    git: SkillGitConfig = Field(default_factory=SkillGitConfig)
+    review: SkillReviewConfig = Field(default_factory=SkillReviewConfig)
+    index: SkillIndexConfig = Field(default_factory=SkillIndexConfig)
+    retention: SkillRetentionConfig = Field(default_factory=SkillRetentionConfig)
     path: str = Field(
         default=DEFAULT_SKILLS_PATH,
         description="技能树根目录。相对路径按项目根解析；其下是 public/ 与 custom/。",

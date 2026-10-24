@@ -21,6 +21,10 @@ postgres = [
 knowledge = [
     "agentkit[knowledge]",
 ]
+# Git 技能目录的 active projection 依赖由 harness 的 skills extra 提供。
+skills = [
+    "agentkit[skills]",
+]
 # M9 §3.6：多 worker / 跨进程直播帧。app 层透传，实际实现在 harness。
 redis = [
     "agentkit[redis]",

@@ -36,6 +36,7 @@ PAT_SCOPE_MENU = frozenset({
     "threads:delete",
     "models:read",
     "skills:read",
+    "skills:write",
     "memory:read",
     "memory:write",
     "knowledge:read",

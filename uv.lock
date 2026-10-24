@@ -49,6 +49,9 @@ postgres = [
 redis = [
     { name = "redis" },
 ]
+skills = [
+    { name = "pymilvus" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -67,11 +70,12 @@ requires-dist = [
     { name = "psycopg-pool", marker = "extra == 'postgres'", specifier = ">=3.3.0" },
     { name = "pydantic", specifier = ">=2.13.5" },
     { name = "pymilvus", marker = "extra == 'knowledge'", specifier = ">=2.5" },
+    { name = "pymilvus", marker = "extra == 'skills'", specifier = ">=2.5" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3.0" },
     { name = "transformers", marker = "extra == 'knowledge'", specifier = ">=4.51" },
 ]
-provides-extras = ["postgres", "mcp", "knowledge", "redis"]
+provides-extras = ["postgres", "mcp", "knowledge", "skills", "redis"]
 
 [[package]]
 name = "aiosqlite"
@@ -198,6 +202,9 @@ postgres = [
 redis = [
     { name = "agentkit", extra = ["redis"] },
 ]
+skills = [
+    { name = "agentkit", extra = ["skills"] },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -212,12 +219,13 @@ requires-dist = [
     { name = "agentkit", extras = ["knowledge"], marker = "extra == 'knowledge'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["postgres"], marker = "extra == 'postgres'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["redis"], marker = "extra == 'redis'", editable = "backend/packages/harness" },
+    { name = "agentkit", extras = ["skills"], marker = "extra == 'skills'", editable = "backend/packages/harness" },
     { name = "bcrypt", specifier = ">=4.1" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "pyjwt", specifier = ">=2.8" },
     { name = "python-multipart", specifier = ">=0.0.20" },
 ]
-provides-extras = ["postgres", "knowledge", "redis"]
+provides-extras = ["postgres", "knowledge", "skills", "redis"]
 
 [package.metadata.requires-dev]
 dev = [
