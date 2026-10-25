@@ -427,6 +427,25 @@ def runtime_for_request(request: Any) -> SkillRuntime | None:
     return runtime if runtime is not None else get_skill_runtime()
 
 
+def _build_skill_reranker(skills: SkillsConfig) -> Any | None:
+    """精排是可选终排：关闭时返回 None，开了但没配地址就让启动失败。
+
+    和 embedding 同一条纪律——代码里没有默认服务地址。空地址不会在启动时炸，
+    只会在每次检索时变成一个沉默的超时。
+    """
+    rerank = skills.search.rerank
+    if not rerank.enabled:
+        return None
+    if not rerank.base_url.strip() or not rerank.model.strip():
+        raise RuntimeError(
+            "skills.search.rerank.enabled=true requires both skills.search.rerank."
+            "base_url and skills.search.rerank.model."
+        )
+    from agentkit.knowledge.rerank import build_reranker
+
+    return build_reranker(rerank)
+
+
 def build_skill_runtime(
     app_config: Any, *, session_factory: Any | None = None
 ) -> SkillRuntime:
@@ -467,6 +486,7 @@ def build_skill_runtime(
     # 否则 git 来源在默认部署下根本没有检索——投影与 outbox 才是可选的那部分。
     if skills.search.enabled:
         embedding = skills.search.embedding
+        reranker = _build_skill_reranker(skills)
         embedder = None
         if embedding.enabled and embedding.base_url.strip():
             vector_store = skills.search.active_vector_store(
@@ -486,7 +506,9 @@ def build_skill_runtime(
                 vector_store,
                 dimensions=embedding.dimensions,
             )
-        search = SkillSearchService(store, projection, content, embedder, skills.search)
+        search = SkillSearchService(
+            store, projection, content, embedder, skills.search, reranker
+        )
         if projection is not None:
             outbox = SkillIndexOutboxWorker(
                 store,

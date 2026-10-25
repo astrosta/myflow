@@ -35,7 +35,13 @@ from agentkit.skills.domain import SkillScope, VisibleSkill
 from agentkit.skills.loader import MIN_USEFUL_BODY_CHARS, clip_body
 from agentkit.skills.parser import FRONTMATTER_RE
 from agentkit.skills.projection import ProjectionHit, SkillProjectionStore
-from agentkit.skills.router import Embedder, SkillDocument, lexical_scores, tokenize
+from agentkit.skills.router import (
+    Embedder,
+    Reranker,
+    SkillDocument,
+    lexical_scores,
+    tokenize,
+)
 from agentkit.skills.store.sql import SqlSkillStore
 from agentkit.skills.types import Skill
 
@@ -45,6 +51,7 @@ logger = logging.getLogger(__name__)
 VECTOR_UNAVAILABLE = "vector_unavailable"
 LEXICAL_FALLBACK = "lexical_fallback"
 CONTENT_UNAVAILABLE = "content_unavailable"
+RERANK_UNAVAILABLE = "rerank_unavailable"
 
 
 class SkillSearchUnavailable(RuntimeError):
@@ -68,6 +75,23 @@ class SkillSearchOutcome:
     hits: tuple[SkillSearchHit, ...]
     candidates: int
     warnings: tuple[str, ...]
+    #: 终排是否真的由精排决定：工具把它回给模型，用来解释“为什么是它”。
+    reranked: bool = False
+
+
+def _rerank_text(skill: Skill, body: str, max_chars: int) -> str:
+    """送进精排的文档：元数据在头、正文在后，整体不超过 max_document_chars。
+
+    正文才是精排要读的东西，但不能无界：cross-encoder 的成本随长度线性增长。
+    """
+    limit = max(1, int(max_chars))
+    head = f"{skill.name}\n{skill.description}"
+    if not body:
+        return head[:limit]
+    room = limit - len(head) - 2
+    if room <= 0:
+        return head[:limit]
+    return f"{head}\n\n{body[:room]}"
 
 
 def _scope_value(scope: SkillScope | str) -> str:
@@ -146,18 +170,23 @@ class SkillSearchService:
         content: SkillContentStore,
         embedder: Embedder | None,
         config: SkillSearchConfig,
+        reranker: Reranker | None = None,
     ) -> None:
-        """Projection and embedder are optional: without them only BM25 runs.
+        """Projection, embedder and reranker are all optional.
 
         The shipped configuration is lexical-only (search.enabled=true,
         embedding.enabled=false), so a missing projection/embedder must mean
-        "local BM25", never "no retrieval service at all".
+        "local BM25", never "no retrieval service at all".  The reranker is the
+        third stage: it can only reorder candidates that already survived
+        recall, confirmation and private dedupe, and it never decides
+        visibility.
         """
         self._store = store
         self._projection = projection
         self._content = content
         self._embedder = embedder
         self._config = config
+        self._reranker = reranker
 
     async def search(
         self,
@@ -255,7 +284,17 @@ class SkillSearchService:
                 item[0].version.skill_id,
             )
         )
-        return await self._load(ordered, candidates=candidates, warnings=warnings)
+        bodies: dict[str, str] = {}
+        ordered, reranked = await self._rerank_candidates(
+            query=query, ordered=ordered, bodies=bodies, warnings=warnings
+        )
+        return await self._load(
+            ordered,
+            candidates=candidates,
+            warnings=warnings,
+            bodies=bodies or None,
+            reranked=reranked,
+        )
 
     # ------------------------------------------------------------------
     # stages
@@ -332,9 +371,73 @@ class SkillSearchService:
             for document, score in ranked
             if score > 0 and document.skill.skill_id is not None
         ]
-        return await self._load(
-            ordered, candidates=candidates, warnings=warnings, bodies=bodies
+        # 词法兜底也走同一段终排：这条路上正文已经在手里，精排是免费的精度。
+        ordered, reranked = await self._rerank_candidates(
+            query=query, ordered=ordered, bodies=bodies, warnings=warnings
         )
+        return await self._load(
+            ordered,
+            candidates=candidates,
+            warnings=warnings,
+            bodies=bodies,
+            reranked=reranked,
+        )
+
+    async def _rerank_candidates(
+        self,
+        *,
+        query: str,
+        ordered: list[tuple[VisibleSkill, float]],
+        bodies: dict[str, str],
+        warnings: list[str],
+    ) -> tuple[list[tuple[VisibleSkill, float]], bool]:
+        """用正文精排已确认、已去重的候选（设计 §7.4 步骤 7）。
+
+        输入顺序是融合顺序；精排只重排前 candidate_k 个，尾部原样接在后面。
+        reranker 缺失、候选不足两个、调用失败或返回空顺序，都退回原顺序并记
+        rerank_unavailable —— 精排永远不能成为“没有结果”的原因。
+        """
+        reranker = self._reranker
+        if reranker is None or len(ordered) < 2:
+            return ordered, False
+
+        head = ordered[: max(1, self._config.candidate_k)]
+        kept: list[tuple[VisibleSkill, float]] = []
+        documents: list[str] = []
+        for source, score in head:
+            skill_id = source.version.skill_id
+            body = bodies.get(skill_id)
+            if body is None:
+                body = await self._read_body(source) or ""
+                bodies[skill_id] = body
+            documents.append(
+                _rerank_text(
+                    source.skill, body, self._config.rerank.max_document_chars
+                )
+            )
+            kept.append((source, score))
+
+        try:
+            results = await reranker.rerank(query=query, documents=documents)
+        except Exception as exc:  # noqa: BLE001 - the fused order still answers
+            logger.warning(
+                "Skill rerank failed (%s); keeping the fused order",
+                type(exc).__name__,
+            )
+            warnings.append(RERANK_UNAVAILABLE)
+            return ordered, False
+
+        order: list[int] = []
+        for item in results:
+            index = getattr(item, "index", None)
+            if isinstance(index, int) and 0 <= index < len(kept) and index not in order:
+                order.append(index)
+        if not order:
+            warnings.append(RERANK_UNAVAILABLE)
+            return ordered, False
+        # 服务漏掉的候选按原顺序补在后面：不能因为精排少返回一条就丢掉技能。
+        order += [index for index in range(len(kept)) if index not in order]
+        return [kept[index] for index in order] + ordered[len(kept) :], True
 
     async def _read_body(self, source: VisibleSkill) -> str | None:
         commit, path = _content_location(source)
@@ -361,6 +464,7 @@ class SkillSearchService:
         candidates: int,
         warnings: list[str],
         bodies: Mapping[str, str] | None = None,
+        reranked: bool = False,
     ) -> SkillSearchOutcome:
         """Read, clip, and cap the loaded bodies under the context budget."""
         remaining = self._config.max_context_chars
@@ -394,6 +498,7 @@ class SkillSearchService:
             hits=tuple(hits),
             candidates=candidates,
             warnings=tuple(dict.fromkeys(warnings)),
+            reranked=reranked,
         )
 
 

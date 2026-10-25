@@ -394,8 +394,16 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
             seen.calls.append(("projection", (config, dimensions)))
 
     class Search:
-        def __init__(self, store: Any, projection: Any, content: Any, embedder: Any, config: Any) -> None:
-            seen.calls.append(("search", (projection, embedder, config)))
+        def __init__(
+            self,
+            store: Any,
+            projection: Any,
+            content: Any,
+            embedder: Any,
+            config: Any,
+            reranker: Any = None,
+        ) -> None:
+            seen.calls.append(("search", (projection, embedder, config, reranker)))
 
     class Outbox:
         def __init__(
@@ -440,7 +448,8 @@ def test_shipped_git_config_still_builds_the_lexical_search_service(
     assert runtime.search is not None
     assert runtime.projection is None
     assert runtime.outbox is None
-    assert ("search", (None, None, config.skills.search)) in seen.calls
+    # reranker 也必须是 None：shipped 配置里 rerank.enabled=false。
+    assert ("search", (None, None, config.skills.search, None)) in seen.calls
     assert [name for name, _ in seen.calls] == [
         "store",
         "git",

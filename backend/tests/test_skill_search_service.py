@@ -15,8 +15,11 @@ from typing import Any
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from types import SimpleNamespace
+
 from agentkit.config.skills_config import (
     SkillEmbeddingChannelConfig,
+    SkillRerankStageConfig,
     SkillSearchConfig,
 )
 from agentkit.persistence.schema import Base
@@ -107,6 +110,24 @@ class FakeEmbedder:
         return [list(self.vector) for _ in texts]
 
 
+class FakeReranker:
+    """Records what it was asked to order; returns a caller-supplied order."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.queries: list[str] = []
+        self.order: list[int] | None = None
+        self.fail = False
+
+    async def rerank(self, *, query: str, documents: list[str] | tuple[str, ...]):
+        self.queries.append(query)
+        self.calls.append(list(documents))
+        if self.fail:
+            raise RuntimeError("rerank service is unavailable")
+        order = self.order if self.order is not None else list(range(len(documents)))
+        return [SimpleNamespace(index=index) for index in order]
+
+
 @dataclass
 class Harness:
     store: SqlSkillStore
@@ -114,6 +135,7 @@ class Harness:
     projection: FakeProjection = field(default_factory=FakeProjection)
     content: FakeContent = field(default_factory=FakeContent)
     embedder: FakeEmbedder = field(default_factory=FakeEmbedder)
+    reranker: FakeReranker | None = None
 
     def service(self, config: SkillSearchConfig | None = None) -> SkillSearchService:
         return SkillSearchService(
@@ -122,6 +144,7 @@ class Harness:
             self.content,  # type: ignore[arg-type]
             self.embedder,
             config or search_config(),
+            self.reranker,  # type: ignore[arg-type]
         )
 
 
@@ -266,6 +289,128 @@ async def test_one_search_and_private_precedence(harness: Harness) -> None:
     assert "description:" not in loaded.body
     assert outcome.candidates == 1
     assert outcome.warnings == ()
+
+
+# ---------------------------------------------------------------------------
+# Task 21: the third stage reorders confirmed, deduped candidates by body
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rerank_reorders_confirmed_candidates_using_bodies(harness: Harness) -> None:
+    alpha, alpha_version = await save_private(
+        harness, owner='u1', name='alpha', body='# Alpha pgvector 建索引', seq=1
+    )
+    beta, beta_version = await save_private(
+        harness, owner='u1', name='beta', body='# Beta pgvector 慢查询排查', seq=2
+    )
+    harness.projection.hits = [
+        hit(scope='private', owner='u1', skill_id=alpha.id, version_id=alpha_version.id, score=0.9),
+        hit(scope='private', owner='u1', skill_id=beta.id, version_id=beta_version.id, score=0.5),
+    ]
+    harness.reranker = FakeReranker()
+    # 向量把 alpha 排在前面，精排认为 beta 更相关。
+    harness.reranker.order = [1, 0]
+
+    outcome = await call(harness)
+
+    assert [item.skill.name for item in outcome.hits][0] == 'beta'
+    assert outcome.reranked is True
+    assert 'rerank_unavailable' not in outcome.warnings
+    # 精排读到的是正文，不是元数据。
+    documents = harness.reranker.calls[0]
+    assert len(documents) == 2
+    assert any('慢查询排查' in document for document in documents)
+    assert harness.reranker.queries == ['pgvector']
+
+
+@pytest.mark.asyncio
+async def test_rerank_never_reorders_a_private_copy_below_the_public_one(
+    harness: Harness,
+) -> None:
+    """去重发生在精排之前：公共副本根本不该出现在精排的文档里。"""
+
+    skill, version = await save_private(
+        harness, owner='u1', name='pdf-tools', body='PRIVATE-BODY-21', seq=1
+    )
+    await publish(harness, owner='u1', skill=skill, version=version)
+    # 第二个技能保证去重后仍有 2 个候选，精排才会真的被调用。
+    other, other_version = await save_private(
+        harness, owner='u1', name='other', body='OTHER-BODY-21', seq=2
+    )
+    harness.projection.hits = [
+        hit(scope='public', owner=None, skill_id=skill.id, version_id=version.id, score=0.9),
+        hit(scope='private', owner='u1', skill_id=skill.id, version_id=version.id, score=0.5),
+        hit(scope='private', owner='u1', skill_id=other.id, version_id=other_version.id, score=0.4),
+    ]
+    harness.reranker = FakeReranker()
+    # 精排更偏好另一个技能：这不该让作者的公共副本冒出来。
+    harness.reranker.order = [1, 0]
+
+    outcome = await call(harness)
+
+    assert {item.scope for item in outcome.hits} == {'private'}
+    documents = harness.reranker.calls[0]
+    assert len(documents) == 2
+    assert any('PRIVATE-BODY-21' in document for document in documents)
+    # 公共副本的正文没有被送进精排，也就不可能被它排到前面。
+    assert not any('Public body' in document for document in documents)
+
+
+@pytest.mark.asyncio
+async def test_rerank_failure_falls_back_to_the_fused_order(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    alpha, alpha_version = await save_private(
+        harness, owner='u1', name='alpha', seq=1
+    )
+    beta, beta_version = await save_private(
+        harness, owner='u1', name='beta', seq=2
+    )
+    harness.projection.hits = [
+        hit(scope='private', owner='u1', skill_id=alpha.id, version_id=alpha_version.id, score=0.9),
+        hit(scope='private', owner='u1', skill_id=beta.id, version_id=beta_version.id, score=0.5),
+    ]
+    harness.reranker = FakeReranker()
+    harness.reranker.fail = True
+
+    outcome = await call(harness)
+
+    # 顺序回到融合/向量顺序；精排失败绝不能变成“没有结果”。
+    assert [item.skill.name for item in outcome.hits] == ['alpha', 'beta']
+    assert outcome.reranked is False
+    assert 'rerank_unavailable' in outcome.warnings
+
+
+@pytest.mark.asyncio
+async def test_rerank_documents_are_clipped_to_max_document_chars(
+    harness: Harness,
+) -> None:
+    long_body = '# 步骤 ' + '很长的正文 ' * 120
+    skill, version = await save_private(
+        harness,
+        owner='u1',
+        name='alpha',
+        description='换流站巡检',
+        body=long_body,
+        seq=1,
+    )
+    other, other_version = await save_private(harness, owner='u1', name='beta', seq=2)
+    harness.projection.hits = [
+        hit(scope='private', owner='u1', skill_id=skill.id, version_id=version.id, score=0.9),
+        hit(scope='private', owner='u1', skill_id=other.id, version_id=other_version.id, score=0.2),
+    ]
+    harness.reranker = FakeReranker()
+    # 200 是这个字段允许的最小值：不要再往小调，那是配置契约。
+    config = search_config(rerank=SkillRerankStageConfig(max_document_chars=200))
+
+    await call(harness, config=config)
+
+    [documents] = harness.reranker.calls
+    assert all(len(document) <= 200 for document in documents)
+    # 元数据在头部，必须留下：正文再长也不能把“这是什么技能”挤掉。
+    assert documents[0].startswith('alpha')
+    assert '换流站巡检' in documents[0]
 
 
 @pytest.mark.asyncio
