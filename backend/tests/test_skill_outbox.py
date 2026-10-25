@@ -446,6 +446,47 @@ async def test_reconcile_upserts_all_active_rows_and_deletes_orphan_keys(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_is_cheap_in_steady_state_and_repairs_real_drift(
+    harness: Harness,
+) -> None:
+    """对账不能每 10 分钟把整个目录重新 embedding 一遍。
+
+    稳态（key 在、版本 ready）= 0 次 upsert；真正漂移的三种情况必须修：
+    collection 被清空、事件丢了（版本一直 pending）、以及 --force 全量重刷。
+    """
+    skill, version = await save_skill(harness, owner="u1", name="one", seq=1)
+    key = f"private:u1:{skill.id}"
+
+    # 第一轮：pending → 建行 + 标 ready。
+    assert await harness.worker().reconcile() == 1
+    assert await version_status(harness, version.id) == "ready"
+    harness.projection.upserts.clear()
+    embedded = len(harness.embedder.calls)
+
+    # 稳态：什么都不做，尤其不重新 embedding。
+    assert await harness.worker().reconcile() == 0
+    assert harness.projection.upserts == []
+    assert len(harness.embedder.calls) == embedded
+
+    # collection 被清空：key 不在 Milvus 里了，必须补回来。
+    harness.projection.keys = []
+    harness.projection.rows = {}
+    assert await harness.worker().reconcile() == 1
+    assert [row.projection_key for row in harness.projection.upserts] == [key]
+
+    # 事件丢了 / 重试耗尽：版本状态不是 ready，必须重刷。
+    harness.projection.upserts.clear()
+    await harness.store.set_version_index_status(version.id, "pending")
+    assert await harness.worker().reconcile() == 1
+    assert await version_status(harness, version.id) == "ready"
+
+    # 运维手工修过 collection：--force 全量重刷，即使看起来是健康的。
+    harness.projection.upserts.clear()
+    assert await harness.worker().reconcile(force=True) == 1
+    assert [row.projection_key for row in harness.projection.upserts] == [key]
+
+
+@pytest.mark.asyncio
 async def test_prune_keeps_active_pending_and_recent_versions_only(
     harness: Harness, tmp_path: Path
 ) -> None:

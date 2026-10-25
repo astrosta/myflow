@@ -290,20 +290,36 @@ class SkillIndexOutboxWorker:
     # repair and retention
     # ------------------------------------------------------------------
 
-    async def reconcile(self) -> int:
+    async def reconcile(self, *, force: bool = False) -> int:
         """Make the projection equal the current active pointers.
 
-        Existing projection keys are read first, every current active row is
-        upserted, and every key without a current pointer is deleted.
+        Existing projection keys are read first, then every current active row
+        is checked against them, and every key without a current pointer is
+        deleted.
+
+        Steady state must be cheap: re-embedding the whole catalog every tick
+        would cost real money for no benefit, so a row is left alone when its
+        key already exists **and** its version is already indexed.  A key that
+        disappeared from Milvus, or a version that never reached ``ready``
+        (a lost outbox event, an exhausted retry, a wiped collection), is
+        repaired.  ``force=True`` redoes every row, for operator repair after
+        editing the collection by hand.
         """
         existing = await self._projection.list_projection_keys()
         sources = await self._store.list_active_visible()
         active_keys: set[str] = set()
+        present = set(existing)
         touched = 0
 
         for source in sources:
             key = _projection_key(source)
             active_keys.add(key)
+            if (
+                not force
+                and key in present
+                and source.version.index_status == _INDEX_READY
+            ):
+                continue
             try:
                 row = await _projection_row(self._content, self._embedder, source)
                 await self._projection.upsert_active(row)
@@ -327,11 +343,18 @@ class SkillIndexOutboxWorker:
             touched += 1
         return touched
 
-    async def prune(self, keep_versions_per_skill: int = 20) -> int:
+    async def prune(
+        self,
+        keep_versions_per_skill: int = 20,
+        *,
+        min_age_seconds: float = 0.0,
+    ) -> int:
         """Delete unreferenced commit caches and projection rows only.
 
         No PostgreSQL metadata is deleted.  The keep-set consists of the active
         pointers, pending outbox targets, and the newest N versions per skill.
+        ``min_age_seconds`` protects caches that only just lost their last
+        reference (skills.retention.cache_ttl_days).
         """
         keep = int(keep_versions_per_skill)
         if keep < 1:
@@ -363,7 +386,9 @@ class SkillIndexOutboxWorker:
             for version in skill_versions[:keep]:
                 _remember_commit(keep_commits, version.draft_commit)
 
-        removed = await self._content.prune(keep_commits)
+        removed = await self._content.prune(
+            keep_commits, min_age_seconds=min_age_seconds
+        )
         existing = await self._projection.list_projection_keys()
         keep_keys = active_keys | pending_keys
         for key in dict.fromkeys(existing):

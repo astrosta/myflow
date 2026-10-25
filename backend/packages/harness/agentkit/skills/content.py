@@ -12,6 +12,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
@@ -245,12 +246,22 @@ class SkillContentStore:
     # retention
     # ------------------------------------------------------------------
 
-    async def prune(self, keep_commits: set[str]) -> int:
-        return await asyncio.to_thread(self._prune_sync, set(keep_commits))
+    async def prune(
+        self, keep_commits: set[str], *, min_age_seconds: float = 0.0
+    ) -> int:
+        """删除不在保留集里的提交缓存；min_age_seconds 是安全期。
 
-    def _prune_sync(self, keep_commits: set[str]) -> int:
+        安全期对应 skills.retention.cache_ttl_days：刚变成“没人引用”的缓存不该
+        在下一轮清理里立刻被删——它通常只是刚被替换掉，回滚时还要用。
+        """
+        return await asyncio.to_thread(
+            self._prune_sync, set(keep_commits), float(min_age_seconds)
+        )
+
+    def _prune_sync(self, keep_commits: set[str], min_age_seconds: float) -> int:
         if not self.commits_dir.is_dir() or self.commits_dir.is_symlink():
             return 0
+        cutoff = time.time() - max(0.0, min_age_seconds)
         removed = 0
         with os.scandir(self.commits_dir) as entries:
             for entry in entries:
@@ -258,9 +269,31 @@ class SkillContentStore:
                     continue
                 if not entry.is_dir(follow_symlinks=False):
                     continue
+                if min_age_seconds > 0:
+                    try:
+                        newest = _newest_mtime(entry.path)
+                    except OSError:  # 读不到就当它还新：宁可少删
+                        continue
+                    if newest > cutoff:
+                        continue
                 shutil.rmtree(entry.path)
                 removed += 1
         return removed
+
+
+def _newest_mtime(root: str) -> float:
+    """子树里最新的 mtime：一个缓存目录只会被整棵写入或整棵替换。"""
+    newest = os.stat(root, follow_symlinks=False).st_mtime
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in (*dirnames, *filenames):
+            try:
+                mtime = os.stat(
+                    os.path.join(current, name), follow_symlinks=False
+                ).st_mtime
+            except OSError:
+                continue
+            newest = max(newest, mtime)
+    return newest
 
 
 __all__ = ["SkillContentStore"]

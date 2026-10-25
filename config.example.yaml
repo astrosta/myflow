@@ -258,11 +258,16 @@ skills:
     require_admin: true
     allow_self_approval: true
 
-  # Milvus active projection 的 outbox 与对账节奏。
+  # Milvus active projection 的 outbox、对账与清理节奏。
+  # outbox：状态变更在同一个 PG 事务里插一行“意图”，worker 异步把它变成 Milvus 的
+  #   active 行（幂等、可重试、过期事件自动跳过）。
+  # 对账：按 reconciliation_interval_minutes 周期跑，修事件丢失/重试耗尽/collection
+  #   被清空这类漂移；稳态下已经索引好的行不会被重新 embedding。
+  # 清理：同一轮里删掉没人引用的提交缓存，受 retention.cache_ttl_days 安全期保护。
   index:
-    outbox_poll_seconds: 2
-    catalog_poll_seconds: 5    # 跨 worker catalog epoch 轮询间隔；0 = 单 worker 不同步
-    reconciliation_interval_minutes: 10
+    outbox_poll_seconds: 2                 # worker 轮询：保存后最慢多久能被向量召回
+    catalog_poll_seconds: 5                # 跨 worker catalog epoch 轮询；0 = 单 worker 不同步
+    reconciliation_interval_minutes: 10    # 对账 + 清理的周期（分钟）
 
   # 可重建缓存的保留策略；元数据与公共历史永久保留。
   retention:

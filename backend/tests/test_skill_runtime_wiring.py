@@ -739,6 +739,146 @@ async def test_start_still_fails_when_the_catalog_cannot_be_read() -> None:
 
 
 # ---------------------------------------------------------------------------
+# index maintenance: reconciliation_interval_minutes actually schedules work
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RecordingOutbox(FakeOutbox):
+    """Records reconcile/prune so the sweeper can be asserted without Milvus."""
+
+    reconciled: int = 0
+    pruned: int = 0
+    keep: int | None = None
+    min_age_seconds: float | None = None
+    fail_with: Exception | None = None
+
+    async def reconcile(self, *, force: bool = False) -> int:
+        self.order.append("outbox.reconcile")
+        if self.fail_with is not None:
+            raise self.fail_with
+        return self.reconciled
+
+    async def prune(
+        self, keep_versions_per_skill: int = 20, *, min_age_seconds: float = 0.0
+    ) -> int:
+        self.order.append("outbox.prune")
+        self.keep = keep_versions_per_skill
+        self.min_age_seconds = min_age_seconds
+        return self.pruned
+
+
+@pytest.mark.asyncio
+async def test_one_sweep_reconciles_then_prunes_with_the_configured_keep() -> None:
+    order: list[str] = []
+    outbox = RecordingOutbox(order=order, reconciled=2, pruned=3)
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        review=None,
+        catalog=FakeCatalog(order=order),
+        outbox=outbox,
+        keep_versions_per_skill=7,
+        prune_min_age_seconds=86400.0,
+    )
+
+    assert await runtime.reconcile_projection_once() == (2, 3)
+    assert order == ["outbox.reconcile", "outbox.prune"]
+    assert outbox.keep == 7
+    # retention.cache_ttl_days 是分钟/秒换算后的安全期，必须真的传下去。
+    assert outbox.min_age_seconds == 86400.0
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_without_a_projection_has_nothing_to_reconcile() -> None:
+    runtime = SkillRuntime(
+        store=FakeStore(),
+        git=FakeGit(),
+        content=FakeContent(),
+        author=None,
+        review=None,
+        outbox=None,
+    )
+
+    assert await runtime.reconcile_projection_once() == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_index_maintenance_is_scheduled_and_stopped_with_the_runtime() -> None:
+    order: list[str] = []
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        review=None,
+        catalog=FakeCatalog(order=order),
+        outbox=FakeOutbox(order=order),
+        reconcile_interval_seconds=3600.0,
+    )
+
+    await runtime.start()
+    task = runtime._index_maintenance_task  # noqa: SLF001 - lifecycle assertion
+    assert task is not None
+    assert task.get_name() == "skill-index-maintenance"
+
+    await runtime.stop()
+    assert runtime._index_maintenance_task is None  # noqa: SLF001
+    assert task.cancelled() or task.done()
+
+
+@pytest.mark.asyncio
+async def test_index_maintenance_needs_a_projection_to_schedule() -> None:
+    order: list[str] = []
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        review=None,
+        catalog=FakeCatalog(order=order),
+        outbox=None,
+        reconcile_interval_seconds=60.0,
+    )
+
+    await runtime.start()
+
+    assert runtime._index_maintenance_task is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_failing_sweep_logs_and_keeps_the_loop_alive(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    order: list[str] = []
+    outbox = RecordingOutbox(order=order, fail_with=RuntimeError("milvus is down"))
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        review=None,
+        catalog=FakeCatalog(order=order),
+        outbox=outbox,
+        reconcile_interval_seconds=0.01,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=skills_catalog.__name__):
+        await runtime.start()
+        task = runtime._index_maintenance_task  # noqa: SLF001
+        assert task is not None
+        await asyncio.sleep(0.05)
+        assert not task.done(), "a failed sweep must not kill the loop"
+        await runtime.stop()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Skill index maintenance failed" in message for message in messages), messages
+    assert order.count("outbox.reconcile") >= 2
+
+
+# ---------------------------------------------------------------------------
 # a runtime that fails to start is torn down, not left half-installed
 # ---------------------------------------------------------------------------
 

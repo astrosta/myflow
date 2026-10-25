@@ -122,6 +122,15 @@ class SkillRuntime:
     outbox: Any = None
     projection: Any = None
     catalog_poll_seconds: float = 0.0
+    #: 对账 + 清理的周期（秒）；0 表示不排期。只有装了 projection/outbox 才有意义。
+    reconcile_interval_seconds: float = 0.0
+    #: prune 时每个技能保留多少个最近版本的提交缓存。
+    keep_versions_per_skill: int = 20
+    #: prune 的安全期：刚失去引用不到这么久的缓存先留着（retention.cache_ttl_days）。
+    prune_min_age_seconds: float = 0.0
+    _index_maintenance_task: asyncio.Task[None] | None = field(
+        default=None, init=False, repr=False
+    )
     _catalog_epoch: int | None = field(default=None, init=False, repr=False)
     _catalog_epoch_task: asyncio.Task[None] | None = field(
         default=None, init=False, repr=False
@@ -242,6 +251,16 @@ class SkillRuntime:
             self._catalog_epoch_task = asyncio.create_task(
                 self._catalog_epoch_loop(), name="skill-catalog-epoch"
             )
+        # 对账/清理排期：outbox 只是“尽力而为”的队列，事件丢失、重试耗尽、
+        # Milvus 被清空这些漂移不会自己好。没有排期，reconciliation_interval_minutes
+        # 就只是一行没人读的配置。
+        if self.outbox is not None and self.reconcile_interval_seconds > 0 and (
+            self._index_maintenance_task is None
+            or self._index_maintenance_task.done()
+        ):
+            self._index_maintenance_task = asyncio.create_task(
+                self._index_maintenance_loop(), name="skill-index-maintenance"
+            )
 
     async def _catalog_epoch_loop(self) -> None:
         """短轮询：失败只记日志，绝不悄悄杀死任务。"""
@@ -255,6 +274,56 @@ class SkillRuntime:
                     "Skill catalog epoch poll failed (%s: %s)", type(exc).__name__, exc
                 )
             await asyncio.sleep(self.catalog_poll_seconds)
+
+    async def reconcile_projection_once(self) -> tuple[int, int]:
+        """一轮对账 + 清理，返回（修复/删除的投影行数, 清掉的缓存目录数）。
+
+        对账修的是“Milvus 与 PostgreSQL 漂移”：事件丢了、重试耗尽了、collection
+        被清空了。清理删的是没被任何活指针/待处理事件/最近 N 版引用的提交缓存。
+        两者都不删 PostgreSQL 元数据，也不自己产生 embedding。
+        """
+        outbox = self.outbox
+        if outbox is None:
+            return (0, 0)
+        reconciled = await outbox.reconcile()
+        pruned = await outbox.prune(
+            self.keep_versions_per_skill, min_age_seconds=self.prune_min_age_seconds
+        )
+        if reconciled or pruned:
+            logger.info(
+                "Skill index maintenance: %s projection row(s) repaired, "
+                "%s cache entr(ies) pruned",
+                reconciled,
+                pruned,
+            )
+        return (reconciled, pruned)
+
+    async def _index_maintenance_loop(self) -> None:
+        """周期对账/清理；失败只记日志，绝不悄悄杀死任务。"""
+        while True:
+            # 先睡再跑：start() 刚 refresh() 过，启动那一刻没有对账的必要。
+            await asyncio.sleep(self.reconcile_interval_seconds)
+            try:
+                await self.reconcile_projection_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the sweep loop must survive
+                logger.warning(
+                    "Skill index maintenance failed (%s: %s)",
+                    type(exc).__name__,
+                    exc,
+                )
+
+    async def _stop_index_maintenance(self) -> None:
+        task = self._index_maintenance_task
+        self._index_maintenance_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def _stop_catalog_poller(self) -> None:
         task = self._catalog_epoch_task
@@ -275,6 +344,7 @@ class SkillRuntime:
         next get_skill_runtime() would hand that dead service to a request.
         """
         try:
+            await self._stop_index_maintenance()
             await self._stop_catalog_poller()
             if self.outbox is not None:
                 await self.outbox.stop()
@@ -437,6 +507,10 @@ def build_skill_runtime(
         outbox=outbox,
         projection=projection,
         catalog_poll_seconds=skills.index.catalog_poll_seconds,
+        # reconciliation_interval_minutes 是分钟，运行时按秒排期。
+        reconcile_interval_seconds=float(skills.index.reconciliation_interval_minutes) * 60.0,
+        keep_versions_per_skill=skills.retention.keep_versions_per_skill,
+        prune_min_age_seconds=float(skills.retention.cache_ttl_days) * 86400.0,
     )
 
 

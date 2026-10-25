@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -326,6 +328,34 @@ async def test_prune_removes_only_cache_directories_not_in_the_keep_set(
     assert not (commits / stale).exists()
     assert unrelated.read_bytes() == b"keep me"
     assert await content_fixture.content.prune({keep, stale}) == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_keeps_unreferenced_caches_inside_the_ttl_window(
+    content_fixture: ContentFixture,
+):
+    """retention.cache_ttl_days 是安全期：刚失去引用的缓存先别删。"""
+
+    keep = content_fixture.draft_one.commit
+    fresh = "2" * 40
+    old = "3" * 40
+    commits = content_fixture.cache_dir / "commits"
+    for name in (fresh, old):
+        (commits / name).mkdir(parents=True)
+        (commits / name / "SKILL.md").write_bytes(b"---\n")
+
+    # old 目录的最后修改时间被压到两天前：TTL 一天之外，可以删。
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(commits / old / "SKILL.md", (two_days_ago, two_days_ago))
+    os.utime(commits / old, (two_days_ago, two_days_ago))
+
+    assert await content_fixture.content.prune({keep}, min_age_seconds=86400) == 1
+    assert not (commits / old).exists()
+    assert (commits / fresh).is_dir()
+
+    # 安全期清零时，剩下那个也该被删。
+    assert await content_fixture.content.prune({keep}) == 1
+    assert not (commits / fresh).exists()
 
 @pytest.mark.asyncio
 async def test_existing_private_owners_lists_the_materialized_trees(
