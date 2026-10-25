@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 from agentkit.config.skills_config import (
     SkillEmbeddingChannelConfig,
+    SkillKeywordChannelConfig,
     SkillRerankStageConfig,
     SkillSearchConfig,
 )
@@ -422,8 +423,11 @@ async def test_other_users_private_hits_are_rejected(harness: Harness) -> None:
 
     outcome = await call(harness)
 
-    assert outcome == SkillSearchOutcome(hits=(), candidates=0, warnings=())
-    assert harness.content.reads == []
+    # 向量命中被 PG 确认阶段丢弃；词法通道只读调用方自己的可见正文，
+    # 所以这里一次 u2 的正文都没读，也没产生命中。
+    assert outcome.hits == ()
+    assert outcome.candidates == 0
+    assert not [read for read in harness.content.reads if "u2" in read[1]]
 
 
 @pytest.mark.asyncio
@@ -436,7 +440,9 @@ async def test_a_stale_active_version_is_dropped(harness: Harness) -> None:
     outcome = await call(harness)
 
     assert outcome.hits == ()
-    assert harness.content.reads == []
+    # 只读当前 active 版本的正文（BM25 通道），不会去读被替换掉的那个 commit。
+    stale_reads = [read for read in harness.content.reads if read[0] == 'stale']
+    assert stale_reads == []
 
 
 @pytest.mark.asyncio
@@ -458,6 +464,80 @@ async def test_public_hits_are_visible_to_another_user(harness: Harness) -> None
     assert loaded.release_id == release.id
     assert loaded.skill.name == "pdf-public"
     assert loaded.body.strip() == "# Public body"
+
+
+# ---------------------------------------------------------------------------
+# Task 22: BM25 is a parallel recall channel, fused with the vector channel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bm25_recall_adds_candidates_the_vector_search_missed(
+    harness: Harness,
+) -> None:
+    """报错原文只出现在正文里：向量没召回，BM25 也必须把它带回来。"""
+
+    lexical_only, lexical_version = await save_private(
+        harness,
+        owner='u1',
+        name='lexical-only',
+        description='与查询无语义相似度',
+        body='排查 pgvector 的 HNSW 参数',
+        seq=1,
+    )
+    dense_only, dense_version = await save_private(
+        harness, owner='u1', name='dense-only', description='向量召回', seq=2
+    )
+    harness.projection.hits = [
+        hit(scope='private', owner='u1', skill_id=dense_only.id, version_id=dense_version.id, score=0.9),
+    ]
+
+    outcome = await call(harness)
+
+    names = [item.skill.name for item in outcome.hits]
+    assert names[0] == 'dense-only' or 'lexical-only' in names
+    assert 'lexical-only' in names
+    assert outcome.channels == ('embedding', 'keyword')
+
+
+@pytest.mark.asyncio
+async def test_min_score_applies_to_the_normalised_fused_score(
+    harness: Harness,
+) -> None:
+    alpha, alpha_version = await save_private(
+        harness, owner='u1', name='alpha', body='pgvector 建索引', seq=1
+    )
+    # beta 只在向量通道出现（正文不含查询词），融合分数因此明显低于 alpha。
+    beta, beta_version = await save_private(
+        harness, owner='u1', name='beta', body='完全无关的正文', seq=2
+    )
+    harness.projection.hits = [
+        hit(scope='private', owner='u1', skill_id=alpha.id, version_id=alpha_version.id, score=0.9),
+        hit(scope='private', owner='u1', skill_id=beta.id, version_id=beta_version.id, score=0.4),
+    ]
+    config = search_config(min_score=0.9)
+
+    outcome = await call(harness, config=config)
+
+    # 融合分数归一化到最高分 1.0，min_score 仍然按 0..1 的直觉生效。
+    assert [item.skill.name for item in outcome.hits] == ['alpha']
+    assert outcome.hits[0].score == 1.0
+
+
+@pytest.mark.asyncio
+async def test_no_channel_available_returns_no_hits_with_reasons(
+    harness: Harness,
+) -> None:
+    await save_private(harness, owner='u1', name='alpha', seq=1)
+    harness.embedder.fail = True
+    config = search_config(keyword=SkillKeywordChannelConfig(enabled=False))
+
+    outcome = await call(harness, config=config)
+
+    assert outcome.hits == ()
+    assert outcome.candidates == 0
+    assert 'vector_unavailable' in outcome.warnings
+    assert outcome.channels == ()
 
 
 @pytest.mark.asyncio

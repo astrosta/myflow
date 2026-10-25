@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from agentkit.config.skills_config import SkillSearchConfig
 from agentkit.skills.content import SkillContentStore
@@ -77,6 +77,63 @@ class SkillSearchOutcome:
     warnings: tuple[str, ...]
     #: 终排是否真的由精排决定：工具把它回给模型，用来解释“为什么是它”。
     reranked: bool = False
+    #: 真正贡献了候选的召回通道（embedding / keyword），按固定顺序去重。
+    channels: tuple[str, ...] = ()
+
+
+CHANNEL_EMBEDDING = 'embedding'
+CHANNEL_KEYWORD = 'keyword'
+
+
+def _is_private(source: VisibleSkill) -> bool:
+    return _scope_value(source.scope) == SkillScope.PRIVATE.value
+
+
+def _fuse_ranked(
+    dense: Sequence[tuple[VisibleSkill, float]],
+    sparse: Sequence[tuple[VisibleSkill, float]],
+    *,
+    rrf_k: int,
+) -> list[tuple[VisibleSkill, float, tuple[str, ...]]]:
+    """RRF 融合两路名次；同一 skill_id 只留一条，私有副本胜出。
+
+    两路的名次各自给 1/(k + rank) 的分，然后**归一化到最高分为 1.0**，这样
+    min_score 仍然是配置里那个 0..1 语义（老 router 也是这么做的）。
+
+    去重发生在这里而不是两路内部：公共副本可能只被向量召回、私有副本只被
+    BM25 召回，先在合并处收敛到私有，才不会出现同一技能两条命中。
+    """
+
+    picked: dict[str, VisibleSkill] = {}
+    order: list[str] = []
+    channels: dict[str, list[str]] = {}
+    fused: dict[str, float] = {}
+    k = max(1, int(rrf_k))
+
+    for name, ranked in ((CHANNEL_EMBEDDING, dense), (CHANNEL_KEYWORD, sparse)):
+        for rank, (source, _score) in enumerate(ranked):
+            skill_id = source.version.skill_id
+            current = picked.get(skill_id)
+            if current is None:
+                picked[skill_id] = source
+                order.append(skill_id)
+                channels[skill_id] = []
+                fused[skill_id] = 0.0
+            elif _is_private(source) and not _is_private(current):
+                picked[skill_id] = source
+            fused[skill_id] += 1.0 / (k + rank + 1)
+            if name not in channels[skill_id]:
+                channels[skill_id].append(name)
+
+    if not order:
+        return []
+    best = max(fused.values())
+    scored = [
+        (picked[skill_id], fused[skill_id] / best, tuple(channels[skill_id]))
+        for skill_id in order
+    ]
+    scored.sort(key=lambda item: (-item[1], item[0].skill.name, item[0].version.skill_id))
+    return scored
 
 
 def _rerank_text(skill: Skill, body: str, max_chars: int) -> str:
@@ -203,97 +260,65 @@ class SkillSearchService:
 
         private_skill_ids = await self._private_skill_ids(user_id)
         warnings: list[str] = []
-        vector = await self._query_vector(query)
-        if vector is None:
-            warnings.append(VECTOR_UNAVAILABLE)
-            return await self._lexical(
-                user_id=user_id,
-                query=query,
-                domain_keywords=domain_keywords,
-                available_skills=available_skills,
-                prefs=prefs,
-                warnings=warnings,
+        dense = await self._dense_ranked(
+            user_id=user_id,
+            query=query,
+            private_skill_ids=private_skill_ids,
+            available_skills=available_skills,
+            prefs=prefs,
+            warnings=warnings,
+        )
+        sparse = await self._sparse_ranked(
+            user_id=user_id,
+            query=query,
+            domain_keywords=domain_keywords,
+            available_skills=available_skills,
+            prefs=prefs,
+            warnings=warnings,
+        )
+        if not dense and not sparse:
+            return SkillSearchOutcome(
+                hits=(), candidates=0, warnings=tuple(dict.fromkeys(warnings))
+            )
+        if not dense:
+            # 只剩词法通道：老名字保留，工具靠它解释“为什么没有向量”。
+            warnings.append(LEXICAL_FALLBACK)
+
+        fused = _fuse_ranked(dense, sparse, rrf_k=self._config.rrf_k)
+        if self._config.min_score is not None:
+            fused = [item for item in fused if item[1] >= self._config.min_score]
+        if not fused:
+            return SkillSearchOutcome(
+                hits=(), candidates=0, warnings=tuple(dict.fromkeys(warnings))
             )
 
-        if self._projection is None:  # 没有投影 = 只跑词法通道，绝不猜
-            warnings.append(VECTOR_UNAVAILABLE)
-            return await self._lexical(
-                user_id=user_id,
-                query=query,
-                domain_keywords=domain_keywords,
-                available_skills=available_skills,
-                prefs=prefs,
-                warnings=warnings,
-            )
-
-        try:
-            hits = await self._projection.search(
-                user_id=user_id,
-                private_skill_ids=private_skill_ids,
-                vector=vector,
-                limit=self._config.candidate_k,
-            )
-        except Exception as exc:  # noqa: BLE001 - the lexical channel is the fallback
-            logger.warning(
-                "Skill projection search failed (%s); using lexical scoring",
-                type(exc).__name__,
-            )
-            warnings.append(VECTOR_UNAVAILABLE)
-            return await self._lexical(
-                user_id=user_id,
-                query=query,
-                domain_keywords=domain_keywords,
-                available_skills=available_skills,
-                prefs=prefs,
-                warnings=warnings,
-            )
-
-        try:
-            confirmed = await self._store.confirm_hits(user_id, hits)
-        except Exception as exc:  # noqa: BLE001 - never fall back to unconfirmed rows
-            raise SkillSearchUnavailable(
-                "skills catalog confirmation is unavailable"
-            ) from exc
-
-        scores: dict[tuple[str, str, str], float] = {}
-        for hit in hits:
-            key = (_scope_value(hit.scope), hit.skill_id, hit.version_id)
-            scores[key] = max(scores.get(key, 0.0), float(hit.score))
-
-        chosen = _prefer_private(confirmed)
-        candidates = len(chosen)
+        channels = (
+            CHANNEL_EMBEDDING if dense else None,
+            CHANNEL_KEYWORD if sparse else None,
+        )
+        # candidates 是“召回规模”：个人偏好/白名单在装载前才生效，它们不该让
+        # 调用方以为只召回了一条。
+        candidates = len(fused)
+        head = fused[: max(1, self._config.candidate_k)]
         ordered = [
-            (
-                source,
-                scores.get(
-                    (
-                        _scope_value(source.scope),
-                        source.version.skill_id,
-                        source.version.id,
-                    ),
-                    0.0,
-                ),
-            )
-            for source in chosen
+            (source, score)
+            for source, score, _names in head
             if _allows(source.skill, available_skills, prefs)
         ]
-        ordered.sort(
-            key=lambda item: (
-                -item[1],
-                item[0].skill.name,
-                item[0].version.skill_id,
-            )
-        )
         bodies: dict[str, str] = {}
         ordered, reranked = await self._rerank_candidates(
             query=query, ordered=ordered, bodies=bodies, warnings=warnings
         )
-        return await self._load(
+        outcome = await self._load(
             ordered,
             candidates=candidates,
             warnings=warnings,
             bodies=bodies or None,
             reranked=reranked,
+        )
+        return replace(
+            outcome,
+            channels=tuple(name for name in channels if name is not None),
         )
 
     # ------------------------------------------------------------------
@@ -321,7 +346,71 @@ class SkillSearchService:
             return None
         return vector or None
 
-    async def _lexical(
+    async def _dense_ranked(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        private_skill_ids: tuple[str, ...],
+        available_skills: frozenset[str] | None,
+        prefs: Mapping[str, bool] | None,
+        warnings: list[str],
+    ) -> list[tuple[VisibleSkill, float]]:
+        """稠密通道：一次 query embedding + 一次 Milvus search + 一次 PG 确认。
+
+        没有向量能力（未配置、embedding 失败、没有投影）或 Milvus 报错时返回空
+        列表并记 vector_unavailable——空列表不是“没有结果”，词法通道还会给候选。
+        """
+        vector = await self._query_vector(query)
+        if vector is None or self._projection is None:
+            warnings.append(VECTOR_UNAVAILABLE)
+            return []
+        try:
+            hits = await self._projection.search(
+                user_id=user_id,
+                private_skill_ids=private_skill_ids,
+                vector=vector,
+                limit=self._config.candidate_k,
+            )
+        except Exception as exc:  # noqa: BLE001 - the lexical channel still answers
+            logger.warning(
+                "Skill projection search failed (%s); using lexical scoring",
+                type(exc).__name__,
+            )
+            warnings.append(VECTOR_UNAVAILABLE)
+            return []
+        try:
+            confirmed = await self._store.confirm_hits(user_id, hits)
+        except Exception as exc:  # noqa: BLE001 - never fall back to unconfirmed rows
+            raise SkillSearchUnavailable(
+                "skills catalog confirmation is unavailable"
+            ) from exc
+
+        scores: dict[tuple[str, str, str], float] = {}
+        for hit in hits:
+            key = (_scope_value(hit.scope), hit.skill_id, hit.version_id)
+            scores[key] = max(scores.get(key, 0.0), float(hit.score))
+
+        ranked = [
+            (
+                source,
+                scores.get(
+                    (
+                        _scope_value(source.scope),
+                        source.version.skill_id,
+                        source.version.id,
+                    ),
+                    0.0,
+                ),
+            )
+            for source in _prefer_private(confirmed)
+        ]
+        ranked.sort(
+            key=lambda item: (-item[1], item[0].skill.name, item[0].version.skill_id)
+        )
+        return ranked
+
+    async def _sparse_ranked(
         self,
         *,
         user_id: str,
@@ -330,25 +419,26 @@ class SkillSearchService:
         available_skills: frozenset[str] | None,
         prefs: Mapping[str, bool] | None,
         warnings: list[str],
-    ) -> SkillSearchOutcome:
-        warnings.append(LEXICAL_FALLBACK)
+    ) -> list[tuple[VisibleSkill, float]]:
+        """稀疏通道：对 PG 可见集合做本地 BM25（读正文，不依赖任何外部服务）。
+
+        正文是“报错原文 / 库名 / 命令”唯一能被字面命中的地方，所以这条通道不是
+        兜底，而是和向量并行的一路；读不出正文只丢该候选，不影响整体。
+        """
+        if not self._config.keyword.enabled:
+            return []
         try:
             visible = await self._store.visible_for_user(user_id)
         except Exception as exc:  # noqa: BLE001 - fail closed, not fail open
             raise SkillSearchUnavailable("skills catalog is unavailable") from exc
 
         chosen = _prefer_private(visible)
-        candidates = len(chosen)
-        bodies: dict[str, str] = {}
         documents: list[SkillDocument] = []
         for source in chosen:
-            if not _allows(source.skill, available_skills, prefs):
-                continue
             body = await self._read_body(source)
             if body is None:
                 warnings.append(CONTENT_UNAVAILABLE)
                 continue
-            bodies[source.version.skill_id] = body
             documents.append(_document(source.skill, body))
 
         scores = lexical_scores(
@@ -366,22 +456,11 @@ class SkillSearchService:
                 item[0].skill.skill_id or "",
             ),
         )
-        ordered = [
+        return [
             (by_id[document.skill.skill_id], score)
             for document, score in ranked
             if score > 0 and document.skill.skill_id is not None
         ]
-        # 词法兜底也走同一段终排：这条路上正文已经在手里，精排是免费的精度。
-        ordered, reranked = await self._rerank_candidates(
-            query=query, ordered=ordered, bodies=bodies, warnings=warnings
-        )
-        return await self._load(
-            ordered,
-            candidates=candidates,
-            warnings=warnings,
-            bodies=bodies,
-            reranked=reranked,
-        )
 
     async def _rerank_candidates(
         self,

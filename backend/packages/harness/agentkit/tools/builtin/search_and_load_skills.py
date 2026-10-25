@@ -213,7 +213,10 @@ async def _search_catalog(
 
 def _catalog_payload(outcome: SkillSearchOutcome) -> dict:
     """与文件系统模式同一 payload 形状，外加 scope/version_id/release_id。"""
-    channels = ["keyword"] if "lexical_fallback" in outcome.warnings else ["embedding"]
+    # 通道来自检索结果本身（谁真的召回到了候选），不再从 warning 反推。
+    channels = list(outcome.channels) or (
+        ["keyword"] if "lexical_fallback" in outcome.warnings else ["embedding"]
+    )
     skills: list[dict] = []
     for hit in outcome.hits:
         skill = hit.skill
@@ -238,7 +241,7 @@ def _catalog_payload(outcome: SkillSearchOutcome) -> dict:
         "retrieval": {
             "channels": list(channels),
             "candidates": outcome.candidates,
-            "reranked": False,
+            "reranked": outcome.reranked,
             "warnings": list(outcome.warnings),
             "skipped": [],
         },

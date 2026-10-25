@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
@@ -27,6 +28,9 @@ from agentkit.skills.package import validate_skill_path
 
 _HEX = frozenset("0123456789abcdefABCDEF")
 _SKILL_FILE = "SKILL.md"
+
+#: 正文 LRU 容量。提交不可变，(commit, path) → 文本可以长期复用。
+_TEXT_CACHE_MAX = 512
 
 
 def _validate_commit_id(commit: str) -> str:
@@ -90,6 +94,9 @@ class SkillContentStore:
         self.git = git
         self.commits_dir = self.cache_dir / "commits"
         self.active_dir = self.cache_dir / "active"
+        # 正文 LRU：提交内容不可变，BM25 通道每次检索都要读可见集合的正文，
+        # 没有这层缓存就是 O(可见技能数) 次磁盘读。
+        self._text_cache: OrderedDict[tuple[str, str], str] = OrderedDict()
 
     # ------------------------------------------------------------------
     # commit cache
@@ -127,7 +134,17 @@ class SkillContentStore:
         return target
 
     async def read_text(self, commit: str, path: str) -> str:
-        return (await self.read_bytes(commit, path)).decode("utf-8")
+        """读一个提交里的文本文件；命中 LRU 就不碰磁盘。"""
+        key = (commit.lower(), path)
+        cached = self._text_cache.get(key)
+        if cached is not None:
+            self._text_cache.move_to_end(key)
+            return cached
+        text = (await self.read_bytes(commit, path)).decode("utf-8")
+        self._text_cache[key] = text
+        if len(self._text_cache) > _TEXT_CACHE_MAX:
+            self._text_cache.popitem(last=False)
+        return text
 
     async def read_bytes(self, commit: str, path: str) -> bytes:
         source = _validate_commit_id(commit)

@@ -358,6 +358,30 @@ async def test_prune_keeps_unreferenced_caches_inside_the_ttl_window(
     assert not (commits / fresh).exists()
 
 @pytest.mark.asyncio
+async def test_a_second_text_read_is_served_from_the_lru(
+    content_fixture: ContentFixture,
+):
+    """BM25 通道每次检索都读可见集合的正文：第二次读不该再碰磁盘。"""
+
+    commit = content_fixture.draft_one.commit
+    reads: list[tuple[str, str]] = []
+    original = content_fixture.content.read_bytes
+
+    async def counting_read_bytes(commit_id: str, path: str) -> bytes:
+        reads.append((commit_id, path))
+        return await original(commit_id, path)
+
+    content_fixture.content.read_bytes = counting_read_bytes  # type: ignore[method-assign]
+
+    path = 'users/u1/s1/SKILL.md'
+    first = await content_fixture.content.read_text(commit, path)
+    second = await content_fixture.content.read_text(commit, path)
+
+    assert first == second
+    assert len(reads) == 1
+
+
+@pytest.mark.asyncio
 async def test_existing_private_owners_lists_the_materialized_trees(
     content_fixture: ContentFixture,
 ):
