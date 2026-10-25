@@ -32,6 +32,9 @@
 - An outbox event older than the current active pointer must not overwrite the newer projection.
 - Approval must reject a submission whose submitted_commit no longer contains the submitted package hash.
 - A Git commit that succeeds before a PostgreSQL failure must leave no active pointer and must be safely retried.
+- 精排（Task 21）只能重排已经按 skill_id 去重过的集合：它不得让作者的公共副本排到自己的私有副本前面。
+- BM25 通道（Task 22）读正文但不得改变可见性：个人偏好、agent 白名单、全局开关仍由 PostgreSQL 判定。
+- 改嵌入文本（Task 23）必须配一次强制重建；对账在稳态会跳过健康行，所以旧向量不会自愈。
 
 ---
 
@@ -1204,12 +1207,155 @@ git add frontend/src/app/workspace/admin/skills/page.tsx frontend/src/components
 git commit -m "feat(frontend): add admin review and skills navigation"
 ~~~
 
+## Phase 2：检索漏斗（M11.1）
+
+Tasks 1-20 shipped a working catalog whose retrieval is **单通道**：向量命中 → PG 确认 →
+按 Milvus 分数排序；BM25 只是降级兜底（`search.py::_lexical` 仅在向量不可用时运行），
+精排（`skills.search.rerank`）在 catalog 模式下完全没接。Phase 2 把它改成设计 §7.4 的
+三阶段漏斗：**元数据向量召回 → 正文 BM25 召回 → 正文精排**。
+
+顺序不能颠倒：先接精排（纯增益，不动召回），再加 BM25 融合（改召回，需要观测），最后
+才改嵌入文本（让全部存量向量失效，必须配强制重建）。
+
+### Task 21: Rerank 接线（不动召回，先拿精度）
+
+**Files:**
+- Modify: backend/packages/harness/agentkit/skills/search.py
+- Modify: backend/app/gateway/skills_catalog.py
+- Test: backend/tests/test_skill_search_service.py
+
+**Interfaces:**
+- `SkillSearchService.__init__(..., reranker: Reranker | None = None)`；`Reranker` 协议
+  已在 `skills/router.py` 定义（`rerank(*, query, documents)`）。
+- `build_skill_runtime` 按 `skills.search.rerank.enabled` 构建 reranker（复用
+  `agentkit.knowledge` 的 cohere/tei 客户端），未启用时为 None。
+- 精排发生在 `_prefer_private` 去重**之后**、`_load` **之前**；文档是正文截断到
+  `rerank.max_document_chars`；失败回退融合顺序并记 `rerank_unavailable`。
+
+- [ ] **Step 1: Write the failing tests**
+
+~~~python
+async def test_rerank_reorders_confirmed_candidates_using_bodies(harness):
+    # 向量分数把 A 排第一，但精排说 B 更相关 → B 进 top_k 第一
+async def test_rerank_never_reorders_a_private_copy_below_the_public_one(harness):
+    # 同一 skill_id 的公共/私有副本：去重后再精排，结果只有私有
+async def test_rerank_failure_falls_back_to_the_fused_order(harness, caplog):
+    # reranker 抛错 → 顺序不变 + warning + 仍返回结果
+async def test_rerank_documents_are_clipped_to_max_document_chars(harness):
+~~~
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: uv run python -m pytest backend/tests/test_skill_search_service.py -v
+
+- [ ] **Step 3: Wire the reranker and the clipping**
+
+- [ ] **Step 4: Run the regression**
+
+Run: uv run python -m pytest backend/tests/test_skill_search_service.py backend/tests/test_skill_runtime_wiring.py backend/tests/test_search_and_load_skills_tool.py backend/tests/test_skill_catalog_e2e.py -v
+
+- [ ] **Step 5: Commit**
+
+~~~bash
+git commit -m "feat(skills): rerank skill candidates on their bodies"
+~~~
+
+### Task 22: BM25 变成并行通道 + RRF 融合
+
+**Files:**
+- Modify: backend/packages/harness/agentkit/skills/search.py
+- Modify: backend/packages/harness/agentkit/skills/content.py（正文 LRU 缓存）
+- Test: backend/tests/test_skill_search_service.py
+
+**Interfaces:**
+- 稀疏召回用 `_document(skill, body)` + `lexical_scores(...)`，输入是 PG 可见集合；
+  正文按 `(commit, path)` 做进程内 LRU，避免每次检索 O(可见技能数) 次磁盘读。
+- 融合：私有去重后，两路名次按 `search.rrf_k` 做 RRF；`min_score` 作用在融合分数上；
+  `SearchOutcome.channels` 报告真实命中的通道，`warnings` 区分
+  `lexical_unavailable` / `vector_unavailable`。
+- 两路都不可用 → 空结果 + 原因（fail-safe，不返回未排序候选）。
+
+- [ ] **Step 1: Write the failing tests**
+
+~~~python
+async def test_bm25_and_vector_scores_are_fused_with_rrf(harness):
+    # 只在正文里出现的报错原文，BM25 命中、向量不命中 → 融合后进入 top_k
+async def test_a_body_read_is_served_from_the_lru_on_the_second_query(harness):
+async def test_min_score_applies_to_the_fused_score(harness):
+async def test_both_channels_down_returns_no_hits_with_reasons(harness):
+~~~
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: uv run python -m pytest backend/tests/test_skill_search_service.py -v
+
+- [ ] **Step 3: Implement the sparse channel, the LRU, and the fusion**
+
+- [ ] **Step 4: Run the regression**
+
+Run: uv run python -m pytest backend/tests/test_skill_search_service.py backend/tests/test_skill_catalog_e2e.py backend/tests/test_search_and_load_skills_tool.py -v
+
+- [ ] **Step 5: Commit**
+
+~~~bash
+git commit -m "feat(skills): fuse BM25 body recall with the vector channel"
+~~~
+
+### Task 23: 嵌入文本改为 name + description，并加管理员重建
+
+**Files:**
+- Modify: backend/packages/harness/agentkit/skills/outbox.py（`_projection_row` 的文本）
+- Modify: backend/app/gateway/routers/skill_reviews.py 或 skills_catalog.py（reindex 路由）
+- Modify: backend/app/gateway/skills_catalog.py（路由注册、审计）
+- Test: backend/tests/test_skill_outbox.py, backend/tests/test_skills_catalog_routes.py
+
+**Interfaces:**
+- 投影文本 = `{name}\n{description}`，正文不再参与 embedding（设计 §7.2）。
+- `POST /api/admin/skills/reindex`：`skills:write` + 审计，语义 `reconcile(force=True)`，
+  返回 `{reconciled, deleted}`；没有运行时 → 503 `skill_runtime_unavailable`。
+- 代码里记 `PROJECTION_TEXT_VERSION`，写进日志与 reindex 响应，便于运维核对重建是否做过。
+
+- [ ] **Step 1: Write the failing tests**
+
+~~~python
+async def test_projection_text_is_name_and_description_only(harness):
+    # 正文改动不改变 embedded text；描述改动才改变
+async def test_admin_reindex_forces_a_full_reprojection(harness, client):
+    # 健康的行也被重写；多余 key 被删除；审计一条
+async def test_reindex_requires_admin_and_a_runtime(client):
+~~~
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: uv run python -m pytest backend/tests/test_skill_outbox.py backend/tests/test_skills_catalog_routes.py -v
+
+- [ ] **Step 3: Implement the text change and the admin reindex route**
+
+- [ ] **Step 4: Run the regression**
+
+Run: uv run python -m pytest backend/tests/test_skill_outbox.py backend/tests/test_skills_catalog_routes.py backend/tests/test_skill_search_service.py backend/tests/test_skill_catalog_e2e.py backend/tests/test_skill_review_routes.py -v
+
+- [ ] **Step 5: Commit**
+
+~~~bash
+git commit -m "feat(skills): embed skill metadata and add an admin reindex"
+~~~
+
+### Phase 2 部署步骤
+
+1. 部署代码（此时检索行为与现在一致，只是多了精排/融合）；
+2. 观察 `search_and_load_skills` 的命中质量与延迟；
+3. 换模型或换嵌入文本后，调一次 `POST /api/admin/skills/reindex`；不调的话旧向量会一直
+   留在 `myflow_skills_active`（对账在稳态会跳过健康行）；
+4. 回滚代码不需要重建：旧代码读的仍是同一批向量字段。
+
 ## Self-Review
 
 - Spec coverage: tasks 1-16 cover schema, Git, staging, author/review, active projection, outbox, one-query search, snapshot, sandbox, API, cutover; tasks 17-20 cover the author and admin UI.
 - Review Focus tests: private isolation is covered by tasks 8, 12, 14, 15; one-query private precedence by task 12; outbox stale guard by task 11; approval hash freeze by task 7; Git-before-PG failure by tasks 6/7.
 - Type consistency: version_id is the only globally unique version key; skill_version is always paired with skill_id; projection_key is the active row key; submitted_commit is the reviewed commit.
 - Deliberate builder choices: one shared Git repository with per-user draft refs; global immutable catalog snapshot with per-user view; one OR Milvus search with private skill_id exclusion; no public fallback when a private projection is missing; public_name immutable after approval.
+- Phase 2（tasks 21-23）把检索从“向量单通道 + BM25 兜底”改成设计 §7.4 的三阶段漏斗：元数据向量召回、正文 BM25 召回、正文精排；嵌入文本只保留 name + description，代价是召回天花板取决于描述质量，由 BM25 正文通道与精排补偿。
 
 ## Execution Handoff
 

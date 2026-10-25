@@ -584,12 +584,27 @@ Milvus collection 默认名 myflow_skills_active。它**不是全量版本索引
 ~~~
 {name}
 {description}
-
-{SKILL.md body}
 ~~~
 
-附件不进入 embedding；它们在正文里被引用。正文超限时按 tokenizer 截断并记录 warning；
-完整正文仍从 Git 缓存读取。
+只有**作者手写的元数据**参与 embedding，正文不参与。理由：
+
+- 元数据是作者对“这个技能处理什么任务”的摘要，正是语义入口；
+- 正文每次改动都会变，嵌正文等于每次保存都重新 embedding 一次，成本高且噪声大；
+- 正文可能超出 embedding 的 max_input_tokens，超限时整条索引失败
+  （index_status=failed）而不是截断；嵌元数据从结构上消除了这条失败路径。
+
+正文不进向量，进的是另外两段：BM25 词法召回（§7.4 步骤 5）读正文，精排（§7.4
+步骤 7）也读正文。归纳成一句：**语义召回靠元数据，字面召回与终排靠正文。**
+
+代价是召回天花板取决于 description 的质量。因此创建/编辑界面必须把“适用任务 +
+关键工具/库名/报错词”写进描述引导里；系统提示词索引展示的同样是 name + description，
+两处口径因此一致。
+
+附件不进入 embedding，也不进入召回；它们只在正文里被引用。正文的用量由两个预算
+分别约束：max_body_chars 管“装载进上下文”，max_document_chars 管“送进精排”。
+
+> 改这一段的语义（换成嵌正文、改前缀格式、换模型）等于让全部存量向量失效，必须配
+> 一次强制重建，见 §7.6。
 
 ### 7.3 可见性和冲突规则
 
@@ -615,10 +630,13 @@ Milvus collection 默认名 myflow_skills_active。它**不是全量版本索引
 
 ### 7.4 检索顺序
 
-1. 生成 query embedding；
+三阶段漏斗：**稠密召回（元数据向量）→ 稀疏召回（正文 BM25）→ 精排（正文**
+**cross-encoder）**。每一段都只做自己最擅长的事，越贵越靠后。
+
+1. 生成 query embedding（只生成一次），查询文本是模型的 task_query；
 2. 从当前用户快照读取私有 active 的 skill_id 集合（数量受草稿配额限制，通常很小；
    不需要额外 DB 查询）；
-3. Milvus **一次 search**，过滤表达式：
+3. **稠密召回**：Milvus **一次 search**，过滤表达式：
    ~~~
    (scope == "public" and enabled == true and skill_id not in [...私有 skill_id...])
    or (scope == "private" and owner_user_id == 当前用户)
@@ -629,10 +647,22 @@ Milvus collection 默认名 myflow_skills_active。它**不是全量版本索引
    - 私有：skill_private_active.owner_user_id=当前用户且 version_id 命中；
    - 版本 hash、skill_id、skill_version 一致；
    - 个人偏好、agent 白名单通过；
-5. 丢弃失效命中；从 Git 缓存读取正文并校验 hash，读不出来的候选也丢弃；
-6. 按 score 排序；按 skill_id 防御性去重（私有优先），取 top_k，按预算装载；
-7. 返回 skill_id、name、scope、skill_version、version_id、git_commit、skill_path、
-   release_id（公共）、score 和 warning。
+   丢弃失效命中。Milvus 只是候选来源，确认之后才存在“技能”，这一步不能省。
+5. **稀疏召回**：对同一份 PG 可见集合做本地 BM25（正文 + name + description），
+   得分来自 keyword 通道配置。正文从 Git 缓存读，按 (commit, path) 做进程内 LRU，
+   避免每次检索都 O(可见技能数) 次磁盘读；读不出正文的候选丢弃并记 warning。
+6. **合并**：按 skill_id 防御性去重（私有优先，无条件），再对两路各自的名次做 RRF
+   融合（rrf_k）。融合分数只用于排序，不改变可见性；min_score 作用在融合分数上。
+7. **精排**：对融合后的前 candidate_k 个候选，用正文（截断到 max_document_chars）
+   送 cross-encoder rerank，得到终排。精排只重排**已去重**的集合，因此不可能把作者
+   的公共副本排到自己的私有副本前面。
+8. 取 top_k，按 max_body_chars / max_context_chars 预算装载正文；
+9. 返回 skill_id、name、scope、skill_version、version_id、git_commit、skill_path、
+   release_id（公共）、score、命中的通道和 warning。
+
+代价与取舍：BM25 要覆盖正文就必须读到正文，这是这条链上唯一随目录规模增长的开销
+（步骤 5 的 LRU 是它的对冲）；精排是每次检索一次网络往返（约 2×候选数 × 4k 字符），
+换来的是“只往上下文里装 top_k 个正文”时的命中率。两者都比“装错技能、走错流程”便宜。
 
 这里仍然只有一次 Milvus search，query embedding 也只生成一次。私有分支用
 `owner_user_id == 当前用户` 过滤；公共分支用 `skill_id not in [我的私有 skill_id]`
@@ -646,14 +676,36 @@ Milvus collection 默认名 myflow_skills_active。它**不是全量版本索引
 
 ### 7.5 降级
 
-- Milvus/embedding 不可用：使用本地 BM25 降级，输入是 PG 的公共 + 本人私有 active 集；
+- 精排不可用（超时/5xx/协议错误）：跳过步骤 7，直接用融合顺序，返回 rerank_unavailable
+  并记 warning；精排永远不阻断检索，也不改变可见性；
+- 向量通道不可用（embedding 或 Milvus）：跳过步骤 1/3/4，只用 BM25 对 PG 可见集合排序，
   返回 lexical_fallback 和 vector_unavailable，并按同一套私有优先规则去重；
+  因为 BM25 读的是正文，这条路仍然能命中“报错原文/库名”类查询；
+- BM25 通道异常（正文读不出）：只用向量分数排序，返回 lexical_unavailable；
+  全部通道都不可用时 fail-safe：返回空结果和原因，不返回未排序的候选；
 - PostgreSQL 不可用：fail-closed，不返回任何未确认的命中；
 - 内容缓存丢失：从 Git mirror 按 commit 重导出；失败则丢弃该条；
 - active projection 缺失/过期：outbox 重试和对账任务修复；修复前检索可能少结果，
   prompt/slash 仍可用；
 - 个人偏好关闭的公共技能可能占用候选名额；candidate_k 允许过采样，确认阶段丢弃；
 - 所有降级显式返回，不静默隐藏。
+
+### 7.6 投影文本版本与强制重建
+
+投影行是**派生数据**，唯一让它失效的方式是重新 embedding。因此 embedding 文本的
+语义变更（§7.2 的格式、模型、维度）必须视为一次数据迁移，而不是一次代码改动。
+
+- 代码里维护一个 PROJECTION_TEXT_VERSION；它与某个 active 版本的“已索引文本版本”
+  不一致时，该行的可检索性是未知的；
+- 下面三种情况都会让存量向量失去意义：改嵌入文本、换 embedding 模型、换维度。
+  三者都必须走**全量重建**，不能依赖 outbox（outbox 只处理新的状态变更）；
+- 对账任务在稳态下会跳过“key 在 Milvus 且版本 ready”的行（这是为了不每十分钟
+  重嵌整个目录），所以**只改代码不会自愈**：必须显式触发重建；
+- 提供管理员入口 POST /api/admin/skills/reindex（skills:write + 审计），语义是
+  reconcile(force=True)：重建全部 active 行、删除多余 key、把版本 index_status 置回
+  ready；返回修复/删除计数。运维在换模型或换文本格式后调用一次即可；
+- 重建期间检索仍然可用：旧向量与新向量在 collection 里共存，Milvus 只是候选来源，
+  最终仍由 PG 确认；重建完成后旧行被覆盖或删除。
 
 ## 8. 运行时快照与沙箱隔离
 
@@ -813,16 +865,25 @@ skills:
     allow_self_approval: true
 
   index:
-    outbox_poll_seconds: 2
-    reconciliation_interval_minutes: 10
+    outbox_poll_seconds: 2          # worker 轮询间隔
+    catalog_poll_seconds: 5         # 跨 worker epoch 轮询；0 = 单 worker
+    reconciliation_interval_minutes: 10   # 对账 + 清理周期
 
   search:
     enabled: true
-    candidate_k: 20
+    candidate_k: 20                 # 每路召回交给融合的候选数，也是精排上限
     top_k: 3
-    max_body_chars: 6000
+    rrf_k: 60                       # 向量名次与 BM25 名次的融合常数
+    min_score: null                 # 作用在融合分数上；null = 不过滤
+    max_body_chars: 6000            # 装载进上下文的单个正文预算
     max_context_chars: 12000
-    embedding:
+    keyword:                        # 稀疏通道：读正文，本地 BM25
+      enabled: true
+      bm25_k1: 1.2
+      bm25_b: 0.75
+      keyword_weight: 2.0
+      name_weight: 3.0
+    embedding:                      # 稠密通道：只嵌 name + description（§7.2）
       enabled: true
       base_url: "$EMBEDDING_BASE_URL"
       path: /embeddings
@@ -837,15 +898,27 @@ skills:
       metric_type: COSINE
       index_type: AUTOINDEX
       consistency_level: Strong
-    lexical_fallback:
-      enabled: true
+    rerank:                         # 终排：读正文的 cross-encoder
+      enabled: false                # 打开时 base_url 与 model 必填
+      protocol: cohere              # cohere | tei
+      base_url: "$RERANK_BASE_URL"
+      path: /rerank
+      api_key: "$RERANK_API_KEY"
+      model: Qwen/Qwen3-Reranker-8B
+      max_document_chars: 4000      # 送进精排的单个正文上限
+      timeout_seconds: 30
+      max_retries: 1
 
   retention:
     keep_versions_per_skill: 20
     cache_ttl_days: 30
 ~~~
 
-- search.enabled=true 时 embedding.base_url 和 vector_store.uri 必填；
+- search.enabled=true 时 embedding.base_url 和 vector_store.uri 必填；关掉向量后
+  检索仍有 BM25 通道（只依赖 PG + Git 缓存，不需要任何外部服务）；
+- keyword.enabled=false 且 embedding.enabled=false 时 search 退化为“没有任何召回通道”，
+  启动时直接报配置错误；
+- rerank.enabled=true 时 base_url 与 model 必填；精排失败只回退融合顺序；
 - git.write 需要服务端可写部署密钥；普通用户永远拿不到该密钥；
 - 创建/审核默认开启；关闭 creation 后只有 admin 能创建；
 - 代码中没有任何默认服务地址。
@@ -887,6 +960,8 @@ skills:
   prompt/slash/read；
 - 复用旧版本但 active 行已被清理/替换：重新激活时重新 embedding 并 upsert，不依赖
   旧向量；
+- 嵌入文本/模型/维度变化：视为数据迁移，必须调 POST /api/admin/skills/reindex 触发
+  全量重建（§7.6）；对账在稳态会跳过健康行，因此不会自愈；
 - 批准时 Git commit 成功、PG 失败：公共 commit 成为未引用对象，不改变 public_active；
 管理员可重试，重试检测同一 source_commit 并复用；
 - PG 不可用：所有技能操作 fail-closed；
@@ -912,7 +987,13 @@ skills.deleted_at 只隐藏私有草稿，公共 release 和 public_active 不�
 - 一次 Milvus OR 检索：公共分支排除本人私有 skill_id，私有分支按 owner 过滤；
   同一 skill_id 不会返回公共/私有两条；作者侧无条件私有优先；
 - active projection 的 scope/owner/enabled 过滤器不超过简单表达式；
-- 公共与私有版本 embedding 高相似时仍只返回一个技能。
+- 公共与私有版本 embedding 高相似时仍只返回一个技能；
+- embedding 文本只由 name + description 组成，正文变化不触发重新 embedding；
+- 融合：两路名次按 rrf_k 合成，min_score 作用在融合分数上；私有去重发生在融合与
+  精排之前，精排无法把公共副本排到作者私有副本之前；
+- 精排：文档按 max_document_chars 截断；精排失败回退融合顺序并带 warning；
+- 降级矩阵：向量不可用 → 纯 BM25；BM25 不可用 → 纯向量；两者都不可用 → 空结果 + 原因；
+- 重建：reconcile(force=True) 会重写健康行；不 force 时健康行不重新 embedding。
 
 ### 14.2 集成
 
@@ -923,6 +1004,9 @@ skills.deleted_at 只隐藏私有草稿，公共 release 和 public_active 不�
 - 管理员驳回后作者仍可用私有版本；
 - 管理员下架/回滚后可见性变化；
 - active projection 重建、outbox 重试/对账、缓存删除、索引失败恢复；
+- 换投影文本版本后：重建前检索可能命中旧向量、重建后与 PG 一致；管理员 reindex 接口
+  返回修复/删除计数并记审计；
+- 精排按正文提高“正文里出现报错原文”的命中名次（用固定分数替身断言，不依赖真模型）；
 - 多用户隔离：A 无法通过 API/检索/文件路径读到 B 的私有包；
 - 权限：普通用户不能审核/下架/全局开关；admin 可以；
 - 版本复用但 active projection 被清理/索引失败时，提交/批准仍可用，outbox 重建后
