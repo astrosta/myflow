@@ -158,6 +158,13 @@ class ReviewQueueResponse(BaseModel):
     items: list[ReviewSummary]
 
 
+class ReindexResponse(BaseModel):
+    """一次强制重建的结果：修了多少投影行、投影文本是哪个版本。"""
+
+    repaired: int
+    projection_text_version: int
+
+
 class ReleaseResponse(BaseModel):
     release_id: str
     skill_id: str

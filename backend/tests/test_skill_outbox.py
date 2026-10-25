@@ -225,16 +225,16 @@ async def test_pending_upsert_embeds_and_marks_the_current_version_ready(
     assert row.package_sha256 == version.package_sha256
     assert row.skill_md_sha256 == version.skill_md_sha256
     assert row.embedding == [1.0, 0.0, 0.0]
-    assert harness.embedder.calls == [(
-        "pdf-tools\npdf-tools description 1\n\n# pdf-tools body 1\n",
-    )]
+    # 嵌入文本只有元数据：正文改变不影响向量，也不会撞 embedding 的 token 上限。
+    assert harness.embedder.calls == [("pdf-tools\npdf-tools description 1",)]
+    assert harness.content.reads == []
     assert await version_status(harness, version.id) == "ready"
     [event] = await outbox_rows(harness)
     assert event.status == "done"
 
 
 @pytest.mark.asyncio
-async def test_public_upsert_reads_the_release_commit_and_public_name(
+async def test_public_upsert_uses_the_release_public_name_without_reading_the_body(
     harness: Harness,
 ) -> None:
     skill, version = await save_skill(harness, owner="u1", name="pdf-tools", seq=1)
@@ -254,7 +254,8 @@ async def test_public_upsert_reads_the_release_commit_and_public_name(
     assert public.name == "pdf-tools"
     assert public.version_id == version.id
     assert public.enabled is True
-    assert (release.git_commit, release.skill_path) in harness.content.reads
+    # 公共名进投影，但不读正文：正文不再参与 embedding。
+    assert harness.content.reads == []
     assert await version_status(harness, version.id) == "ready"
 
 
@@ -438,11 +439,39 @@ async def test_reconcile_upserts_all_active_rows_and_deletes_orphan_keys(
     assert upserted[f"private:u2:{u2_skill.id}"].version_id == u2_version.id
     assert upserted[f"public:{public_skill.id}"].version_id == public_version.id
     assert upserted[f"public:{public_skill.id}"].name == "three"
-    assert (release.git_commit, release.skill_path) in harness.content.reads
+    # 对账不再读正文（嵌入文本只有元数据），只对齐 key 与版本状态。
+    assert harness.content.reads == []
     assert set(harness.projection.deletes) == {"public:gone", "private:u9:gone"}
     assert set(harness.projection.keys) == set(upserted)
     assert await version_status(harness, u1_version.id) == "ready"
     assert await version_status(harness, public_version.id) == "ready"
+
+
+@pytest.mark.asyncio
+async def test_projection_text_is_name_and_description_only(
+    harness: Harness,
+) -> None:
+    """正文改了不重新 embedding；描述改了才重新 embedding。"""
+
+    skill, version = await save_skill(harness, owner='u1', name='pdf-tools', seq=1)
+    assert await harness.worker().run_once() == 1
+    first = harness.embedder.calls[0]
+
+    # 同一描述、新正文：只有 body 变了。
+    changed_body, version_two = await save_skill(
+        harness,
+        owner='u1',
+        name='pdf-tools',
+        seq=2,
+        description='pdf-tools description 1',
+        skill=skill,
+    )
+    assert changed_body.id == skill.id
+    await harness.worker().run_once()
+
+    texts = [call[0] for call in harness.embedder.calls]
+    assert texts[0] == texts[1]
+    assert 'body' not in texts[0].lower()
 
 
 @pytest.mark.asyncio

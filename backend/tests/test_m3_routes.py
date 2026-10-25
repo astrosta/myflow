@@ -80,6 +80,8 @@ EXPECTED_ROUTES = {
     ("POST", "/api/admin/skills/reviews/{submission_id}/reject"),
     ("POST", "/api/admin/skills/{skill_id}/unpublish"),
     ("POST", "/api/admin/skills/{skill_id}/activate"),
+    # M11.1 task 23: 换嵌入文本/模型后的一次性强制重建（设计 §7.6）。
+    ("POST", "/api/admin/skills/reindex"),
     # M10 §2.12：记忆（prefix=/memory，/api 由 create_app 加）
     ("GET", "/api/memory"),
     ("GET", "/api/memory/profile"),

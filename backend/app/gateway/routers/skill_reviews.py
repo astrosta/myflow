@@ -8,6 +8,7 @@ this router never reads private staging rows or emits a host cache path.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable
 from typing import Annotated, Any, TypeVar
 
@@ -22,12 +23,18 @@ from agentkit.skills.domain import (
     SkillReleaseRecord,
     SkillSubmissionRecord,
 )
+from agentkit.skills.outbox import PROJECTION_TEXT_VERSION
 from backend.app.gateway import skills_catalog
 from backend.app.gateway.deps import get_skill_review_service, require_scope
-from backend.app.gateway.errors import SkillConflictAPI, SkillPackageInvalid
+from backend.app.gateway.errors import (
+    SkillConflictAPI,
+    SkillPackageInvalid,
+    SkillRuntimeUnavailable,
+)
 from backend.app.gateway.models.skills import (
     ActivateRequest,
     DraftFileInfo,
+    ReindexResponse,
     RejectRequest,
     ReleaseResponse,
     ReviewDetailResponse,
@@ -37,6 +44,8 @@ from backend.app.gateway.models.skills import (
     UnpublishResponse,
 )
 from backend.app.gateway.run_models import RunCaller
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/skills", tags=["skill-reviews"])
 
@@ -186,6 +195,38 @@ async def reject_review(
     # 驳回只写 submission 行和审计行，不移动任何 active 指针；刷新会重建公共树
     # 和每个作者的私有树，这里纯属浪费。
     return _submission(submission)
+
+
+@router.post("/reindex", response_model=ReindexResponse)
+async def reindex_projection(caller: Admin) -> ReindexResponse:
+    """强制重建整张 active projection（运维入口，设计 §7.6）。
+
+    嵌入文本、模型或维度一变，存量向量就全部失效；对账在稳态会跳过健康行，
+    所以只改代码不会自愈。这里显式跑一次 reconcile(force=True)：重写全部 active
+    行、删掉多余 key，并记一条审计。重建期间检索仍可用（Milvus 只是候选来源）。
+    """
+    runtime = skills_catalog.get_skill_runtime()
+    outbox = getattr(runtime, "outbox", None)
+    if runtime is None or outbox is None:
+        raise SkillRuntimeUnavailable(
+            "skills projection is unavailable: this deployment has no active "
+            "projection (skills.search.embedding.enabled=false or no Milvus endpoint)"
+        )
+
+    repaired = await outbox.reconcile(force=True)
+    store = getattr(runtime, "store", None)
+    if store is not None:
+        await store.audit(
+            actor=caller.user_id or "",
+            action="projection_reindex",
+            detail={"repaired": repaired, "text_version": PROJECTION_TEXT_VERSION},
+        )
+    logger.info(
+        "Forced skill projection rebuild: %s row(s) repaired", repaired
+    )
+    return ReindexResponse(
+        repaired=repaired, projection_text_version=PROJECTION_TEXT_VERSION
+    )
 
 
 @router.post("/{skill_id}/unpublish", response_model=UnpublishResponse)

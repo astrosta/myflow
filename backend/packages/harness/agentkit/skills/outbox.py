@@ -59,8 +59,22 @@ def _source_for_retention(source: VisibleSkill) -> set[str]:
     return commits
 
 
+#: 投影文本的语义版本（设计 §7.2）。改格式、换模型或换维度都等于让全部存量
+#: 向量失效，必须配一次强制重建（POST /api/admin/skills/reindex）。
+PROJECTION_TEXT_VERSION = 2
+
+
+def projection_text(name: str, description: str) -> str:
+    """参与 embedding 的文本：只有作者手写的元数据。
+
+    正文不进来是刻意的：正文每次改动都会变（等于每次保存都重新 embedding），
+    还可能超出 embedding 的 max_input_tokens，让整条索引直接失败。正文交给
+    BM25 通道与精排去读，它们才真的需要长文本（设计 §7.2 / §7.4）。
+    """
+    return f"{name}\n{description}".strip()
+
+
 async def _projection_row(
-    content: SkillContentStore,
     embedder: Embedder,
     source: VisibleSkill,
 ) -> ProjectionRow:
@@ -85,10 +99,7 @@ async def _projection_row(
     if not commit:
         raise ValueError("active skill has no content commit")
 
-    body = await content.read_text(commit, path)
-    text = f"{name}\n{source.skill.description}"
-    if body:
-        text = f"{text}\n\n{body}"
+    text = projection_text(name, source.skill.description)
     vectors = await embedder.embed_documents([text])
     if len(vectors) != 1:
         raise ValueError("embedding provider returned the wrong document count")
@@ -149,7 +160,7 @@ async def build_projection_row(
     source = await _active_source(store, event)
     if source is None or not _matches_event(source, event):
         return None
-    row = await _projection_row(content, embedder, source)
+    row = await _projection_row(embedder, source)
     # Embedding can take long enough for a newer save to win.  Re-check the
     # authoritative pointer immediately before the caller writes to Milvus.
     if not _matches_event(await _active_source(store, event), event):
@@ -321,7 +332,7 @@ class SkillIndexOutboxWorker:
             ):
                 continue
             try:
-                row = await _projection_row(self._content, self._embedder, source)
+                row = await _projection_row(self._embedder, source)
                 await self._projection.upsert_active(row)
                 await self._store.set_version_index_status(
                     row.version_id, _INDEX_READY

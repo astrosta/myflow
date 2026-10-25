@@ -172,6 +172,78 @@ class _Identity(dict):
         return self
 
 
+@dataclass
+class FakeOutbox:
+    """Records a forced rebuild without Milvus."""
+
+    repaired: int = 0
+    force: bool | None = None
+
+    async def reconcile(self, *, force: bool = False) -> int:
+        self.force = force
+        return self.repaired
+
+
+@dataclass
+class FakeRuntime:
+    outbox: FakeOutbox
+    audits: list[dict[str, Any]] = field(default_factory=list)
+
+    class _Store:
+        def __init__(self, audits: list[dict[str, Any]]) -> None:
+            self._audits = audits
+
+        async def audit(self, **kwargs: Any) -> None:
+            self._audits.append(kwargs)
+
+    @property
+    def store(self) -> Any:
+        return self._Store(self.audits)
+
+
+def test_reindex_forces_a_full_reprojection_and_audits_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _identity = _client(monkeypatch, FakeReviewService())
+    runtime = FakeRuntime(outbox=FakeOutbox(repaired=4))
+    monkeypatch.setattr(skills_catalog, "get_skill_runtime", lambda: runtime)
+
+    response = client.post("/api/admin/skills/reindex")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["repaired"] == 4
+    assert body["projection_text_version"] >= 2
+    # 强制重建必须传 force，否则健康行会被跳过（对账的稳态优化）。
+    assert runtime.outbox.force is True
+    assert runtime.audits[0]["action"] == "projection_reindex"
+    assert runtime.audits[0]["detail"]["repaired"] == 4
+
+
+def test_reindex_requires_admin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _identity = _client(monkeypatch, FakeReviewService(), scopes=READ)
+
+    response = client.post("/api/admin/skills/reindex")
+
+    assert response.status_code == 403
+
+
+def test_reindex_without_a_projection_is_a_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _identity = _client(monkeypatch, FakeReviewService())
+    monkeypatch.setattr(
+        skills_catalog,
+        "get_skill_runtime",
+        lambda: FakeRuntime(outbox=None),  # type: ignore[arg-type]
+    )
+
+    response = client.post("/api/admin/skills/reindex")
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "skill_runtime_unavailable"
+
+
 def _client(
     monkeypatch: pytest.MonkeyPatch,
     service: FakeReviewService,
