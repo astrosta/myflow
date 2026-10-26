@@ -469,6 +469,57 @@ class MemoryRepository:
             )
             return _session_view(row) if row is not None else None
 
+    async def get_latest_session(
+        self, user_id: str, thread_id: str
+    ) -> MemorySessionView | None:
+        async with self._sf() as session:
+            row = await session.scalar(
+                select(MemoryEpisodeSessionRow)
+                .where(
+                    MemoryEpisodeSessionRow.user_id == user_id,
+                    MemoryEpisodeSessionRow.thread_id == thread_id,
+                )
+                .order_by(MemoryEpisodeSessionRow.created_at.desc())
+                .limit(1)
+            )
+            return _session_view(row) if row is not None else None
+
+    async def get_ingest_job(self, episode_key: str) -> MemoryIngestJobView | None:
+        async with self._sf() as session:
+            row = await session.scalar(
+                select(MemoryIngestJobRow).where(MemoryIngestJobRow.episode_key == episode_key)
+            )
+            return _job_view(row) if row is not None else None
+
+    async def list_open_sessions(
+        self, *, before: datetime | None = None
+    ) -> list[MemorySessionView]:
+        async with self._sf() as session:
+            statement = select(MemoryEpisodeSessionRow).where(
+                MemoryEpisodeSessionRow.status == "open"
+            )
+            if before is not None:
+                statement = statement.where(MemoryEpisodeSessionRow.last_activity_at < before)
+            rows = (
+                await session.scalars(
+                    statement.order_by(MemoryEpisodeSessionRow.last_activity_at.asc())
+                )
+            ).all()
+            return [_session_view(row) for row in rows]
+
+    async def count_open_sessions(self, user_id: str, thread_id: str) -> int:
+        async with self._sf() as session:
+            value = await session.scalar(
+                select(func.count())
+                .select_from(MemoryEpisodeSessionRow)
+                .where(
+                    MemoryEpisodeSessionRow.user_id == user_id,
+                    MemoryEpisodeSessionRow.thread_id == thread_id,
+                    MemoryEpisodeSessionRow.status == "open",
+                )
+            )
+            return int(value or 0)
+
     async def open_session(
         self, user_id: str, thread_id: str, *, run_id: str, turn_id: str, now: datetime
     ) -> MemorySessionView:
