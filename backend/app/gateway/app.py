@@ -5,22 +5,15 @@ FastAPI装配 + lifespan
 from __future__ import annotations
 
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from agentkit.agents.memory.backends.langmem.store import make_memory_store
 from agentkit.agents.memory.canonical.service import (
     build_memory_runtime,
     configure_memory_service,
     reset_memory_service,
-)
-from agentkit.agents.memory.maintenance.service import MemoryMaintenanceService
-from agentkit.agents.memory.manager import (
-    configure_memory_store,
-    get_memory_manager,
-    reset_memory_manager,
 )
 from agentkit.config import AppConfig, get_app_config
 from agentkit.knowledge.service import configure_knowledge_service, reset_knowledge_service
@@ -145,10 +138,7 @@ async def lifespan(app: FastAPI):
         workers = gateway_worker_count()
         event_store = make_run_event_store(app_config.run_events, gateway_workers=workers)
         async with make_checkpointer(app_config) as checkpointer:
-            with make_memory_store(
-                app_config.database,
-                app_config.memory.backend_config if app_config.memory.enabled else {},
-            ) as memory_store:
+            with nullcontext():
                 services = build_run_services(
                     app_config,
                     checkpointer,
@@ -167,11 +157,7 @@ async def lifespan(app: FastAPI):
                 try:
                     # M10 §2.5.3 / §2.9.1：memory store 和 checkpointer 同一个 database 选择；
                     # maintenance 是独立服务，不复用定时任务服务（那个会创建 thread/run）。
-                    configure_memory_store(memory_store)
-                    memory_manager = get_memory_manager(
-                        store=memory_store, app_config=app_config
-                    )
-                    app.state.memory_manager = memory_manager
+                    app.state.memory_manager = None
                     canonical_runtime = build_memory_runtime(
                         app_config.memory,
                         session_factory,
@@ -190,10 +176,6 @@ async def lifespan(app: FastAPI):
                     app.state.knowledge_service = await configure_knowledge_service(
                         app_config.knowledge_base
                     )
-                    maintenance = MemoryMaintenanceService(memory_manager)
-                    app.state.memory_maintenance = maintenance
-                    if app_config.memory.enabled and app_config.memory.maintenance.enabled:
-                        maintenance.start()
                     # M8 §10.1：进程级子代理容量控制器在这里冻结一次（subagent_runtime.* 是
                     # startup-only）。建在启动时而不是"第一个启用子代理的 run"，是为了让 YAML
                     # 里那个值在启动那一刻就定下来——热重载不能悄悄抬高已经宣告出去的容量。
@@ -206,7 +188,6 @@ async def lifespan(app: FastAPI):
                     try:
                         yield
                     finally:
-                        maintenance.stop()
                         if canonical_runtime.maintenance is not None:
                             await canonical_runtime.maintenance.stop()
                         if canonical_runtime.projector is not None:
@@ -214,11 +195,6 @@ async def lifespan(app: FastAPI):
                         if canonical_runtime.service is not None:
                             await canonical_runtime.service.close()
                         reset_memory_service()
-                        if not memory_manager.flush(
-                            app_config.memory.ingest.shutdown_flush_timeout_seconds
-                        ):
-                            logger.warning("Memory extraction flush exceeded its shutdown budget")
-                        reset_memory_manager()
                         await reset_knowledge_service()
                         app.state.knowledge_service = None
                         timeout = app_config.runs.shutdown_timeout_seconds
