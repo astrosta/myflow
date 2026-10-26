@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from agentkit.agents.memory.canonical.domain import (
     MemoryConflictError,
     MemoryConflictView,
+    SkillCandidateView,
     MemoryIngestJobView,
     MemoryLedgerView,
     MemoryNotFoundError,
@@ -30,6 +31,7 @@ from agentkit.agents.memory.canonical.domain import (
 from agentkit.agents.memory.canonical.models import (
     MemoryConflictRow,
     MemoryEpisodeSessionRow,
+    MemorySkillCandidateRow,
     MemoryIndexOutboxRow,
     MemoryIngestJobRow,
     MemoryMutationLedgerRow,
@@ -521,6 +523,94 @@ class MemoryRepository:
             )
             return _ledger_view(row) if row is not None else None
 
+    async def create_skill_candidate(
+        self,
+        user_id: str,
+        *,
+        private_name: str,
+        description: str | None,
+        trigger_text: str,
+        package_snapshot: dict[str, Any],
+        package_sha256: str,
+        skill_md_sha256: str,
+        source_episode_ids: Sequence[str],
+        origin_idempotency_key: str,
+        validation_report: dict[str, Any] | None = None,
+    ) -> SkillCandidateView:
+        async with self._sf() as session:
+            row = MemorySkillCandidateRow(
+                user_id=user_id,
+                status="pending_confirmation",
+                revision=0,
+                private_name=private_name,
+                description=description,
+                trigger_text=trigger_text,
+                package_snapshot=package_snapshot,
+                package_sha256=package_sha256,
+                skill_md_sha256=skill_md_sha256,
+                validation_report=validation_report or {},
+                source_episode_ids=list(source_episode_ids),
+                origin_idempotency_key=origin_idempotency_key,
+                created_at=_now(),
+                updated_at=_now(),
+            )
+            session.add(row)
+            await session.commit()
+            return _candidate_view(row)
+
+    async def get_skill_candidate(
+        self, user_id: str, candidate_id: str
+    ) -> SkillCandidateView | None:
+        async with self._sf() as session:
+            row = await session.get(MemorySkillCandidateRow, candidate_id)
+            if row is None or row.user_id != user_id:
+                return None
+            return _candidate_view(row)
+
+    async def list_skill_candidates(
+        self, user_id: str, *, status: str | None = None
+    ) -> list[SkillCandidateView]:
+        async with self._sf() as session:
+            statement = select(MemorySkillCandidateRow).where(
+                MemorySkillCandidateRow.user_id == user_id
+            )
+            if status is not None:
+                statement = statement.where(MemorySkillCandidateRow.status == status)
+            rows = (
+                await session.scalars(
+                    statement.order_by(MemorySkillCandidateRow.created_at.desc())
+                )
+            ).all()
+            return [_candidate_view(row) for row in rows]
+
+    async def update_skill_candidate(
+        self,
+        user_id: str,
+        candidate_id: str,
+        *,
+        expected_revision: int,
+        changes: dict[str, Any],
+    ) -> SkillCandidateView:
+        allowed = {"status", "skill_id", "skill_version_id", "validation_report", "rejected_reason"}
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"unsupported skill candidate fields: {sorted(unknown)}")
+        async with self._sf() as session:
+            row = await session.get(MemorySkillCandidateRow, candidate_id)
+            if row is None or row.user_id != user_id:
+                raise MemoryNotFoundError(f"skill candidate {candidate_id} not found")
+            if int(row.revision) != expected_revision:
+                raise MemoryConflictError(
+                    f"skill candidate changed (expected revision {expected_revision}, found {row.revision})",
+                    current_revision=int(row.revision),
+                )
+            for key, value in changes.items():
+                setattr(row, key, value)
+            row.revision = int(row.revision) + 1
+            row.updated_at = _now()
+            await session.commit()
+            return _candidate_view(row)
+
     async def write_conflict(
         self,
         user_id: str,
@@ -939,6 +1029,27 @@ def _seconds(value: float) -> Any:
     from datetime import timedelta
 
     return timedelta(seconds=value)
+
+
+def _candidate_view(row: MemorySkillCandidateRow) -> SkillCandidateView:
+    return SkillCandidateView(
+        id=row.id,
+        user_id=row.user_id,
+        status=row.status,
+        revision=int(row.revision),
+        private_name=row.private_name,
+        description=row.description,
+        trigger_text=row.trigger_text,
+        package_snapshot=dict(row.package_snapshot or {}),
+        package_sha256=row.package_sha256,
+        skill_md_sha256=row.skill_md_sha256,
+        source_episode_ids=list(row.source_episode_ids or []),
+        origin_idempotency_key=row.origin_idempotency_key,
+        skill_id=row.skill_id,
+        skill_version_id=row.skill_version_id,
+        validation_report=dict(row.validation_report or {}),
+        created_at=row.created_at,
+    )
 
 
 def _conflict_view(row: MemoryConflictRow) -> MemoryConflictView:

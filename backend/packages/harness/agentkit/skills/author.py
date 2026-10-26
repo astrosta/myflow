@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 
@@ -266,7 +266,13 @@ class SkillAuthorService:
     # save, submit, withdraw
     # ------------------------------------------------------------------
 
-    async def save(self, *, owner_user_id: str, skill_id: str) -> SkillVersionRecord:
+    async def save(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        extra_metadata: Mapping[str, Any] | None = None,
+    ) -> SkillVersionRecord:
         """Commit the exact staging tree, then record it in the catalog."""
 
         async with self._skill_lock(skill_id):
@@ -290,6 +296,7 @@ class SkillAuthorService:
                 draft_ref=commit.ref,
                 draft_commit=commit.commit,
                 skill_path=self._skill_path(commit),
+                extra_metadata=extra_metadata,
             )
 
     async def submit(

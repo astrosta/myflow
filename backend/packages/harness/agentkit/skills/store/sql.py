@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -463,6 +463,7 @@ class SqlSkillStore:
         draft_ref: str,
         draft_commit: str,
         skill_path: str,
+        extra_metadata: Mapping[str, Any] | None = None,
     ) -> SkillVersionRecord:
         now = _now()
         async with self._sf() as session:
@@ -473,6 +474,10 @@ class SqlSkillStore:
                     SkillVersionRow.package_sha256 == manifest.package_sha256,
                 )
             )
+            if version is not None and extra_metadata:
+                merged = {**dict(version.metadata_json or {}), **dict(extra_metadata)}
+                if merged != dict(version.metadata_json or {}):
+                    version.metadata_json = merged
             if version is None:
                 highest = await session.scalar(
                     select(func.max(SkillVersionRow.version_seq)).where(
@@ -486,7 +491,7 @@ class SqlSkillStore:
                     version_seq=seq,
                     package_sha256=manifest.package_sha256,
                     skill_md_sha256=manifest.skill_md_sha256,
-                    metadata_json=_metadata(manifest),
+                    metadata_json={**_metadata(manifest), **dict(extra_metadata or {})},
                     draft_ref=draft_ref,
                     draft_commit=draft_commit,
                     skill_path=skill_path,

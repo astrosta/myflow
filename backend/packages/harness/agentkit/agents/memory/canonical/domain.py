@@ -103,6 +103,34 @@ class ProfileApplyResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillCandidateView:
+    id: str
+    user_id: str
+    status: str
+    revision: int
+    private_name: str
+    description: str | None
+    trigger_text: str
+    package_snapshot: dict[str, Any]
+    package_sha256: str
+    skill_md_sha256: str
+    source_episode_ids: list[str]
+    origin_idempotency_key: str
+    skill_id: str | None
+    skill_version_id: str | None
+    validation_report: dict[str, Any]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SkillConfirmResult:
+    candidate_id: str
+    skill_id: str
+    version_id: str
+    origin_candidate_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryHitView:
     record: MemoryRecordView
     score: float | None = None
