@@ -15,6 +15,7 @@ from agentkit.agents.memory.canonical.domain import (
     SkillConfirmResult,
 )
 from agentkit.agents.memory.canonical.episodic import EpisodicService, L1Gate
+from agentkit.agents.memory.canonical.maintenance import MemoryMaintenanceWorker
 from agentkit.agents.memory.canonical.operators import LangMemOperators, OperatorUnavailable
 from agentkit.agents.memory.canonical.operator_model import resolve_operator_model
 from agentkit.agents.memory.canonical.profile import ProfileService
@@ -264,6 +265,7 @@ def _render_value(value: Any) -> str | None:
 class MemoryRuntime:
     service: MemoryService | None
     projector: MemoryProjector | None
+    maintenance: MemoryMaintenanceWorker | None = None
 
 
 def build_memory_runtime(
@@ -274,7 +276,7 @@ def build_memory_runtime(
     skill_author: Any = None,
 ) -> MemoryRuntime:
     if not config.enabled or session_factory is None:
-        return MemoryRuntime(None, None)
+        return MemoryRuntime(None, None, None)
     repo = MemoryRepository(session_factory)
     sessions = SessionService(repo, config)
     operators: Any = None
@@ -312,7 +314,8 @@ def build_memory_runtime(
     service = MemoryService(
         repo, sessions, profile, semantic, episodic, skills, retriever, projector, config
     )
-    return MemoryRuntime(service, projector)
+    maintenance = MemoryMaintenanceWorker(service, config)
+    return MemoryRuntime(service, projector, maintenance)
 
 
 class _UnavailableEmbedder:

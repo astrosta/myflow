@@ -183,6 +183,8 @@ async def lifespan(app: FastAPI):
                     configure_memory_service(canonical_runtime.service)
                     if canonical_runtime.projector is not None:
                         await canonical_runtime.projector.start()
+                    if canonical_runtime.maintenance is not None:
+                        await canonical_runtime.maintenance.start()
                     # Knowledge metadata shares the app database; providers are built once.
                     app.state.knowledge_config = app_config.knowledge_base
                     app.state.knowledge_service = await configure_knowledge_service(
@@ -205,6 +207,8 @@ async def lifespan(app: FastAPI):
                         yield
                     finally:
                         maintenance.stop()
+                        if canonical_runtime.maintenance is not None:
+                            await canonical_runtime.maintenance.stop()
                         if canonical_runtime.projector is not None:
                             await canonical_runtime.projector.stop()
                         if canonical_runtime.service is not None:
