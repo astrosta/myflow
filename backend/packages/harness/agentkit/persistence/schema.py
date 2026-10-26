@@ -13,6 +13,20 @@ M4 之前这份清单住在 `persistence/models/__init__.py`；行定义已经�
 
 from __future__ import annotations
 
+from agentkit.agents.memory.canonical.models import (
+    MemoryConflictRow,
+    MemoryConsolidationJobRow,
+    MemoryEpisodeSessionRow,
+    MemoryIndexOutboxRow,
+    MemoryIngestJobRow,
+    MemoryMutationLedgerRow,
+    MemoryProfileRow,
+    MemoryProjectionStateRow,
+    MemoryRecordRow,
+    MemoryRecordVersionRow,
+    MemoryScopeMetaRow,
+    MemorySkillCandidateRow,
+)
 from agentkit.knowledge.store.model import KnowledgeBaseRow, KnowledgeDocumentRow
 from agentkit.persistence.base import Base
 from agentkit.persistence.events.model import RunEventRow
@@ -37,6 +51,18 @@ __all__ = [
     "Base",
     "KnowledgeBaseRow",
     "KnowledgeDocumentRow",
+    "MemoryConflictRow",
+    "MemoryConsolidationJobRow",
+    "MemoryEpisodeSessionRow",
+    "MemoryIndexOutboxRow",
+    "MemoryIngestJobRow",
+    "MemoryMutationLedgerRow",
+    "MemoryProfileRow",
+    "MemoryProjectionStateRow",
+    "MemoryRecordRow",
+    "MemoryRecordVersionRow",
+    "MemoryScopeMetaRow",
+    "MemorySkillCandidateRow",
     "RunEventRow",
     "RunRow",
     "SkillAuditEventRow",
