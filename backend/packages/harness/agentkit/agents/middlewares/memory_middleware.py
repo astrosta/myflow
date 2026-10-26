@@ -277,6 +277,11 @@ class MemoryMiddleware(AgentMiddleware):
                 messages[user_index : assistant_index + 1],
                 terminal=False,
             )
+            user_text = message_content_to_text(messages[user_index].content)
+            if user_text.strip():
+                asyncio.create_task(
+                    service.update_profile_from_message(user_id, user_text)
+                )
         except Exception:
             logger.warning("Failed to capture memory turn", exc_info=True)
 

@@ -8,6 +8,7 @@ request path.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 
@@ -44,6 +45,14 @@ class MemoryMaintenanceWorker:
             )
             if result is not None:
                 processed += 1
+                try:
+                    await service.semantic.ingest_episodes(  # type: ignore[attr-defined]
+                        result.user_id,
+                        [result.id],
+                        source_text=(json.dumps(result.payload, ensure_ascii=False) + " " + result.content),
+                    )
+                except Exception as exc:  # noqa: BLE001 - semantic worker must not kill maintenance
+                    logger.warning("semantic extraction failed (%s)", type(exc).__name__)
         return {"closed": closed, "expired": expired, "episodes": processed}
 
     async def start(self) -> None:

@@ -50,6 +50,20 @@ class ProfileService:
             updated_at=profile.updated_at,
         )
 
+    async def extract_and_apply(self, user_id: str, current_message: str) -> ProfileApplyResult:
+        """Run B on the current message only, then apply the host-validated fields."""
+        if self._operators is None:
+            return ProfileApplyResult(applied=False, snapshot=await self.get(user_id))
+        current = await self._repo.get_profile(user_id) or await self._repo.ensure_profile(
+            user_id
+        )
+        proposal = await self._operators.extract_profile(
+            current_message, dict(current.profile or {})
+        )
+        return await self.apply_extraction(
+            user_id, current_message=current_message, proposal=proposal
+        )
+
     async def patch_manual(
         self,
         user_id: str,

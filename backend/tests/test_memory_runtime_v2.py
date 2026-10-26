@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.memory.canonical.domain import ProfileFieldView, ProfileSnapshotView
+from agentkit.agents.memory.canonical.maintenance import MemoryMaintenanceWorker
 from agentkit.agents.memory.canonical.service import (
     build_memory_runtime,
     render_profile_view,
@@ -44,6 +45,30 @@ def test_runtime_builds_service_and_reads_profile(tmp_path) -> None:
             await engine.dispose()
 
     run(scenario())
+
+
+def test_maintenance_closes_idle_and_expires_pending() -> None:
+    class Sessions:
+        async def close_idle_sessions(self, now):
+            del now
+            return 1
+
+    class Semantic:
+        async def expire_pending(self, *, now):
+            del now
+            return 2
+
+    class Repo:
+        async def claim_ingest_job(self, **kwargs):
+            del kwargs
+            return None
+
+    service = __import__("types").SimpleNamespace(
+        sessions=Sessions(), semantic=Semantic(), repo=Repo(), episodic=None
+    )
+    worker = MemoryMaintenanceWorker(service, MemoryConfig(enabled=True))
+    result = asyncio.run(worker.run_once(now=datetime(2026, 10, 26, tzinfo=UTC)))
+    assert result == {"closed": 1, "expired": 2, "episodes": 0}
 
 
 def test_render_profile_view_uses_whole_fields_and_budget() -> None:

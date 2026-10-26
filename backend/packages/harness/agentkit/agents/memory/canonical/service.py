@@ -104,6 +104,15 @@ class MemoryService:
             user_id, field_path, expected_revision=expected_revision
         )
 
+    async def update_profile_from_message(self, user_id: str, message: str) -> None:
+        """Best-effort B update for the current real user message."""
+        if not message.strip():
+            return
+        try:
+            await self.profile.extract_and_apply(user_id, message)
+        except Exception:
+            logger.warning("profile extraction failed", exc_info=True)
+
     async def render_profile(self, user_id: str) -> RenderedProfile:
         snapshot = await self.get_profile(user_id)
         return render_profile_view(snapshot, self.config.profile.max_tokens)
