@@ -280,6 +280,12 @@ class MemoryRepository:
                 return None
             return _record_view(row)
 
+    async def get_record_unscoped(self, record_id: str) -> MemoryRecordView | None:
+        """Internal lookup for services that already checked ownership."""
+        async with self._sf() as session:
+            row = await session.get(MemoryRecordRow, record_id)
+            return _record_view(row) if row is not None else None
+
     async def find_semantic_existing(
         self,
         user_id: str,
@@ -484,6 +490,16 @@ class MemoryRepository:
             )
             return _session_view(row) if row is not None else None
 
+    async def get_ingest_job_by_id(self, job_id: str) -> MemoryIngestJobView | None:
+        async with self._sf() as session:
+            row = await session.get(MemoryIngestJobRow, job_id)
+            return _job_view(row) if row is not None else None
+
+    async def get_session(self, session_id: str) -> MemorySessionView | None:
+        async with self._sf() as session:
+            row = await session.get(MemoryEpisodeSessionRow, session_id)
+            return _session_view(row) if row is not None else None
+
     async def get_ingest_job(self, episode_key: str) -> MemoryIngestJobView | None:
         async with self._sf() as session:
             row = await session.scalar(
@@ -651,13 +667,22 @@ class MemoryRepository:
             await session.commit()
             return _job_view(row)
 
-    async def finish_ingest_job(self, job_id: str, *, status: str, error: str | None = None) -> None:
+    async def finish_ingest_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         async with self._sf() as session:
             row = await session.get(MemoryIngestJobRow, job_id)
             if row is None:
                 return
             row.status = status
             row.last_error = error
+            if payload is not None:
+                row.payload = {**dict(row.payload or {}), **payload}
             row.lease_until = None
             row.updated_at = _now()
             await session.commit()
