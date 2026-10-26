@@ -313,7 +313,11 @@ def build_memory_runtime(
     projection = MemoryMilvusProjection(
         config.vector_store, dimensions=config.embedding.dimensions
     )
-    projector = MemoryProjector(repo, projection, embedder, config)
+    projector = (
+        MemoryProjector(repo, projection, embedder, config)
+        if config.vector_store.uri and config.embedding.base_url
+        else None
+    )
     retriever = HybridRetriever(repo, projection, embedder, config)
     skills = (
         SkillCandidateService(repo, operators, embedder, skill_author, config)
