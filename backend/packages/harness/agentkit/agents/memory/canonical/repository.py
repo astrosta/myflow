@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from agentkit.agents.memory.canonical.domain import (
     MemoryConflictError,
+    MemoryConflictView,
     MemoryIngestJobView,
     MemoryLedgerView,
     MemoryNotFoundError,
@@ -27,6 +28,7 @@ from agentkit.agents.memory.canonical.domain import (
     RecordDraft,
 )
 from agentkit.agents.memory.canonical.models import (
+    MemoryConflictRow,
     MemoryEpisodeSessionRow,
     MemoryIndexOutboxRow,
     MemoryIngestJobRow,
@@ -442,6 +444,38 @@ class MemoryRepository:
             )
             return _ledger_view(row) if row is not None else None
 
+    async def write_conflict(
+        self,
+        user_id: str,
+        *,
+        kind: str,
+        current_snapshot: dict[str, Any],
+        candidate_snapshot: dict[str, Any],
+        evidence_refs: Sequence[str],
+        field_path: str | None = None,
+        topic_key: str | None = None,
+        current_record_id: str | None = None,
+        candidate_record_id: str | None = None,
+    ) -> MemoryConflictView:
+        async with self._sf() as session:
+            row = MemoryConflictRow(
+                user_id=user_id,
+                kind=kind,
+                field_path=field_path,
+                topic_key=topic_key,
+                current_record_id=current_record_id,
+                candidate_record_id=candidate_record_id,
+                current_snapshot=current_snapshot,
+                candidate_snapshot=candidate_snapshot,
+                status="open",
+                evidence_refs=list(evidence_refs),
+                revision=0,
+                created_at=_now(),
+            )
+            session.add(row)
+            await session.commit()
+            return _conflict_view(row)
+
     async def touch_hits(self, user_id: str, record_ids: Sequence[str], *, now: datetime) -> None:
         if not record_ids:
             return
@@ -807,6 +841,24 @@ def _seconds(value: float) -> Any:
     from datetime import timedelta
 
     return timedelta(seconds=value)
+
+
+def _conflict_view(row: MemoryConflictRow) -> MemoryConflictView:
+    return MemoryConflictView(
+        id=row.id,
+        user_id=row.user_id,
+        kind=row.kind,
+        field_path=row.field_path,
+        topic_key=row.topic_key,
+        current_record_id=row.current_record_id,
+        candidate_record_id=row.candidate_record_id,
+        current_snapshot=dict(row.current_snapshot or {}),
+        candidate_snapshot=dict(row.candidate_snapshot or {}),
+        status=row.status,
+        revision=int(row.revision),
+        evidence_refs=list(row.evidence_refs or []),
+        created_at=row.created_at,
+    )
 
 
 def _profile_view(row: MemoryProfileRow) -> MemoryProfileView:

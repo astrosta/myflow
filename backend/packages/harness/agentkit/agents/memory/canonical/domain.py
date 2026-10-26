@@ -74,6 +74,52 @@ class MemoryProfileView:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileFieldView:
+    value: Any
+    source: str
+    evidence_tier: str | None
+    confidence: float
+    observed_at: datetime
+    tombstoned_at: datetime | None = None
+
+    def model_dump(self) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileSnapshotView:
+    revision: int
+    fields: dict[str, ProfileFieldView]
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileApplyResult:
+    applied: bool
+    snapshot: ProfileSnapshotView
+    conflict_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryConflictView:
+    id: str
+    user_id: str
+    kind: str
+    field_path: str | None
+    topic_key: str | None
+    current_record_id: str | None
+    candidate_record_id: str | None
+    current_snapshot: dict[str, Any]
+    candidate_snapshot: dict[str, Any]
+    status: str
+    revision: int
+    evidence_refs: list[str]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryRecordView:
     id: str
     user_id: str
