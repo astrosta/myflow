@@ -145,12 +145,14 @@ def assemble_agent(
     if resolved_config.memory.enabled:
         # M10 §2.8.2：read-only memory_search. Its closure is bound to the process manager
         # so tests and embedded hosts can inject a manager without touching a global.
+        from agentkit.agents.memory.canonical.service import get_memory_service
         from agentkit.agents.memory.manager import get_memory_manager
         from agentkit.agents.memory.tools import TOOL_NAME as MEMORY_TOOL_NAME
         from agentkit.agents.memory.tools import make_memory_search_tool
 
         try:
-            manager = get_memory_manager(app_config=resolved_config)
+            service = get_memory_service()
+            manager = service or get_memory_manager(app_config=resolved_config)
             if MEMORY_TOOL_NAME not in {tool.name for tool in tools}:
                 tools = [*tools, make_memory_search_tool(manager)]
         except Exception:

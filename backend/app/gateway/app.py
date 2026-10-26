@@ -11,6 +11,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agentkit.agents.memory.backends.langmem.store import make_memory_store
+from agentkit.agents.memory.canonical.service import (
+    build_memory_runtime,
+    configure_memory_service,
+    reset_memory_service,
+)
 from agentkit.agents.memory.maintenance.service import MemoryMaintenanceService
 from agentkit.agents.memory.manager import (
     configure_memory_store,
@@ -41,6 +46,7 @@ from backend.app.gateway.routers import (
     knowledge,
     mcp,
     memory,
+    memory_v2,
     models,
     skill_drafts,
     skill_reviews,
@@ -166,6 +172,17 @@ async def lifespan(app: FastAPI):
                         store=memory_store, app_config=app_config
                     )
                     app.state.memory_manager = memory_manager
+                    canonical_runtime = build_memory_runtime(
+                        app_config.memory,
+                        session_factory,
+                        app_config=app_config,
+                        skill_author=getattr(app.state, "skill_author_service", None),
+                    )
+                    app.state.memory_service = canonical_runtime.service
+                    app.state.memory_projector = canonical_runtime.projector
+                    configure_memory_service(canonical_runtime.service)
+                    if canonical_runtime.projector is not None:
+                        await canonical_runtime.projector.start()
                     # Knowledge metadata shares the app database; providers are built once.
                     app.state.knowledge_config = app_config.knowledge_base
                     app.state.knowledge_service = await configure_knowledge_service(
@@ -188,6 +205,11 @@ async def lifespan(app: FastAPI):
                         yield
                     finally:
                         maintenance.stop()
+                        if canonical_runtime.projector is not None:
+                            await canonical_runtime.projector.stop()
+                        if canonical_runtime.service is not None:
+                            await canonical_runtime.service.close()
+                        reset_memory_service()
                         if not memory_manager.flush(
                             app_config.memory.ingest.shutdown_flush_timeout_seconds
                         ):
@@ -261,7 +283,9 @@ def create_app() -> FastAPI:
     application.include_router(skills.router, prefix="/api")
     # Human-facing knowledge base; same /api prefix as the rest of the browser API.
     application.include_router(knowledge.router, prefix="/api")
-    # M10 §2.12：memory routes，/api 同样加在这里。
+    # Canonical memory routes must win over the legacy wire-compatible router.
+    application.include_router(memory_v2.router, prefix="/api")
+    # M10 §2.12：legacy memory routes，保留到迁移窗口结束。
     application.include_router(memory.router, prefix="/api")
     # M9 §2.12：认证路由 prefix=/v1/auth，/api 同样加在这里。
     application.include_router(auth_router, prefix="/api")

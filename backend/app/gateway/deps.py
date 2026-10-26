@@ -5,6 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from uuid import uuid4
 
+from agentkit.agents.memory.canonical.service import (
+    MemoryService,
+    get_memory_service as get_canonical_memory_service,
+)
 from agentkit.agents.memory.manager import MemoryManager, get_memory_manager
 from agentkit.config import get_app_config
 from agentkit.config.knowledge_config import KnowledgeBaseConfig
@@ -32,6 +36,7 @@ __all__ = [
     "get_knowledge_service",
     "get_knowledge_service_optional",
     "get_memory_manager_service",
+    "get_memory_service",
     "get_skill_author_service",
     "get_skill_review_service",
     "get_request_id",
@@ -80,6 +85,14 @@ def require_authenticated(request: Request) -> AuthResult:
     if auth is None or not auth.is_authenticated:
         raise Unauthenticated("authentication required")
     return auth
+
+
+def get_memory_service(request: Request) -> MemoryService | None:
+    """Canonical service, or None when memory is disabled/unavailable."""
+    service = getattr(request.app.state, "memory_service", None)
+    if isinstance(service, MemoryService):
+        return service
+    return get_canonical_memory_service()
 
 
 def get_memory_manager_service(request: Request) -> MemoryManager:

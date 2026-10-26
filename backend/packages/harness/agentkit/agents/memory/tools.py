@@ -12,6 +12,7 @@ from typing import Any
 from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool, tool
 
+from agentkit.agents.memory.canonical.service import get_memory_service
 from agentkit.agents.memory.manager import MemoryManager, get_memory_manager
 from agentkit.agents.memory.types import (
     MemoryKind,
@@ -64,7 +65,34 @@ def make_memory_search_tool(manager: MemoryManager | None = None) -> BaseTool:
             agent_name=_text(context.get("agent_name")) or _text(context.get("subagent_name")),
             thread_id=_text(context.get("thread_id")),
         )
-        manager_instance = bound_manager or get_memory_manager()
+        manager_instance = bound_manager or get_memory_service() or get_memory_manager()
+        if getattr(manager_instance, "canonical", False):
+            try:
+                page = await manager_instance.search(
+                    user_id,
+                    text=query,
+                    kinds=selected,
+                    limit=max(1, min(int(limit), MAX_LIMIT)),
+                )
+                items = [
+                    {
+                        "kind": hit.record.kind,
+                        "subtype": hit.record.subtype,
+                        "id": hit.record.id,
+                        "content": hit.record.content,
+                        "topic_key": hit.record.topic_key,
+                        "confidence": hit.record.confidence,
+                        "updated_at": hit.record.updated_at.isoformat(),
+                    }
+                    for hit in page.items
+                ]
+                return json.dumps(
+                    {"query": query, "kinds": selected, "items": items, "next_cursor": page.next_cursor},
+                    ensure_ascii=False,
+                )
+            except Exception:
+                logger.warning("memory_search failed", exc_info=True)
+                return json.dumps({"error": "长期记忆检索失败"}, ensure_ascii=False)
         try:
             page = await asyncio.to_thread(
                 manager_instance.search,
