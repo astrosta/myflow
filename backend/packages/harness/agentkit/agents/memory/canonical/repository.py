@@ -611,6 +611,87 @@ class MemoryRepository:
             await session.commit()
             return _candidate_view(row)
 
+    async def list_conflicts(
+        self, user_id: str, *, include_resolved: bool = False
+    ) -> list[MemoryConflictView]:
+        async with self._sf() as session:
+            statement = select(MemoryConflictRow).where(MemoryConflictRow.user_id == user_id)
+            if not include_resolved:
+                statement = statement.where(MemoryConflictRow.status == "open")
+            rows = (
+                await session.scalars(
+                    statement.order_by(MemoryConflictRow.created_at.desc())
+                )
+            ).all()
+            return [_conflict_view(row) for row in rows]
+
+    async def resolve_conflict(
+        self,
+        user_id: str,
+        conflict_id: str,
+        *,
+        expected_revision: int,
+        resolution: str,
+        merged_content: str | None = None,
+    ) -> MemoryConflictView:
+        async with self._sf() as session:
+            row = await session.get(MemoryConflictRow, conflict_id)
+            if row is None or row.user_id != user_id:
+                raise MemoryNotFoundError(f"memory conflict {conflict_id} not found")
+            if int(row.revision) != expected_revision:
+                raise MemoryConflictError(
+                    f"memory conflict changed (expected revision {expected_revision}, found {row.revision})",
+                    current_revision=int(row.revision),
+                )
+            row.status = "resolved"
+            row.revision = int(row.revision) + 1
+            row.resolved_at = _now()
+            if merged_content:
+                row.candidate_snapshot = {**dict(row.candidate_snapshot or {}), "merged_content": merged_content}
+            await session.commit()
+            return _conflict_view(row)
+
+    async def clear_user(
+        self, user_id: str, *, reason: str = "user_clear"
+    ) -> None:
+        now = _now()
+        async with self._sf() as session:
+            scope = await session.get(MemoryScopeMetaRow, user_id)
+            if scope is None:
+                scope = MemoryScopeMetaRow(user_id=user_id, epoch=0, updated_at=now)
+                session.add(scope)
+            scope.epoch = int(scope.epoch) + 1
+            scope.cleared_at = now
+            scope.updated_at = now
+            rows = (
+                await session.scalars(
+                    select(MemoryRecordRow).where(
+                        MemoryRecordRow.user_id == user_id,
+                        MemoryRecordRow.status.in_(("active", "pending_review", "dormant")),
+                    )
+                )
+            ).all()
+            for row in rows:
+                row.status = "deleted"
+                row.deleted_at = now
+                row.revision = int(row.revision) + 1
+                row.updated_at = now
+                session.add(
+                    MemoryRecordVersionRow(
+                        memory_id=row.id,
+                        user_id=user_id,
+                        revision=row.revision,
+                        status=row.status,
+                        content=row.content,
+                        payload=row.payload,
+                        valid_from=row.valid_from,
+                        valid_to=row.valid_to,
+                        changed_at=now,
+                    )
+                )
+                await _enqueue_outbox(session, row, op="delete")
+            await session.commit()
+
     async def write_conflict(
         self,
         user_id: str,

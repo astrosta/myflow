@@ -38,7 +38,6 @@ from backend.app.gateway.routers import (
     artifacts,
     knowledge,
     mcp,
-    memory,
     memory_v2,
     models,
     skill_drafts,
@@ -263,10 +262,8 @@ def create_app() -> FastAPI:
     application.include_router(skills.router, prefix="/api")
     # Human-facing knowledge base; same /api prefix as the rest of the browser API.
     application.include_router(knowledge.router, prefix="/api")
-    # Canonical memory routes must win over the legacy wire-compatible router.
+    # Canonical memory routes. The old BaseStore router is no longer mounted.
     application.include_router(memory_v2.router, prefix="/api")
-    # M10 §2.12：legacy memory routes，保留到迁移窗口结束。
-    application.include_router(memory.router, prefix="/api", include_in_schema=False)
     # M9 §2.12：认证路由 prefix=/v1/auth，/api 同样加在这里。
     application.include_router(auth_router, prefix="/api")
     return application

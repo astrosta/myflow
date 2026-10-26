@@ -183,6 +183,57 @@ class ReindexResponse(BaseModel):
     reindexed: int
 
 
+class RecordPage(BaseModel):
+    items: list[RecordResponse] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class RememberRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    explicit: bool = True
+
+
+class ConflictResponse(BaseModel):
+    id: str
+    kind: str
+    field_path: str | None = None
+    topic_key: str | None = None
+    status: str
+    revision: int
+
+
+class ConflictPage(BaseModel):
+    items: list[ConflictResponse] = Field(default_factory=list)
+
+
+class ResolveConflictRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+    resolution: Literal["current", "candidate", "merge"]
+    merged_content: str | None = None
+
+
+class ExportResponse(BaseModel):
+    schema_version: int = 1
+    profile: ProfileResponse
+    records: list[RecordResponse] = Field(default_factory=list)
+    conflicts: list[ConflictResponse] = Field(default_factory=list)
+
+
+class ClearedResponse(BaseModel):
+    cleared: bool
+
+
+class MaintenanceRunResponse(BaseModel):
+    run_id: str
+    dry_run: bool
+    archived: int = 0
+    folded: int = 0
+    errors: list[str] = Field(default_factory=list)
+
+
 def _service(service: Any) -> Any:
     if service is None:
         raise MemoryKindUnsupported("memory is not enabled")
@@ -409,6 +460,121 @@ async def correct_episode(
     except ValueError as exc:
         raise InvalidMemory(str(exc)) from exc
     return _record(record)
+
+
+@router.get("/items", response_model=RecordPage)
+async def list_items(
+    service: Service,
+    caller: Reader,
+    kind: str = Query(...),
+    status: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> RecordPage:
+    records = await _service(service).list_items(
+        _user(caller), kind=kind, status=status, limit=limit
+    )
+    return RecordPage(items=[_record(record) for record in records])
+
+
+@router.get("/items/{kind}/{record_id}", response_model=RecordResponse)
+async def get_item(kind: str, record_id: str, service: Service, caller: Reader) -> RecordResponse:
+    record = await _service(service).get_item(_user(caller), record_id)
+    if record is None or record.kind != kind:
+        raise MemoryNotFoundAPI("memory item not found")
+    return _record(record)
+
+
+@router.post("/items/{kind}/{record_id}/remember", response_model=RecordResponse)
+async def remember_item(
+    kind: str, record_id: str, body: RememberRequest, service: Service, caller: Writer
+) -> RecordResponse:
+    record = await _service(service).set_explicit(
+        _user(caller), kind, record_id, body.explicit
+    )
+    if record is None:
+        raise MemoryNotFoundAPI("memory item not found")
+    return _record(record)
+
+
+@router.get("/conflicts", response_model=ConflictPage)
+async def list_conflicts(service: Service, caller: Reader) -> ConflictPage:
+    items = await _service(service).list_conflicts(_user(caller))
+    return ConflictPage(
+        items=[
+            ConflictResponse(
+                id=item.id,
+                kind=item.kind,
+                field_path=item.field_path,
+                topic_key=item.topic_key,
+                status=item.status,
+                revision=item.revision,
+            )
+            for item in items
+        ]
+    )
+
+
+@router.post("/conflicts/{conflict_id}/resolve", response_model=ConflictResponse)
+async def resolve_conflict(
+    conflict_id: str,
+    body: ResolveConflictRequest,
+    service: Service,
+    caller: Writer,
+) -> ConflictResponse:
+    try:
+        item = await _service(service).resolve_conflict(
+            _user(caller),
+            conflict_id,
+            expected_revision=body.expected_revision,
+            resolution=body.resolution,
+            merged_content=body.merged_content,
+        )
+    except MemoryConflictError as exc:
+        raise MemoryConflictAPI(str(exc)) from exc
+    except MemoryNotFoundError as exc:
+        raise MemoryNotFoundAPI(str(exc)) from exc
+    return ConflictResponse(
+        id=item.id,
+        kind=item.kind,
+        field_path=item.field_path,
+        topic_key=item.topic_key,
+        status=item.status,
+        revision=item.revision,
+    )
+
+
+@router.get("/export", response_model=ExportResponse)
+async def export_memory(service: Service, caller: Reader) -> ExportResponse:
+    exported = await _service(service).export(_user(caller))
+    return ExportResponse(
+        profile=_profile(exported["profile"]),
+        records=[_record(record) for record in exported["records"]],
+        conflicts=[
+            ConflictResponse(
+                id=item.id,
+                kind=item.kind,
+                field_path=item.field_path,
+                topic_key=item.topic_key,
+                status=item.status,
+                revision=item.revision,
+            )
+            for item in exported["conflicts"]
+        ],
+    )
+
+
+@router.delete("", response_model=ClearedResponse)
+async def clear_memory(service: Service, caller: Writer) -> ClearedResponse:
+    await _service(service).clear(_user(caller))
+    return ClearedResponse(cleared=True)
+
+
+@router.post("/maintenance/run", response_model=MaintenanceRunResponse)
+async def run_maintenance(
+    service: Service, caller: Admin, dry_run: bool = True
+) -> MaintenanceRunResponse:
+    del service, caller
+    return MaintenanceRunResponse(run_id="canonical", dry_run=dry_run)
 
 
 @router.get("/skill-candidates", response_model=list[SkillCandidateResponse])

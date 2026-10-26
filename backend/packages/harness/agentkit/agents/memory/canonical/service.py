@@ -223,6 +223,68 @@ class MemoryService:
             user_id, candidate_id, expected_revision=expected_revision, reason=reason
         )
 
+    async def list_conflicts(
+        self, user_id: str, *, include_resolved: bool = False
+    ) -> list[Any]:
+        return await self.repo.list_conflicts(user_id, include_resolved=include_resolved)
+
+    async def resolve_conflict(
+        self,
+        user_id: str,
+        conflict_id: str,
+        *,
+        expected_revision: int,
+        resolution: str,
+        merged_content: str | None = None,
+    ) -> Any:
+        return await self.repo.resolve_conflict(
+            user_id,
+            conflict_id,
+            expected_revision=expected_revision,
+            resolution=resolution,
+            merged_content=merged_content,
+        )
+
+    async def list_items(
+        self, user_id: str, *, kind: str, status: str | None = None, limit: int = 50
+    ) -> list[Any]:
+        return await self.repo.list_records(
+            user_id,
+            kind=kind,
+            statuses=[status] if status else None,
+            limit=limit,
+        )
+
+    async def get_item(self, user_id: str, record_id: str) -> Any:
+        return await self.repo.get_record(user_id, record_id)
+
+    async def set_explicit(
+        self, user_id: str, kind: str, record_id: str, explicit: bool
+    ) -> Any:
+        if kind != "semantic":
+            raise ValueError("explicit remember only applies to semantic facts")
+        record = await self.repo.get_record(user_id, record_id)
+        if record is None:
+            return None
+        return await self.repo.update_record(
+            user_id,
+            record_id,
+            expected_revision=record.revision,
+            changes={"explicit_remember": bool(explicit)},
+            mutation=MutationContext("USER", user_id, "UPDATE", "explicit_remember", ()),
+        )
+
+    async def export(self, user_id: str) -> dict[str, Any]:
+        profile = await self.get_profile(user_id)
+        records = []
+        for kind in ("semantic", "episodic"):
+            records.extend(await self.repo.list_records(user_id, kind=kind, limit=1000))
+        conflicts = await self.list_conflicts(user_id, include_resolved=True)
+        return {"profile": profile, "records": records, "conflicts": conflicts}
+
+    async def clear(self, user_id: str) -> None:
+        await self.repo.clear_user(user_id)
+
     async def reindex(self, user_id: str | None = None) -> int:
         if self.projector is None:
             return 0

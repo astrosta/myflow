@@ -82,8 +82,7 @@ EXPECTED_ROUTES = {
     ("POST", "/api/admin/skills/{skill_id}/activate"),
     # M11.1 task 23: 换嵌入文本/模型后的一次性强制重建（设计 §7.6）。
     ("POST", "/api/admin/skills/reindex"),
-    # M10 §2.12：记忆（prefix=/memory，/api 由 create_app 加）
-    ("GET", "/api/memory"),
+    # M10 §2.12：canonical memory（prefix=/memory，/api 由 create_app 加）
     ("GET", "/api/memory/profile"),
     ("PATCH", "/api/memory/profile"),
     ("DELETE", "/api/memory/profile/{field_path:path}"),
@@ -100,7 +99,6 @@ EXPECTED_ROUTES = {
     ("POST", "/api/memory/skill-candidates/{candidate_id}/confirm"),
     ("POST", "/api/memory/skill-candidates/{candidate_id}/reject"),
     ("POST", "/api/memory/reindex"),
-    ("GET", "/api/memory/facts"),
     ("GET", "/api/memory/conflicts"),
     ("POST", "/api/memory/conflicts/{conflict_id}/resolve"),
     ("GET", "/api/memory/export"),
