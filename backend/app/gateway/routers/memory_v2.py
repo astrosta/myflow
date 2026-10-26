@@ -175,6 +175,14 @@ class DeletedResponse(BaseModel):
     deleted: str
 
 
+class ClearProfileResponse(BaseModel):
+    cleared: str
+
+
+class ReindexResponse(BaseModel):
+    reindexed: int
+
+
 def _service(service: Any) -> Any:
     if service is None:
         raise MemoryKindUnsupported("memory is not enabled")
@@ -250,7 +258,7 @@ async def patch_profile(
     return _profile(snapshot)
 
 
-@router.delete("/profile/{field_path:path}")
+@router.delete("/profile/{field_path:path}", response_model=ClearProfileResponse)
 async def clear_profile_field(
     field_path: str,
     service: Service,
@@ -459,7 +467,7 @@ async def reject_skill_candidate(
     return _candidate(candidate)
 
 
-@router.post("/reindex")
+@router.post("/reindex", response_model=ReindexResponse)
 async def reindex(service: Service, caller: Admin) -> dict[str, int]:
     del caller
     return {"reindexed": await _service(service).reindex()}
