@@ -100,6 +100,8 @@ export function SidebarContainer() {
           // 高亮按前缀判：/workspace/skills/{id} 也算在「技能」里
           isAdmin={user?.system_role === "admin"}
           knowledgeActive={pathname?.startsWith("/workspace/knowledge") ?? false}
+          pendingActive={pathname?.startsWith("/workspace/memory/pending") ?? false}
+          profileActive={pathname?.startsWith("/workspace/profile") ?? false}
           loading={query.isLoading}
           reviewActive={pathname?.startsWith("/workspace/admin/skills") ?? false}
           skillsActive={pathname?.startsWith("/workspace/skills") ?? false}

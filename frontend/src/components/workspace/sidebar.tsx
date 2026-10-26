@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { BookOpenIcon, SettingsIcon, ToolIcon } from "@/components/ui/icons";
+import { BookOpenIcon, SettingsIcon, ToolIcon, UserIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { ThreadSummary } from "@/core/types";
 import { cn, formatTimestamp } from "@/lib/utils";
@@ -55,6 +55,10 @@ export interface SidebarProps {
   skillsActive?: boolean;
   /** 当前是否在审核路由（/workspace/admin/skills） */
   reviewActive?: boolean;
+  /** 当前是否在「我的画像」 */
+  profileActive?: boolean;
+  /** 当前是否在「待确认记忆」 */
+  pendingActive?: boolean;
   /**
    * 当前会话是不是管理员；只决定要不要画「审核」入口。
    *
@@ -76,6 +80,8 @@ export function Sidebar({
   knowledgeActive = false,
   skillsActive = false,
   reviewActive = false,
+  profileActive = false,
+  pendingActive = false,
   isAdmin = false,
   className,
 }: SidebarProps) {
@@ -127,6 +133,22 @@ export function Sidebar({
         >
           <ToolIcon className="shrink-0" size={15} />
           技能
+        </Link>
+        <Link
+          aria-current={profileActive ? "page" : undefined}
+          className={navItemClass(profileActive)}
+          href="/workspace/profile"
+        >
+          <UserIcon className="shrink-0" size={15} />
+          我的画像
+        </Link>
+        <Link
+          aria-current={pendingActive ? "page" : undefined}
+          className={navItemClass(pendingActive)}
+          href="/workspace/memory/pending"
+        >
+          <BookOpenIcon className="shrink-0" size={15} />
+          待确认记忆
         </Link>
         {/**
          * 「审核」只对管理员画出来：普通用户看不到这个链接。
