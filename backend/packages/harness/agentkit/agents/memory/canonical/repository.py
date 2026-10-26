@@ -345,6 +345,24 @@ class MemoryRepository:
         next_cursor = str(offset + limit) if len(rows) > offset + limit else None
         return PendingPage(items=page, next_cursor=next_cursor)
 
+    async def list_pending_semantic_before(
+        self, cutoff: datetime, *, limit: int = 100
+    ) -> list[MemoryRecordView]:
+        async with self._sf() as session:
+            rows = (
+                await session.scalars(
+                    select(MemoryRecordRow)
+                    .where(
+                        MemoryRecordRow.kind == "semantic",
+                        MemoryRecordRow.status == "pending_review",
+                        MemoryRecordRow.updated_at < cutoff,
+                    )
+                    .order_by(MemoryRecordRow.updated_at.asc())
+                    .limit(limit)
+                )
+            ).all()
+            return [_record_view(row) for row in rows]
+
     async def soft_delete(
         self,
         user_id: str,
