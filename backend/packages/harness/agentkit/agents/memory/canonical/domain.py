@@ -103,6 +103,19 @@ class ProfileApplyResult:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryHitView:
+    record: MemoryRecordView
+    score: float | None = None
+    highlights: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySearchPage:
+    items: list[MemoryHitView] = field(default_factory=list)
+    next_cursor: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryConflictView:
     id: str
     user_id: str

@@ -312,6 +312,43 @@ class MemoryRepository:
             row = await session.get(MemoryScopeMetaRow, user_id)
             return int(row.epoch) if row is not None else 0
 
+    async def search_lexical(
+        self,
+        user_id: str,
+        *,
+        text: str,
+        kinds: Sequence[str],
+        limit: int = 50,
+    ) -> list[tuple[MemoryRecordView, float]]:
+        import re
+
+        terms = set(re.findall(r"[\w-]+", text.lower(), re.UNICODE))
+        async with self._sf() as session:
+            rows = (
+                await session.scalars(
+                    select(MemoryRecordRow)
+                    .where(
+                        MemoryRecordRow.user_id == user_id,
+                        MemoryRecordRow.status == "active",
+                        MemoryRecordRow.kind.in_(tuple(kinds)),
+                    )
+                    .order_by(MemoryRecordRow.updated_at.desc())
+                    .limit(1000)
+                )
+            ).all()
+        scored: list[tuple[MemoryRecordView, float]] = []
+        for row in rows:
+            view = _record_view(row)
+            content = f"{view.content} {view.topic_key or ''}".lower()
+            body_terms = set(re.findall(r"[\w-]+", content, re.UNICODE))
+            overlap = len(terms & body_terms)
+            substring = 0.25 if text.strip().lower() in content else 0.0
+            score = (overlap / max(1, len(terms))) + substring
+            if score > 0.0 or not terms:
+                scored.append((view, score))
+        scored.sort(key=lambda item: (-item[1], item[0].updated_at), reverse=False)
+        return scored[:limit]
+
     async def list_active_records(
         self, user_id: str | None = None, *, limit: int = 1000
     ) -> list[MemoryRecordView]:
@@ -823,6 +860,17 @@ def _projects(row: MemoryRecordRow) -> bool:
 
 
 async def _enqueue_outbox(session: Any, row: MemoryRecordRow, *, op: str) -> None:
+    existing = await session.scalar(
+        select(MemoryIndexOutboxRow.id).where(
+            MemoryIndexOutboxRow.memory_id == row.id,
+            MemoryIndexOutboxRow.revision == int(row.revision),
+            MemoryIndexOutboxRow.op == op,
+        )
+    )
+    if existing is not None:
+        # A touch or repeated transition for the same revision must not violate
+        # the outbox unique key.  The pending event will read current PG state.
+        return
     scope = await session.get(MemoryScopeMetaRow, row.user_id)
     epoch = int(scope.epoch) if scope is not None else 0
     session.add(
