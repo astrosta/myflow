@@ -40,6 +40,11 @@ skills = [
 redis = [
     "redis>=5.0",
 ]
+# Canonical memory runtime: stateless LangMem operators + Milvus projection.
+memory = [
+    "langmem==0.0.30",
+    "pymilvus>=2.5",
+]
 
 [build-system]
 requires = ["hatchling"]

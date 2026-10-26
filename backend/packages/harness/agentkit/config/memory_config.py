@@ -21,9 +21,27 @@ class MemoryProfileConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    injection_enabled: bool = True
+    inject: bool = True
     max_tokens: int = Field(default=800, ge=1, le=16_000)
+    auto_write_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     refresh: Literal["thread_start", "revision_delta"] = "thread_start"
+
+    @property
+    def injection_enabled(self) -> bool:
+        """Backward-compatible read alias; new configs use inject."""
+        return self.inject
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_legacy_injection_enabled(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "injection_enabled" not in data:
+            return data
+        migrated = dict(data)
+        legacy = migrated.pop("injection_enabled")
+        if "inject" in migrated and migrated["inject"] != legacy:
+            raise ValueError("memory.profile.inject and injection_enabled disagree")
+        migrated["inject"] = legacy
+        return migrated
 
 
 class MemoryIngestConfig(BaseModel):
@@ -94,17 +112,130 @@ class MemoryMaintenanceConfig(BaseModel):
         return self
 
 
+class MemoryLangMemConfig(BaseModel):
+    """Operator model and timeout policy; operators are stateless."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = "agent_default"
+    operator_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    schema_version: int = Field(default=1, ge=1)
+
+
+class MemoryVectorStoreConfig(BaseModel):
+    """Milvus projection settings. PostgreSQL remains authoritative."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["milvus"] = "milvus"
+    uri: str = ""
+    token: str = Field(default="", repr=False)
+    collection: str = "myflow_memory_active"
+    metric_type: Literal["COSINE", "IP", "L2"] = "COSINE"
+    index_type: str = "AUTOINDEX"
+    consistency_level: Literal["Strong", "Session", "Bounded", "Eventually"] = "Strong"
+
+
+class MemoryEmbeddingConfig(BaseModel):
+    """Embedding endpoint used by the memory projection/retrieval."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = ""
+    api_key: str = Field(default="", repr=False)
+    model: str = "Qwen/Qwen3-Embedding-8B"
+    dimensions: int = Field(default=4096, ge=1, le=65536)
+    batch_size: int = Field(default=8, ge=1, le=512)
+    timeout_seconds: float = Field(default=120.0, gt=0.0)
+    max_retries: int = Field(default=2, ge=0, le=8)
+
+
+class MemorySemanticConfig(BaseModel):
+    """Semantic fact visibility thresholds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    auto_activate_threshold: float = Field(default=0.80, ge=0.0, le=1.0)
+    pending_review_ttl_days: int = Field(default=30, ge=1)
+    include_pending_in_extraction: bool = True
+
+
+class MemoryEpisodicConfig(BaseModel):
+    """Episode capture/close policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_idle_close_minutes: int = Field(default=30, ge=1)
+    max_turns_per_session: int = Field(default=40, ge=1)
+    gate_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
+    max_summary_tokens: int = Field(default=1200, ge=1)
+    ttl_days: int = Field(default=180, ge=1)
+
+
+class MemoryConsolidationConfig(BaseModel):
+    """L2/L3 consolidation cadence; shadow is observability-only by default."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    l2_unconsolidated_threshold: int = Field(default=10, ge=1)
+    l3_cron: str = "0 3 * * *"
+    shadow: bool = True
+
+
+class MemorySkillCandidatesConfig(BaseModel):
+    """Host-side skill candidate thresholds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    min_source_episodes: int = Field(default=3, ge=1)
+    min_distinct_threads: int = Field(default=2, ge=1)
+    min_success_rate: float = Field(default=0.80, ge=0.0, le=1.0)
+    trigger_similarity_threshold: float = Field(default=0.82, ge=0.0, le=1.0)
+    strong_trigger_similarity: float = Field(default=0.92, ge=0.0, le=1.0)
+    min_common_steps: int = Field(default=2, ge=1)
+    expire_days: int = Field(default=30, ge=1)
+    require_user_confirmation: bool = True
+
+
+class MemoryRetrievalConfig(BaseModel):
+    """Hybrid retrieval quotas and lexical fallback."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_k: int = Field(default=50, ge=1)
+    lexical_fallback: bool = True
+    per_kind_quota: dict[str, int] = Field(
+        default_factory=lambda: {"semantic": 6, "episodic": 2}
+    )
+
+
+class MemoryConfigError(ValueError):
+    """Memory configuration cannot be used to build a runtime."""
+
+
 class MemoryConfig(BaseModel):
     """memory: block in config.yaml."""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    canonical_store: Literal["postgres"] = "postgres"
     backend_class: str = Field(
         default="langmem",
         description=format_field_description("memory.backend_class"),
     )
+    langmem: MemoryLangMemConfig = Field(default_factory=MemoryLangMemConfig)
+    vector_store: MemoryVectorStoreConfig = Field(default_factory=MemoryVectorStoreConfig)
+    embedding: MemoryEmbeddingConfig = Field(default_factory=MemoryEmbeddingConfig)
     profile: MemoryProfileConfig = Field(default_factory=MemoryProfileConfig)
+    semantic: MemorySemanticConfig = Field(default_factory=MemorySemanticConfig)
+    episodic: MemoryEpisodicConfig = Field(default_factory=MemoryEpisodicConfig)
+    consolidation: MemoryConsolidationConfig = Field(default_factory=MemoryConsolidationConfig)
+    skill_candidates: MemorySkillCandidatesConfig = Field(
+        default_factory=MemorySkillCandidatesConfig
+    )
+    retrieval: MemoryRetrievalConfig = Field(default_factory=MemoryRetrievalConfig)
     ingest: MemoryIngestConfig = Field(default_factory=MemoryIngestConfig)
     maintenance: MemoryMaintenanceConfig = Field(default_factory=MemoryMaintenanceConfig)
     backend_config: dict[str, Any] = Field(default_factory=dict)

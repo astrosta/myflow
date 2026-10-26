@@ -29,6 +29,9 @@ skills = [
 redis = [
     "agentkit[redis]",
 ]
+memory = [
+    "agentkit[memory,postgres]",
+]
 
 [dependency-groups]
 dev = [
@@ -36,6 +39,8 @@ dev = [
     "pytest-asyncio>=1.4.0",
     # Redis 版桥的协议测试跑在 fakeredis 上：不需要真的 Redis 服务，也不进生产依赖
     "fakeredis>=2.30",
+    # Memory operator contract tests import LangMem directly.
+    "langmem==0.0.30",
 ]
 
 [tool.uv.sources]
