@@ -307,6 +307,28 @@ class MemoryRepository:
             rows = (await session.scalars(statement)).all()
             return [_record_view(row) for row in rows]
 
+    async def get_epoch(self, user_id: str) -> int:
+        async with self._sf() as session:
+            row = await session.get(MemoryScopeMetaRow, user_id)
+            return int(row.epoch) if row is not None else 0
+
+    async def list_active_records(
+        self, user_id: str | None = None, *, limit: int = 1000
+    ) -> list[MemoryRecordView]:
+        async with self._sf() as session:
+            statement = select(MemoryRecordRow).where(
+                MemoryRecordRow.status == "active",
+                MemoryRecordRow.kind.in_(("semantic", "episodic")),
+            )
+            if user_id is not None:
+                statement = statement.where(MemoryRecordRow.user_id == user_id)
+            rows = (
+                await session.scalars(
+                    statement.order_by(MemoryRecordRow.updated_at.asc()).limit(limit)
+                )
+            ).all()
+            return [_record_view(row) for row in rows]
+
     async def list_records(
         self,
         user_id: str,
@@ -846,13 +868,23 @@ def _ledger(
             after_revision=after_revision,
             before_status=before_status,
             after_status=after_status,
-            op_json=op_json,
-            inverse_json=inverse_json,
+            op_json=_jsonable(op_json),
+            inverse_json=_jsonable(inverse_json),
             source_episode_ids=list(mutation.source_episode_ids),
             reason=mutation.reason,
             created_at=_now(),
         )
     )
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def _seconds(value: float) -> Any:
