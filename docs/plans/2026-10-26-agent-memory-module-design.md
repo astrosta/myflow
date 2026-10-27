@@ -457,14 +457,15 @@ session 不是记忆，也不是 thread；它只是把多轮对话攒成一个�
 - 分类器只读 `ThreadState` 的有界任务窗口，输出边界决策；不写记忆、不写 `memory_episode_sessions`。
 - session 关闭/创建由 Capture/Memory 层消费 `boundary_pending` 后执行；分类器本身不持有 Repository。
 
-#### L0 规则门：纯打招呼/寒暄
+#### L0 规则门：纯打招呼/寒暄/继续提示
 
 在调用模型之前先做确定性规则门，命中后**零模型调用**：
 
 - 纯问候/寒暄/致谢/确认/告别（如“你好”“在吗”“谢谢”“好的”“收到”“晚安”“hello”“thanks”“ok”“bye”）不进入任务分类器模型。
+- 纯任务继续提示（如“继续”“接着做”“下一步”“go on”“continue”“keep going”）也不进入模型。
 - 当前没有 `task_id`：返回 `None`，不生成 `task_context`、`task_id` 或 `task_goal`。
 - 当前已有 `task_id`：决策固定为 `CONTINUE`，直接沿用现有 `task_id` 和 `task_goal`，不生成新目标，也不改 `task_goal_source`。
-- 问候后面带真实请求（如“你好，帮我修部署脚本”）不算纯寒暄，仍进入分类器，避免漏掉任务。
+- 问候/继续提示后面带真实请求（如“你好，帮我修部署脚本”“继续，把测试也跑一下”）不算纯提示，仍进入分类器，避免漏掉任务。
 - 规则门只做文本规则，不调用模型；它不写记忆、不关 session。
 
 #### 输入
@@ -508,8 +509,8 @@ class TaskBoundaryResult(BaseModel):
 
 | 条件/输出 | task_context | session/task_id | job |
 |---|---|---|---|
-| 纯寒暄且无 task_id | 不生成 task_context/task_id/task_goal | 不创建新任务 | 无 |
-| 纯寒暄且已有 task_id | 沿用现有 task_id/task_goal；boundary_decision=CONTINUE | 追加到当前 session | 无 |
+| 纯寒暄/继续提示且无 task_id | 不生成 task_context/task_id/task_goal | 不创建新任务 | 无 |
+| 纯寒暄/继续提示且已有 task_id | 沿用现有 task_id/task_goal；boundary_decision=CONTINUE | 追加到当前 session | 无 |
 | `task_goal` 为空 | 强制 NEW_TASK；分类器生成新 task_goal；生成 task_id | 若存在 open session，先关闭并标记 `task_boundary`；再开新 session | 关闭旧 session 时只入队一次 |
 | CONTINUE | 保持 task_id/task_goal；忽略模型的 task_goal；记录 boundary_decision | 追加到当前 session | 无 |
 | NEW_TASK | 生成新 task_id；采用分类器返回的 task_goal（宿主校验/截断） | 先关闭旧 session（close_reason=task_boundary），再把本轮追加到新 session | 旧 session 只入队一个 episode job |
@@ -1195,9 +1196,9 @@ memory:
 | 冷热恢复 | dormant/archived -> restore | 恢复 active；Milvus upsert；explicit_remember 不衰减 |
 | 验证失败 | candidate validating 时静态校验失败 | status=rejected；不进入 pending_confirmation |
 | 多轮 session | 同一 thread 多轮任务后终态；再开新任务 | 旧 session 关闭只生成一个 episode；新任务新 session；不互相污染 |
-| 纯寒暄无任务 | 新 thread 首条消息是“你好/hello/谢谢” | 不生成 task_id/task_goal/task_context；不调用分类模型 |
-| 纯寒暄有任务 | 当前任务非空，新消息是“谢谢/收到/好的” | 沿用 task_id/task_goal；boundary_decision=CONTINUE；不改 goal；不调用模型 |
-| 寒暄+真实请求 | “你好，帮我修部署脚本” | 不算纯寒暄；进入模型分类 |
+| 纯寒暄/继续无任务 | 新 thread 首条消息是“你好/hello/谢谢/继续” | 不生成 task_id/task_goal/task_context；不调用分类模型 |
+| 纯寒暄/继续有任务 | 当前任务非空，新消息是“谢谢/收到/接着做/继续” | 沿用 task_id/task_goal；boundary_decision=CONTINUE；不改 goal；不调用模型 |
+| 寒暄/继续+真实请求 | “你好，帮我修部署脚本”“继续，把测试也跑一下” | 不算纯提示；进入模型分类 |
 | 任务边界 CONTINUE | 当前 task_goal 非空，新消息是当前任务的追问 | 决策 CONTINUE；task_id/task_goal 不变；本轮进入当前 session |
 | 任务边界 NEW_TASK | 当前 task_goal 非空，新消息是无关任务 | 决策 NEW_TASK；旧 session close_reason=task_boundary 且只入队一次；新 task_id；分类器生成新 task_goal；旧消息不进入新 session |
 | 任务边界 UNCERTAIN | 分类器返回 UNCERTAIN/超时/非法 schema | 不关闭 session；task_id 不变；boundary_uncertain=true；本轮仍被捕获 |
@@ -1219,7 +1220,7 @@ memory:
 - 同一 thread 同时最多一个 open episode session；多轮任务不会被切成每轮一个 episode；关闭后只入队一次。
 - 任务分类器：task_goal 为空 100% 强制 NEW_TASK，且 task_goal 只能来自分类器或显式 fallback；task_id 只由宿主代码生成；NEW_TASK 后旧任务消息进入新 session = 0；UNCERTAIN 不默认切任务；同一首条消息重复执行只产生一个 task_id；非法 task_goal 不得静默写库。
 - 任务分类器输入只包含 `task_context.completed_runs` 中已完成 run 的 `human_message + final_ai_message` 对和当前新 run 的 `human_message`；中间 AI/tool 输出进入分类输入 = 0；`memory.enabled=false` 时分类器运行 = 0；每个 run 完成后 `completed_runs` 只保留最近 `max_history_runs` 个。
-- 纯打招呼/寒暄：无任务时不生成 task_id/task_goal；已有任务时只沿用 task_id/task_goal，均不调用分类模型；问候+真实请求不得被规则门吞掉。
+- 纯打招呼/寒暄/继续提示：无任务时不生成 task_id/task_goal；已有任务时只沿用 task_id/task_goal，均不调用分类模型；提示+真实请求不得被规则门吞掉。
 - 画像对话直写达到阈值才发生；只从当前新用户消息取证据；历史 transcript/compaction 不重放；低证据不覆盖；高证据可覆盖页面值；“我的画像”页面可改。
 - pending_review 语义事实不进 Milvus、不注入、不出现在 memory_search；只出现在“待确认记忆”页，owner-only；但会作为 LangMem A 的内部 existing 候选；promote 或后续证据过阈值后才 active。
 - 四类提取都由 LangMem 无状态算子产生；代码中不存在绑定 store 的 LangMem manager 写库路径。

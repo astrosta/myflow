@@ -110,15 +110,54 @@ _SOCIAL_TOKENS = tuple(
         reverse=True,
     )
 )
-_SOCIAL_RE = re.compile(
-    r"^(?:"
-    + "|".join(re.escape(token) for token in _SOCIAL_TOKENS)
-    + r")(?:[\s,，.。!！?？~～…、;；:：\-—–_=+*#@/\\|'\"“”‘’()（）\[\]{}<>《》]*"
-    + r"(?:"
-    + "|".join(re.escape(token) for token in _SOCIAL_TOKENS)
-    + r"))*$",
-    re.IGNORECASE,
+_SEPARATOR = r"[\s,，.。!！?？~～…、;；:：\-—–_=+*#@/\\|'\"“”‘’()（）\[\]{}<>《》]*"
+
+
+def _tokens_pattern(tokens: tuple[str, ...]) -> re.Pattern[str]:
+    body = "|".join(re.escape(token) for token in tokens)
+    return re.compile(rf"^(?:{body})(?:{_SEPARATOR}(?:{body}))*$", re.IGNORECASE)
+
+
+_SOCIAL_RE = _tokens_pattern(_SOCIAL_TOKENS)
+_CONTINUATION_TOKENS = tuple(
+    sorted(
+        {
+            "继续",
+            "继续吧",
+            "继续做",
+            "继续干",
+            "继续执行",
+            "继续任务",
+            "继续下一步",
+            "接着",
+            "接着做",
+            "接着来",
+            "接着干",
+            "接着下一步",
+            "接着往下",
+            "接着往下做",
+            "下一步",
+            "然后呢",
+            "然后",
+            "往下",
+            "往下做",
+            "往下走",
+            "go on",
+            "continue",
+            "keep going",
+            "proceed",
+            "carry on",
+            "go ahead",
+            "next",
+            "next step",
+            "resume",
+            "keep it up",
+        },
+        key=len,
+        reverse=True,
+    )
 )
+_CONTINUATION_RE = _tokens_pattern(_CONTINUATION_TOKENS)
 _EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]+")
 
 _SYSTEM_PROMPT = """You classify whether a new user message continues the current task or starts a new one.
@@ -235,23 +274,12 @@ class TaskClassifierMiddleware(AgentMiddleware):
         if current_id and existing.get("last_classified_message_id") == current_id:
             return None
 
-        if is_social_message(current_text):
-            if not _text(existing.get("task_id")):
-                # A greeting must not create a task or a goal.
-                return None
-            social_context: TaskContext = dict(existing)
-            social_context["boundary_decision"] = "CONTINUE"
-            social_context["boundary_uncertain"] = False
-            social_context["boundary_pending"] = False
-            social_context["last_classified_message_id"] = current_id or ""
-            _emit_task_event(
-                decision="CONTINUE",
-                task_goal_source=str(existing.get("task_goal_source") or "classifier"),
-                previous_task_id=_text(existing.get("task_id")),
-                task_id=_text(existing.get("task_id")),
+        if is_social_message(current_text) or is_continuation_prompt(current_text):
+            return _reuse_existing_task(
+                existing,
+                current_id,
                 policy=self._config.task_classifier.uncertain_policy,
             )
-            return {"task_context": social_context}
 
         current_text, current_goal, completed = _fit_input(
             current_text,
@@ -415,6 +443,37 @@ def is_social_message(value: str) -> bool:
     """
     cleaned = _EMOJI_RE.sub("", str(value or "")).strip()
     return bool(cleaned) and bool(_SOCIAL_RE.fullmatch(cleaned))
+
+
+def is_continuation_prompt(value: str) -> bool:
+    """True only for a pure "continue" cue such as 继续 / 接着做 / go on."""
+    cleaned = _EMOJI_RE.sub("", str(value or "")).strip()
+    return bool(cleaned) and bool(_CONTINUATION_RE.fullmatch(cleaned))
+
+
+def _reuse_existing_task(
+    existing: TaskContext,
+    current_id: str | None,
+    *,
+    policy: str,
+) -> dict[str, Any] | None:
+    task_id = _text(existing.get("task_id"))
+    if task_id is None:
+        # A greeting/continuation must not create a task or a goal.
+        return None
+    context: TaskContext = dict(existing)
+    context["boundary_decision"] = "CONTINUE"
+    context["boundary_uncertain"] = False
+    context["boundary_pending"] = False
+    context["last_classified_message_id"] = current_id or ""
+    _emit_task_event(
+        decision="CONTINUE",
+        task_goal_source=str(existing.get("task_goal_source") or "classifier"),
+        previous_task_id=task_id,
+        task_id=task_id,
+        policy=policy,
+    )
+    return {"task_context": context}
 
 
 def _normalize_goal(value: str | None) -> str | None:

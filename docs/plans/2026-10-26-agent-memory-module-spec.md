@@ -43,7 +43,7 @@
 | task_id | 只由宿主代码生成；模型/客户端不可指定 |
 | task_goal | 仅 NEW_TASK 由分类器生成；CONTINUE/UNCERTAIN 不改写；分类器失败可用 fallback |
 | UNCERTAIN | 默认继续当前任务，不切 session |
-| 纯寒暄 | 无任务时不生成 task_id/task_goal/task_context；已有任务时只沿用 task_id/task_goal；均不调用分类模型 |
+| 纯寒暄/继续 | 无任务时不生成 task_id/task_goal/task_context；已有任务时只沿用 task_id/task_goal；均不调用分类模型 |
 | 长期记忆关闭 | 任务分类器不挂载、不运行、不生成 task_context |
 | 画像直写阈值 | confidence >= 0.85 |
 | 语义自动 active | confidence >= 0.80 |
@@ -70,7 +70,7 @@
 11. task_id 只由宿主代码生成；model/client 不得指定。task_goal 只允许来自分类器的 NEW_TASK 分支或显式 fallback，CONTINUE/UNCERTAIN 不得改写当前 task_goal。
 12. 任务分类器只在 `memory.enabled=true` 且 `task_classifier.enabled=true` 时运行，每轮最多在 lead 的 before_agent 运行一次；只写 ThreadState.task_context 和 task:classified 事件，不写记忆、不直接关闭 session；子代理不运行；长期记忆关闭时不生成 task_context。
 13. 分类器返回非法/空 task_goal 时不得静默写库：原 task_goal 为空则 fallback，非空则降级 UNCERTAIN，不切任务。
-14. 纯打招呼/寒暄在模型调用前由规则门处理：无 task_id 时不生成 task_context/task_id/task_goal；已有 task_id 时固定 CONTINUE 并沿用现有 task_id/task_goal。规则门不得吞掉“问候+真实请求”。
+14. 纯打招呼/寒暄/继续提示在模型调用前由规则门处理：无 task_id 时不生成 task_context/task_id/task_goal；已有 task_id 时固定 CONTINUE 并沿用现有 task_id/task_goal。规则门不得吞掉“问候/继续提示+真实请求”。
 
 ## 4. 组件
 
@@ -510,7 +510,7 @@ model = create_chat_model(
 ### 7.1.1 任务分类器
 
 - 位置：lead 主循环 `before_agent`，位于 `MemoryMiddleware` 之前；只在 `memory.enabled=true` 且 `task_classifier.enabled=true` 时挂载；每轮最多一次；子代理不运行；长期记忆关闭时完全不运行。
-- L0 规则门：纯打招呼/寒暄/致谢/确认/告别在调用模型前直接处理。无 `task_id` 时返回 `None`，不生成 `task_context/task_id/task_goal`；已有 `task_id` 时固定 `CONTINUE`，沿用现有 `task_id/task_goal`，不改 goal。问候+真实请求（如“你好，帮我修部署”）不算纯寒暄，仍进入分类器。
+- L0 规则门：纯打招呼/寒暄/致谢/确认/告别，以及纯任务继续提示（“继续”“接着做”“下一步”“go on”等）在调用模型前直接处理。无 `task_id` 时返回 `None`，不生成 `task_context/task_id/task_goal`；已有 `task_id` 时固定 `CONTINUE`，沿用现有 `task_id/task_goal`，不改 goal。问候/继续提示+真实请求（如“你好，帮我修部署”“继续，把测试也跑一下”）不算纯提示，仍进入分类器。
 - 输入按 run 对齐：当前新 run 的 `human_message`、当前 `task_goal`、`task_context.completed_runs` 中已完成 run 的 `RunPair` 列表。每个 `RunPair` 只含 `run_id/human_message/final_ai_message`；`final_ai_message` 只取该 run 的最终可见 AI 回复（非 tool-call、非隐藏/画像/子代理）。只传 PII 脱敏文本，不传中间 AI tool-call、工具输出、完整 transcript、SystemMessage、子代理消息；按 `max_history_runs/max_input_tokens` 截断。
 - 每个 run 的 `after_agent` 捕获后，把 `{run_id, human_message, final_ai_message}` 追加到 `task_context.completed_runs`，只保留最近 `max_history_runs` 个；NEW_TASK 清空，CONTINUE/UNCERTAIN 追加。当前新 run 还没有最终 AI 回复，不能进入本轮分类输入。
 - `TaskContext` 的 `completed_runs` 只存 `RunPair`，不存 `ToolMessage`、中间 AI tool-call 或完整工具结果。
@@ -771,9 +771,9 @@ memory:
 | T6 | 分类器失败且 task_goal 为空 | 新消息到达 | NEW_TASK + fallback task_goal；task_id 由代码生成 |
 | T7 | 分类器 CONTINUE 返回新 goal | 当前任务非空 | host 忽略 goal；task_goal 不漂移 |
 | T8 | 模型/用户尝试指定 task_id | 任意 | 不采信；task_id 只由宿主代码生成 |
-| T11 | 纯寒暄且无当前任务 | 新消息“你好/hello/谢谢” | 不生成 task_context/task_id/task_goal；不调用分类模型 |
-| T12 | 纯寒暄且已有任务 | 新消息“谢谢/收到/好的” | 沿用 task_id/task_goal；boundary_decision=CONTINUE；不调用模型 |
-| T13 | 寒暄+真实请求 | “你好，帮我修部署脚本” | 不算纯寒暄；进入模型分类 |
+| T11 | 纯寒暄/继续且无当前任务 | 新消息“你好/hello/谢谢/继续” | 不生成 task_context/task_id/task_goal；不调用分类模型 |
+| T12 | 纯寒暄/继续且已有任务 | 新消息“谢谢/收到/接着做/继续” | 沿用 task_id/task_goal；boundary_decision=CONTINUE；不调用模型 |
+| T13 | 寒暄/继续+真实请求 | “你好，帮我修部署脚本”“继续，把测试也跑一下” | 不算纯提示；进入模型分类 |
 | T9 | 长期记忆关闭 | 新用户消息到达 | 任务分类器不挂载、不运行、不生成 task_context；session 保持旧行为 |
 | T10 | 当前任务有 2 个已完成 run，每个 run 有中间 tool-call AI | 构造分类输入 / after_agent 追加 | 只取每个 run 的 `human_message + final_ai_message` 对；中间 AI/tool 输出不进入输入；`completed_runs` 最多保留 `max_history_runs` 个 |
 | S1 | thread 多轮任务 | 终态关闭 session | 一个 episode；一个 job；不每轮抽 |
@@ -824,7 +824,7 @@ memory:
 
 - 四类提取只走 LangMem A/B/C/D；代码中没有 create_memory_store_manager 写库路径。
 - 同一 thread 同时最多一个 open session；多轮任务只生成一个 episode；历史不重放。
-- 任务分类器：task_goal 为空 100% 强制 NEW_TASK；task_id 只由代码生成；NEW_TASK 先关闭旧 session（task_boundary）且只入队一次；CONTINUE/UNCERTAIN 不改写 task_goal；UNCERTAIN 默认不切；NEW_TASK 后旧任务消息进入新 session = 0；长期记忆关闭时分类器运行 = 0；输入只含 `completed_runs` 的 human/final AI 对和当前 human，中间 tool-call AI/工具输出进入输入 = 0；`completed_runs` 最多保留 `max_history_runs` 个；纯寒暄无任务不生成 task_id/task_goal，纯寒暄有任务只沿用现有 task_id/task_goal，均不调用模型。
+- 任务分类器：task_goal 为空 100% 强制 NEW_TASK；task_id 只由代码生成；NEW_TASK 先关闭旧 session（task_boundary）且只入队一次；CONTINUE/UNCERTAIN 不改写 task_goal；UNCERTAIN 默认不切；NEW_TASK 后旧任务消息进入新 session = 0；长期记忆关闭时分类器运行 = 0；输入只含 `completed_runs` 的 human/final AI 对和当前 human，中间 tool-call AI/工具输出进入输入 = 0；`completed_runs` 最多保留 `max_history_runs` 个；纯寒暄/继续提示无任务不生成 task_id/task_goal，已有任务只沿用现有 task_id/task_goal，均不调用模型。
 - 画像只从当前新用户消息取证据；历史 transcript/compaction 不重放；高证据可覆盖页面值；无新用户消息时页面值不变。
 - semantic >=0.80 active；0.50–0.79 pending_review；pending 不进 Milvus/context；可手动/后续证据晋升；30 天过期。
 - 待确认记忆页 owner-only；admin 只聚合计数。

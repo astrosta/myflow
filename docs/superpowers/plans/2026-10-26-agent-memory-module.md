@@ -22,7 +22,7 @@
 - 画像没有 `pinned` 字段，也没有 pin/unpin UI；页面编辑是普通写入，后续高证据对话可以覆盖，历史通过 ledger 保留。
 - session 空闲关闭 `30 分钟`，最多 `40 轮`；同一 `(user_id, thread_id)` 同时最多一个 open session；一个 session 只生成一个 episode/job。
 - 任务分类器只在 `memory.enabled && task_classifier.enabled` 时、lead 的 `before_agent` 运行一次；长期记忆关闭时不挂载、不生成 `task_context`；输出 `CONTINUE/NEW_TASK/UNCERTAIN` + `task_goal`；`task_goal` 为空强制 NEW_TASK，但仍由分类器生成新目标；`task_id` 只由宿主代码生成；`CONTINUE/UNCERTAIN` 不改写 `task_goal`；UNCERTAIN 默认继续当前任务。
-- 纯打招呼/寒暄在模型调用前走规则门：无 task_id 时不生成 task_context/task_id/task_goal；已有 task_id 时固定 CONTINUE 并沿用 task_id/task_goal；问候+真实请求不得被规则门吞掉。
+- 纯打招呼/寒暄和纯继续提示（继续/接着做/下一步/go on）在模型调用前走规则门：无 task_id 时不生成 task_context/task_id/task_goal；已有 task_id 时固定 CONTINUE 并沿用 task_id/task_goal；提示+真实请求不得被规则门吞掉。
 - 分类器输入按 run 对齐：每个已完成 run 只取 `human_message + final_ai_message` 对，当前新 run 只取 `human_message`；不传中间 tool-call AI、工具输出或完整 transcript。
 - 分类器超时 `8 秒`；默认历史 `10` 个已完成 run、输入预算 `4000` token；原 `task_goal` 非空时超时/非法输出降级 UNCERTAIN，原为空时 NEW_TASK + fallback goal；fallback 必须标记 `task_goal_source=fallback`。
 - 默认技能候选需要 `3` 条成功 episode、至少 `2` 个 thread、成功率 `>=0.80`、trigger 相似度 `>=0.82`、至少 `2` 个共同关键步骤；用户显式要求可用 `1` 条。
@@ -875,6 +875,27 @@ def _runtime():
     return SimpleNamespace(context={"user_id": "u1", "thread_id": "t1"})
 
 
+def test_continuation_prompt_without_task_creates_no_task_context():
+    classifier = FakeClassifier(TaskBoundaryResult(decision="NEW_TASK", task_goal="不该生成"))
+    middleware = TaskClassifierMiddleware(config=MemoryConfig(enabled=True), classifier=classifier)
+    assert asyncio.run(middleware.abefore_agent(_state(text="继续"), _runtime())) is None
+    assert classifier.calls == []
+
+
+def test_continuation_prompt_reuses_existing_task_without_model():
+    classifier = FakeClassifier(TaskBoundaryResult(decision="NEW_TASK", task_goal="不该生成"))
+    middleware = TaskClassifierMiddleware(config=MemoryConfig(enabled=True), classifier=classifier)
+    state = {
+        "messages": [HumanMessage(id="u2", content="接着做")],
+        "task_context": {"task_id": "task-1", "task_goal": "原目标", "task_goal_source": "classifier", "status": "open"},
+    }
+    update = asyncio.run(middleware.abefore_agent(state, _runtime()))
+    assert update["task_context"]["task_id"] == "task-1"
+    assert update["task_context"]["task_goal"] == "原目标"
+    assert update["task_context"]["boundary_decision"] == "CONTINUE"
+    assert classifier.calls == []
+
+
 def test_empty_goal_forces_new_task_and_uses_model_goal():
     classifier = FakeClassifier(TaskBoundaryResult(decision="NEW_TASK", task_goal="修复部署脚本"))
     middleware = TaskClassifierMiddleware(config=MemoryConfig(enabled=True), classifier=classifier)
@@ -999,7 +1020,7 @@ Expected: FAIL，模块不存在。
 - 从 `state.task_context` 取 `task_goal/task_id/started_at/completed_runs`；
 - 只把 `completed_runs` 中已有的 `human_message + final_ai_message` 对加入输入；当前新 run 只提供 `human_message`；按 `max_history_runs/max_input_tokens` 截断；不解析中间 tool-call AI；
 - 调分类器（默认 `agents.default_model`，thinking 关闭，`timeout_seconds`），结构化输出 `TaskBoundaryResult`；
-- 先走 L0 规则门：纯寒暄且无 task_id -> 直接返回 `None`；纯寒暄且已有 task_id -> `CONTINUE` 并原样沿用 task_id/task_goal；两者都不调用模型；问候+真实请求不命中规则门；
+- 先走 L0 规则门：纯寒暄或纯继续提示且无 task_id -> 直接返回 `None`；已有 task_id -> `CONTINUE` 并原样沿用 task_id/task_goal；两者都不调用模型；提示+真实请求不命中规则门；
 - `task_goal` 为空 -> 强制 NEW_TASK；调用分类器生成 goal；失败/禁用 -> fallback（首条脱敏消息，纯多模态用 `未命名任务`）；
 - `CONTINUE/UNCERTAIN` 忽略模型 `task_goal`；
 - `append_completed_run` 只接受 `{run_id, human_message, final_ai_message}`，保留最近 `max_history_runs` 个；NEW_TASK 时先清空；
@@ -2365,7 +2386,7 @@ git commit -m "refactor(memory): remove legacy runtime write path"
 
 ## 验收对照（执行时逐项勾选）
 
-- [ ] T1–T13：任务分类器空 goal、CONTINUE、NEW_TASK、UNCERTAIN、超时、fallback、goal 漂移、task_id 注入、长期记忆关闭、run pair 输入、纯寒暄无任务、纯寒暄有任务、寒暄+请求通过（Task 5A–5C、Task 14）。
+- [ ] T1–T13：任务分类器空 goal、CONTINUE、NEW_TASK、UNCERTAIN、超时、fallback、goal 漂移、task_id 注入、长期记忆关闭、run pair 输入、纯寒暄/继续提示无任务、纯寒暄/继续提示有任务、提示+请求通过（Task 5A–5C、Task 14）。
 - [ ] S1–S4：session 捕获/关闭/空闲/40 轮/压缩去重通过（Task 5、Task 5C、Task 14）。
 - [ ] P1–P4：画像只取当前消息、高证据覆盖、无 pin、revision 409（Task 7、Task 12、Task 13）。
 - [ ] E1–E3：情景脱水、幂等、纠正（Task 6）。
