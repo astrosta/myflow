@@ -891,6 +891,24 @@ class MemoryRepository:
             await session.commit()
             return _session_view(row)
 
+    async def set_session_boundary(
+        self,
+        session_id: str,
+        *,
+        boundary_decision: str | None,
+        boundary_uncertain: bool,
+        now: datetime,
+    ) -> MemorySessionView:
+        async with self._sf() as session:
+            row = await session.get(MemoryEpisodeSessionRow, session_id)
+            if row is None:
+                raise MemoryNotFoundError(f"episode session {session_id} not found")
+            row.boundary_decision = boundary_decision
+            row.boundary_uncertain = bool(boundary_uncertain)
+            row.updated_at = now
+            await session.commit()
+            return _session_view(row)
+
     async def close_session(
         self, session_id: str, *, reason: str, episode_key: str, now: datetime
     ) -> MemorySessionView:

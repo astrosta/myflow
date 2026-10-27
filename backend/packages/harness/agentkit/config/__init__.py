@@ -27,6 +27,7 @@ from agentkit.config.memory_config import (
     MemoryIngestConfig,
     MemoryMaintenanceConfig,
     MemoryProfileConfig,
+    MemoryTaskClassifierConfig,
 )
 from agentkit.config.model_config import ModelConfig, ReasoningEffortOption
 from agentkit.config.pii_config import PIIConfig
@@ -83,6 +84,7 @@ __all__ = [
     "MemoryIngestConfig",
     "MemoryMaintenanceConfig",
     "MemoryProfileConfig",
+    "MemoryTaskClassifierConfig",
     "ModelConfig",
     "PIIConfig",
     "ReasoningEffortOption",

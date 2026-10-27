@@ -28,11 +28,11 @@ from agentkit.agents.thread_state import RunPair, TaskContext
 from agentkit.config.memory_config import MemoryConfig
 from agentkit.models import create_chat_model
 from agentkit.privacy import PIIRedactor
+from agentkit.utils.custom_events import emit_custom_event
 from agentkit.utils.messages import message_content_to_text
 
 logger = logging.getLogger(__name__)
 
-_MEMORY_DISABLED = "memory disabled"
 _MAX_GOAL_CHARS = 500
 _FALLBACK_GOAL = "未命名任务"
 
@@ -115,12 +115,13 @@ class TaskClassifierMiddleware(AgentMiddleware):
         self._config = config
         self._app_config = app_config
         self._classifier = classifier
+        self._default_classifier: TaskClassifier | None = None
         self._user_id = user_id
 
     async def abefore_agent(self, state: Mapping, runtime: Runtime) -> dict[str, Any] | None:
         if not self._config.enabled:
             return None
-        if not self._config.task_classifier.enabled and self._classifier is None:
+        if not self._config.task_classifier.enabled:
             return None
 
         context = _context(runtime)
@@ -149,6 +150,12 @@ class TaskClassifierMiddleware(AgentMiddleware):
         if current_id and existing.get("last_classified_message_id") == current_id:
             return None
 
+        current_text, current_goal, completed = _fit_input(
+            current_text,
+            current_goal,
+            completed,
+            self._config.task_classifier.max_input_tokens,
+        )
         model_result: TaskBoundaryResult | None = None
         model_failed = False
         if self._config.task_classifier.enabled:
@@ -221,13 +228,14 @@ class TaskClassifierMiddleware(AgentMiddleware):
         return {"task_context": task_context}
 
     async def _run_classifier(self, payload: TaskClassifierInput) -> TaskBoundaryResult:
-        classifier = self._classifier
-        if classifier is None:
-            classifier = TaskClassifier(
+        if self._classifier is not None:
+            return await self._classifier.classify(payload)
+        if self._default_classifier is None:
+            self._default_classifier = TaskClassifier(
                 _build_model(self._config, self._app_config),
                 timeout_seconds=self._config.task_classifier.timeout_seconds,
             )
-        return await classifier.classify(payload)
+        return await self._default_classifier.classify(payload)
 
 
 def append_completed_run(
@@ -303,6 +311,27 @@ def _normalize_goal(value: str | None) -> str | None:
     if not compact or len(compact) > _MAX_GOAL_CHARS or looks_like_secret(compact):
         return None
     return compact
+
+
+def _fit_input(
+    current: str,
+    goal: str,
+    runs: list[RunPair],
+    max_input_tokens: int,
+) -> tuple[str, str, list[RunPair]]:
+    """Approximate the token budget with a 4-characters-per-token ceiling."""
+    budget = max(1, int(max_input_tokens)) * 4
+    current = current[:budget]
+    goal = goal[:budget]
+    used = len(current) + len(goal)
+    selected: list[RunPair] = []
+    for pair in reversed(runs):
+        size = len(pair["human_message"]) + len(pair["final_ai_message"])
+        if used + size > budget:
+            break
+        selected.append(pair)
+        used += size
+    return current, goal, list(reversed(selected))
 
 
 def _bounded_runs(value: Any, limit: int) -> list[RunPair]:
@@ -381,7 +410,7 @@ def _emit_task_event(
     except Exception:
         return
     try:
-        writer(
+        emit_custom_event(
             {
                 "type": "task:classified",
                 "decision": decision,
@@ -389,7 +418,8 @@ def _emit_task_event(
                 "previous_task_id": previous_task_id,
                 "task_id": task_id,
                 "uncertain_policy": policy,
-            }
+            },
+            writer=writer,
         )
     except Exception:
         logger.debug("task:classified event failed", exc_info=True)

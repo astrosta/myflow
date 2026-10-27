@@ -133,6 +133,26 @@ def test_classifier_input_uses_only_completed_run_pairs():
     ]
 
 
+def test_classifier_input_is_trimmed_to_token_budget():
+    classifier = FakeClassifier(TaskBoundaryResult(decision="CONTINUE"))
+    config = MemoryConfig(enabled=True, task_classifier={"max_input_tokens": 10})
+    middleware = TaskClassifierMiddleware(config=config, classifier=classifier)
+    state = _state(
+        _task_context(
+            completed_runs=[
+                {"run_id": "r1", "human_message": "h" * 200, "final_ai_message": "a" * 200}
+            ]
+        ),
+        text="x" * 200,
+    )
+
+    asyncio.run(middleware.abefore_agent(state, _runtime()))
+
+    value = classifier.calls[0]
+    assert len(value["current_human_message"]) <= 40
+    assert value["completed_runs"] == []
+
+
 def test_append_completed_run_keeps_only_pairs_and_bounds():
     context = {"task_id": "task-1", "completed_runs": []}
     for index in range(3):
@@ -171,6 +191,15 @@ def test_subagent_does_not_run_classifier():
 def test_memory_disabled_does_not_run_classifier():
     classifier = FakeClassifier(TaskBoundaryResult(decision="NEW_TASK", task_goal="不该发生"))
     middleware = TaskClassifierMiddleware(config=MemoryConfig(enabled=False), classifier=classifier)
+
+    assert asyncio.run(middleware.abefore_agent(_state(), _runtime())) is None
+    assert classifier.calls == []
+
+
+def test_disabled_classifier_does_not_run():
+    classifier = FakeClassifier(TaskBoundaryResult(decision="NEW_TASK", task_goal="不该发生"))
+    config = MemoryConfig(enabled=True, task_classifier={"enabled": False})
+    middleware = TaskClassifierMiddleware(config=config, classifier=classifier)
 
     assert asyncio.run(middleware.abefore_agent(_state(), _runtime())) is None
     assert classifier.calls == []

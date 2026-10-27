@@ -91,7 +91,7 @@ database:
 
 # ------------------------------------------------------------
 # M10 §2 持久记忆。画像常驻注入；长尾事实用 memory_search 按需检索。
-# 记忆按用户存进 LangGraph BaseStore，和 checkpointer 共用 database 选择。
+# canonical 运行路径：PostgreSQL 权威 + Milvus 活跃投影；旧 BaseStore 仅保留迁移兼容。
 # backend_class 变更需要重启（manager 单例），其余字段每轮读取。
 # ------------------------------------------------------------
 memory:
@@ -104,6 +104,13 @@ memory:
   ingest:
     debounce_seconds: 30
     shutdown_flush_timeout_seconds: 30
+  task_classifier:
+    enabled: true
+    model: agent_default       # 默认继承 agents.default_model
+    timeout_seconds: 8
+    max_history_runs: 10       # 只取最近 N 个已完成 run 的 human/final-AI 对
+    max_input_tokens: 4000
+    uncertain_policy: continue # continue | new_task
   maintenance:
     enabled: true
     interval_hours: 24
