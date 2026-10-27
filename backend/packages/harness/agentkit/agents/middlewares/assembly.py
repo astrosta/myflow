@@ -22,6 +22,7 @@ from agentkit.agents.middlewares.dynamic_context_middleware import DynamicContex
 from agentkit.agents.middlewares.input_sanitization_middleware import InputSanitizationMiddleware
 from agentkit.agents.middlewares.llm_error_handling_middleware import LLMErrorHandlingMiddleware
 from agentkit.agents.middlewares.memory_middleware import MemoryMiddleware
+from agentkit.agents.middlewares.task_classifier import TaskClassifierMiddleware
 from agentkit.agents.middlewares.pii_middleware import PIIMiddleware, PIIOutputMiddleware
 from agentkit.agents.middlewares.skill_activation_middleware import SkillActivationMiddleware
 from agentkit.agents.middlewares.skill_tool_policy_middleware import SkillToolPolicyMiddleware
@@ -182,6 +183,14 @@ def build_middlewares(
             chain.append(summarization)
     # SLOT: TodoList if is_plan_mode
     chain.append(TitleMiddleware(app_config=resolved))
+    if resolved.memory.enabled and resolved.memory.task_classifier.enabled:
+        chain.append(
+            TaskClassifierMiddleware(
+                config=resolved.memory,
+                app_config=resolved,
+                user_id=user_id,
+            )
+        )
     # M10 §2.6.1 / §2.8.1：画像注入与轮次入队。after_model 反序，所以它在 Title 之后注册、
     # 在 Title 之前跑——标题生成失败不影响记忆入队。
     # 注意参数类型：它吃的是 MemoryConfig（`resolved.memory`），不是整个 AppConfig——
