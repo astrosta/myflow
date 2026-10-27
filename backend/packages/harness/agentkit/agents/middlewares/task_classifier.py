@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -35,6 +36,90 @@ logger = logging.getLogger(__name__)
 
 _MAX_GOAL_CHARS = 500
 _FALLBACK_GOAL = "未命名任务"
+
+_SOCIAL_TOKENS = tuple(
+    sorted(
+        {
+            "你好",
+            "您好",
+            "大家好",
+            "嗨",
+            "哈喽",
+            "哈啰",
+            "早上好",
+            "早安",
+            "中午好",
+            "下午好",
+            "晚上好",
+            "晚安",
+            "在吗",
+            "在么",
+            "在不在",
+            "好久不见",
+            "谢谢",
+            "谢谢你",
+            "多谢",
+            "感谢",
+            "辛苦了",
+            "好的",
+            "好",
+            "嗯",
+            "嗯嗯",
+            "哦",
+            "收到",
+            "明白了",
+            "知道了",
+            "可以",
+            "行",
+            "没问题",
+            "再见",
+            "拜拜",
+            "回头见",
+            "哈哈",
+            "哈哈哈",
+            "嘿嘿",
+            "呵呵",
+            "最近怎么样",
+            "最近如何",
+            "过得怎么样",
+            "hi",
+            "hello",
+            "hey",
+            "good morning",
+            "good afternoon",
+            "good evening",
+            "good night",
+            "thanks",
+            "thank you",
+            "thx",
+            "ok",
+            "okay",
+            "got it",
+            "sure",
+            "bye",
+            "goodbye",
+            "see you",
+            "how are you",
+            "how are you doing",
+            "how's it going",
+            "what's up",
+            "nice to meet you",
+            "long time no see",
+        },
+        key=len,
+        reverse=True,
+    )
+)
+_SOCIAL_RE = re.compile(
+    r"^(?:"
+    + "|".join(re.escape(token) for token in _SOCIAL_TOKENS)
+    + r")(?:[\s,，.。!！?？~～…、;；:：\-—–_=+*#@/\\|'\"“”‘’()（）\[\]{}<>《》]*"
+    + r"(?:"
+    + "|".join(re.escape(token) for token in _SOCIAL_TOKENS)
+    + r"))*$",
+    re.IGNORECASE,
+)
+_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]+")
 
 _SYSTEM_PROMPT = """You classify whether a new user message continues the current task or starts a new one.
 Return only the structured result. Use the current task goal and the completed run pairs as context.
@@ -149,6 +234,24 @@ class TaskClassifierMiddleware(AgentMiddleware):
 
         if current_id and existing.get("last_classified_message_id") == current_id:
             return None
+
+        if is_social_message(current_text):
+            if not _text(existing.get("task_id")):
+                # A greeting must not create a task or a goal.
+                return None
+            social_context: TaskContext = dict(existing)
+            social_context["boundary_decision"] = "CONTINUE"
+            social_context["boundary_uncertain"] = False
+            social_context["boundary_pending"] = False
+            social_context["last_classified_message_id"] = current_id or ""
+            _emit_task_event(
+                decision="CONTINUE",
+                task_goal_source=str(existing.get("task_goal_source") or "classifier"),
+                previous_task_id=_text(existing.get("task_id")),
+                task_id=_text(existing.get("task_id")),
+                policy=self._config.task_classifier.uncertain_policy,
+            )
+            return {"task_context": social_context}
 
         current_text, current_goal, completed = _fit_input(
             current_text,
@@ -302,6 +405,16 @@ def _goal_for_decision(
 
 def _valid_goal(value: str | None) -> bool:
     return _normalize_goal(value) is not None
+
+
+def is_social_message(value: str) -> bool:
+    """True only for a pure greeting/small-talk turn.
+
+    A greeting plus a real request ("你好，帮我修部署") is deliberately not
+    social: the request must still reach the task classifier.
+    """
+    cleaned = _EMOJI_RE.sub("", str(value or "")).strip()
+    return bool(cleaned) and bool(_SOCIAL_RE.fullmatch(cleaned))
 
 
 def _normalize_goal(value: str | None) -> str | None:

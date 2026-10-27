@@ -153,6 +153,56 @@ def test_classifier_input_is_trimmed_to_token_budget():
     assert value["completed_runs"] == []
 
 
+def test_social_message_without_task_creates_no_task_context():
+    classifier = FakeClassifier(TaskBoundaryResult(decision="NEW_TASK", task_goal="不该生成"))
+    middleware = TaskClassifierMiddleware(config=MemoryConfig(enabled=True), classifier=classifier)
+
+    update = asyncio.run(middleware.abefore_agent(_state(text="你好"), _runtime()))
+
+    assert update is None
+    assert classifier.calls == []
+
+
+def test_social_message_continues_existing_task_without_model():
+    classifier = FakeClassifier(TaskBoundaryResult(decision="NEW_TASK", task_goal="不该生成"))
+    middleware = TaskClassifierMiddleware(config=MemoryConfig(enabled=True), classifier=classifier)
+    existing = _task_context(task_goal="原目标")
+
+    update = asyncio.run(middleware.abefore_agent(_state(existing, text="谢谢"), _runtime()))
+
+    context = update["task_context"]
+    assert context["task_id"] == "task-1"
+    assert context["task_goal"] == "原目标"
+    assert context["boundary_decision"] == "CONTINUE"
+    assert context["boundary_pending"] is False
+    assert context["boundary_uncertain"] is False
+    assert classifier.calls == []
+
+
+def test_social_message_keeps_empty_goal_empty():
+    classifier = FakeClassifier(TaskBoundaryResult(decision="NEW_TASK", task_goal="不该生成"))
+    middleware = TaskClassifierMiddleware(config=MemoryConfig(enabled=True), classifier=classifier)
+    existing = _task_context(task_goal="")
+
+    update = asyncio.run(middleware.abefore_agent(_state(existing, text="hello"), _runtime()))
+
+    context = update["task_context"]
+    assert context["task_id"] == "task-1"
+    assert context["task_goal"] == ""
+    assert classifier.calls == []
+
+
+def test_greeting_plus_real_request_still_uses_model():
+    classifier = FakeClassifier(TaskBoundaryResult(decision="CONTINUE"))
+    middleware = TaskClassifierMiddleware(config=MemoryConfig(enabled=True), classifier=classifier)
+
+    asyncio.run(
+        middleware.abefore_agent(_state(_task_context(), text="你好，帮我修部署脚本"), _runtime())
+    )
+
+    assert classifier.calls
+
+
 def test_append_completed_run_keeps_only_pairs_and_bounds():
     context = {"task_id": "task-1", "completed_runs": []}
     for index in range(3):
