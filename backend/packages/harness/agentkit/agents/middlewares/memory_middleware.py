@@ -14,6 +14,7 @@ from langgraph.runtime import Runtime
 
 from agentkit.agents.middlewares.message_utils import is_real_user_message
 from agentkit.agents.middlewares.provenance import ContentKind, provenance_kwargs
+from agentkit.agents.memory.canonical.capture import is_explicit_remember
 from agentkit.agents.memory.canonical.service import (
     MemoryService,
     get_memory_service,
@@ -269,6 +270,7 @@ class MemoryMiddleware(AgentMiddleware):
         assistant_index = _latest_visible_ai_index(messages)
         if assistant_index is None or assistant_index < user_index:
             return
+        user_text = message_content_to_text(messages[user_index].content)
         try:
             await service.capture_turn(
                 user_id,
@@ -276,8 +278,8 @@ class MemoryMiddleware(AgentMiddleware):
                 _text(context.get("run_id")),
                 messages[user_index : assistant_index + 1],
                 terminal=False,
+                explicit_remember=is_explicit_remember(user_text),
             )
-            user_text = message_content_to_text(messages[user_index].content)
             if user_text.strip():
                 asyncio.create_task(
                     service.update_profile_from_message(user_id, user_text)

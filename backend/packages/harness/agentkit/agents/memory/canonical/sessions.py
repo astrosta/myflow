@@ -45,6 +45,7 @@ class SessionService:
         messages: Sequence[Any],
         *,
         terminal: bool,
+        explicit_remember: bool = False,
     ) -> CaptureResult:
         refs = build_turn_refs(messages, run_id=run_id)
         if not refs:
@@ -79,6 +80,9 @@ class SessionService:
         if terminal:
             closed = await self._close(updated, "terminal")
             return CaptureResult(updated.id, appended, True, closed.job_id)
+        if explicit_remember:
+            closed = await self._close(updated, "explicit_remember")
+            return CaptureResult(updated.id, appended, True, closed.job_id)
         return CaptureResult(updated.id, appended, False, None)
 
     async def close_session(
@@ -95,6 +99,12 @@ class SessionService:
             if job is not None:
                 return CloseResult(latest.id, job.id, already_closed=True)
         return await self._close(latest, reason)
+
+    async def close_all_open_sessions(self, reason: str = "shutdown") -> int:
+        sessions = await self._repo.list_open_sessions()
+        for session in sessions:
+            await self._close(session, reason)
+        return len(sessions)
 
     async def close_idle_sessions(self, now: datetime) -> int:
         cutoff = now - timedelta(

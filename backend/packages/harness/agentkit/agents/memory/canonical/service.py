@@ -125,15 +125,24 @@ class MemoryService:
         messages: list[Any],
         *,
         terminal: bool,
+        explicit_remember: bool = False,
     ) -> CaptureResult:
         return await self.sessions.capture_turn(
-            user_id, thread_id, run_id, messages, terminal=terminal
+            user_id,
+            thread_id,
+            run_id,
+            messages,
+            terminal=terminal,
+            explicit_remember=explicit_remember,
         )
 
     async def close_session(
         self, user_id: str, thread_id: str, reason: str
     ) -> Any:
         return await self.sessions.close_session(user_id, thread_id, reason)
+
+    async def close_all_open_sessions(self, reason: str = "shutdown") -> int:
+        return await self.sessions.close_all_open_sessions(reason)
 
     async def search(
         self, user_id: str, *, text: str, kinds: list[str] | None = None, limit: int = 8, cursor: str | None = None

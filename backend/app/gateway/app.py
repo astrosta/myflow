@@ -189,6 +189,8 @@ async def lifespan(app: FastAPI):
                     finally:
                         if canonical_runtime.maintenance is not None:
                             await canonical_runtime.maintenance.stop()
+                        if canonical_runtime.service is not None:
+                            await canonical_runtime.service.close_all_open_sessions("shutdown")
                         if canonical_runtime.projector is not None:
                             await canonical_runtime.projector.stop()
                         if canonical_runtime.service is not None:

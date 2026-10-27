@@ -83,9 +83,21 @@ def build_turn_refs(
     return refs
 
 
-_REMEMBER = re.compile(
-    r"(记住(?:这次|这个|一下)?|总结一下|remember\s+this|save\s+this)", re.IGNORECASE
+_EXPLICIT_REMEMBER_PATTERNS = (
+    r"记住(?:这次|这个|一下|刚才)?",
+    r"记一下",
+    r"记下来",
+    r"把[^。！？\n]{0,40}(?:记下来|记住|记录下来|保存下来)",
+    r"保存(?:这次|这个|刚才|一下|这个做法|这个流程)",
+    r"记录(?:一下|下来)",
+    r"帮我(?:记住|记一下|记下来|总结一下)",
+    r"总结一下(?:这次|这个|刚才)?",
+    r"这次(?:记住|记下来|记一下|记录一下)",
+    r"remember\s+(?:this|that|it)",
+    r"(?:save|keep|note|log)\s+(?:this|that|it)",
+    r"don'?t\s+forget\s+(?:this|that)",
 )
+_REMEMBER = re.compile("|".join(_EXPLICIT_REMEMBER_PATTERNS), re.IGNORECASE)
 
 
 def is_explicit_remember(text: str) -> bool:

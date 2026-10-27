@@ -60,8 +60,51 @@ def test_tool_output_is_not_stored() -> None:
 
 def test_explicit_remember_is_detected_without_an_llm() -> None:
     assert is_explicit_remember("记住这次部署的修复步骤") is True
+    assert is_explicit_remember("把刚才的修复步骤记下来") is True
+    assert is_explicit_remember("记一下这个部署流程") is True
+    assert is_explicit_remember("帮我总结一下这次排障") is True
+    assert is_explicit_remember("保存这个做法") is True
     assert is_explicit_remember("remember this workflow") is True
+    assert is_explicit_remember("don't forget this") is True
+    assert is_explicit_remember("save this pattern") is True
     assert is_explicit_remember("这次用三行输出") is False
+    assert is_explicit_remember("查一下日志") is False
+
+
+def test_explicit_remember_closes_synchronously(tmp_path) -> None:
+    async def scenario():
+        repo, sessions, _operators = await make_stack(tmp_path)
+        result = await sessions.capture_turn(
+            "u1",
+            "t1",
+            "r1",
+            [HumanMessage(id="u1", content="记住这个流程")],
+            terminal=False,
+            explicit_remember=True,
+        )
+        assert result.closed is True
+        assert result.job_id is not None
+        assert await sessions.count_open("u1", "t1") == 0
+        latest = await repo.get_latest_session("u1", "t1")
+        assert latest is not None and latest.close_reason == "explicit_remember"
+
+    run(scenario())
+
+
+def test_shutdown_closes_all_open_sessions(tmp_path) -> None:
+    async def scenario():
+        _repo, sessions, _operators = await make_stack(tmp_path)
+        await sessions.capture_turn(
+            "u1", "t1", "r1", [HumanMessage(id="u1", content="a")], terminal=False
+        )
+        await sessions.capture_turn(
+            "u2", "t2", "r2", [HumanMessage(id="u2", content="b")], terminal=False
+        )
+        assert await sessions.close_all_open_sessions(reason="shutdown") == 2
+        assert await sessions.count_open("u1", "t1") == 0
+        assert await sessions.count_open("u2", "t2") == 0
+
+    run(scenario())
 
 
 def test_capture_dedupes_and_closes_once(tmp_path) -> None:
