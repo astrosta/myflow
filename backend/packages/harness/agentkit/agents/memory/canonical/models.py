@@ -83,6 +83,7 @@ class MemoryRecordRow(Base):
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     provenance: Mapped[dict[str, Any]] = mapped_column(JsonB, nullable=False, default=dict)
@@ -100,6 +101,7 @@ class MemoryRecordRow(Base):
         UniqueConstraint("user_id", "id", name="uq_memory_records_user_id"),
         Index("ix_memory_records_user_kind_status", "user_id", "kind", "status"),
         Index("ix_memory_records_user_topic_status", "user_id", "topic_key", "status"),
+        Index("ix_memory_records_user_task", "user_id", "task_id"),
         Index(
             "ix_memory_records_episodic_pending",
             "user_id",
@@ -142,6 +144,11 @@ class MemoryEpisodeSessionRow(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False)
     thread_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False, default="")
+    task_goal: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    task_goal_source: Mapped[str] = mapped_column(String(16), nullable=False, default="fallback")
+    boundary_decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    boundary_uncertain: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
     open_turn_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_turn_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -169,6 +176,7 @@ class MemoryEpisodeSessionRow(Base):
             postgresql_where=text("status = 'open'"),
         ),
         Index("ix_memory_episode_sessions_user_status", "user_id", "status"),
+        Index("ix_memory_episode_sessions_user_task", "user_id", "task_id"),
     )
 
 

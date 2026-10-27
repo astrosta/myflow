@@ -61,6 +61,7 @@ class RecordDraft:
     agent_name: str | None
     provenance: dict[str, Any] = field(default_factory=dict)
     source_episode_ids: tuple[str, ...] = ()
+    task_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +187,7 @@ class MemoryRecordView:
     valid_from: datetime | None
     valid_to: datetime | None
     occurred_at: datetime | None
+    task_id: str | None
     thread_id: str | None
     agent_name: str | None
     provenance: dict[str, Any]
@@ -201,6 +203,11 @@ class MemorySessionView:
     id: str
     user_id: str
     thread_id: str
+    task_id: str
+    task_goal: str
+    task_goal_source: str
+    boundary_decision: str | None
+    boundary_uncertain: bool
     status: str
     turn_refs: list[dict[str, Any]]
     episode_key: str | None

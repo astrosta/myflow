@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import func, select
@@ -20,6 +22,9 @@ from agentkit.agents.memory.canonical.models import (
 )
 from agentkit.agents.memory.canonical.repository import MemoryRepository
 from agentkit.persistence.schema import Base
+
+
+NOW = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 
 
 def run(coro):
@@ -77,6 +82,48 @@ def test_record_write_is_one_atomic_unit(tmp_path) -> None:
                 assert await session.scalar(
                     select(func.count()).select_from(MemoryIndexOutboxRow)
                 ) == 1
+        finally:
+            await engine.dispose()
+
+    run(scenario())
+
+
+def test_open_session_persists_task_context(tmp_path) -> None:
+    async def scenario():
+        repo, engine = await _repo(tmp_path)
+        try:
+            created = await repo.open_session(
+                "u1",
+                "t1",
+                run_id="r1",
+                turn_id="u1",
+                now=NOW,
+                task_id="task-1",
+                task_goal="修复部署",
+                task_goal_source="classifier",
+                boundary_decision="NEW_TASK",
+                boundary_uncertain=False,
+            )
+            assert created.task_id == "task-1"
+            assert created.task_goal == "修复部署"
+            assert created.task_goal_source == "classifier"
+            assert created.boundary_decision == "NEW_TASK"
+            assert created.boundary_uncertain is False
+        finally:
+            await engine.dispose()
+
+    run(scenario())
+
+
+def test_record_carries_task_id(tmp_path) -> None:
+    async def scenario():
+        repo, engine = await _repo(tmp_path)
+        try:
+            record = await repo.create_record(
+                replace(semantic_draft("任务事实"), task_id="task-1"),
+                mutation=MutationContext("SYSTEM", "w", "ADD", None, ()),
+            )
+            assert record.task_id == "task-1"
         finally:
             await engine.dispose()
 
