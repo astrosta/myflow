@@ -173,6 +173,7 @@ class EpisodicService:
                 valid_from=None,
                 valid_to=None,
                 occurred_at=now,
+                task_id=str(job.payload.get("task_id") or "") or None,
                 thread_id=job.thread_id,
                 agent_name=None,
                 provenance={
@@ -222,6 +223,7 @@ class EpisodicService:
                 valid_from=None,
                 valid_to=None,
                 occurred_at=now,
+                task_id=old.task_id,
                 thread_id=old.thread_id,
                 agent_name=old.agent_name,
                 provenance={"evidence_refs": list(evidence_refs), "correction_of": old.id},

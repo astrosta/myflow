@@ -149,6 +149,49 @@ def test_middleware_passes_explicit_remember_to_capture() -> None:
     asyncio.run(scenario())
 
 
+def test_middleware_appends_final_ai_pair_and_resets_on_new_task() -> None:
+    class Service:
+        canonical = True
+        config = MemoryConfig(enabled=True)
+
+        async def capture_turn(self, *args, **kwargs):
+            del args, kwargs
+            return SimpleNamespace(session_id="s1", appended=1, closed=False, job_id=None)
+
+        async def update_profile_from_message(self, *args, **kwargs):
+            del args, kwargs
+
+    async def scenario():
+        middleware = MemoryMiddleware(service=Service(), user_id="u1")
+        state = {
+            "messages": [
+                HumanMessage(id="u2", content="新任务"),
+                AIMessage(id="a2", content="新任务最终回复"),
+            ],
+            "task_context": {
+                "task_id": "task-2",
+                "task_goal": "新目标",
+                "task_goal_source": "classifier",
+                "status": "open",
+                "started_at": "2026-10-26T00:00:00Z",
+                "boundary_pending": True,
+                "completed_runs": [
+                    {"run_id": "r1", "human_message": "旧任务", "final_ai_message": "旧回复"}
+                ],
+            },
+        }
+        runtime = SimpleNamespace(context={"user_id": "u1", "thread_id": "t1", "run_id": "r2"})
+        update = await middleware.aafter_agent(state, runtime)
+        assert update is not None
+        context = update["task_context"]
+        assert context["boundary_pending"] is False
+        assert context["completed_runs"] == [
+            {"run_id": "r2", "human_message": "新任务", "final_ai_message": "新任务最终回复"}
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_maintenance_closes_idle_and_expires_pending() -> None:
     class Sessions:
         async def close_idle_sessions(self, now):

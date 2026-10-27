@@ -58,6 +58,16 @@ def test_tool_output_is_not_stored() -> None:
     assert len(payload) < 2_000
 
 
+def _task(task_id: str, goal: str) -> dict:
+    return {
+        "task_id": task_id,
+        "task_goal": goal,
+        "task_goal_source": "classifier",
+        "status": "open",
+        "started_at": "2026-10-26T00:00:00Z",
+    }
+
+
 def test_explicit_remember_is_detected_without_an_llm() -> None:
     assert is_explicit_remember("记住这次部署的修复步骤") is True
     assert is_explicit_remember("把刚才的修复步骤记下来") is True
@@ -87,6 +97,86 @@ def test_explicit_remember_closes_synchronously(tmp_path) -> None:
         assert await sessions.count_open("u1", "t1") == 0
         latest = await repo.get_latest_session("u1", "t1")
         assert latest is not None and latest.close_reason == "explicit_remember"
+
+    run(scenario())
+
+
+def test_new_task_closes_old_session_once(tmp_path) -> None:
+    async def scenario():
+        repo, sessions, _operators = await make_stack(tmp_path)
+        old = await sessions.capture_turn(
+            "u1", "t1", "r1", [HumanMessage(id="u1", content="旧任务")],
+            terminal=False, task_context=_task("task-1", "旧目标"),
+        )
+        new = await sessions.capture_turn(
+            "u1", "t1", "r2", [HumanMessage(id="u2", content="新任务")],
+            terminal=False, task_context=_task("task-2", "新目标"),
+        )
+        old_view = await repo.get_session(old.session_id)
+        new_view = await repo.get_session(new.session_id)
+        assert new.session_id != old.session_id
+        assert old_view.status == "closed"
+        assert old_view.close_reason == "task_boundary"
+        assert new_view.task_id == "task-2"
+        assert [ref["message_id"] for ref in new_view.turn_refs] == ["u2"]
+
+    run(scenario())
+
+
+def test_continue_keeps_same_session_and_task(tmp_path) -> None:
+    async def scenario():
+        repo, sessions, _operators = await make_stack(tmp_path)
+        first = await sessions.capture_turn(
+            "u1", "t1", "r1", [HumanMessage(id="u1", content="第一步")],
+            terminal=False, task_context=_task("task-1", "目标"),
+        )
+        second = await sessions.capture_turn(
+            "u1", "t1", "r2", [HumanMessage(id="u2", content="继续")],
+            terminal=False, task_context=_task("task-1", "目标"),
+        )
+        assert second.session_id == first.session_id
+        view = await repo.get_session(first.session_id)
+        assert view.task_id == "task-1"
+        assert view.task_goal == "目标"
+        assert view.status == "open"
+        assert [ref["message_id"] for ref in view.turn_refs] == ["u1", "u2"]
+
+    run(scenario())
+
+
+def test_uncertain_task_does_not_split_session(tmp_path) -> None:
+    async def scenario():
+        repo, sessions, _operators = await make_stack(tmp_path)
+        first = await sessions.capture_turn(
+            "u1", "t1", "r1", [HumanMessage(id="u1", content="第一步")],
+            terminal=False, task_context=_task("task-1", "目标"),
+        )
+        second = await sessions.capture_turn(
+            "u1", "t1", "r2", [HumanMessage(id="u2", content="可能是新任务")],
+            terminal=False,
+            task_context={**_task("task-1", "目标"), "boundary_uncertain": True},
+        )
+        assert second.session_id == first.session_id
+        view = await repo.get_session(first.session_id)
+        assert view.status == "open"
+        assert view.task_id == "task-1"
+        assert view.boundary_uncertain is True
+
+    run(scenario())
+
+
+def test_job_payload_carries_task_context(tmp_path) -> None:
+    async def scenario():
+        repo, sessions, _operators = await make_stack(tmp_path)
+        captured = await sessions.capture_turn(
+            "u1", "t1", "r1", [HumanMessage(id="u1", content="任务")],
+            terminal=True, task_context=_task("task-1", "目标"),
+        )
+        assert captured.job_id is not None
+        job = await repo.get_ingest_job_by_id(captured.job_id)
+        assert job is not None
+        assert job.payload["task_id"] == "task-1"
+        assert job.payload["task_goal"] == "目标"
 
     run(scenario())
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from collections.abc import Mapping
 from typing import Any, Sequence
 
 from agentkit.agents.memory.canonical.capture import (
@@ -48,29 +49,22 @@ class SessionService:
         *,
         terminal: bool,
         explicit_remember: bool = False,
+        task_context: Mapping[str, Any] | None = None,
     ) -> CaptureResult:
         refs = build_turn_refs(messages, run_id=run_id)
         if not refs:
             return CaptureResult(None, 0, False, None)
 
+        task = _task_fields(task_context)
         session = await self._repo.get_open_session(user_id, thread_id)
         if session is None:
-            session = await self._repo.open_session(
-                user_id,
-                thread_id,
-                run_id=run_id or "",
-                turn_id=refs[0].message_id,
-                now=_now(),
-            )
+            session = await self._open(user_id, thread_id, run_id, refs[0].message_id, task)
+        elif task["task_id"] and session.task_id != task["task_id"]:
+            await self._close(session, "task_boundary")
+            session = await self._open(user_id, thread_id, run_id, refs[0].message_id, task)
         elif _user_turns(session.turn_refs) >= self._config.episodic.max_turns_per_session:
             await self._close(session, "max_turns")
-            session = await self._repo.open_session(
-                user_id,
-                thread_id,
-                run_id=run_id or "",
-                turn_id=refs[0].message_id,
-                now=_now(),
-            )
+            session = await self._open(user_id, thread_id, run_id, refs[0].message_id, task)
 
         before = len(session.turn_refs)
         updated = await self._repo.append_session_refs(
@@ -78,6 +72,15 @@ class SessionService:
             [_ref_dict(ref) for ref in refs],
             now=_now(),
         )
+        if task_context is not None:
+            updated = await self._repo.set_session_boundary(
+                updated.id,
+                boundary_decision=(
+                    str(task["boundary_decision"]) if task.get("boundary_decision") else None
+                ),
+                boundary_uncertain=bool(task.get("boundary_uncertain")),
+                now=_now(),
+            )
         appended = max(0, len(updated.turn_refs) - before)
         if terminal:
             closed = await self._close(updated, "terminal")
@@ -145,10 +148,51 @@ class SessionService:
             payload={
                 "thread_id": session.thread_id,
                 "episode_key": episode_key,
+                "task_id": session.task_id,
+                "task_goal": session.task_goal,
                 "turn_refs": closed.turn_refs,
             },
         )
         return CloseResult(session.id, job.id)
+
+    async def _open(
+        self,
+        user_id: str,
+        thread_id: str,
+        run_id: str | None,
+        turn_id: str,
+        task: Mapping[str, Any],
+    ) -> MemorySessionView:
+        return await self._repo.open_session(
+            user_id,
+            thread_id,
+            run_id=run_id or "",
+            turn_id=turn_id,
+            now=_now(),
+            task_id=str(task.get("task_id") or ""),
+            task_goal=str(task.get("task_goal") or ""),
+            task_goal_source=str(task.get("task_goal_source") or "fallback"),
+            boundary_decision=str(task["boundary_decision"]) if task.get("boundary_decision") else None,
+            boundary_uncertain=bool(task.get("boundary_uncertain")),
+        )
+
+
+def _task_fields(task_context: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(task_context, Mapping):
+        return {
+            "task_id": "",
+            "task_goal": "",
+            "task_goal_source": "fallback",
+            "boundary_decision": None,
+            "boundary_uncertain": False,
+        }
+    return {
+        "task_id": str(task_context.get("task_id") or ""),
+        "task_goal": str(task_context.get("task_goal") or ""),
+        "task_goal_source": str(task_context.get("task_goal_source") or "fallback"),
+        "boundary_decision": task_context.get("boundary_decision"),
+        "boundary_uncertain": bool(task_context.get("boundary_uncertain")),
+    }
 
 
 def _ref_dict(ref: TurnRef) -> dict[str, Any]:
