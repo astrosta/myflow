@@ -28,6 +28,12 @@ def test_spec_defaults_are_exact() -> None:
     assert config.episodic.gate_threshold == 0.55
     assert config.episodic.max_summary_tokens == 1200
     assert config.episodic.ttl_days == 180
+    assert config.task_classifier.enabled is True
+    assert config.task_classifier.model == "agent_default"
+    assert config.task_classifier.timeout_seconds == 8.0
+    assert config.task_classifier.max_history_runs == 10
+    assert config.task_classifier.max_input_tokens == 4000
+    assert config.task_classifier.uncertain_policy == "continue"
     assert config.skill_candidates.min_source_episodes == 3
     assert config.skill_candidates.min_distinct_threads == 2
     assert config.skill_candidates.min_success_rate == 0.80
