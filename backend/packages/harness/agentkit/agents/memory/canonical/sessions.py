@@ -22,6 +22,8 @@ class CaptureResult:
     appended: int
     closed: bool
     job_id: str | None
+    episode_id: str | None = None
+    semantic_extracted: bool = False
 
 
 @dataclass(frozen=True, slots=True)

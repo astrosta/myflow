@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,7 +15,7 @@ from agentkit.agents.memory.canonical.domain import (
     SkillCandidateView,
     SkillConfirmResult,
 )
-from agentkit.agents.memory.canonical.episodic import EpisodicService, L1Gate
+from agentkit.agents.memory.canonical.episodic import EpisodicService, GateSignals, L1Gate
 from agentkit.agents.memory.canonical.maintenance import MemoryMaintenanceWorker
 from agentkit.agents.memory.canonical.operators import LangMemOperators, OperatorUnavailable
 from agentkit.agents.memory.canonical.operator_model import resolve_operator_model
@@ -127,7 +128,7 @@ class MemoryService:
         terminal: bool,
         explicit_remember: bool = False,
     ) -> CaptureResult:
-        return await self.sessions.capture_turn(
+        result = await self.sessions.capture_turn(
             user_id,
             thread_id,
             run_id,
@@ -135,6 +136,33 @@ class MemoryService:
             terminal=terminal,
             explicit_remember=explicit_remember,
         )
+        if not explicit_remember or result.job_id is None:
+            return result
+        return await self._extract_explicit_remember(result)
+
+    async def _extract_explicit_remember(self, result: CaptureResult) -> CaptureResult:
+        """Explicit remember is the one path allowed to extract inline."""
+        try:
+            episode = await self.episodic.process_ingest_job(
+                result.job_id or "",
+                signals=GateSignals(explicit_remember=True),
+            )
+        except Exception:
+            logger.warning("explicit memory extraction failed", exc_info=True)
+            return result
+        if episode is None:
+            return result
+        extracted = replace(result, episode_id=episode.id)
+        try:
+            await self.semantic.ingest_episodes(
+                episode.user_id,
+                [episode.id],
+                source_text=(json.dumps(episode.payload, ensure_ascii=False) + " " + episode.content),
+            )
+            extracted = replace(extracted, semantic_extracted=True)
+        except Exception as exc:  # noqa: BLE001 - episode is still durable
+            logger.warning("explicit semantic extraction failed (%s)", type(exc).__name__)
+        return extracted
 
     async def close_session(
         self, user_id: str, thread_id: str, reason: str

@@ -36,6 +36,7 @@ class GateSignals:
     long_task: bool = False
     terminal_success: bool = False
     terminal_failure: bool = False
+    explicit_remember: bool = False
     greeting: bool = False
 
 
@@ -61,6 +62,7 @@ class L1Gate:
             ("long_task", 0.10),
             ("terminal_success", 0.10),
             ("terminal_failure", 0.10),
+            ("explicit_remember", 1.00),
         ):
             if getattr(signals, name):
                 score += weight
