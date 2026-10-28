@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 
@@ -74,11 +74,14 @@ class SkillAuthorService:
         git: SkillGitRepository,
         content: SkillContentStore,
         creation: SkillCreationConfig,
+        *,
+        reserved_names: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         self._store = store
         self._git = git
         self._content = content
         self._creation = creation
+        self._reserved_names = reserved_names
         self._local_locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
 
@@ -94,6 +97,9 @@ class SkillAuthorService:
         This never writes Git.  The first save is what produces a version and
         a private active pointer.
         """
+
+        if self._reserved_names is not None and name in self._reserved_names():
+            raise SkillConflict("name is reserved by a built-in skill")
 
         initial = StagedFile(
             path=SKILL_FILE_NAME,

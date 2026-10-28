@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from difflib import unified_diff
@@ -54,11 +54,14 @@ class SkillReviewService:
         git: SkillGitRepository,
         content: SkillContentStore,
         review: SkillReviewConfig,
+        *,
+        reserved_names: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         self._store = store
         self._git = git
         self._content = content
         self._review = review
+        self._reserved_names = reserved_names
         self._local_locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
 
@@ -228,6 +231,8 @@ class SkillReviewService:
         )
 
     async def _ensure_public_name_free(self, public_name: str, skill_id: str) -> None:
+        if self._reserved_names is not None and public_name in self._reserved_names():
+            raise SkillConflict("name is reserved by a built-in skill")
         factory = getattr(self._store, "_sf", None)
         if factory is None:  # pragma: no cover - defensive for alternate stores
             return

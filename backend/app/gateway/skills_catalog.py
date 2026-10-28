@@ -34,7 +34,7 @@ from agentkit.knowledge.embedding import OpenAICompatibleEmbedder
 from agentkit.persistence.engine import get_session_factory
 from agentkit.skills import search as skill_search
 from agentkit.skills.author import SkillAuthorService
-from agentkit.skills.builtin import clear_builtin_cache, load_builtin_skills
+from agentkit.skills.builtin import builtin_names, clear_builtin_cache, load_builtin_skills
 from agentkit.skills.catalog import (
     SkillCatalogService,
     SkillSnapshot,
@@ -475,8 +475,13 @@ def build_skill_runtime(
     cache_dir = resolve_path(skills.git.cache_dir)
     git = SkillGitRepository(skills.git, cache_dir)
     content = SkillContentStore(cache_dir, git)
-    author = SkillAuthorService(store, git, content, skills.creation)
-    review = SkillReviewService(store, git, content, skills.review)
+    reserved_names = lambda: builtin_names(skills)
+    author = SkillAuthorService(
+        store, git, content, skills.creation, reserved_names=reserved_names
+    )
+    review = SkillReviewService(
+        store, git, content, skills.review, reserved_names=reserved_names
+    )
     catalog = SkillCatalogService(store, content, skills.container_path)
 
     search = None

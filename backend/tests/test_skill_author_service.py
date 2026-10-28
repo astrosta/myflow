@@ -600,6 +600,25 @@ def test_create_draft_enforces_quota_and_public_name(harness: Harness) -> None:
     harness.run(scenario)
 
 
+def test_create_draft_rejects_a_builtin_name(harness: Harness) -> None:
+    service = SkillAuthorService(
+        harness.store,
+        harness.git,  # type: ignore[arg-type]
+        FakeContent(),  # type: ignore[arg-type]
+        harness.creation,
+        reserved_names=lambda: frozenset({"demo"}),
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(SkillConflict, match="built-in"):
+            await service.create_draft(
+                owner_user_id="u1", name="demo", description="demo"
+            )
+        assert await harness.store.list_owned("u1") == []
+
+    harness.run(scenario)
+
+
 def test_put_file_enforces_package_limits_before_staging(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
