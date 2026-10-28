@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -127,6 +128,7 @@ class MemoryService:
         *,
         terminal: bool,
         explicit_remember: bool = False,
+        task_context: Mapping[str, Any] | None = None,
     ) -> CaptureResult:
         result = await self.sessions.capture_turn(
             user_id,
@@ -135,6 +137,7 @@ class MemoryService:
             messages,
             terminal=terminal,
             explicit_remember=explicit_remember,
+            task_context=task_context,
         )
         if not explicit_remember or result.job_id is None:
             return result

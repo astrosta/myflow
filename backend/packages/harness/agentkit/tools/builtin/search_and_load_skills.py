@@ -147,7 +147,8 @@ async def search_and_load_skills(
         config=config.skills,
         user_id=runtime_user_bucket(runtime) if runtime is not None else None,
     )
-    skills = registry.visible()  # 加载失败 → 空（fail-closed）
+    # 检索只认 public/custom：内置技能走索引与 slash，不参与检索，也不把正文带出来。
+    skills = registry.visible(include_builtin=False)  # 加载失败 → 空（fail-closed）
     embedder, reranker = _build_optional_stages(search_config)
     try:
         outcome = await search_skills(

@@ -269,8 +269,12 @@ def _configure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **skills_overrid
 @pytest.fixture(autouse=True)
 def _reset_runtime_registry():
     reset_skill_runtime()
+    # 同名冲突的“已告警”集合是进程级的：不隔离的话，先撞名的用例会让后一个用例
+    # 一条 WARNING 都看不到。
+    skills_catalog._reset_builtin_collision_warnings()
     yield
     reset_skill_runtime()
+    skills_catalog._reset_builtin_collision_warnings()
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +556,18 @@ def test_reload_refreshes_the_snapshot_and_clears_the_prompt_cache(
     assert {item["name"] for item in client.get("/api/skills").json()["skills"]} == {"renamed"}
 
 
+def test_reload_clears_builtin_cache_before_runtime_check(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    cleared = []
+    monkeypatch.setattr(skills_catalog, "clear_builtin_cache", lambda: cleared.append("builtin"))
+    client = _client(monkeypatch, scopes=ADMIN, user_id="root", runtime=None)
+
+    response = client.post("/api/skills/reload")
+
+    assert response.status_code == 503
+    assert cleared == ["builtin"]
+
+
 def test_reload_requires_admin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"})
     runtime = _runtime(_snapshot())
@@ -591,6 +607,123 @@ def test_git_mode_without_a_runtime_does_not_fall_back_to_disk(
     client = _client(monkeypatch, runtime=None)
 
     assert client.get("/api/skills").json() == {"skills": []}
+
+
+# ---------------------------------------------------------------------------
+# built-in skills: listed first, canonical by name, no runtime required
+# ---------------------------------------------------------------------------
+
+
+def test_builtin_rows_are_listed_without_a_git_runtime(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "demo", description="Demo skill")
+    client = _client(monkeypatch, runtime=None)
+
+    response = client.get("/api/skills")
+
+    assert response.status_code == 200
+    row = next(item for item in response.json()["skills"] if item["name"] == "demo")
+    assert row["scope"] == "builtin"
+    assert row["category"] == "builtin"
+    assert row["status"] == "builtin"
+    assert row["enabled"] is True
+    assert row["global_enabled"] is None
+    assert row["container_file"] == "/mnt/skills/builtin/demo/SKILL.md"
+
+
+def test_builtin_rows_are_listed_before_catalog_rows(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "demo")
+    runtime = _runtime(_snapshot())
+    set_skill_snapshot(runtime.catalog.snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+
+    names = [item["name"] for item in client.get("/api/skills").json()["skills"]]
+    assert names[0] == "demo"
+    assert set(names[1:]) == {"shared", "alice-tools"}
+
+
+def test_builtin_hides_a_same_name_catalog_row(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "shared")
+    runtime = _runtime(_snapshot())
+    set_skill_snapshot(runtime.catalog.snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+
+    rows = [
+        item
+        for item in client.get("/api/skills").json()["skills"]
+        if item["name"] == "shared"
+    ]
+
+    assert len(rows) == 1
+    assert rows[0]["scope"] == "builtin"
+
+
+def test_a_builtin_collision_warns_once_per_name(tmp_path, monkeypatch, caplog):
+    """列表是每请求都会走的路径：同一条 WARNING 不能每次 GET 都刷一遍。"""
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "shared")
+    runtime = _runtime(_snapshot())
+    set_skill_snapshot(runtime.catalog.snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+    caplog.set_level(logging.WARNING, logger="backend.app.gateway.skills_catalog")
+
+    client.get("/api/skills")
+    client.get("/api/skills")
+
+    logged = [
+        record
+        for record in caplog.records
+        if "builtin hides the catalog row" in record.getMessage()
+    ]
+    assert len(logged) == 1
+
+
+def test_filesystem_source_lists_builtin_rows_first(tmp_path, monkeypatch):
+    """磁盘来源也走同一次合并：内置行在前，catalog 行在后。"""
+    _configure(tmp_path, monkeypatch, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "demo", description="Demo skill")
+    write_skill(tmp_path, "public", "legacy-tool")
+    client = _client(monkeypatch, runtime=None)
+
+    rows = client.get("/api/skills").json()["skills"]
+
+    assert [item["name"] for item in rows] == ["demo", "legacy-tool"]
+    builtin = rows[0]
+    assert builtin["scope"] == "builtin"
+    assert builtin["category"] == "builtin"
+    assert builtin["status"] == "builtin"
+    assert builtin["enabled"] is True
+    assert builtin["global_enabled"] is None
+    assert builtin["skill_id"] is None
+    assert builtin["version_id"] is None
+    assert builtin["git_commit"] is None
+    assert builtin["skill_path"] is None
+    assert builtin["owner_user_id"] is None
+    assert builtin["container_file"] == "/mnt/skills/builtin/demo/SKILL.md"
+
+
+def test_list_survives_an_unusable_builtin_root(tmp_path, monkeypatch):
+    """根目录不合法时 loader 已退化成空元组，列表不能 500。"""
+    _configure(
+        tmp_path,
+        monkeypatch,
+        source="git",
+        git={"repository": "https://example.test/s.git"},
+        builtin={"path": str(tmp_path / "skills" / "builtin")},
+    )
+
+    def boom(_config):
+        raise ValueError("unsafe built-in root")
+
+    monkeypatch.setattr("agentkit.skills.builtin.resolve_builtin_root", boom)
+    client = _client(monkeypatch, runtime=None)
+
+    response = client.get("/api/skills")
+
+    assert response.status_code == 200
+    assert response.json() == {"skills": []}
 
 
 def test_filesystem_source_keeps_the_legacy_scanner(

@@ -23,7 +23,8 @@ import { SkillStatusBadge } from "./skill-status-badge";
 
 /**
  * 「我的技能」：左半是**我自己的私有草稿**（/skills/mine，作者路由），
- * 右半是**我能看到的公共目录**（/skills，只读 + 自己的那一行可回编辑器）。
+ * 右半是**我能看到的技能目录**（/skills）：内置技能单独只读列出，
+ * 公共目录只读 + 自己的那一行可回编辑器。
  *
  * 两个列表必须分开取：mine 是 author 路由，行主键叫 id、永远 scope=private；
  * 公共目录是运行时快照，行是 skill_id、来源可能是 filesystem（skill_id
@@ -67,6 +68,9 @@ export function MySkillsPage() {
 
   const mine = mineQuery.data ?? [];
   const catalog = catalogQuery.data ?? [];
+  // 同一个 /skills 目录里混着内置行和公共行；内置只读，不能开草稿或编辑。
+  const builtins = catalog.filter((skill) => skill.scope === "builtin");
+  const publicSkills = catalog.filter((skill) => skill.scope !== "builtin");
   const error = mineQuery.error ?? catalogQuery.error;
   const loading = mineQuery.isLoading || catalogQuery.isLoading;
 
@@ -188,7 +192,7 @@ export function MySkillsPage() {
             <h2 className="text-xs font-medium text-neutral-500">我的草稿</h2>
             <ul className="mt-3 grid gap-3 sm:grid-cols-2">
               {mine.map((skill) => (
-                <li className={ROW_CLASS} key={skill.skill_id}>
+                <li className={ROW_CLASS} key={skill.skill_id || skill.name}>
                   <Link
                     className="group block"
                     href={editorHref(skill.skill_id)}
@@ -217,14 +221,37 @@ export function MySkillsPage() {
           </section>
         ) : null}
 
-        {catalog.length > 0 ? (
+        {builtins.length > 0 ? (
+          <section className="mt-6">
+            <h2 className="text-xs font-medium text-neutral-500">内置技能</h2>
+            <ul className="mt-3 grid gap-3 sm:grid-cols-2">
+              {builtins.map((skill) => (
+                <li className={ROW_CLASS} key={skill.skill_id || skill.name}>
+                  <h3 className="truncate text-sm font-semibold text-neutral-900">
+                    {skill.name || "未命名技能"}
+                  </h3>
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                    <ScopeTag scope={skill.scope} />
+                  </div>
+                  {skill.description ? (
+                    <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-neutral-500">
+                      {skill.description}
+                    </p>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+
+        {publicSkills.length > 0 ? (
           <section className="mt-6">
             <h2 className="text-xs font-medium text-neutral-500">公共技能</h2>
             <ul className="mt-3 grid gap-3 sm:grid-cols-2">
-              {catalog.map((skill) => {
+              {publicSkills.map((skill) => {
                 const owned = Boolean(user?.id) && skill.owner_user_id === user?.id;
                 return (
-                  <li className={ROW_CLASS} key={skill.skill_id}>
+                  <li className={ROW_CLASS} key={skill.skill_id || skill.name}>
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <h3 className="truncate text-sm font-semibold text-neutral-900">
@@ -273,19 +300,23 @@ export function MySkillsPage() {
   );
 }
 
-/** 私有/公共。和状态徽标分开：一个说"谁能看"，一个说"审核到哪了"。 */
+/** 私有/公共/内置。和状态徽标分开：一个说"谁能看"，一个说"审核到哪了"。 */
 function ScopeTag({ scope }: { scope: SkillListItem["scope"] }) {
-  const isPrivate = scope === "private";
+  const label = scope === "private" ? "私有" : scope === "builtin" ? "内置" : "公共";
+  const tone =
+    scope === "private"
+      ? "border-sky-200 bg-sky-50 text-sky-700"
+      : scope === "builtin"
+        ? "border-amber-200 bg-amber-50 text-amber-700"
+        : "border-violet-200 bg-violet-50 text-violet-700";
   return (
     <span
       className={
         "inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[11px] leading-none " +
-        (isPrivate
-          ? "border-sky-200 bg-sky-50 text-sky-700"
-          : "border-violet-200 bg-violet-50 text-violet-700")
+        tone
       }
     >
-      {isPrivate ? "私有" : "公共"}
+      {label}
     </span>
   );
 }

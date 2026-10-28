@@ -1,11 +1,9 @@
 """技能扫描与 live registry（M7 §3.4）。
 
-两条容易忽略的规则：
-
-* **技能目录是一个包边界**：遇到一个 SKILL.md 就停止（只扫 category 根的一级子目录），
-  绝不 rglob —— 否则技能包里的示例、fixture、子模板都会变成独立技能。
-* **符号链接分两种**：一级符号链接目录允许（运维的技能树常这么组织，target 可以在
-  skills root 之外），但符号链接的 SKILL.md 和任何更深层的 resolve() 逃逸一律拒。
+扫描规则本身（包边界、目录名、符号链接）在 scan.py：内置技能与 public/custom 共用
+同一份，规则只写一遍。这里负责 **两个 category 的合并**（custom 覆盖 public）、
+把全局开关落到 Skill.enabled 上，以及 **内置技能 overlay**：内置技能没有全局/个人开关，
+只受 agent 白名单限制，同名时压过 catalog 行，读 catalog 失败时照样留在索引里。
 
 load_skills() **每次调用都扫盘**，不缓目录：技能刚被运维加进来，下一次组装提示词
 就该出现在索引里。缓的是 JSON 里的两层开关。
@@ -14,24 +12,37 @@ load_skills() **每次调用都扫盘**，不缓目录：技能刚被运维加�
 from __future__ import annotations
 
 import logging
-import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agentkit.config.skills_config import SkillsConfig
-from agentkit.skills.parser import SkillParseError, parse_skill_file
+from agentkit.skills.builtin import load_builtin_skills
 from agentkit.skills.prefs import effective_enabled, global_enabled_map, read_user_skill_prefs
-from agentkit.skills.types import SKILL_FILE_NAME, Skill, SkillCategory, SkillPathError
+from agentkit.skills.scan import is_within, scan_skill_category
+from agentkit.skills.types import Skill, SkillCategory, SkillPathError
 
 if TYPE_CHECKING:
     from agentkit.skills.catalog import SkillSnapshot
 
 logger = logging.getLogger(__name__)
 
-#: §2.4：技能目录名和 PATCH 的 name 用同一条正则，否则列表里有名字、PATCH 却 422。
-SKILL_DIR_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: 已经告警过的同名冲突（内置技能盖住 catalog 行）。提示词每次模型调用都会重建
+#: registry 视图；同一条 WARNING 每次刷一遍等于没有告警。reload 时清空。
+_warned_builtin_collisions: set[str] = set()
+
+
+def clear_builtin_collision_warnings() -> None:
+    """清空 registry 的同名冲突告警去重；POST /api/skills/reload 时和内置缓存一起清。"""
+    _warned_builtin_collisions.clear()
+
+
+def _warn_builtin_collision(name: str, category: SkillCategory) -> None:
+    if name in _warned_builtin_collisions:
+        return
+    _warned_builtin_collisions.add(name)
+    logger.warning("Skill %s: builtin hides the %s row", name, category.value)
 
 
 def load_skills(config: SkillsConfig, *, enabled_map: Mapping[str, bool]) -> list[Skill]:
@@ -39,82 +50,25 @@ def load_skills(config: SkillsConfig, *, enabled_map: Mapping[str, bool]) -> lis
     found: dict[str, Skill] = {}
     root = config.root_dir()
     for category in (SkillCategory.PUBLIC, SkillCategory.CUSTOM):  # custom 后写，覆盖 public
-        category_root = root / category.value
-        if not category_root.is_dir():
-            continue
-        for entry in sorted(category_root.iterdir(), key=lambda item: item.name):  # 稳定顺序
-            skill_file = entry / SKILL_FILE_NAME
-            if not SKILL_DIR_NAME_RE.match(entry.name):
-                logger.warning("Skipping skill directory with an illegal name: %s", entry)
-                continue
-            if not _is_usable_entry(entry, skill_file, category_root):  # 包边界 + 符号链接校验
-                continue
-            try:
-                parsed = parse_skill_file(skill_file)
-            except (SkillParseError, OSError) as exc:
-                logger.warning("Skipping skill %s: %s", entry, exc)  # 一个坏技能不拖垮全部
-                continue
-            if parsed.name != entry.name:
-                # 目录名与 name 不一致时以 frontmatter 为准（§3.1）；name 的正则由 parser 管。
-                logger.warning(
-                    "Skill %s: directory %r != name %r; using frontmatter name",
-                    skill_file,
-                    entry.name,
-                    parsed.name,
-                )
-            previous = found.get(parsed.name)
+        for skill in scan_skill_category(
+            root / category.value,
+            category=category,
+            container_path=config.container_path,
+        ):
+            previous = found.get(skill.name)
             if previous is not None:
                 logger.warning(
                     "Skill %s: category %s overrides %s",
-                    parsed.name,
+                    skill.name,
                     category.value,
                     previous.category.value,
                 )
-            found[parsed.name] = Skill(
-                name=parsed.name,
-                description=parsed.description,
-                license=parsed.license,
-                argument_hint=parsed.argument_hint,
-                skill_dir=entry,
-                skill_file=skill_file,
-                relative_path=entry.relative_to(category_root),
-                category=category,
-                allowed_tools=parsed.allowed_tools,
-                required_secrets=parsed.required_secrets,
-                secrets_autonomous=parsed.secrets_autonomous,
-                enabled=enabled_map.get(parsed.name, True),  # 扫描到的新技能默认开
-                container_path=config.container_path,
-            )
-    return list(found.values())
-
-
-def _is_usable_entry(entry: Path, skill_file: Path, category_root: Path) -> bool:
-    """一级符号链接目录允许；符号链接的 SKILL.md 和更深层的逃逸一律拒绝。"""
-    if not skill_file.is_file():
-        return False
-    if skill_file.is_symlink():
-        logger.warning("Refusing symlinked %s", skill_file)
-        return False
-    entry_resolved = entry.resolve()
-    if not _is_within(entry_resolved, category_root.resolve()):
-        # 只有 category 根下的一级符号链接可以指到外面
-        if entry.is_symlink() and entry.parent == category_root:
-            logger.debug("Skill directory %s is a first-level symlink to %s", entry, entry_resolved)
-        else:
-            logger.warning("Refusing skill outside the skills root: %s", entry)
-            return False
-    if not _is_within(skill_file.resolve(), entry_resolved):
-        logger.warning("Refusing %s: it escapes its skill directory", skill_file)
-        return False
-    return True
-
-
-def _is_within(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
+            found[skill.name] = skill
+    # 全局开关在这里落到 Skill.enabled；个人偏好是 prefs 的事（§2.4），不进扫描。
+    return [
+        replace(skill, enabled=enabled_map.get(skill.name, True))  # 扫描到的新技能默认开
+        for skill in found.values()
+    ]
 
 
 def validate_skill_file_path(skill: Skill) -> Path:
@@ -126,7 +80,7 @@ def validate_skill_file_path(skill: Skill) -> Path:
         resolved = skill_file.resolve(strict=True)
     except OSError as exc:
         raise SkillPathError(f"skill file is not readable: {skill_file}") from exc
-    if not _is_within(resolved, skill.skill_dir.resolve()):
+    if not is_within(resolved, skill.skill_dir.resolve()):
         raise SkillPathError(f"skill file escapes its skill directory: {skill_file}")
     return resolved
 
@@ -138,6 +92,10 @@ class SkillRegistry:
     With a snapshot, reads project that immutable catalog generation for this
     user; without one, the legacy filesystem scanner runs on every read so tests
     and filesystem-source deployments keep their old behavior.
+
+    Built-in skills are a separate overlay, not a catalog generation: they are
+    merged on every read (injectable via builtin_skills for tests), ordered
+    before catalog rows, and kept even when the catalog itself fails.
     """
 
     config: SkillsConfig | None = None
@@ -146,6 +104,8 @@ class SkillRegistry:
     prefs_path: Path | None = None
     _enabled_map: Mapping[str, bool] | None = field(default=None, repr=False)
     snapshot: "SkillSnapshot | None" = None
+    #: 注入点：给了就用它，没给就按 config 扫（loader 自带指纹缓存）。测试固定内置技能用。
+    builtin_skills: tuple[Skill, ...] | None = None
 
     def enabled_map(self) -> Mapping[str, bool]:
         return self._enabled_map if self._enabled_map is not None else global_enabled_map()
@@ -178,35 +138,77 @@ class SkillRegistry:
             )
         ]
 
-    def load(self) -> list[Skill]:
+    def _builtin_skills(self) -> tuple[Skill, ...]:
+        """内置技能：注入的 tuple 优先，否则按当前配置扫。"""
+        if self.builtin_skills is not None:
+            return self.builtin_skills
+        if self.config is None:
+            return ()
+        return load_builtin_skills(self.config)
+
+    def _visible_builtins(self) -> list[Skill]:
+        """内置技能只受 agent 白名单限制：不读全局开关，也不读个人偏好。"""
+        try:
+            rows = self._builtin_skills()
+        except Exception:  # loader 已经按失败退化；overlay 再兜一层，提示词不该 500
+            logger.exception("Built-in skill overlay unavailable")
+            return []
+        allowed = self.available_skills
+        return [skill for skill in rows if allowed is None or skill.name in allowed]
+
+    def _merge_builtins(self, catalog: Sequence[Skill]) -> list[Skill]:
+        """内置技能排在 catalog 之前；同名的 catalog 行被隐藏（内置优先）。"""
+        builtins = self._visible_builtins()
+        if not builtins:
+            return list(catalog)
+        names = {skill.name for skill in builtins}
+        for skill in catalog:
+            if skill.name in names:
+                _warn_builtin_collision(skill.name, skill.category)
+        return [*builtins, *(skill for skill in catalog if skill.name not in names)]
+
+    def _catalog_skills(self) -> list[Skill]:
+        """catalog/filesystem 的原始行：不含内置 overlay，也不做个人过滤。"""
         if self.snapshot is not None:
             return self._snapshot_skills(prefs=None, available_skills=None)
         if self.config is None:
             raise ValueError("SkillRegistry needs config when no snapshot is supplied")
         return load_skills(self.config, enabled_map=self.enabled_map())
 
-    def visible(self) -> list[Skill]:
-        """对当前用户**有效启用**、且在该 agent 白名单里的技能。加载失败 → 空（fail-closed）。"""
+    def _catalog_visible(self) -> list[Skill]:
+        """现有可见性逻辑：两层开关 + agent 白名单，只作用于 catalog/filesystem 行。"""
         if self.snapshot is not None:
-            try:
-                return self._snapshot_skills(
-                    prefs=self.prefs(), available_skills=self.available_skills
-                )
-            except Exception:
-                logger.exception("Skill snapshot unavailable; failing closed")
-                return []
-        try:
-            skills = self.load()
-        except Exception:  # 配置读不出来 / 路径解析失败：宁可模型"不知道有这个技能"
-            logger.exception("Skill registry unavailable; failing closed")
-            return []
+            return self._snapshot_skills(
+                prefs=self.prefs(), available_skills=self.available_skills
+            )
         prefs = self.prefs()
         allowed = self.available_skills
         return [
             skill
-            for skill in skills
+            for skill in self._catalog_skills()
             if effective_enabled(skill, prefs) and (allowed is None or skill.name in allowed)
         ]
+
+    def load(self) -> list[Skill]:
+        """所有已知技能（内置在前）：不做个人过滤，catalog 读不出来时照旧抛。"""
+        return self._merge_builtins(self._catalog_skills())
+
+    def visible(self, *, include_builtin: bool = True) -> list[Skill]:
+        """对当前用户**有效启用**、且在该 agent 白名单里的技能。
+
+        返回内置技能在前、catalog 行在后。加载失败 → 失败的那部分是空的（fail-closed），
+        但 fail-closed 只针对 catalog：内置技能是独立 overlay，Git runtime 或文件系统
+        读不出来时它仍然留在索引和 slash 里。
+
+        include_builtin=False 是**检索**口径：只返回 catalog 行本身，不加载内置技能，
+        也不隐藏同名的 catalog 行——公共技能恰好和内置技能同名时检索仍要能找到它。
+        """
+        try:
+            catalog = self._catalog_visible()
+        except Exception:  # 配置读不出来 / 路径解析失败：宁可模型"不知道有这个技能"
+            logger.exception("Skill registry unavailable; failing closed")
+            return self._visible_builtins() if include_builtin else []
+        return self._merge_builtins(catalog) if include_builtin else catalog
 
     def find(self, name: str) -> Skill | None:
         """slash 解析：同名时私有 active 优先于公共行（custom 覆盖 public 的旧规则保留）。"""

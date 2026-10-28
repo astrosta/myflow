@@ -163,6 +163,7 @@ async def run(*, source: Path, admin_user_id: str, apply: bool) -> int:
     from agentkit.config.runtime_paths import resolve_path
     from agentkit.persistence.engine import close_engine, get_session_factory, init_engine_from_config
     from agentkit.skills.author import SkillAuthorService
+    from agentkit.skills.builtin import builtin_names
     from agentkit.skills.content import SkillContentStore
     from agentkit.skills.git import SkillGitRepository
     from agentkit.skills.review import SkillReviewService
@@ -180,8 +181,13 @@ async def run(*, source: Path, admin_user_id: str, apply: bool) -> int:
         await git.ensure_ready()
         content = SkillContentStore(cache_dir, git)
         store = SqlSkillStore(get_session_factory())
-        author = SkillAuthorService(store, git, content, skills.creation)
-        review = SkillReviewService(store, git, content, skills.review)
+        reserved_names = lambda: builtin_names(skills)
+        author = SkillAuthorService(
+            store, git, content, skills.creation, reserved_names=reserved_names
+        )
+        review = SkillReviewService(
+            store, git, content, skills.review, reserved_names=reserved_names
+        )
         count = await bootstrap(
             store=store,
             author=author,

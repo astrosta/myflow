@@ -173,6 +173,30 @@ SOP 固定 `SKILL.md`"的约定在块前说一次，路径可推），
 `{user_id: {skill_id: bool}}`（任何登录用户），有效状态 = 两者相与。旧的
 `extensions_config.json` 技能开关与按名字的偏好用 `backend/scripts/migrate_skill_state.py` 迁移。
 
+**内置技能是例外**（`skills.builtin`，默认 `skills/builtin`）：随项目发布、只读，
+不进 Git、不进 PostgreSQL，也不需要数据库迁移。`skills/builtin/<name>/SKILL.md`
+放进去就被扫描进索引（按 SKILL.md 的 mtime/size 做目录指纹缓存，
+`POST /api/skills/reload` 可显式失效）；`enabled` 与 `path` 都是 **startup-only**：
+只读挂载在 Sandbox provider 构造时固定，改完要重启进程。`enabled: false` 时完全不扫描、
+不索引、不挂载；目录缺失或读不了只在首次读取时 warning 一次，进程照常起来。
+`POST /api/skills/reload` 会清空这个去重标记，重载后如果目录仍不可用会重新告警一次。
+它们**没有个人开关，也没有管理员全局开关**：`skills_prefs.json` 的同名 false 与
+`extensions_config.json` 的同名条目都不生效，部署级开关只有 `skills.builtin.enabled`；
+`subagents.custom_agents.<name>.skills` 白名单仍然生效（`subagents.agents.<name>` 只覆盖超时/轮次/
+模型/token 预算，不含 skills），`/name` 与 `read_file` 照常解析，同名时内置优先、同名的 catalog
+行被隐藏并 warning（同名冲突告警也是进程级 warn-once，reload 时重置；新建草稿和审核通过都会拒绝内置保留名）。
+加载只有渐进式两条：索引行（方括号标 `[builtin]`）→ `read_file` 读
+`<container_path>/builtin/<name>/SKILL.md`，或 `/name` 激活；**内置技能不参与
+`search_and_load_skills`**（filesystem 分支检索 `visible(include_builtin=False)`，
+Git 分支的检索服务从不接收内置技能），关键词通道开着也不会命中它。
+沙箱里 `<container_path>/builtin` 是宿主 `skills.builtin.path` 的**只读**映射，
+文件工具写不进去，`sandbox.mounts` 也不能覆盖 `<container_path>` 下的路径
+（宿主 bash 仍是已知的非隔离边界）。`GET /api/skills` 的内置行排在最前
+（`scope` / `category` / `status` 都是 `builtin`，`skill_id`、版本、commit、path 为 null）；
+Git runtime 缺失时 catalog 那一半照旧 fail-closed，内置行照样返回；
+`/api/skills/mine` 不含内置技能，技能页把它们放在只读的「内置技能」区块：
+没有编辑按钮、没有开关，也不跳编辑器。
+
 ## 认证（M9 §2）
 
 身份只有一个权威来源：**AuthMiddleware 写的 `request.state.auth`**。

@@ -7,6 +7,7 @@ from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from agentkit.agents.memory.canonical.domain import MutationContext, RecordDraft
 from agentkit.agents.memory.canonical.fakes import FakeOperators
 from agentkit.agents.memory.canonical.proposals import (
     SemanticDocument,
@@ -53,6 +54,45 @@ def test_semantic_thresholds_and_pending_is_not_projected(tmp_path) -> None:
         result = await service.ingest_episodes("u1", ["e1"], source_text="用户偏好 pytest；用户可能喜欢 unittest")
         assert [item.status for item in result.records] == ["active", "pending_review"]
         assert len(await repo.list_outbox("u1")) == 1
+    run(scenario())
+
+
+def test_semantic_inherits_source_episode_task_id(tmp_path) -> None:
+    async def scenario():
+        repo, service, _ = await semantic_stack(tmp_path)
+        episode = await repo.create_record(
+            RecordDraft(
+                user_id="u1",
+                id="episode-1",
+                kind="episodic",
+                subtype="episode",
+                status="active",
+                content="部署修复",
+                payload={},
+                topic_key="deploy",
+                scope_condition="global",
+                source="conversation",
+                evidence_tier="BEHAVIORAL_OBSERVED",
+                confidence=0.70,
+                salience=0.5,
+                explicit_remember=False,
+                parent_memory_id=None,
+                correction_of=None,
+                valid_from=None,
+                valid_to=None,
+                occurred_at=None,
+                thread_id="t1",
+                agent_name=None,
+                task_id="task-1",
+            ),
+            mutation=MutationContext("SYSTEM", "test", "ADD", None, ()),
+        )
+        service._operators.semantic_results = [semantic_doc("用户偏好 pytest")]
+        result = await service.ingest_episodes(
+            "u1", [episode.id], source_text="用户偏好 pytest"
+        )
+        assert result.records[0].task_id == "task-1"
+
     run(scenario())
 
 

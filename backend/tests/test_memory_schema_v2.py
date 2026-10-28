@@ -114,3 +114,32 @@ def test_migration_points_at_previous_head() -> None:
     spec.loader.exec_module(module)
     assert module.revision == "0006_agent_memory"
     assert module.down_revision == "0005_skill_catalog"
+
+
+def test_task_context_columns_are_registered() -> None:
+    sessions = Base.metadata.tables["memory_episode_sessions"]
+    records = Base.metadata.tables["memory_records"]
+    assert {
+        "task_id",
+        "task_goal",
+        "task_goal_source",
+        "boundary_decision",
+        "boundary_uncertain",
+    } <= set(sessions.columns.keys())
+    assert "task_id" in records.columns
+
+
+def test_task_migration_follows_0006() -> None:
+    import importlib.util
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "packages/harness/agentkit/persistence/migrations/versions/0007_task_classifier.py"
+    )
+    spec = importlib.util.spec_from_file_location("task_migration", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.revision == "0007_task_classifier"
+    assert module.down_revision == "0006_agent_memory"

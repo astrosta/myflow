@@ -53,6 +53,7 @@ class SemanticService:
         existing = await self._repo.find_semantic_existing(
             user_id, topic_key=None, include_pending=True
         )
+        task_id = await self._source_task_id(user_id, episode_ids)
         existing_payload = [
             ExistingSemantic(id=item.id, document=_document_from_record(item))
             for item in existing
@@ -154,6 +155,7 @@ class SemanticService:
                     valid_from=None,
                     valid_to=None,
                     occurred_at=None,
+                    task_id=task_id,
                     thread_id=None,
                     agent_name=None,
                     provenance={"evidence_refs": [document.evidence_quote]},
@@ -163,6 +165,15 @@ class SemanticService:
             )
             result.records.append(record)
         return result
+
+    async def _source_task_id(
+        self, user_id: str, episode_ids: Sequence[str]
+    ) -> str | None:
+        for episode_id in episode_ids:
+            episode = await self._repo.get_record(user_id, episode_id)
+            if episode is not None and episode.task_id:
+                return episode.task_id
+        return None
 
     async def promote(
         self, user_id: str, record_id: str, *, expected_revision: int

@@ -91,7 +91,7 @@ database:
 
 # ------------------------------------------------------------
 # M10 §2 持久记忆。画像常驻注入；长尾事实用 memory_search 按需检索。
-# 记忆按用户存进 LangGraph BaseStore，和 checkpointer 共用 database 选择。
+# canonical 运行路径：PostgreSQL 权威 + Milvus 活跃投影；旧 BaseStore 仅保留迁移兼容。
 # backend_class 变更需要重启（manager 单例），其余字段每轮读取。
 # ------------------------------------------------------------
 memory:
@@ -104,6 +104,13 @@ memory:
   ingest:
     debounce_seconds: 30
     shutdown_flush_timeout_seconds: 30
+  task_classifier:
+    enabled: true
+    model: agent_default       # 默认继承 agents.default_model
+    timeout_seconds: 8
+    max_history_runs: 10       # 只取最近 N 个已完成 run 的 human/final-AI 对
+    max_input_tokens: 4000
+    uncertain_policy: continue # continue | new_task
   maintenance:
     enabled: true
     interval_hours: 24
@@ -233,6 +240,12 @@ skills:
   # filesystem：仅测试/迁移时扫描本地 skills/ 目录。旧部署用
   # `python -m backend.scripts.migrate_skill_state` 迁移开关与个人偏好。
   source: git                 # startup-only：切换来源要重启
+
+  # 内置技能：随项目发布、只读，不进 Git/数据库；每个子目录一个技能（builtin/<name>/SKILL.md）。
+  # enabled 与 path 都是 startup-only：只读挂载在 Sandbox provider 构造时固定，改完要重启进程。
+  builtin:
+    enabled: true
+    path: skills/builtin
 
   # 私有草稿的配额与包边界（普通用户创作；admin 也受同一套限制）。
   creation:

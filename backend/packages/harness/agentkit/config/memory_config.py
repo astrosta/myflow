@@ -172,6 +172,19 @@ class MemoryEpisodicConfig(BaseModel):
     ttl_days: int = Field(default=180, ge=1)
 
 
+class MemoryTaskClassifierConfig(BaseModel):
+    """Constrained task-boundary classifier run before memory capture."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    model: str = "agent_default"
+    timeout_seconds: float = Field(default=8.0, gt=0.0)
+    max_history_runs: int = Field(default=10, ge=0)
+    max_input_tokens: int = Field(default=4000, ge=1)
+    uncertain_policy: Literal["continue", "new_task"] = "continue"
+
+
 class MemoryConsolidationConfig(BaseModel):
     """L2/L3 consolidation cadence; shadow is observability-only by default."""
 
@@ -231,6 +244,9 @@ class MemoryConfig(BaseModel):
     profile: MemoryProfileConfig = Field(default_factory=MemoryProfileConfig)
     semantic: MemorySemanticConfig = Field(default_factory=MemorySemanticConfig)
     episodic: MemoryEpisodicConfig = Field(default_factory=MemoryEpisodicConfig)
+    task_classifier: MemoryTaskClassifierConfig = Field(
+        default_factory=MemoryTaskClassifierConfig
+    )
     consolidation: MemoryConsolidationConfig = Field(default_factory=MemoryConsolidationConfig)
     skill_candidates: MemorySkillCandidatesConfig = Field(
         default_factory=MemorySkillCandidatesConfig

@@ -290,12 +290,12 @@ class SkillResponse(BaseModel):
 
     name: str
     description: str
-    category: Literal["public", "custom"]
+    category: Literal["public", "custom", "builtin"]
     enabled: bool
     global_enabled: bool | None = None
     # ---- Git catalog fields (Task 15) ----
     skill_id: str | None = None
-    scope: Literal["public", "private"] | None = None
+    scope: Literal["public", "private", "builtin"] | None = None
     skill_version: str | None = None
     version_id: str | None = None
     git_commit: str | None = None

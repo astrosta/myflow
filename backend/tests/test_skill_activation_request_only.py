@@ -198,6 +198,27 @@ def test_the_audit_tag_is_logged_on_activation(tmp_path, caplog):
     assert any(SKILL_ACTIVATION_AUDIT_TAG in record.getMessage() for record in caplog.records)
 
 
+def test_a_builtin_slash_injects_the_body_and_records_the_builtin_source(tmp_path):
+    write_skill(tmp_path, "builtin", "demo", body=BODY_MARKER)
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    activation = SkillActivationMiddleware(skills_config=config, user_id="u1")
+    context: dict = {"user_id": "u1"}
+    seen: dict = {}
+
+    def handler(request: ModelRequest):
+        seen["request"] = request
+        return "ok"
+
+    activation.wrap_model_call(
+        _request([HumanMessage(content="/demo go", id="m1")], context), handler
+    )
+
+    assert any(BODY_MARKER in str(message.content) for message in seen["request"].messages)
+    assert read_secret_context(
+        context, SLASH_SKILL_SOURCE_CONTEXT_KEY, token=activation.owner_token
+    ) == "/mnt/skills/builtin/demo/SKILL.md"
+
+
 def test_a_snapshot_activation_never_rescans_the_filesystem(tmp_path, monkeypatch):
     """The catalog generation is authoritative: slash reads its Skill.skill_file."""
     from agentkit.agents.middlewares import skill_activation_middleware as module

@@ -49,7 +49,12 @@ def write_skill(
 
 
 def skills_config(root: Path, **overrides) -> SkillsConfig:
-    values: dict = {"path": str(root / "skills")}
+    """临时技能树的配置。**内置技能默认关**。
+
+    仓库里真有一个 skills/builtin（默认相对路径按项目根解析），不关就会让 temp-root
+    用例读到项目自带的技能。需要内置技能的用例显式传 builtin={"path": ...}。
+    """
+    values: dict = {"path": str(root / "skills"), "builtin": {"enabled": False}}
     values.update(overrides)
     return SkillsConfig(**values)
 
@@ -90,6 +95,8 @@ def write_app_config(root: Path, *, skills_path: Path | None = None, **skills_ov
     data = yaml.safe_load(
         APP_CONFIG_TEMPLATE.format(skills_path=str(skills_path or (root / "skills")))
     )
+    # 同 skills_config()：默认关掉仓库里的内置技能，再让显式覆盖生效。
+    data["skills"]["builtin"] = {"enabled": False}
     data["skills"].update(skills_overrides)
     path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
     return path

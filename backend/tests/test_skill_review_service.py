@@ -403,6 +403,29 @@ def test_approve_rejects_a_public_name_collision(harness: Harness) -> None:
     harness.run(scenario)
 
 
+def test_approve_rejects_a_reserved_public_name(harness: Harness) -> None:
+    async def scenario() -> None:
+        _skill, _version, submission = await _submitted(harness, name="demo")
+        review = SkillReviewService(
+            harness.store,
+            harness.git,  # type: ignore[arg-type]
+            FakeContent(),  # type: ignore[arg-type]
+            harness.review_config,
+            reserved_names=lambda: frozenset({"demo"}),
+        )
+        with pytest.raises(SkillConflict, match="built-in"):
+            await review.approve(
+                admin_user_id="admin", submission_id=submission.id
+            )
+
+        assert harness.git.publish_calls == []
+        async with harness.session_factory() as session:
+            row = await session.get(SkillSubmissionRow, submission.id)
+            assert row is not None and row.status == "pending"
+
+    harness.run(scenario)
+
+
 def test_approve_rejects_self_approval_when_disabled(harness: Harness) -> None:
     async def scenario() -> None:
         harness.review_config.allow_self_approval = False

@@ -144,7 +144,7 @@ def _tree(tmp_path) -> SkillsConfig:
         description="CSV 导出",
         body="# 导出\n另存为 UTF-8。\n",
     )
-    return SkillsConfig(path=str(tmp_path / "skills"))
+    return SkillsConfig(path=str(tmp_path / "skills"), builtin={"enabled": False})
 
 
 def _install(skills: SkillsConfig) -> AppConfig:
@@ -221,7 +221,7 @@ def test_a_blank_query_is_refused_with_guidance(tmp_path):
 
 
 def test_an_empty_skill_tree_tells_the_model_not_to_retry(tmp_path):
-    (_install(SkillsConfig(path=str(tmp_path / "missing"))))
+    (_install(SkillsConfig(path=str(tmp_path / "missing"), builtin={"enabled": False})))
 
     payload = _call()
 
@@ -249,6 +249,35 @@ def test_skills_switched_off_by_the_user_are_not_loaded(tmp_path, monkeypatch):
 
     assert _call(runtime=_runtime("u1"))["skills"] == []
     assert [item["name"] for item in _call(runtime=_runtime("u2"))["skills"]] == [SKILL]
+
+
+def test_a_builtin_skill_is_never_a_search_candidate(tmp_path):
+    """内置技能走索引/slash/read_file：检索只认 public/custom，正文也绝不能被带出来。"""
+    _tree(tmp_path)
+    write_skill(
+        tmp_path,
+        "builtin",
+        "builtin-searchable",
+        description="PostgreSQL 多租户 search_path 串库排查",
+        body="# builtin secret\nBUILTIN-BODY-MARKER",
+    )
+    _install(
+        SkillsConfig(
+            path=str(tmp_path / "skills"),
+            builtin={"path": str(tmp_path / "skills" / "builtin")},
+        )
+    )
+
+    payload = _call()
+
+    # 检索本身照旧：公共技能还是被找到、正文照旧返回
+    assert [item["name"] for item in payload["skills"]] == [SKILL]
+    assert BODY_MARKER in payload["skills"][0]["body"]
+    # 内置技能不在结果里，正文标记也没被带出来
+    assert "builtin-searchable" not in [item["name"] for item in payload["skills"]]
+    assert all("BUILTIN-BODY-MARKER" not in item["body"] for item in payload["skills"])
+    # 连候选都不是：它根本没进 BM25 索引
+    assert payload["retrieval"]["candidates"] == 1
 
 
 def test_the_tool_runs_inside_a_real_agent_loop(tmp_path):

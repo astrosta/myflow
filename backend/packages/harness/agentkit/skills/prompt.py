@@ -3,7 +3,8 @@
 索引是有界的、唯一的形态：每技能一行，描述截断，正文一律按需（read_file 或 slash 注入）。
 五条规则：
 
-1. 只列**对当前用户有效启用**、且在 agent 白名单里的技能，从 live registry 现算。
+1. 只列**对当前用户有效启用**、且在 agent 白名单里的技能，从 live registry 现算；
+   内置技能是唯一的例外——它没有个人开关，永远在索引里（方括号标 [builtin]）。
 2. 排序稳定 (category, name)：加一个技能只该多出它自己那一行，否则前缀缓存在第一处变动起全失效。
 3. 只截断描述（config.index_description_max_chars），其余字段根本不进索引。
 4. **根目录只写一次**：块里不放每个技能的路径（几十条技能就是几十份重复前缀），
@@ -25,6 +26,7 @@ from collections.abc import Sequence
 
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.skills.catalog import get_skill_snapshot
+from agentkit.skills.domain import SkillScope
 from agentkit.skills.storage import SkillRegistry
 from agentkit.skills.types import Skill
 
@@ -48,6 +50,21 @@ SKILL_CATALOG_ROOT_CONVENTION = (
     "每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的 `SKILL.md`，"
     "即 `{public_root}/<name>/SKILL.md`（公共）或 `{private_root}/<name>/SKILL.md`（私有）；"
     "索引行方括号里的 public / private 标明作用域，同名时私有优先。"
+)
+#: filesystem 源 + 内置技能：public / custom / builtin 三个目录（同一棵树里）。
+SKILL_FILESYSTEM_BUILTIN_ROOT_CONVENTION = (
+    "技能根目录 {root}：公共技能在 {root}/public/<name>/SKILL.md，自定义技能在 "
+    "{root}/custom/<name>/SKILL.md，内置技能在 {root}/builtin/<name>/SKILL.md；"
+    "目录名就是技能名，同名时内置技能优先于 custom 和 public；custom 仍覆盖 public。"
+)
+#: catalog 快照（git 源）同时有内置技能：public / private / builtin 三个根。
+SKILL_CATALOG_BUILTIN_ROOT_CONVENTION = (
+    "技能根目录：公共技能在 `{public_root}`，私有技能在 `{private_root}`，内置技能在 "
+    "`{builtin_root}`。每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的 "
+    "`SKILL.md`，即 `{public_root}/<name>/SKILL.md`（公共）、"
+    "`{private_root}/<name>/SKILL.md`（私有）或 `{builtin_root}/<name>/SKILL.md`（内置）；"
+    "索引行方括号里的 public / private / builtin 标明作用域，同名时内置技能优先于 public 和 private；"
+    "catalog 内部 private 仍覆盖 public。"
 )
 SKILL_INDEX_PREAMBLE = (
     "下面是技能索引 `<available_skills>`：每个已启用技能一行，只有名字、类别和截断描述"
@@ -134,7 +151,9 @@ def build_skills_section(
     except Exception:
         logger.exception("Skill registry unavailable; rendering an empty index")
         return ""
-    key = _cache_key(skills, config.index_description_max_chars)
+    # 根目录说明随 source 变（git 用 catalog 文本，filesystem 用目录文本），
+    # 同一批技能在两个源下的段落并不相同，缓存键必须带上它。
+    key = f"{config.source}:{_cache_key(skills, config.index_description_max_chars)}"
     cached = _index_cache.get(key)
     if cached is not None:
         _index_cache.move_to_end(key)
@@ -157,14 +176,30 @@ def clear_skill_prompt_cache() -> None:
 
 
 def _root_convention(skills: Sequence[Skill], config: SkillsConfig) -> str:
-    """Use the two catalog roots when the registry returned snapshot skills."""
-    if not any(getattr(skill.scope, "value", skill.scope) is not None for skill in skills):
-        return SKILL_ROOT_CONVENTION.format(root=config.container_path)
+    """按"来源 + 实际 scope"选根目录说明。
+
+    catalog 行（public/private scope）用两段或三段文本；纯 filesystem 的 public/custom
+    目录用旧的一段文本——**没有内置技能时措辞一个字不改**，旧提示词与旧测试都不动。
+    内置技能是独立 overlay：它出现在 filesystem 索引里时只是多一个根，不改变其余约定。
+    """
+    scopes = {getattr(skill.scope, "value", skill.scope) for skill in skills}
+    has_builtin = SkillScope.BUILTIN in scopes
+    has_catalog_scope = bool(scopes & {SkillScope.PUBLIC, SkillScope.PRIVATE})
     root = config.container_path.rstrip("/") or config.container_path
-    return SKILL_CATALOG_ROOT_CONVENTION.format(
-        public_root=f"{root}/public",
-        private_root=f"{root}/private",
-    )
+    if config.source == "git" or has_catalog_scope:
+        if has_builtin:
+            return SKILL_CATALOG_BUILTIN_ROOT_CONVENTION.format(
+                public_root=f"{root}/public",
+                private_root=f"{root}/private",
+                builtin_root=f"{root}/builtin",
+            )
+        return SKILL_CATALOG_ROOT_CONVENTION.format(
+            public_root=f"{root}/public",
+            private_root=f"{root}/private",
+        )
+    if has_builtin:
+        return SKILL_FILESYSTEM_BUILTIN_ROOT_CONVENTION.format(root=root)
+    return SKILL_ROOT_CONVENTION.format(root=config.container_path)
 
 
 def _cache_key(skills: Sequence[Skill], max_description_chars: int) -> str:

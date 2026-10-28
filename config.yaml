@@ -140,6 +140,12 @@ skills:
   # `python -m backend.scripts.migrate_skill_state` 迁移开关与个人偏好。
   source: git                 # startup-only：切换来源要重启
 
+  # 内置技能：随项目发布、只读，不进 Git/数据库；每个子目录一个技能（builtin/<name>/SKILL.md）。
+  # enabled 与 path 都是 startup-only：只读挂载在 Sandbox provider 构造时固定，改完要重启进程。
+  builtin:
+    enabled: true
+    path: skills/builtin
+
   # 私有草稿的配额与包边界（普通用户创作；admin 也受同一套限制）。
   creation:
     enabled: true             # 关掉后只有 admin 能创建技能

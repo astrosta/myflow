@@ -374,12 +374,28 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
             seen.calls.append(("content", (cache_dir, git)))
 
     class Author:
-        def __init__(self, store: Any, git: Any, content: Any, creation: Any) -> None:
-            seen.calls.append(("author", (creation,)))
+        def __init__(
+            self,
+            store: Any,
+            git: Any,
+            content: Any,
+            creation: Any,
+            *,
+            reserved_names: Any = None,
+        ) -> None:
+            seen.calls.append(("author", (creation, reserved_names)))
 
     class Review:
-        def __init__(self, store: Any, git: Any, content: Any, review: Any) -> None:
-            seen.calls.append(("review", (review,)))
+        def __init__(
+            self,
+            store: Any,
+            git: Any,
+            content: Any,
+            review: Any,
+            *,
+            reserved_names: Any = None,
+        ) -> None:
+            seen.calls.append(("review", (review, reserved_names)))
 
     class Catalog:
         def __init__(self, store: Any, content: Any, container_path: str) -> None:
@@ -423,6 +439,25 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
     monkeypatch.setattr(skills_catalog, "SkillIndexOutboxWorker", Outbox)
     del embedding
     return seen
+
+
+def test_factory_injects_builtin_names_for_author_and_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _patch_factory(monkeypatch, embedding=False)
+    monkeypatch.setattr(
+        skills_catalog,
+        "builtin_names",
+        lambda config: frozenset({"demo"}),
+    )
+
+    build_skill_runtime(_config(**GIT_SKILLS), session_factory=object())
+
+    payloads = {name: payload for name, payload in seen.calls}
+    author_reserved = payloads["author"][1]
+    review_reserved = payloads["review"][1]
+    assert author_reserved is review_reserved
+    assert author_reserved() == frozenset({"demo"})
 
 
 def test_shipped_git_config_still_builds_the_lexical_search_service(

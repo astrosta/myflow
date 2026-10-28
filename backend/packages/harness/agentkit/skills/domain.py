@@ -20,6 +20,7 @@ class SkillScope(StrEnum):
 
     PUBLIC = "public"
     PRIVATE = "private"
+    BUILTIN = "builtin"
 
 
 @dataclass(frozen=True, slots=True)

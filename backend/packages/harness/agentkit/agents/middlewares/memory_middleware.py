@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.runtime import Runtime
 
 from agentkit.agents.middlewares.message_utils import is_real_user_message
+from agentkit.agents.middlewares.task_classifier import append_completed_run, clear_completed_runs
 from agentkit.agents.middlewares.provenance import ContentKind, provenance_kwargs
 from agentkit.agents.memory.canonical.capture import is_explicit_remember
 from agentkit.agents.memory.canonical.service import (
@@ -24,6 +25,7 @@ from agentkit.agents.memory.context import ProfileContextBuilder
 from agentkit.agents.memory.manager import MemoryManager, get_memory_manager
 from agentkit.agents.memory.types import MemoryScope
 from agentkit.config.memory_config import MemoryConfig
+from agentkit.privacy import PIIRedactor
 from agentkit.utils.custom_events import emit_custom_event
 from agentkit.utils.messages import message_content_to_text
 
@@ -124,7 +126,7 @@ class MemoryMiddleware(AgentMiddleware):
     async def aafter_agent(self, state: Mapping, runtime: Runtime) -> dict | None:
         service = self._resolved_service()
         if service is not None:
-            await self._capture_turn_service(service, state, runtime)
+            return await self._capture_turn_service(service, state, runtime)
         return None
 
     # -- profile injection --------------------------------------------------
@@ -250,27 +252,30 @@ class MemoryMiddleware(AgentMiddleware):
 
     async def _capture_turn_service(
         self, service: MemoryService, state: Mapping, runtime: Runtime
-    ) -> None:
+    ) -> dict | None:
         config = self._resolved_config()
         if not config.enabled:
-            return
+            return None
         context = _context(runtime)
         if context.get("skip_memory_flush") is True:
-            return
+            return None
         if _text(context.get("subagent_name")) is not None:
-            return
+            return None
         user_id = _text(context.get("user_id")) or self._user_id
         thread_id = _text(context.get("thread_id"))
         if not user_id or not thread_id:
-            return
+            return None
         messages = list(state.get("messages") or [])
         user_index = _latest_real_user_index(messages)
         if user_index is None:
-            return
+            return None
         assistant_index = _latest_visible_ai_index(messages)
         if assistant_index is None or assistant_index < user_index:
-            return
+            return None
         user_text = message_content_to_text(messages[user_index].content)
+        assistant_text = message_content_to_text(messages[assistant_index].content)
+        task_context = state.get("task_context")
+        task_context = dict(task_context) if isinstance(task_context, Mapping) else None
         try:
             await service.capture_turn(
                 user_id,
@@ -279,6 +284,7 @@ class MemoryMiddleware(AgentMiddleware):
                 messages[user_index : assistant_index + 1],
                 terminal=False,
                 explicit_remember=is_explicit_remember(user_text),
+                task_context=task_context,
             )
             if user_text.strip():
                 asyncio.create_task(
@@ -286,6 +292,26 @@ class MemoryMiddleware(AgentMiddleware):
                 )
         except Exception:
             logger.warning("Failed to capture memory turn", exc_info=True)
+            return None
+
+        if task_context is None:
+            return None
+        base = (
+            clear_completed_runs(task_context)
+            if task_context.get("boundary_pending")
+            else task_context
+        )
+        updated = append_completed_run(
+            base,
+            {
+                "run_id": _text(context.get("run_id")) or "",
+                "human_message": _redacted_run_text(user_text),
+                "final_ai_message": _redacted_run_text(assistant_text),
+            },
+            max_history_runs=config.task_classifier.max_history_runs,
+        )
+        updated["boundary_pending"] = False
+        return {"task_context": updated}
 
     # -- enqueue ------------------------------------------------------------
 
@@ -320,6 +346,11 @@ class MemoryMiddleware(AgentMiddleware):
             )
         except Exception:
             logger.warning("Failed to enqueue memory extraction", exc_info=True)
+
+
+def _redacted_run_text(value: str) -> str:
+    cleaned = PIIRedactor().redact_for_memory(str(value or "")).strip()
+    return cleaned[:2000]
 
 
 def _context(runtime: Any) -> dict[str, Any]:

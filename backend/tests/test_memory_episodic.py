@@ -54,6 +54,13 @@ def test_episode_job_is_idempotent_and_has_no_transcript(tmp_path) -> None:
             "r1",
             [HumanMessage(id="u1", content="部署失败后修复"), AIMessage(id="a1", content="已修复")],
             terminal=True,
+            task_context={
+                "task_id": "task-1",
+                "task_goal": "修复部署",
+                "task_goal_source": "classifier",
+                "status": "open",
+                "started_at": "2026-10-26T00:00:00Z",
+            },
         )
         service = EpisodicService(repo, ops, L1Gate(0.55), max_summary_tokens=1200)
         first = await service.process_ingest_job(
@@ -68,6 +75,7 @@ def test_episode_job_is_idempotent_and_has_no_transcript(tmp_path) -> None:
         assert "messages" not in first.payload
         assert "已修复" not in str(first.payload)
         assert first.consolidation_status == "pending"
+        assert first.task_id == "task-1"
 
     run(scenario())
 

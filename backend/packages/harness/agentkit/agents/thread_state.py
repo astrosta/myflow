@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated, Literal, NotRequired, TypedDict
 
 from langchain.agents import AgentState
 
@@ -72,6 +72,30 @@ class SkillEntry(TypedDict):
     name: str
     path: str
     description: str
+
+
+class RunPair(TypedDict):
+    """One completed run as seen by the task classifier."""
+
+    run_id: str
+    human_message: str
+    final_ai_message: str
+
+
+class TaskContext(TypedDict, total=False):
+    """Task boundary state carried through checkpoints."""
+
+    task_id: str
+    task_goal: str
+    task_goal_source: Literal["classifier", "fallback"]
+    status: Literal["open", "closed"]
+    started_at: str
+    completed_runs: list[RunPair]
+    boundary_decision: Literal["CONTINUE", "NEW_TASK", "UNCERTAIN"]
+    boundary_uncertain: bool
+    boundary_pending: bool
+    previous_task_id: str | None
+    last_classified_message_id: str
 
 
 def merge_sandbox(existing, new):
@@ -195,6 +219,7 @@ class ThreadState(AgentState):
     promoted: Annotated[list[str], merge_promoted]
 
     thread_data: NotRequired[ThreadDataState | None]
+    task_context: NotRequired[TaskContext | None]
     title: NotRequired[str | None]
     uploaded_files: NotRequired[list[dict] | None]
     summary_text: NotRequired[str | None]

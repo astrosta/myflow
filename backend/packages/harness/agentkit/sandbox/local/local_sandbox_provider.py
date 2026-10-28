@@ -12,6 +12,7 @@ from agentkit.config.skills_config import DEFAULT_SKILLS_CONTAINER_PATH
 from agentkit.sandbox.local.local_sandbox import LocalSandbox
 from agentkit.sandbox.sandbox_provider import SandboxProvider
 from agentkit.sandbox.security import PathMapping, is_host_bash_allowed, sandbox_flag
+from agentkit.skills.builtin import resolve_builtin_root
 from agentkit.utils import validate_user_id
 
 _DEFAULT_USER_ID = "default"
@@ -40,10 +41,12 @@ class LocalSandboxProvider(SandboxProvider):
         self._skills_source = _skills_source()
         self._public_skills = f"{self._skills_root}/public"
         self._private_skills = f"{self._skills_root}/private"
+        self._builtin_skills_dir = _builtin_skills_dir()
         self._static_mappings = _static_mappings(
             self._skills_cache_dir,
             container_root=self._skills_root,
             source=self._skills_source,
+            builtin_dir=self._builtin_skills_dir,
         )
 
     @property
@@ -212,17 +215,36 @@ def _skills_tree_root() -> Path:
         return runtime_home() / "skills"
 
 
+def _builtin_skills_dir() -> Path | None:
+    """Configured built-in tree, or None when disabled, unreadable, or unsafe.
+
+    Uses the same resolver as the loader so an empty/relative-root/symlink/junction
+    path never becomes a read-only mount of the project or host filesystem.
+    """
+    try:
+        config = get_app_config().skills
+        if not config.builtin.enabled:
+            return None
+        return resolve_builtin_root(config)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    except Exception:  # noqa: BLE001 - 单元测试可能没有可读的 app config
+        return None
+
+
 def _static_mappings(
     skills_cache_dir: Path,
     *,
     container_root: str = DEFAULT_SKILLS_CONTAINER_PATH,
     source: str = "git",
+    builtin_dir: Path | None = None,
 ) -> list[PathMapping]:
     """Process-wide mounts only. Never bind a user id here.
 
     git 来源挂 active 公共树（私有树按用户挂，见 _build）。filesystem 来源没有
     runtime，也就没有 active 树：它必须挂**技能树根本身**，否则提示词里写的
-    {container}/<category>/<name>/SKILL.md 在沙箱里根本不存在。
+    {container}/<category>/<name>/SKILL.md 在沙箱里根本不存在。内置技能树在两种
+    来源下都额外挂到 {root}/builtin；目录不存在也挂，配置变化要重启进程。
     """
     root = container_root.rstrip("/") or "/"
     mappings: list[PathMapping] = (
@@ -236,9 +258,15 @@ def _static_mappings(
         if source == "git"
         else [PathMapping(root, str(_skills_tree_root()), read_only=True)]
     )
+    if builtin_dir is not None:
+        mappings.append(
+            PathMapping(f"{root}/builtin", str(builtin_dir), read_only=True)
+        )
     protected = [skills_cache_dir.resolve()]
     if source != "git":
         protected.append(_skills_tree_root().resolve())
+    if builtin_dir is not None:
+        protected.append(builtin_dir.resolve())
     raw = sandbox_flag("mounts", []) or []
     if isinstance(raw, list):
         cache_root = skills_cache_dir.resolve()

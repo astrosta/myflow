@@ -12,11 +12,19 @@ import { apiFetch, apiUrl } from "./base";
  *   前端类型叫 `skill_id`；客户端在边界上统一成 `skill_id`，并保留 `id`。
  * - GET /skills 与 PUT /skills/{id}/preference 返回的是目录行（`skill_id`），
  *   在 filesystem 来源下 `skill_id` 可能为空，这里回退到 id/name。
+ * - 内置行也走 GET /skills，scope/status 是 `builtin`、skill_id 可能为 null；
+ *   客户端保留 scope，只把主键回退到 id/name。
  */
 
-export type SkillScope = "public" | "private";
+export type SkillScope = "public" | "private" | "builtin";
 
-export type SkillStatus = "draft" | "pending" | "approved" | "rejected" | "withdrawn";
+export type SkillStatus =
+  | "draft"
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "withdrawn"
+  | "builtin";
 
 export interface SkillListItem {
   skill_id: string;

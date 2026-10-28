@@ -21,6 +21,8 @@ STARTUP_ONLY_FIELDS: dict[str,str] = {
     "stream_bridge.backend": "create_stream_bridge() 在 lifespan 里构造一次；换后端要重建单例",
     "sandbox.use": "get_sandbox_provider() 首次调用时按 use 创建单例；重载后的 AppConfig 不会重建它",
     "skills.container_path": "它被编译进系统提示词的技能索引和沙箱 mount；换路径要重建沙箱视图",
+    "skills.builtin.path": "内置技能目录在 Sandbox provider 构造时固化为只读挂载；换路径要重启进程",
+    "skills.builtin.enabled": "内置技能开关与只读挂载一起在 Sandbox provider 构造时冻结",
     # M8 §4.2：进程级准入控制器在 Gateway 启动时构建；热重载改 YAML 不会重建它。
     # 提示词和 Limit 中间件读的是同一个冻结值，不能让热重载把容量宣告得比控制器更大。
     "subagent_runtime.max_running": (

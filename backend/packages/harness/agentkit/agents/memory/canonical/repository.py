@@ -161,6 +161,7 @@ class MemoryRepository:
                 valid_from=draft.valid_from,
                 valid_to=draft.valid_to,
                 occurred_at=draft.occurred_at,
+                task_id=draft.task_id,
                 thread_id=draft.thread_id,
                 agent_name=draft.agent_name,
                 provenance=draft.provenance,
@@ -819,12 +820,28 @@ class MemoryRepository:
             return int(value or 0)
 
     async def open_session(
-        self, user_id: str, thread_id: str, *, run_id: str, turn_id: str, now: datetime
+        self,
+        user_id: str,
+        thread_id: str,
+        *,
+        run_id: str,
+        turn_id: str,
+        now: datetime,
+        task_id: str = "",
+        task_goal: str = "",
+        task_goal_source: str = "fallback",
+        boundary_decision: str | None = None,
+        boundary_uncertain: bool = False,
     ) -> MemorySessionView:
         async with self._sf() as session:
             row = MemoryEpisodeSessionRow(
                 user_id=user_id,
                 thread_id=thread_id,
+                task_id=task_id,
+                task_goal=task_goal,
+                task_goal_source=task_goal_source,
+                boundary_decision=boundary_decision,
+                boundary_uncertain=boundary_uncertain,
                 status="open",
                 open_turn_id=turn_id,
                 last_turn_id=turn_id,
@@ -870,6 +887,24 @@ class MemoryRepository:
             if refs:
                 row.last_turn_id = str(refs[-1].get("message_id") or row.last_turn_id or "")
             row.last_activity_at = now
+            row.updated_at = now
+            await session.commit()
+            return _session_view(row)
+
+    async def set_session_boundary(
+        self,
+        session_id: str,
+        *,
+        boundary_decision: str | None,
+        boundary_uncertain: bool,
+        now: datetime,
+    ) -> MemorySessionView:
+        async with self._sf() as session:
+            row = await session.get(MemoryEpisodeSessionRow, session_id)
+            if row is None:
+                raise MemoryNotFoundError(f"episode session {session_id} not found")
+            row.boundary_decision = boundary_decision
+            row.boundary_uncertain = bool(boundary_uncertain)
             row.updated_at = now
             await session.commit()
             return _session_view(row)
@@ -1188,6 +1223,7 @@ def _record_view(row: MemoryRecordRow) -> MemoryRecordView:
         valid_from=row.valid_from,
         valid_to=row.valid_to,
         occurred_at=row.occurred_at,
+        task_id=row.task_id,
         thread_id=row.thread_id,
         agent_name=row.agent_name,
         provenance=dict(row.provenance or {}),
@@ -1204,6 +1240,11 @@ def _session_view(row: MemoryEpisodeSessionRow) -> MemorySessionView:
         id=row.id,
         user_id=row.user_id,
         thread_id=row.thread_id,
+        task_id=row.task_id,
+        task_goal=row.task_goal,
+        task_goal_source=row.task_goal_source,
+        boundary_decision=row.boundary_decision,
+        boundary_uncertain=bool(row.boundary_uncertain),
         status=row.status,
         turn_refs=list(row.turn_refs or []),
         episode_key=row.episode_key,
