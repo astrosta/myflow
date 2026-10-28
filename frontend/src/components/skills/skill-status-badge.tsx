@@ -14,6 +14,7 @@ const LABELS: Record<SkillStatus, string> = {
   approved: "已通过",
   rejected: "已驳回",
   withdrawn: "已撤回",
+  builtin: "内置",
 };
 
 const TONES: Record<SkillStatus, string> = {
@@ -22,6 +23,7 @@ const TONES: Record<SkillStatus, string> = {
   approved: "border-emerald-200 bg-emerald-50 text-emerald-700",
   rejected: "border-red-200 bg-red-50 text-red-700",
   withdrawn: "border-neutral-200 bg-neutral-100 text-neutral-500",
+  builtin: "border-neutral-300 bg-neutral-100 text-neutral-600",
 };
 
 export function skillStatusLabel(status: SkillStatus): string {

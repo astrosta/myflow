@@ -175,6 +175,38 @@ describe("我的技能页", () => {
     expect(screen.queryByRole("button", { name: "编辑" })).toBeNull();
   });
 
+  it("内置技能单独回显且没有编辑入口", async () => {
+    mockedListMine.mockResolvedValue([]);
+    mockedListCatalog.mockResolvedValue([
+      makeSkill({
+        skill_id: "builtin-demo",
+        name: "代码规范",
+        description: "内置规范",
+        scope: "builtin",
+        status: "builtin",
+        owner_user_id: null,
+      }),
+      makeSkill({
+        skill_id: "pub-1",
+        name: "公开技能",
+        scope: "public",
+        status: "approved",
+        owner_user_id: "u-alice",
+      }),
+    ]);
+
+    renderPage();
+
+    expect(await screen.findByText("内置技能")).toBeTruthy();
+    const builtinRow = screen.getByText("代码规范").closest("li");
+    expect(builtinRow?.textContent).toContain("内置");
+    expect(builtinRow?.textContent).toContain("内置规范");
+    expect(builtinRow?.querySelector("button")).toBeNull();
+
+    const publicRow = screen.getByText("公开技能").closest("li");
+    expect(publicRow?.querySelector("button")?.textContent).toContain("编辑");
+  });
+
   it("创建对话框提交 name/description，成功后跳到新技能的编辑器", async () => {
     mockedListMine.mockResolvedValue([]);
     mockedListCatalog.mockResolvedValue([]);
