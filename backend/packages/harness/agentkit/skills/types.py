@@ -18,6 +18,7 @@ SKILL_FILE_NAME = "SKILL.md"
 class SkillCategory(StrEnum):
     PUBLIC = "public"
     CUSTOM = "custom"
+    BUILTIN = "builtin"
     # INTEGRATION / LEGACY —— M7 不实现，枚举值先占位以免字符串漂移
 
 

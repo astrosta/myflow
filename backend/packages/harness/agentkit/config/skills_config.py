@@ -22,6 +22,7 @@ from agentkit.knowledge.config import EmbeddingConfig, MilvusConfig, RerankConfi
 from agentkit.skills.projection import ACTIVE_COLLECTION
 
 DEFAULT_SKILLS_PATH = "skills"
+DEFAULT_BUILTIN_SKILLS_PATH = "skills/builtin"
 DEFAULT_SKILLS_CONTAINER_PATH = "/mnt/skills"
 DEFAULT_INDEX_DESCRIPTION_MAX_CHARS = 120
 DEFAULT_SEARCH_CANDIDATE_K = 20
@@ -297,6 +298,31 @@ class SkillRetentionConfig(BaseModel):
     cache_ttl_days: int = Field(default=30, ge=1, description="未被引用的缓存最长保留天数。")
 
 
+class BuiltinSkillsConfig(BaseModel):
+    """随项目发布的内置技能目录。只读，不写 Git，也不写数据库。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True,
+        description=format_field_description(
+            "skills.builtin.enabled",
+            field_doc="关掉后不扫描、不索引、不挂载内置技能。",
+        ),
+    )
+    path: str = Field(
+        default=DEFAULT_BUILTIN_SKILLS_PATH,
+        description=format_field_description(
+            "skills.builtin.path",
+            field_doc="内置技能根目录；相对路径按项目根解析。",
+        ),
+    )
+
+    def root_dir(self) -> Path:
+        """宿主上的内置技能根目录（用于扫描）。"""
+        return resolve_path(self.path)
+
+
 class SkillsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -304,6 +330,7 @@ class SkillsConfig(BaseModel):
         default="filesystem",
         description="技能目录来源。filesystem 仅用于测试/本地调试；生产使用 git。",
     )
+    builtin: BuiltinSkillsConfig = Field(default_factory=BuiltinSkillsConfig)
     creation: SkillCreationConfig = Field(default_factory=SkillCreationConfig)
     git: SkillGitConfig = Field(default_factory=SkillGitConfig)
     review: SkillReviewConfig = Field(default_factory=SkillReviewConfig)
