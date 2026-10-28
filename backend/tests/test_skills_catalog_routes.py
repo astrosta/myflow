@@ -552,6 +552,18 @@ def test_reload_refreshes_the_snapshot_and_clears_the_prompt_cache(
     assert {item["name"] for item in client.get("/api/skills").json()["skills"]} == {"renamed"}
 
 
+def test_reload_clears_builtin_cache_before_runtime_check(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    cleared = []
+    monkeypatch.setattr(skills_catalog, "clear_builtin_cache", lambda: cleared.append("builtin"))
+    client = _client(monkeypatch, scopes=ADMIN, user_id="root", runtime=None)
+
+    response = client.post("/api/skills/reload")
+
+    assert response.status_code == 503
+    assert cleared == ["builtin"]
+
+
 def test_reload_requires_admin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"})
     runtime = _runtime(_snapshot())
@@ -591,6 +603,57 @@ def test_git_mode_without_a_runtime_does_not_fall_back_to_disk(
     client = _client(monkeypatch, runtime=None)
 
     assert client.get("/api/skills").json() == {"skills": []}
+
+
+# ---------------------------------------------------------------------------
+# built-in skills: listed first, canonical by name, no runtime required
+# ---------------------------------------------------------------------------
+
+
+def test_builtin_rows_are_listed_without_a_git_runtime(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "demo", description="Demo skill")
+    client = _client(monkeypatch, runtime=None)
+
+    response = client.get("/api/skills")
+
+    assert response.status_code == 200
+    row = next(item for item in response.json()["skills"] if item["name"] == "demo")
+    assert row["scope"] == "builtin"
+    assert row["category"] == "builtin"
+    assert row["status"] == "builtin"
+    assert row["enabled"] is True
+    assert row["global_enabled"] is None
+    assert row["container_file"] == "/mnt/skills/builtin/demo/SKILL.md"
+
+
+def test_builtin_rows_are_listed_before_catalog_rows(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "demo")
+    runtime = _runtime(_snapshot())
+    set_skill_snapshot(runtime.catalog.snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+
+    names = [item["name"] for item in client.get("/api/skills").json()["skills"]]
+    assert names[0] == "demo"
+    assert set(names[1:]) == {"shared", "alice-tools"}
+
+
+def test_builtin_hides_a_same_name_catalog_row(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "shared")
+    runtime = _runtime(_snapshot())
+    set_skill_snapshot(runtime.catalog.snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+
+    rows = [
+        item
+        for item in client.get("/api/skills").json()["skills"]
+        if item["name"] == "shared"
+    ]
+
+    assert len(rows) == 1
+    assert rows[0]["scope"] == "builtin"
 
 
 def test_filesystem_source_keeps_the_legacy_scanner(

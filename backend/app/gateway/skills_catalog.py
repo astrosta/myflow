@@ -34,6 +34,7 @@ from agentkit.knowledge.embedding import OpenAICompatibleEmbedder
 from agentkit.persistence.engine import get_session_factory
 from agentkit.skills import search as skill_search
 from agentkit.skills.author import SkillAuthorService
+from agentkit.skills.builtin import clear_builtin_cache, load_builtin_skills
 from agentkit.skills.catalog import (
     SkillCatalogService,
     SkillSnapshot,
@@ -665,6 +666,54 @@ def visible_catalog_rows(snapshot: SkillSnapshot, user_id: str | None) -> list[S
     )
 
 
+# ---------------------------------------------------------------------------
+# 内置技能：随项目发布、只读、不进 Git/数据库，所以单独成行再合并进列表
+# ---------------------------------------------------------------------------
+
+
+def _builtin_skills() -> tuple[Skill, ...]:
+    """按当前配置扫内置技能；加载器本身已按失败退化成空元组。"""
+    return load_builtin_skills(get_app_config().skills)
+
+
+def _builtin_response(skill: Skill) -> SkillResponse:
+    """内置行只有“它是什么”，没有目录身份：id/版本/commit/path 一律为空。"""
+    return SkillResponse(
+        name=skill.name,
+        description=skill.description,
+        category="builtin",
+        enabled=True,
+        global_enabled=None,
+        skill_id=None,
+        scope="builtin",
+        skill_version=None,
+        version_id=None,
+        git_commit=None,
+        skill_path=None,
+        status="builtin",
+        owner_user_id=None,
+        container_file=skill.container_file,
+    )
+
+
+def builtin_skill_responses() -> list[SkillResponse]:
+    """GET /api/skills 的内置行：与 catalog 无关，没有 Git 运行时也存在。"""
+    return [_builtin_response(skill) for skill in _builtin_skills()]
+
+
+def merge_builtin_responses(
+    builtin: list[SkillResponse], catalog: list[SkillResponse]
+) -> list[SkillResponse]:
+    """内置行在前；同名的 catalog 行被隐藏（内置优先，和提示词 overlay 一致）。"""
+    if not builtin:
+        return list(catalog)
+    names = {row.name for row in builtin}
+    for row in catalog:
+        if row.name in names:
+            logger.warning("Skill %s: builtin hides the catalog row", row.name)
+    return [*builtin, *(row for row in catalog if row.name not in names)]
+
+
 def _catalog_response(
     skill: Skill,
     *,
@@ -702,7 +751,11 @@ def _catalog_response(
 
 
 async def _status_for(runtime: SkillRuntime | None, skill: Skill) -> str:
-    if _scope_value(skill.scope) == "public":
+    scope = _scope_value(skill.scope)
+    if scope == "builtin":
+        # 内置技能不走评审，也没有提交记录：状态就是它自己。
+        return "builtin"
+    if scope == "public":
         return "approved"
     latest = getattr(getattr(runtime, "store", None), "latest_submission", None)
     if callable(latest) and skill.skill_id:
@@ -745,24 +798,32 @@ async def list_skills_for_api(
     include_global: bool = False,
     is_admin: bool = False,
 ) -> list[SkillResponse]:
-    """GET /api/skills: filesystem scans disk; git reads the published snapshot."""
+    """GET /api/skills: filesystem scans disk; git reads the published snapshot.
+
+    内置技能是两条路径共有的 overlay：既不在磁盘技能树里，也不在 Git 快照里，
+    所以两条分支都要在 catalog 行之前合并它；Git 没有运行时也只 fail-closed
+    catalog 那一半，内置技能照旧列出（它们是随进程发布的，不需要运行时）。
+    """
+    builtin = builtin_skill_responses()
     if _skill_source() != GIT_SOURCE:
-        return await asyncio.to_thread(
+        catalog = await asyncio.to_thread(
             scan_skills_for_api, user_id=user_id, include_global=include_global
         )
+        return merge_builtin_responses(builtin, catalog)
     if runtime is None:
         # 没有运行时 = 没有权威目录。已发布的快照只是上一次刷新留下的残影，
         # 拿它当答案等于把删除的技能继续列出来，所以 git 来源 fail-closed。
-        logger.error("Git skill catalog has no runtime; failing closed with an empty list")
-        return []
+        logger.error("Git skill catalog has no runtime; failing closed with an empty catalog list")
+        return builtin
     snapshot = get_skill_snapshot()
-    return await _catalog_responses(
+    catalog = await _catalog_responses(
         snapshot,
         runtime=runtime,
         user_id=user_id,
         include_global=include_global,
         is_admin=is_admin,
     )
+    return merge_builtin_responses(builtin, catalog)
 
 
 async def set_skill_preference(
@@ -832,12 +893,17 @@ async def set_global_skill_enabled(
 
 async def reload_skills(*, runtime: SkillRuntime | None) -> None:
     """POST /api/skills/reload: rebuild this process's snapshot (git) or caches."""
+    # 内置技能的目录指纹缓存也要跟着重载走，且必须在任何 fail-closed 之前清：
+    # 503 也要保证下次请求看见磁盘上的新目录。
+    clear_builtin_cache()
     if _skill_source() != GIT_SOURCE:
         await asyncio.to_thread(reload_skill_caches)
         return
     if runtime is None:
         # 报 200 却什么都没刷新，比失败更糟：调用方会以为新技能已经生效。
         logger.error("Refusing to reload: the skill runtime is not configured")
+        # 没有快照可刷新，但提示词段落里仍可能留着内置技能的旧缓存；清一次再报错。
+        clear_skill_prompt_cache()
         raise SkillRuntimeUnavailable(
             "skills catalog runtime is not configured; reload cannot refresh the snapshot"
         )
