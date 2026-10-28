@@ -144,7 +144,7 @@ def _tree(tmp_path) -> SkillsConfig:
         description="CSV 导出",
         body="# 导出\n另存为 UTF-8。\n",
     )
-    return SkillsConfig(path=str(tmp_path / "skills"))
+    return SkillsConfig(path=str(tmp_path / "skills"), builtin={"enabled": False})
 
 
 def _install(skills: SkillsConfig) -> AppConfig:
@@ -221,7 +221,7 @@ def test_a_blank_query_is_refused_with_guidance(tmp_path):
 
 
 def test_an_empty_skill_tree_tells_the_model_not_to_retry(tmp_path):
-    (_install(SkillsConfig(path=str(tmp_path / "missing"))))
+    (_install(SkillsConfig(path=str(tmp_path / "missing"), builtin={"enabled": False})))
 
     payload = _call()
 

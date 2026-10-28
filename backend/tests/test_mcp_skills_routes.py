@@ -72,7 +72,10 @@ def config_path(tmp_path, monkeypatch) -> Path:
     )
     monkeypatch.setenv("MYFLOW_EXTENSIONS_CONFIG_PATH", str(path))
     monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
-    monkeypatch.setenv("MYFLOW_CONFIG_PATH", str(write_app_config(tmp_path)))
+    # 这一组用例只关心技能列表/索引的一致性；显式关掉仓库内置技能，避免真实 builtin 树混入。
+    monkeypatch.setenv(
+        "MYFLOW_CONFIG_PATH", str(write_app_config(tmp_path, builtin={"enabled": False}))
+    )
     return path
 
 

@@ -445,3 +445,34 @@ def test_git_convention_with_builtin_names_all_three_roots(tmp_path):
     assert "builtin" in section
     assert "/mnt/skills/private/<name>/SKILL.md" in section
     assert "/mnt/skills/builtin/<name>/SKILL.md" in section
+
+
+def test_filesystem_snapshot_with_builtin_keeps_catalog_text_and_adds_builtin(
+    tmp_path,
+):
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(
+        tmp_path,
+        builtin={"path": str(tmp_path / "skills" / "builtin")},
+    )
+    snapshot = SkillSnapshot(
+        epoch="e-fs",
+        public=(),
+        private_by_owner={
+            "u1": (_catalog_skill("private-one", SkillScope.PRIVATE, "u1"),)
+        },
+    )
+    registry = SkillRegistry(
+        config=config,
+        user_id="u1",
+        builtin_skills=load_builtin_skills(config),
+        snapshot=snapshot,
+    )
+    clear_skill_prompt_cache()
+
+    section = build_skills_section(config=config, registry=registry)
+
+    assert "/mnt/skills/private/<name>/SKILL.md" in section
+    assert "/mnt/skills/builtin/<name>/SKILL.md" in section
+    assert "- private-one [private]:" in section
+    assert "- demo [builtin]:" in section

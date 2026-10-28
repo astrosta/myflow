@@ -333,6 +333,7 @@ def test_provider_uses_the_configured_git_cache_dir(tmp_path: Path, monkeypatch)
         # active 树只在 git 来源存在；filesystem 来源挂的是整棵技能树。
         skills=SkillsConfig(
             source="git",
+            builtin={"enabled": False},
             git=SkillGitConfig(repository="origin", cache_dir=str(cache)),
         )
     )
@@ -361,7 +362,11 @@ def test_filesystem_source_mounts_the_skill_tree_not_an_active_tree(
     tree = tmp_path / "skills"
     (tree / "public" / "demo").mkdir(parents=True)
     config = AppConfig(
-        skills=SkillsConfig(source="filesystem", path=str(tree))
+        skills=SkillsConfig(
+            source="filesystem",
+            path=str(tree),
+            builtin={"enabled": False},
+        )
     )
     monkeypatch.setattr(
         "agentkit.sandbox.local.local_sandbox_provider.get_app_config", lambda: config
