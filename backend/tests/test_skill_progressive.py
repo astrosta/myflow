@@ -6,13 +6,16 @@
 
 from __future__ import annotations
 
+from agentkit.skills.domain import SkillScope
+from agentkit.skills.loader import read_skill_body
 from agentkit.skills.prompt import build_skills_section
-from agentkit.skills.storage import load_skills
+from agentkit.skills.storage import SkillRegistry, load_skills
 from agentkit.tools.registry import get_available_tools
 from agentkit.config import AppConfig
 from fakes.skill_tree import skills_config, write_skill
 
 BODY_MARKER = "SECRET-BODY-MARKER"
+BUILTIN_BODY_MARKER = "BUILTIN-SECRET-BODY"
 
 
 def _skills(tmp_path):
@@ -52,3 +55,46 @@ def test_l0_is_the_only_place_the_index_appears(tmp_path):
 
     assert "search_and_load_skills" in names
     assert "describe_skill" not in names
+
+
+def _builtin_config(tmp_path):
+    write_skill(
+        tmp_path,
+        "builtin",
+        "demo",
+        description="内置演示技能",
+        body=f"# 说明\n{BUILTIN_BODY_MARKER}\n",
+    )
+    return skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+
+
+def test_builtin_l0_holds_no_body_and_reads_it_on_demand(tmp_path):
+    config = _builtin_config(tmp_path)
+
+    section = build_skills_section(config=config)
+
+    assert "- demo [builtin]: 内置演示技能" in section
+    assert BUILTIN_BODY_MARKER not in section
+
+    skill = SkillRegistry(config=config).find("demo")
+    assert skill is not None
+    assert skill.scope is SkillScope.BUILTIN
+    assert BUILTIN_BODY_MARKER in (read_skill_body(skill) or "")
+
+
+def test_the_builtin_path_never_runs_the_search_runtime(tmp_path, monkeypatch):
+    """内置技能走"索引 → read_file / slash"，不经过检索管线。"""
+    config = _builtin_config(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("built-in skills must not enter the search pipeline")
+
+    monkeypatch.setattr("agentkit.skills.router.build_documents", forbidden)
+    monkeypatch.setattr("agentkit.skills.router.search_skills", forbidden)
+
+    section = build_skills_section(config=config)
+    skill = SkillRegistry(config=config).find("demo")
+
+    assert "- demo [builtin]:" in section
+    assert skill is not None
+    assert read_skill_body(skill) is not None

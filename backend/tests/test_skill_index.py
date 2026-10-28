@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from agentkit.config.skills_config import SkillsConfig
+from agentkit.skills.builtin import load_builtin_skills
 from agentkit.skills.catalog import (
     SkillSnapshot,
     get_skill_snapshot,
     set_skill_snapshot,
 )
 from agentkit.skills.domain import SkillScope
+from agentkit.skills.prefs import effective_enabled
 from agentkit.skills.prompt import (
     SKILL_INDEX_FOOTER,
     SKILL_INDEX_HEADER,
@@ -309,3 +312,136 @@ def test_filesystem_source_still_scans_the_disk(tmp_path):
 
     assert "- on-disk [" in section
     assert "public-one" not in section
+
+
+# --- built-in overlay (always-on, never a preference) -------------------------
+
+
+def test_builtin_is_visible_even_when_user_pref_is_false(tmp_path):
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    prefs = tmp_path / "skills_prefs.json"
+    prefs.write_text('{"u1": {"demo": false}}', encoding="utf-8")
+
+    registry = SkillRegistry(config=config, user_id="u1", prefs_path=prefs)
+
+    assert [skill.name for skill in registry.visible()] == ["demo"]
+    assert registry.visible(include_builtin=False) == []
+
+
+def test_effective_enabled_ignores_preferences_for_a_builtin(tmp_path):
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    skill = load_builtin_skills(config)[0]
+
+    assert effective_enabled(skill, {"demo": False}) is True
+    # 排在全局开关之前：内置技能的开关只有 skills.builtin.enabled。
+    assert effective_enabled(replace(skill, enabled=False), {"demo": False}) is True
+
+
+def test_builtin_wins_a_name_collision(tmp_path):
+    write_skill(tmp_path, "public", "demo", body="public body")
+    write_skill(tmp_path, "builtin", "demo", body="builtin body")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+
+    visible = SkillRegistry(config=config).visible()
+
+    assert [skill.name for skill in visible] == ["demo"]
+    assert visible[0].scope is SkillScope.BUILTIN
+
+
+def test_a_hidden_collision_is_warned(tmp_path, caplog):
+    write_skill(tmp_path, "public", "demo")
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+
+    with caplog.at_level("WARNING", logger="agentkit.skills.storage"):
+        SkillRegistry(config=config).visible()
+
+    assert any("demo" in record.getMessage() for record in caplog.records)
+
+
+def test_builtin_respects_the_agent_allowlist(tmp_path):
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    registry = SkillRegistry(config=config, available_skills=frozenset({"other"}))
+    assert registry.visible() == []
+
+
+def test_search_visibility_keeps_a_same_name_catalog_row(tmp_path):
+    write_skill(tmp_path, "public", "demo", body="public body")
+    write_skill(tmp_path, "builtin", "demo", body="builtin body")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    registry = SkillRegistry(config=config)
+
+    search_view = registry.visible(include_builtin=False)
+
+    assert [skill.name for skill in search_view] == ["demo"]
+    assert search_view[0].scope is None
+    assert search_view[0].category is SkillCategory.PUBLIC
+
+
+def test_builtins_come_first_and_load_includes_them(tmp_path):
+    write_skill(tmp_path, "public", "aaa-catalog")
+    write_skill(tmp_path, "builtin", "zzz-builtin")
+    registry = SkillRegistry(
+        config=skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    )
+
+    assert [skill.name for skill in registry.visible()] == ["zzz-builtin", "aaa-catalog"]
+    assert [skill.name for skill in registry.load()] == ["zzz-builtin", "aaa-catalog"]
+    found = registry.find("zzz-builtin")
+    assert found is not None
+    assert found.container_file == "/mnt/skills/builtin/zzz-builtin/SKILL.md"
+
+
+def test_a_catalog_failure_keeps_the_builtin_rows(tmp_path, monkeypatch):
+    """fail-closed 只针对 catalog：内置技能是独立 overlay，catalog 挂了也还在。"""
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("catalog is down")
+
+    monkeypatch.setattr("agentkit.skills.storage.load_skills", boom)
+    registry = SkillRegistry(config=config)
+
+    assert [skill.name for skill in registry.visible()] == ["demo"]
+    assert registry.visible(include_builtin=False) == []
+
+
+def test_builtin_prompt_index_marks_builtin_and_names_its_root(tmp_path):
+    write_skill(tmp_path, "builtin", "demo", description="Demo skill")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    section = build_skills_section(config=config)
+    assert "- demo [builtin]: Demo skill" in section
+    assert "内置技能在" in section
+    assert "/mnt/skills/builtin/<name>/SKILL.md" in section
+    assert "SECRET-BODY" not in section
+
+
+def test_filesystem_convention_is_unchanged_without_builtins(tmp_path):
+    write_skill(tmp_path, "public", "public-one")
+    config = skills_config(tmp_path)
+    section = build_skills_section(config=config)
+    assert "category 是 public 或 custom" in section
+    assert "private" not in section
+
+
+def test_git_convention_with_builtin_names_all_three_roots(tmp_path):
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(
+        tmp_path,
+        source="git",
+        builtin={"path": str(tmp_path / "skills" / "builtin")},
+    )
+    registry = SkillRegistry(
+        config=config,
+        builtin_skills=load_builtin_skills(config),
+        snapshot=SkillSnapshot("e", (), {}),
+    )
+    section = build_skills_section(config=config, registry=registry)
+    assert "private" in section
+    assert "builtin" in section
+    assert "/mnt/skills/private/<name>/SKILL.md" in section
+    assert "/mnt/skills/builtin/<name>/SKILL.md" in section

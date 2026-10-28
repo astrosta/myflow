@@ -23,6 +23,7 @@ from agentkit.config.skills_prefs import (
     writable_skills_prefs_path,
     write_user_skill_pref,
 )
+from agentkit.skills.domain import SkillScope
 from agentkit.skills.types import Skill
 
 __all__ = [
@@ -58,7 +59,12 @@ def effective_enabled(skill: Skill, prefs: Mapping[str, bool] | None = None) -> 
     Catalog preferences are keyed by skill_id (Task 15 migration); a name-keyed
     entry is still accepted so filesystem skills and un-migrated preferences
     keep working.
+
+    内置技能在两层之上：随项目发布、只读，部署级开关只有 skills.builtin.enabled，
+    个人偏好与 extensions_config 的同名条目都不该让它消失。
     """
+    if skill.scope == SkillScope.BUILTIN:
+        return True
     if not skill.enabled:
         return False
     if prefs is None:
