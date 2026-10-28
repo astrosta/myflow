@@ -671,6 +671,23 @@ def visible_catalog_rows(snapshot: SkillSnapshot, user_id: str | None) -> list[S
 # ---------------------------------------------------------------------------
 
 
+#: 已经告警过的同名冲突（内置技能盖住 catalog 行）。列表是每请求都走的路径，
+#: 每次 GET 都刷同一条 WARNING 等于没有告警；reload 时清空，让配置改动重新可见。
+_warned_builtin_collisions: set[str] = set()
+
+
+def _warn_builtin_collision(name: str) -> None:
+    if name in _warned_builtin_collisions:
+        return
+    _warned_builtin_collisions.add(name)
+    logger.warning("Skill %s: builtin hides the catalog row", name)
+
+
+def _reset_builtin_collision_warnings() -> None:
+    """reload 之后重新告警：和 clear_builtin_cache() 清 warned-roots 是同一个理由。"""
+    _warned_builtin_collisions.clear()
+
+
 def _builtin_skills() -> tuple[Skill, ...]:
     """按当前配置扫内置技能；加载器本身已按失败退化成空元组。"""
     return load_builtin_skills(get_app_config().skills)
@@ -710,7 +727,7 @@ def merge_builtin_responses(
     names = {row.name for row in builtin}
     for row in catalog:
         if row.name in names:
-            logger.warning("Skill %s: builtin hides the catalog row", row.name)
+            _warn_builtin_collision(row.name)
     return [*builtin, *(row for row in catalog if row.name not in names)]
 
 
@@ -896,6 +913,7 @@ async def reload_skills(*, runtime: SkillRuntime | None) -> None:
     # 内置技能的目录指纹缓存也要跟着重载走，且必须在任何 fail-closed 之前清：
     # 503 也要保证下次请求看见磁盘上的新目录。
     clear_builtin_cache()
+    _reset_builtin_collision_warnings()
     if _skill_source() != GIT_SOURCE:
         await asyncio.to_thread(reload_skill_caches)
         return

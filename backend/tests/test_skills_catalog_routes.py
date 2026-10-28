@@ -269,8 +269,12 @@ def _configure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **skills_overrid
 @pytest.fixture(autouse=True)
 def _reset_runtime_registry():
     reset_skill_runtime()
+    # 同名冲突的“已告警”集合是进程级的：不隔离的话，先撞名的用例会让后一个用例
+    # 一条 WARNING 都看不到。
+    skills_catalog._reset_builtin_collision_warnings()
     yield
     reset_skill_runtime()
+    skills_catalog._reset_builtin_collision_warnings()
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +658,50 @@ def test_builtin_hides_a_same_name_catalog_row(tmp_path, monkeypatch):
 
     assert len(rows) == 1
     assert rows[0]["scope"] == "builtin"
+
+
+def test_a_builtin_collision_warns_once_per_name(tmp_path, monkeypatch, caplog):
+    """列表是每请求都会走的路径：同一条 WARNING 不能每次 GET 都刷一遍。"""
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "shared")
+    runtime = _runtime(_snapshot())
+    set_skill_snapshot(runtime.catalog.snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+    caplog.set_level(logging.WARNING, logger="backend.app.gateway.skills_catalog")
+
+    client.get("/api/skills")
+    client.get("/api/skills")
+
+    logged = [
+        record
+        for record in caplog.records
+        if "builtin hides the catalog row" in record.getMessage()
+    ]
+    assert len(logged) == 1
+
+
+def test_filesystem_source_lists_builtin_rows_first(tmp_path, monkeypatch):
+    """磁盘来源也走同一次合并：内置行在前，catalog 行在后。"""
+    _configure(tmp_path, monkeypatch, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    write_skill(tmp_path, "builtin", "demo", description="Demo skill")
+    write_skill(tmp_path, "public", "legacy-tool")
+    client = _client(monkeypatch, runtime=None)
+
+    rows = client.get("/api/skills").json()["skills"]
+
+    assert [item["name"] for item in rows] == ["demo", "legacy-tool"]
+    builtin = rows[0]
+    assert builtin["scope"] == "builtin"
+    assert builtin["category"] == "builtin"
+    assert builtin["status"] == "builtin"
+    assert builtin["enabled"] is True
+    assert builtin["global_enabled"] is None
+    assert builtin["skill_id"] is None
+    assert builtin["version_id"] is None
+    assert builtin["git_commit"] is None
+    assert builtin["skill_path"] is None
+    assert builtin["owner_user_id"] is None
+    assert builtin["container_file"] == "/mnt/skills/builtin/demo/SKILL.md"
 
 
 def test_filesystem_source_keeps_the_legacy_scanner(
