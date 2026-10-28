@@ -251,6 +251,35 @@ def test_skills_switched_off_by_the_user_are_not_loaded(tmp_path, monkeypatch):
     assert [item["name"] for item in _call(runtime=_runtime("u2"))["skills"]] == [SKILL]
 
 
+def test_a_builtin_skill_is_never_a_search_candidate(tmp_path):
+    """内置技能走索引/slash/read_file：检索只认 public/custom，正文也绝不能被带出来。"""
+    _tree(tmp_path)
+    write_skill(
+        tmp_path,
+        "builtin",
+        "builtin-searchable",
+        description="PostgreSQL 多租户 search_path 串库排查",
+        body="# builtin secret\nBUILTIN-BODY-MARKER",
+    )
+    _install(
+        SkillsConfig(
+            path=str(tmp_path / "skills"),
+            builtin={"path": str(tmp_path / "skills" / "builtin")},
+        )
+    )
+
+    payload = _call()
+
+    # 检索本身照旧：公共技能还是被找到、正文照旧返回
+    assert [item["name"] for item in payload["skills"]] == [SKILL]
+    assert BODY_MARKER in payload["skills"][0]["body"]
+    # 内置技能不在结果里，正文标记也没被带出来
+    assert "builtin-searchable" not in [item["name"] for item in payload["skills"]]
+    assert all("BUILTIN-BODY-MARKER" not in item["body"] for item in payload["skills"])
+    # 连候选都不是：它根本没进 BM25 索引
+    assert payload["retrieval"]["candidates"] == 1
+
+
 def test_the_tool_runs_inside_a_real_agent_loop(tmp_path):
     """`.ainvoke` 只是模拟：这里走真正的 `create_agent` → 工具节点，验证 runtime 注入没被
     `args_schema` 挡掉（模型只给业务字段，框架自己补 runtime）。"""
