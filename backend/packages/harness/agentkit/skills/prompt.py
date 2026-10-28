@@ -55,7 +55,7 @@ SKILL_CATALOG_ROOT_CONVENTION = (
 SKILL_FILESYSTEM_BUILTIN_ROOT_CONVENTION = (
     "技能根目录 {root}：公共技能在 {root}/public/<name>/SKILL.md，自定义技能在 "
     "{root}/custom/<name>/SKILL.md，内置技能在 {root}/builtin/<name>/SKILL.md；"
-    "目录名就是技能名，同名时 custom 覆盖 public。"
+    "目录名就是技能名，同名时内置技能优先于 custom 和 public；custom 仍覆盖 public。"
 )
 #: catalog 快照（git 源）同时有内置技能：public / private / builtin 三个根。
 SKILL_CATALOG_BUILTIN_ROOT_CONVENTION = (
@@ -63,7 +63,8 @@ SKILL_CATALOG_BUILTIN_ROOT_CONVENTION = (
     "`{builtin_root}`。每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的 "
     "`SKILL.md`，即 `{public_root}/<name>/SKILL.md`（公共）、"
     "`{private_root}/<name>/SKILL.md`（私有）或 `{builtin_root}/<name>/SKILL.md`（内置）；"
-    "索引行方括号里的 public / private / builtin 标明作用域，同名时私有优先。"
+    "索引行方括号里的 public / private / builtin 标明作用域，同名时内置技能优先于 public 和 private；"
+    "catalog 内部 private 仍覆盖 public。"
 )
 SKILL_INDEX_PREAMBLE = (
     "下面是技能索引 `<available_skills>`：每个已启用技能一行，只有名字、类别和截断描述"

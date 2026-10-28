@@ -61,6 +61,22 @@ def test_scan_skill_category_rejects_symlinked_dirs_when_disallowed(tmp_path: Pa
     ) == []
 
 
+def test_scan_skill_category_ignores_files_and_dotfiles(tmp_path: Path, caplog):
+    root = tmp_path / "skills" / "builtin"
+    root.mkdir(parents=True)
+    (root / ".gitkeep").write_text("", encoding="utf-8")
+    (root / "README.md").write_text("not a skill", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="agentkit.skills.scan"):
+        assert scan_skill_category(
+            root,
+            category=SkillCategory.BUILTIN,
+            container_path="/mnt/skills",
+        ) == []
+
+    assert not caplog.records, "占位文件不是非法技能目录，不应触发 warning"
+
+
 def test_scan_skill_category_skips_malformed_yaml_frontmatter(tmp_path: Path):
     write_skill(tmp_path, "builtin", "good", description="good")
     write_skill(

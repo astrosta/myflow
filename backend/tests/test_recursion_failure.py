@@ -31,7 +31,7 @@ def test_an_empty_skill_search_tells_the_model_to_stop(monkeypatch) -> None:
         def __init__(self, **_kwargs) -> None:
             pass
 
-        def visible(self):
+        def visible(self, *, include_builtin: bool = True):
             return []
 
     from agentkit.config.skills_config import SkillSearchConfig

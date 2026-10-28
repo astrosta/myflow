@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.skills.builtin import load_builtin_skills
@@ -22,9 +25,20 @@ from agentkit.skills.prompt import (
     clear_skill_prompt_cache,
     render_skill_index,
 )
-from agentkit.skills.storage import SkillRegistry, load_skills
+from agentkit.skills.storage import (
+    SkillRegistry,
+    clear_builtin_collision_warnings,
+    load_skills,
+)
 from agentkit.skills.types import Skill, SkillCategory
 from fakes.skill_tree import skills_config, write_skill
+
+
+@pytest.fixture(autouse=True)
+def _reset_registry_collision_warnings():
+    clear_builtin_collision_warnings()
+    yield
+    clear_builtin_collision_warnings()
 
 
 def _index(tmp_path, **overrides) -> str:
@@ -361,6 +375,30 @@ def test_a_hidden_collision_is_warned(tmp_path, caplog):
     assert any("demo" in record.getMessage() for record in caplog.records)
 
 
+def test_registry_collision_warning_is_once_per_process_until_reset(tmp_path, caplog):
+    """提示词每次模型调用都重建 registry：同名 WARNING 不能每次调用都刷。"""
+    write_skill(tmp_path, "public", "warn-once")
+    write_skill(tmp_path, "builtin", "warn-once")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    caplog.set_level(logging.WARNING, logger="agentkit.skills.storage")
+
+    def warnings() -> list[str]:
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if "warn-once" in record.getMessage()
+        ]
+
+    build_skills_section(config=config)
+    build_skills_section(config=config)
+    assert len(warnings()) == 1
+
+    clear_builtin_collision_warnings()
+    clear_skill_prompt_cache()
+    build_skills_section(config=config)
+    assert len(warnings()) == 2
+
+
 def test_builtin_respects_the_agent_allowlist(tmp_path):
     write_skill(tmp_path, "builtin", "demo")
     config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
@@ -417,6 +455,7 @@ def test_builtin_prompt_index_marks_builtin_and_names_its_root(tmp_path):
     assert "- demo [builtin]: Demo skill" in section
     assert "内置技能在" in section
     assert "/mnt/skills/builtin/<name>/SKILL.md" in section
+    assert "同名时内置技能优先于 custom 和 public；custom 仍覆盖 public" in section
     assert "SECRET-BODY" not in section
 
 
@@ -445,6 +484,7 @@ def test_git_convention_with_builtin_names_all_three_roots(tmp_path):
     assert "builtin" in section
     assert "/mnt/skills/private/<name>/SKILL.md" in section
     assert "/mnt/skills/builtin/<name>/SKILL.md" in section
+    assert "同名时内置技能优先于 public 和 private；catalog 内部 private 仍覆盖 public" in section
 
 
 def test_filesystem_snapshot_with_builtin_keeps_catalog_text_and_adds_builtin(

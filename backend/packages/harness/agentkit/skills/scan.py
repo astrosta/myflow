@@ -54,6 +54,10 @@ def scan_skill_category(
         return []
     found: dict[str, Skill] = {}
     for entry in sorted(category_root.iterdir(), key=lambda item: item.name):  # 稳定顺序
+        # 目录根里的普通文件（README）和隐藏文件（.gitkeep）不是技能包，也不该触发
+        # "非法目录名"告警——仓库自带的 skills/builtin/.gitkeep 就是这种占位文件。
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
         skill_file = entry / SKILL_FILE_NAME
         if not SKILL_DIR_NAME_RE.match(entry.name):
             logger.warning("Skipping skill directory with an illegal name: %s", entry)

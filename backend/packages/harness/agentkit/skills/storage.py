@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.skills.builtin import load_builtin_skills
-from agentkit.skills.domain import SkillScope
 from agentkit.skills.prefs import effective_enabled, global_enabled_map, read_user_skill_prefs
 from agentkit.skills.scan import is_within, scan_skill_category
 from agentkit.skills.types import Skill, SkillCategory, SkillPathError
@@ -28,6 +27,22 @@ if TYPE_CHECKING:
     from agentkit.skills.catalog import SkillSnapshot
 
 logger = logging.getLogger(__name__)
+
+#: 已经告警过的同名冲突（内置技能盖住 catalog 行）。提示词每次模型调用都会重建
+#: registry 视图；同一条 WARNING 每次刷一遍等于没有告警。reload 时清空。
+_warned_builtin_collisions: set[str] = set()
+
+
+def clear_builtin_collision_warnings() -> None:
+    """清空 registry 的同名冲突告警去重；POST /api/skills/reload 时和内置缓存一起清。"""
+    _warned_builtin_collisions.clear()
+
+
+def _warn_builtin_collision(name: str, category: SkillCategory) -> None:
+    if name in _warned_builtin_collisions:
+        return
+    _warned_builtin_collisions.add(name)
+    logger.warning("Skill %s: builtin hides the %s row", name, category.value)
 
 
 def load_skills(config: SkillsConfig, *, enabled_map: Mapping[str, bool]) -> list[Skill]:
@@ -149,9 +164,7 @@ class SkillRegistry:
         names = {skill.name for skill in builtins}
         for skill in catalog:
             if skill.name in names:
-                logger.warning(
-                    "Skill %s: builtin hides the %s row", skill.name, skill.category.value
-                )
+                _warn_builtin_collision(skill.name, skill.category)
         return [*builtins, *(skill for skill in catalog if skill.name not in names)]
 
     def _catalog_skills(self) -> list[Skill]:

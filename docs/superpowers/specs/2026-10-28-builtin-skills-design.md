@@ -106,10 +106,11 @@
 - 只扫描 builtin.path 的直接子目录；每个含 SKILL.md 的目录是一个技能包。
 - 目录名和 frontmatter name 不一致时，以 frontmatter 为准并 warning；索引会自动带 dir=。
 - SKILL.md 必须是 UTF-8，frontmatter 至少有 name 和 description。
-- 内置目录拒绝符号链接目录和符号链接 SKILL.md，避免把项目外的路径带进沙箱。
+- 内置目录本身及其中技能目录都拒绝符号链接/目录联接（junction），SKILL.md 也拒绝符号链接，避免把项目外的路径带进沙箱。
+- `path` 不能是空白、`.`/`..`、含 `..` 的逃逸路径或文件系统根（含 Windows 盘符根）；不安全的内置根按不可用处理，不扫描也不挂载。
 - enabled: false 时完全不加载、不挂载；该字段和 path 都是 startup-only，因为沙箱静态映射在 provider 构造时固定。
 - 仓库提交一个 skills/builtin/.gitkeep，保证默认路径存在；没有内置技能时目录为空即可。
-- 默认 path 不存在时等于没有内置技能，不报启动错误；但 enabled=true 且路径缺失时启动日志 warning 一次，避免镜像漏打包后静默为零技能。
+- 默认 path 不存在时等于没有内置技能，不报启动错误；但 enabled=true 且路径缺失时首次读取 warning 一次，避免镜像漏打包后静默为零技能。
 - 部署时必须把 skills/builtin 放进网关进程的 project_root（或配置绝对路径）；API 进程看到的宿主路径必须和沙箱挂载的是同一个路径。
 
 ### 5.2 类型与扫描
@@ -135,7 +136,7 @@
 缓存：
 
 - 模块级 BuiltinSkillSource 保存上次指纹和扫描结果。
-- 指纹从每个技能 SKILL.md 的 name + mtime_ns + size 计算。
+- 指纹从每个技能**目录名** + 其 SKILL.md 的 mtime_ns + size 计算（frontmatter name 不参与指纹）。
 - 每次 SkillRegistry.visible()、API 列表调用时检查指纹；变化才重新解析。
 - clear_builtin_cache() 供 POST /api/skills/reload 显式失效。
 - 解析失败的单个技能跳过并 warning，不影响其它内置技能。
@@ -273,7 +274,7 @@ SkillResponse 扩展：
 - 运行时同名：内置优先；catalog 行不出现在 registry/API 列表/索引中，记 warning。
 - 新建草稿时：SkillAuthorService.create_draft 读取当前内置名集合，命中则返回 SkillConflict，提示该名称被内置技能保留。
 - 审核通过时：SkillReviewService.approve 再次检查 public_name，防止草稿创建后内置技能新增导致冲突。
-- 两个内置目录同名：按目录名排序保留第一个，warning 第二个。
+- 两个内置目录同名：按目录名排序保留最后一个（与扫描器一致），warning 被覆盖的前一个。
 - 这保证 slash、索引、容器路径始终只有一条可解析的 builtin 技能。
 
 ### 5.11 安全
@@ -281,7 +282,7 @@ SkillResponse 扩展：
 - 内置技能正文仍作为不可信数据处理：索引 HTML 转义、正文经现有 provenance 注入。
 - allowed-tools、required-secrets、secrets-autonomous 继续走现有 parser/policy。
 - 服务端不执行内置技能里的脚本；只读挂载给沙箱。
-- 拒绝符号链接，避免把项目外文件映射进容器。
+- 拒绝符号链接/目录联接（junction）和文件系统根，避免把项目外文件映射进容器。
 - 不允许通过 sandbox.mounts 覆盖 <container_path>/builtin。
 
 ## 6. 改动清单

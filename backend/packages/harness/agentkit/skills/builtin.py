@@ -22,6 +22,7 @@ import logging
 import threading
 from pathlib import Path
 
+from agentkit.config.runtime_paths import project_root
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.skills.domain import SkillScope
 from agentkit.skills.scan import scan_skill_category
@@ -37,24 +38,48 @@ _cache: dict[Path, _CacheEntry] = {}
 _warned_roots: set[Path] = set()
 _lock = threading.Lock()
 
-__all__ = ["builtin_names", "clear_builtin_cache", "load_builtin_skills"]
+__all__ = [
+    "builtin_names",
+    "clear_builtin_cache",
+    "load_builtin_skills",
+    "resolve_builtin_root",
+]
+
+
+def resolve_builtin_root(config: SkillsConfig) -> Path:
+    """解析并校验内置技能根；不安全时抛 ValueError（不可读时抛 OSError）。
+
+    内置根会被只读挂载进沙箱，所以不能是符号链接/目录联接（junction）或文件系统根。
+    相对路径和 skills.path 一样按项目根解析。校验发生在 resolve() **之前**：
+    symlink 的 resolve 只会把危险目标藏起来，事后再看已经看不出它原本是链接。
+    """
+    configured = Path(config.builtin.path)
+    candidate = configured if configured.is_absolute() else project_root() / configured
+    if candidate.is_symlink() or _is_junction(candidate):
+        raise ValueError(f"built-in skills root must not be a symlink or junction: {candidate}")
+    resolved = candidate.resolve()
+    if resolved.parent == resolved:
+        raise ValueError(f"built-in skills root must not be a filesystem root: {resolved}")
+    return resolved
+
+
+def _is_junction(path: Path) -> bool:
+    """Python 3.12 在 Windows 上提供 Path.is_junction；其它平台没有这个 API。"""
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction()) if callable(is_junction) else False
 
 
 def load_builtin_skills(config: SkillsConfig) -> tuple[Skill, ...]:
-    """返回内置技能；关闭、根目录缺失或读不了时返回空元组（告警一次，失败不缓存）。"""
+    """返回内置技能；关闭、根目录不合法/缺失/读不了时返回空元组（告警一次，失败不缓存）。"""
     if not config.builtin.enabled:
         return ()
 
-    configured_root = config.builtin.root_dir()
+    warn_key = Path(config.builtin.path)
     with _lock:
+        root: Path | None = None
         try:
-            root = configured_root.resolve()
-        except OSError as exc:
-            # 连路径都解析不了（父目录权限、磁盘异常）：用配置里的路径当告警 key。
-            _warn_unusable(configured_root, exc)
-            return ()
-
-        try:
+            root = resolve_builtin_root(config)
+            warn_key = root
             if not root.is_dir():
                 # 不缓存空结果：目录晚一点出现时，下一次调用必须能发现它。
                 _cache.pop(root, None)
@@ -76,11 +101,14 @@ def load_builtin_skills(config: SkillsConfig) -> tuple[Skill, ...]:
                     allow_symlink_dirs=False,
                 )
             )
-        except OSError as exc:
-            # is_dir() 通过不等于读得到：权限不足、检查后被并发删除、IO 错误都在这里
+        except (OSError, RuntimeError, ValueError) as exc:
+            # 路径不合法、is_dir() 通过但读不到、检查后被并发删除、IO 错误都在这里
             # 退化成空元组。失败结果不缓存，目录/权限恢复后下一次调用就能重新发现。
-            _cache.pop(root, None)
-            _warn_unusable(root, exc)
+            # 解析本身失败时 root 还是 None，用配置里的绝对路径兜底清掉旧缓存。
+            _cache.pop(warn_key, None)
+            if root is not None:
+                _cache.pop(root, None)
+            _warn_unusable(warn_key, exc)
             return ()
 
         _cache[root] = (fingerprint, skills)
@@ -99,15 +127,15 @@ def builtin_names(config: SkillsConfig) -> frozenset[str]:
     return frozenset(skill.name for skill in load_builtin_skills(config))
 
 
-def _warn_unusable(root: Path, error: OSError | None = None) -> None:
-    """根目录缺失或读不了：每个根只告警一次。调用方已持有 _lock。"""
+def _warn_unusable(root: Path, error: Exception | None = None) -> None:
+    """根目录不合法、缺失或读不了：每个根只告警一次。调用方已持有 _lock。"""
     if root in _warned_roots:
         return
     _warned_roots.add(root)
     if error is None:
         logger.warning("built-in skills directory is missing: %s", root)
     else:
-        logger.warning("built-in skills directory is unreadable: %s (%s)", root, error)
+        logger.warning("built-in skills directory is unusable: %s (%s)", root, error)
 
 
 def _fingerprint(root: Path) -> _Fingerprint:

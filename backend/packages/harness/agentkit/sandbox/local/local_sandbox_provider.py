@@ -12,6 +12,7 @@ from agentkit.config.skills_config import DEFAULT_SKILLS_CONTAINER_PATH
 from agentkit.sandbox.local.local_sandbox import LocalSandbox
 from agentkit.sandbox.sandbox_provider import SandboxProvider
 from agentkit.sandbox.security import PathMapping, is_host_bash_allowed, sandbox_flag
+from agentkit.skills.builtin import resolve_builtin_root
 from agentkit.utils import validate_user_id
 
 _DEFAULT_USER_ID = "default"
@@ -215,12 +216,18 @@ def _skills_tree_root() -> Path:
 
 
 def _builtin_skills_dir() -> Path | None:
-    """Configured built-in tree, or None when disabled or config is unreadable."""
+    """Configured built-in tree, or None when disabled, unreadable, or unsafe.
+
+    Uses the same resolver as the loader so an empty/relative-root/symlink/junction
+    path never becomes a read-only mount of the project or host filesystem.
+    """
     try:
-        builtin = get_app_config().skills.builtin
-        if not builtin.enabled:
+        config = get_app_config().skills
+        if not config.builtin.enabled:
             return None
-        return builtin.root_dir()
+        return resolve_builtin_root(config)
+    except (OSError, RuntimeError, ValueError):
+        return None
     except Exception:  # noqa: BLE001 - 单元测试可能没有可读的 app config
         return None
 

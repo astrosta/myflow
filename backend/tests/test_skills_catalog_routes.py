@@ -704,6 +704,28 @@ def test_filesystem_source_lists_builtin_rows_first(tmp_path, monkeypatch):
     assert builtin["container_file"] == "/mnt/skills/builtin/demo/SKILL.md"
 
 
+def test_list_survives_an_unusable_builtin_root(tmp_path, monkeypatch):
+    """根目录不合法时 loader 已退化成空元组，列表不能 500。"""
+    _configure(
+        tmp_path,
+        monkeypatch,
+        source="git",
+        git={"repository": "https://example.test/s.git"},
+        builtin={"path": str(tmp_path / "skills" / "builtin")},
+    )
+
+    def boom(_config):
+        raise ValueError("unsafe built-in root")
+
+    monkeypatch.setattr("agentkit.skills.builtin.resolve_builtin_root", boom)
+    client = _client(monkeypatch, runtime=None)
+
+    response = client.get("/api/skills")
+
+    assert response.status_code == 200
+    assert response.json() == {"skills": []}
+
+
 def test_filesystem_source_keeps_the_legacy_scanner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

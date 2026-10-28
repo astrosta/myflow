@@ -1,5 +1,7 @@
 # Built-in Skills Implementation Plan
 
+> **Status:** Completed — all tasks implemented, reviewed, and final-review fixes applied on branch `feature/builtin-skills`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add project-shipped built-in skills under skills/builtin that are always indexed, progressively loaded through read_file or slash, never searched, and shown read-only in the UI.
@@ -49,7 +51,7 @@
 - Produces: SkillsConfig.builtin: BuiltinSkillsConfig.
 - Produces: SkillCategory.BUILTIN = "builtin" and SkillScope.BUILTIN = "builtin".
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
     from agentkit.config.runtime_paths import resolve_path
     from agentkit.config.skills_config import SkillsConfig
@@ -64,23 +66,23 @@
         assert SkillScope.BUILTIN == "builtin"
         assert SkillCategory.BUILTIN == "builtin"
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: uv run python -m pytest backend/tests/test_builtin_skills.py::test_builtin_config_defaults_and_enum_values -v
 Expected: FAIL because BuiltinSkillsConfig and the enum values do not exist.
 
-- [ ] **Step 3: Implement config types**
+- [x] **Step 3: Implement config types**
 
 Add DEFAULT_BUILTIN_SKILLS_PATH = "skills/builtin". Add BuiltinSkillsConfig with model_config = ConfigDict(extra="forbid"), enabled=True, path=DEFAULT_BUILTIN_SKILLS_PATH, and root_dir() using resolve_path. Add builtin to SkillsConfig with default_factory.
 
 Add startup-only descriptions for skills.builtin.path and skills.builtin.enabled in reload_boundary.py. Add SkillCategory.BUILTIN and SkillScope.BUILTIN. Create skills/builtin/.gitkeep.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: uv run python -m pytest backend/tests/test_builtin_skills.py::test_builtin_config_defaults_and_enum_values -v
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add backend/packages/harness/agentkit/config/skills_config.py backend/packages/harness/agentkit/config/reload_boundary.py backend/packages/harness/agentkit/skills/types.py backend/packages/harness/agentkit/skills/domain.py skills/builtin/.gitkeep backend/tests/test_builtin_skills.py
     git commit -m "feat(skills): add builtin skill config and types"
@@ -99,7 +101,7 @@ Expected: PASS.
 - Consumes: existing parse_skill_file, Skill, SkillCategory, SkillScope.
 - The function returns [] for a missing root, skips bad names and bad frontmatter, and stops at a package's SKILL.md boundary.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
     import os
     from pathlib import Path
@@ -155,23 +157,23 @@ Expected: PASS.
             allow_symlink_dirs=False,
         ) == []
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: uv run python -m pytest backend/tests/test_skill_scan.py -v
 Expected: FAIL because agentkit.skills.scan does not exist.
 
-- [ ] **Step 3: Implement the shared scanner**
+- [x] **Step 3: Implement the shared scanner**
 
 Move the directory-name regex, entry usability check, and within-root check into scan.py. Implement scan_skill_category with the exact signature above. For allow_symlink_dirs=False, reject both symlinked skill directories and symlinked SKILL.md files. Parse frontmatter with parse_skill_file; a directory name mismatch logs a warning and uses the frontmatter name. Duplicate names in one category keep the last sorted directory and log a warning.
 
 Refactor storage.load_skills to call scan_skill_category for public and custom, preserving custom-over-public override behavior. Apply the enabled map with dataclasses.replace(skill, enabled=enabled_map.get(skill.name, True)) after scanning. Keep validate_skill_file_path in storage.py and import the shared within-root helper from scan.py.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: uv run python -m pytest backend/tests/test_skill_scan.py backend/tests/test_skill_loading.py backend/tests/test_skill_scope_layers.py -v
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add backend/packages/harness/agentkit/skills/scan.py backend/packages/harness/agentkit/skills/storage.py backend/tests/test_skill_scan.py
     git commit -m "refactor(skills): share the skill directory scanner"
@@ -190,7 +192,7 @@ Expected: all PASS.
 - Produces: builtin_names(config: SkillsConfig) -> frozenset[str].
 - The loader uses scan_skill_category(..., category=SkillCategory.BUILTIN, scope=SkillScope.BUILTIN, enabled=True, allow_symlink_dirs=False).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
     import os
     from pathlib import Path
@@ -247,12 +249,10 @@ Expected: all PASS.
         config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
         first = load_builtin_skills(config)
         skill_file = tmp_path / "skills" / "builtin" / "demo" / "SKILL.md"
-        skill_file.write_text("---
-name: demo
-description: second
----
-# second
-", encoding="utf-8")
+        skill_file.write_text(
+            "---\nname: demo\ndescription: second\n---\n# second\n",
+            encoding="utf-8",
+        )
         future = 2_000_000_000_000_000_000
         os.utime(skill_file, ns=(future, future))
 
@@ -261,23 +261,23 @@ description: second
         assert first[0].description == "first"
         assert second[0].description == "second"
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: uv run python -m pytest backend/tests/test_builtin_skills.py -k "loader or cache or missing" -v
 Expected: FAIL because agentkit.skills.builtin does not exist.
 
-- [ ] **Step 3: Implement the loader and cache**
+- [x] **Step 3: Implement the loader and cache**
 
 Implement a module-level lock and a cache keyed by resolved root. The cache value is (fingerprint, tuple of Skill). The fingerprint is a sorted tuple of (directory name, SKILL.md st_mtime_ns, st_size) for direct child directories. Load only when enabled and the root exists. A missing root logs the warning "built-in skills directory is missing: <path>" once per root; clear_builtin_cache() resets both the cache and the warned-roots set.
 
 Implement builtin_names as a frozenset of names from load_builtin_skills. Keep all scanning in scan_skill_category; builtin.py must not parse frontmatter itself.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: uv run python -m pytest backend/tests/test_builtin_skills.py -v
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add backend/packages/harness/agentkit/skills/builtin.py backend/tests/test_builtin_skills.py
     git commit -m "feat(skills): load project built-in skills"
@@ -302,7 +302,7 @@ Expected: all PASS.
 - Produces: SKILL_FILESYSTEM_BUILTIN_ROOT_CONVENTION and SKILL_CATALOG_BUILTIN_ROOT_CONVENTION.
 - effective_enabled(skill, prefs) returns True for scope builtin without reading prefs.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
     def test_builtin_is_visible_even_when_user_pref_is_false(tmp_path):
         write_skill(tmp_path, "builtin", "demo")
@@ -379,12 +379,12 @@ Expected: all PASS.
 
 Add from agentkit.skills.builtin import load_builtin_skills to the test_skill_index.py imports before running these tests.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: uv run python -m pytest backend/tests/test_skill_index.py -k builtin -v
 Expected: FAIL because builtins are not merged and the prompt has no builtin convention.
 
-- [ ] **Step 3: Implement the overlay and isolate test fixtures**
+- [x] **Step 3: Implement the overlay and isolate test fixtures**
 
 First update backend/tests/fakes/skill_tree.py: skills_config() must add builtin={"enabled": False} by default, and write_app_config() must write data["skills"]["builtin"] = {"enabled": False} before applying explicit overrides. This keeps temp-root tests from loading the repository's real skills/builtin tree; tests that need builtins pass builtin={"path": ...} explicitly.
 
@@ -406,12 +406,12 @@ Add slash and progressive-loading coverage:
 - In test_skill_activation_request_only.py: write a builtin with body marker, build middleware with a builtin-aware config, assert /demo injects the body and records /mnt/skills/builtin/demo/SKILL.md as the slash source.
 - In test_skill_progressive.py: assert the builtin body is absent from build_skills_section, read_skill_body returns it, and no search runtime is involved.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: uv run python -m pytest backend/tests/test_skill_index.py backend/tests/test_skill_activation_request_only.py backend/tests/test_skill_progressive.py backend/tests/test_skill_loading.py backend/tests/test_skill_catalog_snapshot.py -v
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add backend/packages/harness/agentkit/skills/storage.py backend/packages/harness/agentkit/skills/prefs.py backend/packages/harness/agentkit/skills/prompt.py backend/tests/fakes/skill_tree.py backend/tests/test_skill_index.py backend/tests/test_skill_activation_request_only.py backend/tests/test_skill_progressive.py
     git commit -m "feat(skills): overlay builtin skills in the registry and prompt"
@@ -429,7 +429,7 @@ Expected: all PASS.
 - Produces: _static_mappings(..., builtin_dir: Path | None = None).
 - The provider adds PathMapping("<container_path>/builtin", str(builtin_dir), read_only=True) in both git and filesystem source modes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
     from pathlib import Path
     from types import SimpleNamespace
@@ -459,21 +459,21 @@ Expected: all PASS.
         with pytest.raises(PermissionError):
             assert_writable("/mnt/skills/builtin/demo/SKILL.md", sandbox.path_mappings)
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: uv run python -m pytest backend/tests/test_builtin_mounts.py -v
 Expected: FAIL because no builtin mapping exists.
 
-- [ ] **Step 3: Implement the mount**
+- [x] **Step 3: Implement the mount**
 
 Add _builtin_skills_dir near the existing _skills_tree_root helper. In LocalSandboxProvider.__init__, resolve it once and pass it to _static_mappings. Add the exact mapping in both source branches and include the resolved builtin path in the operator-mount protected list. Keep the existing behavior when builtin is disabled or the config is unreadable.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: uv run python -m pytest backend/tests/test_builtin_mounts.py backend/tests/test_skill_private_mounts.py -v
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add backend/packages/harness/agentkit/sandbox/local/local_sandbox_provider.py backend/tests/test_builtin_mounts.py
     git commit -m "feat(sandbox): mount built-in skills read-only"
@@ -494,7 +494,7 @@ Expected: all PASS.
 - list_skills_for_api returns builtin rows even when the Git runtime is None.
 - reload_skills calls clear_builtin_cache() first; clear_skill_prompt_cache() runs exactly once per path: before the 503 when runtime is missing, after a successful refresh otherwise.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
     def test_builtin_rows_are_listed_without_a_git_runtime(tmp_path, monkeypatch):
         _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"}, builtin={"path": str(tmp_path / "skills" / "builtin")})
@@ -550,23 +550,23 @@ Expected: all PASS.
         assert response.status_code == 503
         assert cleared == ["builtin"]
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: uv run python -m pytest backend/tests/test_skills_catalog_routes.py -k builtin -v
 Expected: FAIL because the response literals reject builtin and the list fails closed.
 
-- [ ] **Step 3: Implement the API changes**
+- [x] **Step 3: Implement the API changes**
 
 Add "builtin" to the SkillResponse category and scope literals. In skills_catalog.py, load builtins from get_app_config().skills, convert them to SkillResponse rows with enabled=True, global_enabled=None, status="builtin", and container_file from the Skill, and merge them before catalog rows. Filter catalog rows whose name collides with a builtin. Do the merge in both the filesystem branch and the Git branch; when runtime is None in Git mode, return builtin rows instead of an empty list.
 
 Add "_status_for" handling for builtin. In reload_skills, call clear_builtin_cache() at the top. For filesystem, keep reload_skill_caches() (it clears the prompt cache). For Git with runtime None, clear_skill_prompt_cache() once and then raise SkillRuntimeUnavailable, preserving the existing 503. For Git with a runtime, refresh, bump, then clear_skill_prompt_cache() once as today. Do not clear the prompt cache twice on the success path.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: uv run python -m pytest backend/tests/test_skills_catalog_routes.py backend/tests/test_skill_runtime_wiring.py -v
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add backend/app/gateway/models/response.py backend/app/gateway/skills_catalog.py backend/tests/test_skills_catalog_routes.py
     git commit -m "feat(api): list built-in skills and clear their cache on reload"
@@ -590,7 +590,7 @@ Expected: all PASS.
 - approve raises the same SkillConflict when the public name is reserved.
 - build_skill_runtime passes lambda: builtin_names(skills) to both services.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
     def test_create_draft_rejects_a_builtin_name(harness):
         service = SkillAuthorService(
@@ -624,23 +624,23 @@ Expected: all PASS.
 
         harness.run(scenario)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: uv run python -m pytest backend/tests/test_skill_author_service.py backend/tests/test_skill_review_service.py -k builtin -v
 Expected: FAIL because the constructors do not accept reserved_names.
 
-- [ ] **Step 3: Implement the reservation checks**
+- [x] **Step 3: Implement the reservation checks**
 
 Add the optional keyword-only reserved_names arguments to both constructors and store the callable. In SkillAuthorService.create_draft, check before store writes. In SkillReviewService._ensure_public_name_free, check before the database query. In build_skill_runtime, pass the same callable to both services.
 
 Update the fake Author and Review constructors in backend/tests/test_skill_runtime_wiring.py to accept reserved_names: Any = None; otherwise build_skill_runtime's new keyword argument breaks that test's fakes.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: uv run python -m pytest backend/tests/test_skill_author_service.py backend/tests/test_skill_review_service.py backend/tests/test_skill_runtime_wiring.py -v
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add backend/packages/harness/agentkit/skills/author.py backend/packages/harness/agentkit/skills/review.py backend/app/gateway/skills_catalog.py backend/tests/test_skill_author_service.py backend/tests/test_skill_review_service.py backend/tests/test_skill_runtime_wiring.py
     git commit -m "feat(skills): reserve built-in skill names"
@@ -657,7 +657,7 @@ Expected: all PASS.
 - Consumes: SkillRegistry.visible(include_builtin=False).
 - Produces: filesystem-mode search candidates are public/custom only; Git mode is unchanged.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
     def test_builtin_body_is_not_returned_by_search(tmp_path):
         _tree(tmp_path)
@@ -674,21 +674,21 @@ Expected: all PASS.
         assert "builtin-searchable" not in names
         assert all("BODY-MARKER" not in item["body"] for item in payload["skills"])
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: uv run python -m pytest backend/tests/test_search_and_load_skills_tool.py::test_builtin_body_is_not_returned_by_search -v
 Expected: FAIL because registry.visible() currently includes the builtin and loads its body.
 
-- [ ] **Step 3: Implement the exclusion**
+- [x] **Step 3: Implement the exclusion**
 
 In search_and_load_skills.py, change the filesystem branch from registry.visible() to registry.visible(include_builtin=False). Do not add builtins to SkillSearchService and do not change router scoring, budgets, or Milvus code.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: uv run python -m pytest backend/tests/test_search_and_load_skills_tool.py -v
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add backend/packages/harness/agentkit/tools/builtin/search_and_load_skills.py backend/tests/test_search_and_load_skills_tool.py
     git commit -m "feat(skills): keep built-ins out of skill search"
@@ -708,7 +708,7 @@ Expected: all PASS.
 - Produces: the skills page renders a "内置技能" section before "公共技能"; builtin rows have no edit button and no toggle.
 - Builtin list keys use skill.skill_id || skill.name.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
     it("内置技能单独回显且没有编辑入口", async () => {
       mockedListMine.mockResolvedValue([]);
@@ -742,21 +742,21 @@ Expected: all PASS.
       expect(publicRow?.querySelector("button")?.textContent).toContain("编辑");
     });
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: cd frontend && pnpm vitest run src/components/skills/my-skills-page.dom.test.tsx
 Expected: FAIL because builtin is not in the TypeScript scope and no builtin section exists.
 
-- [ ] **Step 3: Implement the frontend**
+- [x] **Step 3: Implement the frontend**
 
 Add builtin to SkillScope and SkillStatus. In my-skills-page.tsx, split catalog into builtins and publicSkills, render a "内置技能" section with ScopeTag "内置" and no edit action, and use key={skill.skill_id || skill.name}. Keep the public section behavior unchanged. Add the builtin label/tone to SkillStatusBadge if the badge is rendered.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: cd frontend && pnpm vitest run src/components/skills/my-skills-page.dom.test.tsx
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add frontend/src/core/api/skills.ts frontend/src/components/skills/my-skills-page.tsx frontend/src/components/skills/skill-status-badge.tsx frontend/src/components/skills/my-skills-page.dom.test.tsx
     git commit -m "feat(web): show built-in skills read-only"
@@ -779,25 +779,25 @@ Expected: PASS.
         path: skills/builtin
 - Produces: README guidance: add skills/builtin/<name>/SKILL.md, always indexed, read_file or slash only, no search, no personal toggle, UI read-only.
 
-- [ ] **Step 1: Add the config block**
+- [x] **Step 1: Add the config block**
 
 Add the block beside skills.source in config.example.yaml and config.yaml without changing unrelated settings. Keep the comments short and mention that path and enabled are startup-only.
 
-- [ ] **Step 2: Document the behavior**
+- [x] **Step 2: Document the behavior**
 
 Update backend/README.md's skills section: builtin directory, progressive loading, no search_and_load_skills, no personal toggle, UI read-only, read-only sandbox mount.
 
-- [ ] **Step 3: Run the backend focused suite**
+- [x] **Step 3: Run the backend focused suite**
 
 Run: uv run python -m pytest backend/tests/test_builtin_skills.py backend/tests/test_skill_scan.py backend/tests/test_skill_index.py backend/tests/test_skill_activation_request_only.py backend/tests/test_skill_progressive.py backend/tests/test_builtin_mounts.py backend/tests/test_skills_catalog_routes.py backend/tests/test_skill_author_service.py backend/tests/test_skill_review_service.py backend/tests/test_skill_runtime_wiring.py backend/tests/test_search_and_load_skills_tool.py backend/tests/test_skill_loading.py backend/tests/test_skill_scope_layers.py backend/tests/test_skill_catalog_snapshot.py -v
 Expected: all PASS.
 
-- [ ] **Step 4: Run the frontend test**
+- [x] **Step 4: Run the frontend test**
 
 Run: cd frontend && pnpm vitest run src/components/skills/my-skills-page.dom.test.tsx
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
     git add config.example.yaml config.yaml backend/README.md
     git commit -m "docs(skills): document built-in skill configuration"

@@ -318,8 +318,22 @@ class BuiltinSkillsConfig(BaseModel):
         ),
     )
 
+    @field_validator("path")
+    @classmethod
+    def _reject_unsafe_builtin_root(cls, value: str) -> str:
+        """内置根会成为只读挂载源，绝不能是项目根/文件系统根或含 .. 的逃逸路径。"""
+        if not value or not value.strip():
+            raise ValueError("skills.builtin.path must not be blank")
+        path = Path(value)
+        if any(part == ".." for part in path.parts):
+            raise ValueError("skills.builtin.path must not contain '..'")
+        if path.parent == path:
+            # 包括 POSIX "/"、Windows 盘符根（C:\）和 UNC share 根。
+            raise ValueError("skills.builtin.path must not be a filesystem root")
+        return value
+
     def root_dir(self) -> Path:
-        """宿主上的内置技能根目录（用于扫描）。"""
+        """宿主上的内置技能根目录（仅解析；安全校验见 skills.builtin.resolve_builtin_root）。"""
         return resolve_path(self.path)
 
 

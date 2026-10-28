@@ -1,16 +1,23 @@
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from agentkit.config.reload_boundary import STARTUP_ONLY_FIELDS, STARTUP_ONLY_PREFIX
 from agentkit.config.runtime_paths import resolve_path
 from agentkit.config.skills_config import BuiltinSkillsConfig, SkillsConfig
 from agentkit.skills import builtin as builtin_loader
-from agentkit.skills.builtin import builtin_names, clear_builtin_cache, load_builtin_skills
+from agentkit.skills.builtin import (
+    builtin_names,
+    clear_builtin_cache,
+    load_builtin_skills,
+    resolve_builtin_root,
+)
 from agentkit.skills.domain import SkillScope
 from agentkit.skills.types import SkillCategory
-from fakes.skill_tree import skills_config, write_skill
+from fakes.skill_tree import skills_config, symlinks_available, write_skill
 
 BUILTIN_WARNING_PREFIX = "built-in skills directory"
 
@@ -27,6 +34,44 @@ def builtin_warnings(caplog) -> list[str]:
     return [record.message for record in caplog.records if BUILTIN_WARNING_PREFIX in record.message]
 
 
+def _create_directory_link(link: Path, target: Path, kind: str) -> None:
+    """建 symlink 或 Windows junction；宿主不支持时跳过，不把环境差异当失败。"""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "symlink":
+        if not symlinks_available(link.parent):
+            pytest.skip("symlinks unavailable")
+        os.symlink(target, link, target_is_directory=True)
+        return
+    if os.name != "nt":
+        pytest.skip("junctions are Windows-only")
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"cannot create a junction: {completed.stderr or completed.stdout}")
+
+
+@pytest.fixture(params=["symlink", "junction"])
+def linked_builtin_root(request, tmp_path: Path):
+    target_parent = tmp_path / "outside"
+    write_skill(target_parent, "builtin", "demo")
+    target = target_parent / "skills" / "builtin"
+    link = tmp_path / "skills" / "builtin"
+    _create_directory_link(link, target, request.param)
+    try:
+        yield link
+    finally:
+        try:
+            link.unlink()
+        except OSError:
+            try:
+                link.rmdir()
+            except OSError:
+                pass
+
+
 def test_builtin_config_defaults_and_enum_values():
     config = SkillsConfig()
     assert config.builtin.enabled is True
@@ -34,6 +79,36 @@ def test_builtin_config_defaults_and_enum_values():
     assert config.builtin.root_dir() == resolve_path("skills/builtin")
     assert SkillScope.BUILTIN == "builtin"
     assert SkillCategory.BUILTIN == "builtin"
+
+
+@pytest.mark.parametrize("path", ["", "   ", ".", "..", "skills/../builtin"])
+def test_builtin_config_rejects_blank_or_escaping_paths(path: str):
+    with pytest.raises(ValidationError):
+        BuiltinSkillsConfig(path=path)
+
+
+def test_builtin_config_rejects_a_filesystem_root():
+    roots = ["/"]
+    anchor = Path.cwd().anchor
+    if anchor:
+        roots.append(anchor)
+    for root in roots:
+        with pytest.raises(ValidationError):
+            BuiltinSkillsConfig(path=root)
+
+
+def test_builtin_config_accepts_normal_relative_and_absolute_paths(tmp_path: Path):
+    assert BuiltinSkillsConfig(path="skills/builtin").path == "skills/builtin"
+    absolute = str(tmp_path / "skills" / "builtin")
+    assert BuiltinSkillsConfig(path=absolute).path == absolute
+
+
+def test_resolve_builtin_root_resolves_relative_to_project_root(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
+    root = tmp_path / "skills" / "builtin"
+    root.mkdir(parents=True)
+
+    assert resolve_builtin_root(SkillsConfig()) == root.resolve()
 
 
 def test_builtin_fields_are_startup_only():
@@ -65,6 +140,63 @@ def test_builtin_loader_is_disabled_by_config(tmp_path: Path):
     write_skill(tmp_path, "builtin", "demo")
     config = skills_config(tmp_path, builtin={"enabled": False, "path": str(tmp_path / "skills" / "builtin")})
     assert load_builtin_skills(config) == ()
+
+
+def test_resolve_builtin_root_rejects_a_linked_root(linked_builtin_root: Path):
+    config = skills_config(
+        linked_builtin_root.parents[1],
+        builtin={"path": str(linked_builtin_root)},
+    )
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        resolve_builtin_root(config)
+
+
+def test_builtin_loader_rejects_a_linked_root(linked_builtin_root: Path, caplog):
+    config = skills_config(
+        linked_builtin_root.parents[1],
+        builtin={"path": str(linked_builtin_root)},
+    )
+
+    with caplog.at_level("WARNING", logger="agentkit.skills.builtin"):
+        assert load_builtin_skills(config) == ()
+        assert load_builtin_skills(config) == ()
+
+    assert len(builtin_warnings(caplog)) == 1
+    assert not builtin_loader._cache, "不合法根不能留下缓存"
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError])
+def test_builtin_loader_degrades_when_root_resolution_fails(
+    tmp_path: Path, caplog, monkeypatch, error_type: type[Exception]
+):
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+
+    def boom(_config: SkillsConfig):
+        raise error_type("unsafe root")
+
+    monkeypatch.setattr(builtin_loader, "resolve_builtin_root", boom)
+    with caplog.at_level("WARNING", logger="agentkit.skills.builtin"):
+        assert load_builtin_skills(config) == ()
+        assert load_builtin_skills(config) == ()
+
+    assert len(builtin_warnings(caplog)) == 1
+
+
+def test_a_resolution_failure_drops_a_cached_result(tmp_path: Path, monkeypatch):
+    write_skill(tmp_path, "builtin", "demo")
+    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
+    assert [skill.name for skill in load_builtin_skills(config)] == ["demo"]
+    assert builtin_loader._cache
+
+    def boom(_config: SkillsConfig):
+        raise ValueError("unsafe root")
+
+    monkeypatch.setattr(builtin_loader, "resolve_builtin_root", boom)
+
+    assert load_builtin_skills(config) == ()
+    assert builtin_loader._cache == {}
 
 
 def test_builtin_loader_warns_once_for_a_missing_root(tmp_path: Path, caplog):

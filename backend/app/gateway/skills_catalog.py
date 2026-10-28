@@ -49,7 +49,7 @@ from agentkit.skills.prompt import clear_skill_prompt_cache
 from agentkit.skills.projection import MilvusSkillProjection
 from agentkit.skills.review import SkillReviewService
 from agentkit.skills.search import SkillSearchService
-from agentkit.skills.storage import load_skills
+from agentkit.skills.storage import clear_builtin_collision_warnings, load_skills
 from agentkit.skills.store.sql import SqlSkillStore
 from agentkit.skills.types import Skill
 from backend.app.gateway.errors import SkillNotFound, SkillRuntimeUnavailable
@@ -918,6 +918,7 @@ async def reload_skills(*, runtime: SkillRuntime | None) -> None:
     # 内置技能的目录指纹缓存也要跟着重载走，且必须在任何 fail-closed 之前清：
     # 503 也要保证下次请求看见磁盘上的新目录。
     clear_builtin_cache()
+    clear_builtin_collision_warnings()
     _reset_builtin_collision_warnings()
     if _skill_source() != GIT_SOURCE:
         await asyncio.to_thread(reload_skill_caches)
