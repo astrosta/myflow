@@ -21,6 +21,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import yaml
+
 from agentkit.skills.parser import SkillParseError, parse_skill_file
 from agentkit.skills.types import SKILL_FILE_NAME, Skill, SkillCategory
 
@@ -63,8 +65,9 @@ def scan_skill_category(
             continue
         try:
             parsed = parse_skill_file(skill_file)
-        except (SkillParseError, OSError) as exc:
-            logger.warning("Skipping skill %s: %s", entry, exc)  # 一个坏技能不拖垮全部
+        except (SkillParseError, OSError, yaml.YAMLError, UnicodeError) as exc:
+            # 一个坏技能不拖垮全部：畸形 YAML 与非法编码和坏 frontmatter 一样只跳过这一个。
+            logger.warning("Skipping skill %s: %s", entry, exc)
             continue
         if parsed.name != entry.name:
             # 目录名与 name 不一致时以 frontmatter 为准（§3.1）；name 的正则由 parser 管。

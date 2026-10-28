@@ -59,3 +59,37 @@ def test_scan_skill_category_rejects_symlinked_dirs_when_disallowed(tmp_path: Pa
         container_path="/mnt/skills",
         allow_symlink_dirs=False,
     ) == []
+
+
+def test_scan_skill_category_skips_malformed_yaml_frontmatter(tmp_path: Path):
+    write_skill(tmp_path, "builtin", "good", description="good")
+    write_skill(
+        tmp_path,
+        "builtin",
+        "broken",
+        text="---\nname: broken\ndescription: [unclosed\n---\n# body\n",
+    )
+
+    skills = scan_skill_category(
+        tmp_path / "skills" / "builtin",
+        category=SkillCategory.BUILTIN,
+        container_path="/mnt/skills",
+    )
+
+    assert [skill.name for skill in skills] == ["good"]
+
+
+def test_scan_skill_category_skips_non_utf8_skill_file(tmp_path: Path):
+    write_skill(tmp_path, "builtin", "good", description="good")
+    broken = write_skill(tmp_path, "builtin", "broken", description="broken")
+    (broken / "SKILL.md").write_bytes(
+        b"---\nname: broken\ndescription: broken\n---\n# body\n\xff\n"
+    )
+
+    skills = scan_skill_category(
+        tmp_path / "skills" / "builtin",
+        category=SkillCategory.BUILTIN,
+        container_path="/mnt/skills",
+    )
+
+    assert [skill.name for skill in skills] == ["good"]
