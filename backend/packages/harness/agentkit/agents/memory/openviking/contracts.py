@@ -95,6 +95,22 @@ class ProfileView:
 
 
 @dataclass(frozen=True, slots=True)
+class PersonalizationDocument:
+    content: str
+    source: str
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalizationView:
+    profile_fields: dict[str, Any]
+    identity: PersonalizationDocument
+    soul: PersonalizationDocument
+    profile_etag: str
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryHit:
     uri: str
     memory_type: MemoryType
