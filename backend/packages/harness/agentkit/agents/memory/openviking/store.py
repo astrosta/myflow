@@ -59,6 +59,17 @@ class MemorySyncStore:
             await session.refresh(row)
             return row
 
+    async def bump_epoch(self, user_id: str, thread_id: str) -> MemorySyncStateRow:
+        async with self._session_factory() as session:
+            row = await session.get(MemorySyncStateRow, (user_id, thread_id))
+            if row is None:
+                raise KeyError(f"missing sync state for {user_id}/{thread_id}")
+            row.session_epoch += 1
+            row.state = "idle"
+            await session.commit()
+            await session.refresh(row)
+            return row
+
     async def set_state(self, user_id: str, thread_id: str, state: str) -> None:
         async with self._session_factory() as session:
             row = await session.get(MemorySyncStateRow, (user_id, thread_id))
