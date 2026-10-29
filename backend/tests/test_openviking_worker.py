@@ -142,3 +142,16 @@ async def test_epoch_mismatch_is_acked_without_append(stack) -> None:
     assert await worker.process(captured) == "skipped"
     assert client.appended == []
     assert captured.stream_id in stream.acked
+
+
+@pytest.mark.asyncio
+async def test_stale_appending_row_is_retried(stack) -> None:
+    client, _sync_store, dedup, sessions, _stream, publisher, worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    captured = await publisher.publish_human(ref, "r1", HumanMessage(content="hi"), sequence=0)
+    await dedup.reserve(captured)
+    await dedup.mark_appending(captured, lease_seconds=0)
+
+    assert await worker.process(captured) == "appended"
+    assert len(client.appended) == 1

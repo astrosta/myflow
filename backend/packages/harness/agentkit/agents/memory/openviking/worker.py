@@ -34,28 +34,28 @@ class TurnCaptureWorker:
     async def process(self, captured: CapturedMessage) -> str:
         sync = await self._sync_store.get(captured.user_id, captured.thread_id)
         if sync is None or sync.state == "deleted":
-            await self._stream.ack(captured.stream_id)
+            await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
             return "skipped"
 
         if (
             sync.session_epoch != captured.session_epoch
             or sync.session_incarnation != captured.session_incarnation
         ):
-            await self._stream.ack(captured.stream_id)
+            await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
             return "skipped"
 
         if captured.kind == "control":
-            await self._stream.ack(captured.stream_id)
+            await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
             return "skipped"
 
         message = _message_from_snapshot(captured.message)
         if message is None or not self._adapter.is_recordable(message):
-            await self._stream.ack(captured.stream_id)
+            await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
             return "skipped"
 
         payloads = self._adapter.to_payloads(message)
         if not payloads:
-            await self._stream.ack(captured.stream_id)
+            await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
             return "skipped"
 
         for payload in payloads:
@@ -64,12 +64,11 @@ class TurnCaptureWorker:
 
         state = await self._dedup.reserve(captured)
         if state == "appended":
-            await self._stream.ack(captured.stream_id)
+            await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
             return "skipped"
-        if state == "appending":
-            # A live lease means another attempt is in flight. Do not ack;
-            # the PEL owner will retry after the lease expires.
-            return "retry"
+        # pending and expired appending both reach this point. mark_appending
+        # refuses only a still-live lease, which means another attempt is in
+        # flight and the PEL owner will retry after it expires.
         if not await self._dedup.mark_appending(captured, lease_seconds=self._lease_seconds):
             return "retry"
 
@@ -92,7 +91,7 @@ class TurnCaptureWorker:
 
         await self._dedup.mark_appended(captured, ov_message_ids=_message_ids(response))
         await self._sync_store.set_state(captured.user_id, captured.thread_id, "appended")
-        await self._stream.ack(captured.stream_id)
+        await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
         return "appended"
 
 

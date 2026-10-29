@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from langchain_core.messages import BaseMessage
 
 from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig

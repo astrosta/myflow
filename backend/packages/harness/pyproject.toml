@@ -45,6 +45,10 @@ memory = [
     "langmem==0.0.30",
     "pymilvus>=2.5",
 ]
+# OpenViking thin adapter. Server 0.4.19 is external; this is only the HTTP SDK.
+openviking = [
+    "openviking-sdk==0.1.17",
+]
 
 [build-system]
 requires = ["hatchling"]

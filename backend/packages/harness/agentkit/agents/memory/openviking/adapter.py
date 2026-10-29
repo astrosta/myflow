@@ -12,7 +12,6 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from agentkit.agents.memory.openviking.contracts import CaptureRole
 from agentkit.privacy import PIIRedactor
 
 

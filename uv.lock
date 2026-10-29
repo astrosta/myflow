@@ -45,6 +45,9 @@ memory = [
     { name = "langmem" },
     { name = "pymilvus" },
 ]
+openviking = [
+    { name = "openviking-sdk" },
+]
 postgres = [
     { name = "asyncpg" },
     { name = "psycopg", extra = ["binary"] },
@@ -71,6 +74,7 @@ requires-dist = [
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.1.2" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.1" },
     { name = "langmem", marker = "extra == 'memory'", specifier = "==0.0.30" },
+    { name = "openviking-sdk", marker = "extra == 'openviking'", specifier = "==0.1.17" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.3.3" },
     { name = "psycopg-pool", marker = "extra == 'postgres'", specifier = ">=3.3.0" },
     { name = "pydantic", specifier = ">=2.13.5" },
@@ -81,7 +85,7 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3.0" },
     { name = "transformers", marker = "extra == 'knowledge'", specifier = ">=4.51" },
 ]
-provides-extras = ["postgres", "mcp", "knowledge", "skills", "redis", "memory"]
+provides-extras = ["postgres", "mcp", "knowledge", "skills", "redis", "memory", "openviking"]
 
 [[package]]
 name = "aiosqlite"
@@ -1592,6 +1596,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2e/02/6e0ae9cc61bd3169d401077b507b3ebc344745171e1051ab430be012dcd9/opentelemetry_api-1.45.1.tar.gz", hash = "sha256:aa38ed19bcc084ba42782a73255b3582283eced7ad6dddbd6695189e69adfb75", size = 72804, upload-time = "2026-10-06T17:32:58.133Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/41/f7dcf80b81ee8e71c1a2b59f14208bc723edbd89ed027a73b175abf6348e/opentelemetry_api-1.45.1-py3-none-any.whl", hash = "sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb", size = 60256, upload-time = "2026-10-06T17:32:33.506Z" },
+]
+
+[[package]]
+name = "openviking-sdk"
+version = "0.1.17"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8b/f5/2f63ccc7543e14af9facf500db8774fbd03ef47c9f7d362882f27ccaf93f/openviking_sdk-0.1.17.tar.gz", hash = "sha256:9f365e02a780ad04e4573180924e5afbe71f84342956356afc1e6834b2291751", size = 58085, upload-time = "2026-10-26T03:26:29.718Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/7a/95698db99666c833fcd9fec0050f7d26f3202080003373a73a1e35bc439e/openviking_sdk-0.1.17-py3-none-any.whl", hash = "sha256:9bd2b4df917d8d807876b10acee3cc69d4ce7d292bb3b0ac44379a6ed959d205", size = 35006, upload-time = "2026-10-26T03:26:28.264Z" },
 ]
 
 [[package]]

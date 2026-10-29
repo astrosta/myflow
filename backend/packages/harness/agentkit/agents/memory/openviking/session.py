@@ -44,6 +44,10 @@ class SessionClient(Protocol):
 
     async def delete_session(self, session_id: str) -> None: ...
 
+    async def batch_add_messages(
+        self, session_id: str, messages: list[dict[str, Any]]
+    ) -> dict[str, Any]: ...
+
 
 def _hmac_hex(salt: str, value: str) -> str:
     if len(salt) < 32:
@@ -115,6 +119,11 @@ class SessionManager:
         await self._ensure_auto_policy(ref, response)
         return ref
 
+    async def append_messages(
+        self, ref: SessionRef, messages: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return await self._client.batch_add_messages(ref.ov_session_id, messages)
+
     async def delete_session(self, user_id: str, thread_id: str) -> None:
         row = await self._sync_store.get(user_id, thread_id)
         if row is not None:
@@ -164,7 +173,7 @@ class SessionManager:
             ref.ov_session_id,
             options={"auto_commit_policy": expected},
         )
-        if updated.get("auto_commit_policy") not in (None, expected):
+        if updated.get("auto_commit_policy") != expected:
             raise SessionPolicyMismatch("session auto_commit_policy mismatch")
 
     @staticmethod

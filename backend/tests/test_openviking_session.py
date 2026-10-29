@@ -42,6 +42,7 @@ class FakeClient:
 
     async def update_session_config(self, session_id: str, *, options: dict) -> dict:
         self.calls.append(("update", session_id, options))
+        self.sessions[session_id].update(options)
         return self.sessions[session_id]
 
     async def delete_session(self, session_id: str) -> None:
@@ -114,6 +115,22 @@ async def test_memory_policy_mismatch_fails_closed(manager) -> None:
     }
     with pytest.raises(SessionPolicyMismatch):
         await session_manager.ensure_session(ref)
+
+
+@pytest.mark.asyncio
+async def test_auto_policy_mismatch_is_updated(manager) -> None:
+    session_manager, _store, client, config = manager
+    ref = await session_manager.resolve_capture_context("u1", "t1")
+    client.sessions[ref.ov_session_id] = {
+        "session_id": ref.ov_session_id,
+        "memory_policy": config.session.memory_policy(),
+        "auto_commit_policy": {},
+    }
+
+    await session_manager.ensure_session(ref)
+
+    assert [call[0] for call in client.calls] == ["get", "update"]
+    assert client.sessions[ref.ov_session_id]["auto_commit_policy"] == config.session_create_options()["auto_commit_policy"]
 
 
 @pytest.mark.asyncio
