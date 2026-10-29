@@ -13,6 +13,13 @@ M4 之前这份清单住在 `persistence/models/__init__.py`；行定义已经�
 
 from __future__ import annotations
 
+from agentkit.agents.memory.openviking.models import (
+    MemoryCaptureDedupRow,
+    MemoryProfileDocumentRow,
+    MemoryProfileOnboardingRow,
+    MemoryProfileSuggestionRow,
+    MemorySyncStateRow,
+)
 from agentkit.agents.memory.canonical.models import (
     MemoryConflictRow,
     MemoryConsolidationJobRow,
@@ -51,8 +58,13 @@ __all__ = [
     "Base",
     "KnowledgeBaseRow",
     "KnowledgeDocumentRow",
+    "MemoryCaptureDedupRow",
     "MemoryConflictRow",
     "MemoryConsolidationJobRow",
+    "MemoryProfileDocumentRow",
+    "MemoryProfileOnboardingRow",
+    "MemoryProfileSuggestionRow",
+    "MemorySyncStateRow",
     "MemoryEpisodeSessionRow",
     "MemoryIndexOutboxRow",
     "MemoryIngestJobRow",
