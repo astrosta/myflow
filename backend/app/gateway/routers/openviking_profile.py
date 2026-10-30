@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from agentkit.agents.memory.openviking.profile import ProfileConflict, ProfileService
-from backend.app.gateway.deps import require_scope
+from backend.app.gateway.deps import get_openviking_profile_service, require_scope
 from backend.app.gateway.errors import InvalidMemoryProfile, ProfileConflictAPI
 from backend.app.gateway.run_models import RunCaller
 
@@ -38,13 +38,6 @@ class ProfileResponse(BaseModel):
     updated_at: str
 
 
-def get_profile_service(request: Request) -> ProfileService:
-    service = getattr(request.app.state, "profile_service", None)
-    if not isinstance(service, ProfileService):
-        raise RuntimeError("OpenViking ProfileService is not initialized")
-    return service
-
-
 def _user_id(caller: RunCaller) -> str:
     return caller.user_id or "default"
 
@@ -53,7 +46,7 @@ def _user_id(caller: RunCaller) -> str:
 async def get_profile(
     request: Request,
     caller: Annotated[RunCaller, Depends(require_scope("memory:read"))],
-    service: Annotated[ProfileService, Depends(get_profile_service)],
+    service: Annotated[ProfileService, Depends(get_openviking_profile_service)],
 ) -> ProfileResponse:
     view = await service.get_snapshot(_user_id(caller))
     return ProfileResponse(fields=view.fields, etag=view.etag, updated_at=view.updated_at)
@@ -64,7 +57,7 @@ async def patch_profile(
     request: Request,
     body: ProfilePatchRequest,
     caller: Annotated[RunCaller, Depends(require_scope("memory:write"))],
-    service: Annotated[ProfileService, Depends(get_profile_service)],
+    service: Annotated[ProfileService, Depends(get_openviking_profile_service)],
 ) -> ProfileResponse:
     try:
         view = await service.patch(_user_id(caller), body.fields, etag=body.etag)
@@ -80,7 +73,7 @@ async def clear_profile(
     request: Request,
     body: ProfileDeleteRequest,
     caller: Annotated[RunCaller, Depends(require_scope("memory:write"))],
-    service: Annotated[ProfileService, Depends(get_profile_service)],
+    service: Annotated[ProfileService, Depends(get_openviking_profile_service)],
 ) -> ProfileResponse:
     try:
         view = await service.clear(_user_id(caller), etag=body.etag)
@@ -95,7 +88,7 @@ async def delete_profile_field(
     field_path: str,
     body: ProfileDeleteRequest,
     caller: Annotated[RunCaller, Depends(require_scope("memory:write"))],
-    service: Annotated[ProfileService, Depends(get_profile_service)],
+    service: Annotated[ProfileService, Depends(get_openviking_profile_service)],
 ) -> ProfileResponse:
     try:
         view = await service.delete_field(_user_id(caller), field_path, etag=body.etag)

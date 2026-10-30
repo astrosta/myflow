@@ -10,6 +10,7 @@ from agentkit.agents.memory.canonical.service import (
     get_memory_service as get_canonical_memory_service,
 )
 from agentkit.agents.memory.manager import MemoryManager, get_memory_manager
+from agentkit.agents.memory.openviking.profile import ProfileService
 from agentkit.config import get_app_config
 from agentkit.config.knowledge_config import KnowledgeBaseConfig
 from agentkit.knowledge.errors import KnowledgeDisabled
@@ -37,6 +38,7 @@ __all__ = [
     "get_knowledge_service_optional",
     "get_memory_manager_service",
     "get_memory_service",
+    "get_openviking_profile_service",
     "get_skill_author_service",
     "get_skill_review_service",
     "get_request_id",
@@ -103,6 +105,13 @@ def get_memory_manager_service(request: Request) -> MemoryManager:
     request.state.memory_manager = manager
     request.state.memory_maintenance = getattr(request.app.state, "memory_maintenance", None)
     return manager
+
+
+def get_openviking_profile_service(request: Request) -> ProfileService:
+    service = getattr(request.app.state, "profile_service", None)
+    if not isinstance(service, ProfileService):
+        raise RuntimeError("OpenViking ProfileService is not initialized")
+    return service
 
 
 def get_run_services(request: Request) -> RunServices:
