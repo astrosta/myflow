@@ -191,6 +191,11 @@ class MemoryConflictAPI(Exception):
     code: ClassVar[str] = "memory_conflict"
 
 
+class ProfileConflictAPI(Exception):
+    status_code: ClassVar[int] = 409
+    code: ClassVar[str] = "profile_conflict"
+
+
 class InvalidMemory(Exception):
     status_code: ClassVar[int] = 422
     code: ClassVar[str] = "invalid_memory"
@@ -254,6 +259,7 @@ def install_error_handlers(app: FastAPI) -> None:
         StdioCommandRejected,
         InvalidExtensionsConfig,
         MemoryConflictAPI,
+        ProfileConflictAPI,
         InvalidMemory,
         InvalidMemoryProfile,
         MemoryRequestInvalid,
