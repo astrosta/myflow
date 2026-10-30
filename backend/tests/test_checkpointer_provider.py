@@ -1,12 +1,14 @@
 import builtins
 import logging
+import sqlite3
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from agentkit.config import CheckpointerConfig
+from agentkit.config import CheckpointerConfig, DatabaseConfig
 from agentkit.runtime.checkpointer import provider
 
 
@@ -22,13 +24,17 @@ class _Saver:
 def created(monkeypatch: pytest.MonkeyPatch) -> list[_Saver]:
     made: list[_Saver] = []
 
-    def factory(_config: object) -> _Saver:
+    def factory(_config: object, _database: object) -> _Saver:
         saver = _Saver()
         made.append(saver)
         return saver
 
     monkeypatch.setattr(provider, "_make_checkpointer", factory)
-    monkeypatch.setattr(provider, "_resolve_checkpointer_config", lambda: CheckpointerConfig())
+    monkeypatch.setattr(
+        provider,
+        "_resolve_checkpointer_settings",
+        lambda: (CheckpointerConfig(), DatabaseConfig()),
+    )
     provider.reset_checkpointer()
     yield made
     provider.reset_checkpointer()
@@ -77,15 +83,15 @@ def test_config_is_resolved_before_the_lock_is_held(monkeypatch: pytest.MonkeyPa
     provider.reset_checkpointer()
     order: list[tuple[str, bool]] = []
 
-    def resolve() -> CheckpointerConfig:
+    def resolve() -> tuple[CheckpointerConfig, DatabaseConfig]:
         order.append(("resolve", provider._checkpointer_lock.locked()))
-        return CheckpointerConfig()
+        return CheckpointerConfig(), DatabaseConfig()
 
-    def make(_config: object) -> _Saver:
+    def make(_config: object, _database: object) -> _Saver:
         order.append(("make", provider._checkpointer_lock.locked()))
         return _Saver()
 
-    monkeypatch.setattr(provider, "_resolve_checkpointer_config", resolve)
+    monkeypatch.setattr(provider, "_resolve_checkpointer_settings", resolve)
     monkeypatch.setattr(provider, "_make_checkpointer", make)
     try:
         provider.get_checkpointer()
@@ -96,13 +102,13 @@ def test_config_is_resolved_before_the_lock_is_held(monkeypatch: pytest.MonkeyPa
 
 def test_resolving_config_can_reset_without_deadlock(monkeypatch: pytest.MonkeyPatch) -> None:
     provider.reset_checkpointer()
-    monkeypatch.setattr(provider, "_make_checkpointer", lambda _config: _Saver())
+    monkeypatch.setattr(provider, "_make_checkpointer", lambda _config, _database: _Saver())
 
-    def resolve() -> CheckpointerConfig:
+    def resolve() -> tuple[CheckpointerConfig, DatabaseConfig]:
         provider.reset_checkpointer()
-        return CheckpointerConfig()
+        return CheckpointerConfig(), DatabaseConfig()
 
-    monkeypatch.setattr(provider, "_resolve_checkpointer_config", resolve)
+    monkeypatch.setattr(provider, "_resolve_checkpointer_settings", resolve)
     finished = threading.Event()
 
     def run() -> None:
@@ -123,16 +129,16 @@ def test_concurrent_first_gets_share_one_singleton(monkeypatch: pytest.MonkeyPat
     made: list[_Saver] = []
     both_resolving = threading.Barrier(2)
 
-    def resolve() -> CheckpointerConfig:
+    def resolve() -> tuple[CheckpointerConfig, DatabaseConfig]:
         both_resolving.wait(timeout=2)
-        return CheckpointerConfig()
+        return CheckpointerConfig(), DatabaseConfig()
 
-    def make(_config: object) -> _Saver:
+    def make(_config: object, _database: object) -> _Saver:
         saver = _Saver()
         made.append(saver)
         return saver
 
-    monkeypatch.setattr(provider, "_resolve_checkpointer_config", resolve)
+    monkeypatch.setattr(provider, "_resolve_checkpointer_settings", resolve)
     monkeypatch.setattr(provider, "_make_checkpointer", make)
     results: list[_Saver] = []
 
@@ -178,16 +184,116 @@ def test_postgres_missing_package_includes_install_hint(monkeypatch: pytest.Monk
     assert exc_info.value.__cause__ is not None
 
 
-def test_sqlite_package_present_is_not_implemented_yet(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_module(monkeypatch, "langgraph.checkpoint.sqlite", "SqliteSaver")
-    with pytest.raises(NotImplementedError):
-        provider._make_checkpointer(SimpleNamespace(type="sqlite"))
+def test_sqlite_checkpointer_creates_the_database_and_closes_it(tmp_path) -> None:
+    database = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path))
+    saver = provider._make_checkpointer(SimpleNamespace(type="sqlite"), database)
+
+    assert saver.__class__.__name__ == "SqliteSaver"
+    assert Path(database.sqlite_path).exists()
+    provider._close_checkpointer(saver)
+    with pytest.raises(sqlite3.ProgrammingError):
+        saver.conn.execute("SELECT 1")
 
 
-def test_postgres_package_present_is_not_implemented_yet(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_module(monkeypatch, "langgraph.checkpoint.postgres", "PostgresSaver")
-    with pytest.raises(NotImplementedError):
-        provider._make_checkpointer(SimpleNamespace(type="postgres"))
+class _FakeConnection:
+    instances: list["_FakeConnection"] = []
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+        self.closed = False
+        self.instances.append(self)
+
+    @classmethod
+    def connect(cls, dsn: str, **kwargs):
+        conn = cls()
+        conn.dsn = dsn
+        conn.kwargs = kwargs
+        return conn
+
+    def execute(self, statement: str):
+        self.executed.append(statement)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakePostgresSaver:
+    def __init__(self, *, conn) -> None:
+        self.conn = conn
+        self.setup_called = False
+
+    def setup(self) -> None:
+        self.setup_called = True
+
+
+def test_postgres_checkpointer_connects_sets_search_path_and_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeConnection.instances.clear()
+    monkeypatch.setattr(
+        provider,
+        "_postgres_components",
+        lambda: (_FakePostgresSaver, _FakeConnection, object()),
+    )
+    database = DatabaseConfig(
+        backend="postgres",
+        postgres_url="postgresql+asyncpg://user:pass@db:5432/myflow",
+        postgres_schema="agent",
+    )
+
+    saver = provider._make_checkpointer(SimpleNamespace(type="postgres"), database)
+
+    assert isinstance(saver, _FakePostgresSaver)
+    assert saver.setup_called
+    conn = _FakeConnection.instances[0]
+    assert "options=-csearch_path%3Dagent" in conn.dsn
+    assert conn.kwargs["autocommit"] is True
+    assert conn.kwargs["prepare_threshold"] == 0
+    assert conn.kwargs["keepalives"] == 1
+    assert conn.executed == ['CREATE SCHEMA IF NOT EXISTS "agent"']
+
+    provider._close_checkpointer(saver)
+    assert conn.closed
+
+
+def test_postgres_checkpointer_closes_the_connection_on_setup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeConnection.instances.clear()
+
+    class _BrokenSaver(_FakePostgresSaver):
+        def setup(self) -> None:
+            raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(
+        provider,
+        "_postgres_components",
+        lambda: (_BrokenSaver, _FakeConnection, object()),
+    )
+    database = DatabaseConfig(
+        backend="postgres",
+        postgres_url="postgresql://user:pass@db:5432/myflow",
+    )
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        provider._make_checkpointer(SimpleNamespace(type="postgres"), database)
+    assert _FakeConnection.instances[0].closed
+
+
+def test_postgres_checkpointer_requires_a_postgres_database() -> None:
+    with pytest.raises(ValueError, match="database.backend"):
+        provider._make_checkpointer(
+            SimpleNamespace(type="postgres"),
+            DatabaseConfig(backend="sqlite"),
+        )
+
+
+def test_postgres_checkpointer_requires_a_url() -> None:
+    with pytest.raises(ValueError, match="database.url"):
+        provider._make_checkpointer(
+            SimpleNamespace(type="postgres"),
+            DatabaseConfig(backend="postgres"),
+        )
 
 
 def _block_import(monkeypatch: pytest.MonkeyPatch, module_name: str) -> None:
@@ -199,12 +305,3 @@ def _block_import(monkeypatch: pytest.MonkeyPatch, module_name: str) -> None:
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", _import)
-
-
-def _install_fake_module(monkeypatch: pytest.MonkeyPatch, module_name: str, class_name: str) -> None:
-    import sys
-    import types
-
-    module = types.ModuleType(module_name)
-    setattr(module, class_name, type(class_name, (), {}))
-    monkeypatch.setitem(sys.modules, module_name, module)

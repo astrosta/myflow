@@ -52,6 +52,14 @@ uv run --env-file .env --with uvicorn \
 
 `lifespan` 会建数据库引擎、thread_meta / run_store / event_store、checkpointer，并把 `RunServices` 挂到 `app.state`。默认 `database` / `run_events` / `checkpointer` 都可以是 memory：重启即失忆。
 
+### Checkpointer 后端
+
+Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postgres），和 ORM 共用
+`database.url`，构建后先跑 `setup()` 再交给图。`AgentClient` / CLI 的同步路径由
+`checkpointer.type` 决定；选 `sqlite` / `postgres` 时同样读取 `database.sqlite_dir` /
+`database.url`，`postgres` 还要求 `database.backend: postgres`。两处都只支持进程内单例或
+一次性上下文，换后端要重启。
+
 沙箱段见 `config.yaml` 的 `sandbox`。本机 Local provider 默认不开宿主 bash；可信环境可设 `allow_host_bash: true`。
 
 ### 模型与推理等级（输入框里的两个选择）

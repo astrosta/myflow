@@ -2,7 +2,7 @@ import pytest
 
 from agentkit.agents.leader_agent import ASSEMBLY_INPUT_KEYS, AgentAssembly
 from agentkit.client import DEFAULT_USER_ID, AgentClient
-from agentkit.config import AppConfig, CheckpointerConfig
+from agentkit.config import AppConfig, CheckpointerConfig, DatabaseConfig
 from agentkit.runtime.checkpointer import provider
 
 
@@ -84,7 +84,11 @@ def test_every_embedded_run_carries_a_run_id(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_reset_checkpointer_rebuilds_onto_the_new_saver(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(provider, "_resolve_checkpointer_config", lambda: CheckpointerConfig())
+    monkeypatch.setattr(
+        provider,
+        "_resolve_checkpointer_settings",
+        lambda: (CheckpointerConfig(), DatabaseConfig()),
+    )
     provider.reset_checkpointer()
     assembled = _install_assemble(monkeypatch)
     client = AgentClient(app_config=AppConfig())
