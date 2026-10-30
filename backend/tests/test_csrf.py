@@ -8,13 +8,20 @@ from __future__ import annotations
 
 import asyncio
 
-from fakes.auth_app import ACCESS_COOKIE_NAME, ADMIN_EMAIL, ADMIN_PASSWORD, CSRF_COOKIE_NAME, USER_EMAIL, make_auth_app
+from fakes.auth_app import (
+    ACCESS_COOKIE_NAME,
+    ADMIN_PASSWORD,
+    ADMIN_USERNAME,
+    CSRF_COOKIE_NAME,
+    USER_USERNAME,
+    make_auth_app,
+)
 
 
 def _logged_in(**kwargs):
     harness = make_auth_app(**kwargs)
     asyncio.run(harness.seed_admin())
-    assert harness.login(ADMIN_EMAIL, ADMIN_PASSWORD).status_code == 200
+    assert harness.login(ADMIN_USERNAME, ADMIN_PASSWORD).status_code == 200
     return harness
 
 
@@ -55,7 +62,7 @@ def test_a_mismatched_pair_is_rejected() -> None:
 def test_bootstrap_login_needs_no_token_but_rejects_a_hostile_origin() -> None:
     harness = make_auth_app()
     asyncio.run(harness.seed_admin())
-    body = {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+    body = {"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD}
 
     hostile = harness.client.post(
         "/api/v1/auth/login/local", json=body, headers={"Origin": "http://evil.example"}

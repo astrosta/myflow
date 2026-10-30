@@ -68,7 +68,7 @@ export function isSessionExpired(now: number = Date.now()): boolean {
  *
  * 不这么做的话，`register` / `initialize` 那条路径（响应里没有 expires_in，
  * 只能靠探活发现）会一律报成 rejected，登录页于是显示成干巴巴的
- * "用你的邮箱和密码登录"，而不是"登录已过期"。
+ * "用你的用户名和密码登录"，而不是"登录已过期"。
  */
 const ACTIVE_KEY = "myflow.session.active";
 let active: boolean | null = null;

@@ -46,7 +46,6 @@ from backend.app.gateway.auth.models import (
     PAT_SCOPE_MENU,
     SYSTEM_ROLES,
     normalize_email,
-    normalize_identifier,
     normalize_username,
 )
 from backend.app.gateway.auth.password import hash_password, verify_password
@@ -88,24 +87,23 @@ class AuthService:
         return await self._store.active_admin_count() == 0
 
     async def initialize(
-        self, *, email: str, username: str, password: str, settings: AuthSettings
+        self, *, username: str, password: str, settings: AuthSettings
     ) -> tuple[dict, str, int]:
         """只在零 admin 时可用。并发输家拿到 409 `admin_already_exists`。
 
-        邮箱 / 用户名形状、口令策略的错误在这里就是**具体**的
-        （422 `invalid_email` / `invalid_username` / `password_too_short` / …）。
+        用户名形状、口令策略的错误在这里就是**具体**的
+        （422 `invalid_username` / `password_too_short` / …）。
         """
-        normalized = normalize_email(email)
         handle = normalize_username(username)
         password_hash = hash_password(password)
         try:
             user = await self._store.create_first_admin(
-                user_id=self._new_id(), email=normalized, username=handle, password_hash=password_hash
+                user_id=self._new_id(), email=None, username=handle, password_hash=password_hash
             )
         except UserAlreadyExistsError as exc:
-            raise conflict_field_error(exc, email=normalized, username=handle) from exc
+            raise conflict_field_error(exc, email=None, username=handle) from exc
         if user is None:
-            # 不点名现有 admin 的邮箱：这条路由是公开的。
+            # 不点名现有 admin 的用户名：这条路由是公开的。
             raise AdminAlreadyExists(
                 "an admin account already exists; sign in instead of running setup again"
             )
@@ -114,25 +112,23 @@ class AuthService:
         return user, token, expires_in
 
     async def register(
-        self, *, email: str, username: str, password: str, settings: AuthSettings
+        self, *, username: str, password: str, settings: AuthSettings
     ) -> tuple[dict, str, int]:
         if not settings.allow_registration:
             raise RegistrationClosed(
                 "self-registration is disabled on this server; ask an admin to create the account"
             )
-        normalized = normalize_email(email)
         handle = normalize_username(username)
         password_hash = hash_password(password)
         try:
             user = await self._store.create(
                 user_id=self._new_id(),
-                email=normalized,
+                email=None,
                 username=handle,
                 password_hash=password_hash,
             )
         except UserAlreadyExistsError as exc:
-            # 撞车必须说清**撞的是哪个字段**：邮箱要换邮箱，用户名要换用户名。
-            raise conflict_field_error(exc, email=normalized, username=handle) from exc
+            raise conflict_field_error(exc, email=None, username=handle) from exc
         token, expires_in = self.issue_token(user, settings=settings)
         return user, token, expires_in
 
@@ -141,23 +137,20 @@ class AuthService:
     async def login_local(
         self,
         *,
-        identifier: str,
+        username: str,
         password: str,
         peer_ip: str,
         settings: AuthSettings,
     ) -> tuple[dict, str, int]:
-        """`identifier` 是**邮箱或用户名**（带 `@` 当邮箱，否则当用户名）。
+        """`username + password` 登录。
 
         失败按 **TCP peer IP** 计数，并且**说清是哪一种失败**。
         默认（`auth.local.specific_errors=true`）分四种回答：
         没这个账号 / 密码不对 / 账号被禁用 / 账号处于回收期。
         `false` 时全部收敛成 401 `invalid_credentials`，减少账号枚举面。
 
-        两条顺序上的讲究：
-
-        - 禁用与回收期只在**口令正确**之后才说——不知道口令的人不该从响应里读出
-          "这个账号存在且被禁用了"。
-        - 查不到时**不说是邮箱还是用户名没注册**：说了等于把两个命名空间都交出去探测。
+        禁用与回收期只在**口令正确**之后才说——不知道口令的人不该从响应里读出
+        "这个账号存在且被禁用了"。
         """
         if (remaining := self._limiter.locked_for(peer_ip)) > 0:
             seconds = int(remaining) + 1
@@ -166,15 +159,14 @@ class AuthService:
                 retry_after=seconds,
             )
 
-        # 格式错就说格式错（422 invalid_email / invalid_username），
-        # 不要把它伪装成"密码不对"——用户会一直改密码。
-        lookup = normalize_identifier(identifier)
-        user = await self._store.get_by_identifier(lookup)
+        # 用户名格式错就报 invalid_username，不要伪装成"密码不对"。
+        lookup = normalize_username(username)
+        user = await self._store.get_by_username(lookup)
         if user is None:
             self._record_failure(peer_ip, settings)
             raise self._login_failure(
                 settings,
-                AccountNotFound(f"no account for {lookup!r}; register first"),
+                AccountNotFound(f"no account for username {lookup!r}; register first"),
             )
         if not verify_password(password, user["password_hash"]):
             self._record_failure(peer_ip, settings)
@@ -206,7 +198,7 @@ class AuthService:
         """`specific_errors=false` 时把具体理由收敛成同一个 401（防账号枚举）。"""
         if settings.specific_errors:
             return specific
-        return InvalidCredentials("invalid email or password")
+        return InvalidCredentials("invalid username or password")
 
     def _record_failure(self, peer_ip: str, settings: AuthSettings) -> None:
         self._limiter.record_failure(

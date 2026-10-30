@@ -46,8 +46,8 @@ def default_username(email: str) -> str:
     return email.split("@", 1)[0]
 
 
-def registration_payload(email: str, password: str, *, username: str | None = None) -> dict:
-    return {"email": email, "username": username or default_username(email), "password": password}
+def registration_payload(username: str, password: str) -> dict:
+    return {"username": username, "password": password}
 
 
 class _RunManagerStub:
@@ -112,22 +112,21 @@ class Browser:
     def delete(self, url: str, **kwargs: Any):
         return self.client.delete(url, headers=self._headers(kwargs.pop("headers", None)), **kwargs)
 
-    def login(self, identifier: str, password: str, **extra: Any):
-        """`identifier` 可以是邮箱**或**用户名（`2.4 的两个登录标识）。"""
+    def login(self, username: str, password: str, **extra: Any):
         return self.post(
-            "/api/v1/auth/login/local", json={"identifier": identifier, "password": password, **extra}
+            "/api/v1/auth/login/local", json={"username": username, "password": password, **extra}
         )
 
-    def register(self, email: str, password: str, *, username: str | None = None, **extra: Any):
+    def register(self, username: str, password: str, **extra: Any):
         return self.post(
             "/api/v1/auth/register",
-            json={**registration_payload(email, password, username=username), **extra},
+            json={**registration_payload(username, password), **extra},
         )
 
-    def initialize(self, email: str, password: str, *, username: str | None = None, **extra: Any):
+    def initialize(self, username: str, password: str, **extra: Any):
         return self.post(
             "/api/v1/auth/initialize",
-            json={**registration_payload(email, password, username=username), **extra},
+            json={**registration_payload(username, password), **extra},
         )
 
     def clear_cookies(self) -> None:
@@ -174,10 +173,10 @@ class AuthHarness:
     def new_browser(self) -> Browser:
         return Browser(self.app, self.base_url)
 
-    def login_as(self, identifier: str, password: str) -> Browser:
+    def login_as(self, username: str, password: str) -> Browser:
         """新开一个浏览器并登录——两用户用例必须各有各的 cookie jar。"""
         browser = self.new_browser()
-        assert browser.login(identifier, password).status_code == 200
+        assert browser.login(username, password).status_code == 200
         return browser
 
     def replay(self, token: str) -> Browser:
@@ -196,11 +195,12 @@ class AuthHarness:
         password: str = ADMIN_PASSWORD,
     ) -> dict:
         user, _token, _expires = await self.service.initialize(
-            email=email,
             username=username or default_username(email),
             password=password,
             settings=self.settings,
         )
+        if email:
+            user = await self.store.update(user["id"], email=email)
         return user
 
     async def seed_user(
@@ -222,21 +222,21 @@ class AuthHarness:
         )
         return user
 
-    def login(self, identifier: str, password: str, **extra: Any):
+    def login(self, username: str, password: str, **extra: Any):
         return self.client.post(
-            "/api/v1/auth/login/local", json={"identifier": identifier, "password": password, **extra}
+            "/api/v1/auth/login/local", json={"username": username, "password": password, **extra}
         )
 
-    def register(self, email: str, password: str, *, username: str | None = None, **extra: Any):
+    def register(self, username: str, password: str, **extra: Any):
         return self.client.post(
             "/api/v1/auth/register",
-            json={**registration_payload(email, password, username=username), **extra},
+            json={**registration_payload(username, password), **extra},
         )
 
-    def initialize(self, email: str, password: str, *, username: str | None = None, **extra: Any):
+    def initialize(self, username: str, password: str, **extra: Any):
         return self.client.post(
             "/api/v1/auth/initialize",
-            json={**registration_payload(email, password, username=username), **extra},
+            json={**registration_payload(username, password), **extra},
         )
 
 

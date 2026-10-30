@@ -12,8 +12,10 @@ import asyncio
 from fakes.auth_app import (
     ACCESS_COOKIE_NAME,
     ADMIN_EMAIL,
+    ADMIN_USERNAME,
     ADMIN_PASSWORD,
     USER_EMAIL,
+    USER_USERNAME,
     USER_PASSWORD,
     make_auth_app,
 )
@@ -22,7 +24,7 @@ from fakes.auth_app import (
 def _logged_in(**kwargs):
     harness = make_auth_app(**kwargs)
     asyncio.run(harness.seed_admin())
-    assert harness.login(ADMIN_EMAIL, ADMIN_PASSWORD).status_code == 200
+    assert harness.login(ADMIN_USERNAME, ADMIN_PASSWORD).status_code == 200
     return harness
 
 
@@ -46,7 +48,7 @@ def test_change_password_kills_every_session() -> None:
     assert not harness.client.cookies.get(ACCESS_COOKIE_NAME), "改密后自己这枚也要失效"
     assert harness.replay(old_token).get("/api/probe").status_code == 401
 
-    assert harness.login(ADMIN_EMAIL, "new-password-1").status_code == 200
+    assert harness.login(ADMIN_USERNAME, "new-password-1").status_code == 200
     assert harness.client.get("/api/probe").status_code == 200
 
 
@@ -96,7 +98,7 @@ def test_logout_is_not_a_global_logout() -> None:
 
 def test_admin_reset_invalidates_sessions_and_pats() -> None:
     harness, admin, user = _with_user()
-    assert harness.login(USER_EMAIL, USER_PASSWORD).status_code == 200
+    assert harness.login(USER_USERNAME, USER_PASSWORD).status_code == 200
     token = harness.client.cookies.get(ACCESS_COOKIE_NAME)
     plain, _row = asyncio.run(
         harness.service.create_pat(
@@ -118,7 +120,7 @@ def test_admin_reset_invalidates_sessions_and_pats() -> None:
 
 def test_disabling_an_account_invalidates_everything() -> None:
     harness, admin, user = _with_user()
-    assert harness.login(USER_EMAIL, USER_PASSWORD).status_code == 200
+    assert harness.login(USER_USERNAME, USER_PASSWORD).status_code == 200
     token = harness.client.cookies.get(ACCESS_COOKIE_NAME)
     plain, _row = asyncio.run(
         harness.service.create_pat(
@@ -131,14 +133,14 @@ def test_disabling_an_account_invalidates_everything() -> None:
     assert harness.replay(token).get("/api/probe").status_code == 401
     assert harness.client.get("/api/probe", headers={"Authorization": f"Bearer {plain}"}).status_code == 401
     # 口令是对的，所以这里可以说清是"被禁用"（§2.12 的具体错误）
-    denied = harness.login(USER_EMAIL, USER_PASSWORD)
+    denied = harness.login(USER_USERNAME, USER_PASSWORD)
     assert denied.status_code == 403
     assert denied.json()["code"] == "account_disabled"
 
 
 def test_a_soft_deleted_account_is_locked_out_until_restored() -> None:
     harness, admin, user = _with_user()
-    assert harness.login(USER_EMAIL, USER_PASSWORD).status_code == 200
+    assert harness.login(USER_USERNAME, USER_PASSWORD).status_code == 200
     token = harness.client.cookies.get(ACCESS_COOKIE_NAME)
 
     asyncio.run(harness.service.delete_user(actor_id=admin["id"], user_id=user["id"]))
@@ -148,13 +150,13 @@ def test_a_soft_deleted_account_is_locked_out_until_restored() -> None:
     assert harness.replay(token).get("/api/probe").status_code == 401
 
     asyncio.run(harness.service.restore_user(actor_id=admin["id"], user_id=user["id"]))
-    assert harness.login(USER_EMAIL, USER_PASSWORD).status_code == 200
+    assert harness.login(USER_USERNAME, USER_PASSWORD).status_code == 200
 
 
 def test_role_and_email_changes_keep_sessions_alive() -> None:
     """`sub` 是 uuid：改邮箱不该踢人，更不该换桶（§2.2）。"""
     harness, admin, user = _with_user()
-    assert harness.login(USER_EMAIL, USER_PASSWORD).status_code == 200
+    assert harness.login(USER_USERNAME, USER_PASSWORD).status_code == 200
     token = harness.client.cookies.get(ACCESS_COOKIE_NAME)
 
     asyncio.run(
@@ -169,7 +171,7 @@ def test_remember_me_only_changes_max_age() -> None:
     harness = _logged_in(base_url="http://localhost")  # 本机直连 HTTP：允许持久化
     harness.clear_cookies()
 
-    response = harness.login(ADMIN_EMAIL, ADMIN_PASSWORD, remember_me=True)
+    response = harness.login(ADMIN_USERNAME, ADMIN_PASSWORD, remember_me=True)
     cookies = "\n".join(response.headers.get_list("set-cookie"))
 
     assert "Max-Age=2592000" in cookies
@@ -183,7 +185,7 @@ def test_a_public_http_origin_degrades_to_a_session_cookie() -> None:
     harness = _logged_in(base_url="http://gateway.example.com")
     harness.clear_cookies()
 
-    response = harness.login(ADMIN_EMAIL, ADMIN_PASSWORD, remember_me=True)
+    response = harness.login(ADMIN_USERNAME, ADMIN_PASSWORD, remember_me=True)
 
     assert "Max-Age" not in "\n".join(response.headers.get_list("set-cookie"))
 
@@ -191,6 +193,6 @@ def test_a_public_http_origin_degrades_to_a_session_cookie() -> None:
 def test_https_marks_the_cookie_secure() -> None:
     harness = _logged_in(base_url="https://gateway.example.com")
 
-    response = harness.login(ADMIN_EMAIL, ADMIN_PASSWORD)
+    response = harness.login(ADMIN_USERNAME, ADMIN_PASSWORD)
 
     assert "Secure" in "\n".join(response.headers.get_list("set-cookie"))

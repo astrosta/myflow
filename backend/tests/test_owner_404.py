@@ -10,9 +10,9 @@ import asyncio
 import logging
 
 from fakes.auth_app import (
-    ADMIN_EMAIL,
     ADMIN_PASSWORD,
-    USER_EMAIL,
+    ADMIN_USERNAME,
+    USER_USERNAME,
     USER_PASSWORD,
     make_auth_app,
     run_row,
@@ -26,8 +26,8 @@ def _two_clients(*, second_role: str = "user"):
     admin = asyncio.run(harness.seed_admin())
     second = asyncio.run(harness.seed_user(role=second_role))
 
-    owner_client = harness.login_as(ADMIN_EMAIL, ADMIN_PASSWORD)
-    other_client = harness.login_as(USER_EMAIL, USER_PASSWORD)
+    owner_client = harness.login_as(ADMIN_USERNAME, ADMIN_PASSWORD)
+    other_client = harness.login_as(USER_USERNAME, USER_PASSWORD)
     return harness, admin, second, owner_client, other_client
 
 

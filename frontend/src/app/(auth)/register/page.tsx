@@ -9,7 +9,7 @@ export const metadata = {
 /**
  * 注册页。
  *
- * 表单在 Suspense 里：它要读 `?email=`（useSearchParams），而 useSearchParams
+ * 表单在 Suspense 里：它要读 `?username=`（useSearchParams），而 useSearchParams
  * 在预渲染时必须被 Suspense 包住，否则整个路由会退化成动态渲染（和登录页同一个理由）。
  */
 export default function RegisterPage() {

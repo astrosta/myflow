@@ -56,7 +56,7 @@ def test_0009_drops_legacy_tables_and_keeps_openviking_tables(tmp_path: Path) ->
         names = set(inspect(conn).get_table_names())
         version = conn.scalar(text("SELECT version_num FROM alembic_version"))
 
-    assert version == _head_revision() == "0009_drop_canonical_memory"
+    assert version == _head_revision()
     assert LEGACY_CANONICAL_MEMORY_TABLES.isdisjoint(names)
     assert {
         "memory_profile_documents",

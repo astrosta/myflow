@@ -239,11 +239,13 @@ function AccountSection({ user, onSignOut }: { user: AuthUser; onSignOut: () => 
 
         {manageOpen ? (
           <div className="mt-2 space-y-4 rounded-lg border border-neutral-200 bg-neutral-50/60 p-4">
-            <div className="space-y-1">
-              <span className="block text-xs font-medium text-neutral-500">邮箱</span>
-              {/* 邮箱是登录标识 + 找回入口，改它要走验证流程（§2.13），这里只读 */}
-              <p className="text-sm text-neutral-800">{user.email}</p>
-            </div>
+            {user.email ? (
+              <div className="space-y-1">
+                <span className="block text-xs font-medium text-neutral-500">邮箱</span>
+                {/* 旧账号可能保留邮箱；新注册账号没有邮箱，也不再以邮箱登录 */}
+                <p className="text-sm text-neutral-800">{user.email}</p>
+              </div>
+            ) : null}
 
             <div className="space-y-2 border-t border-neutral-200 pt-4">
               {confirming ? (

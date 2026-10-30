@@ -29,18 +29,6 @@ export function normalizeUsername(raw: string): string {
   return raw.trim().toLowerCase();
 }
 
-/**
- * 从邮箱派生默认用户名：取 @ 前面那段（"邮箱名称"）。
- *
- * 只做**归一**（去空白、转小写），不做"修好它"的猜测——比如把非法字符替换掉。
- * 猜出来的名字和用户以为的不是一回事，而且可能恰好撞上别人的账号。
- * 形状不对就让 validateUsername 如实报错。
- */
-export function usernameFromEmail(email: string): string {
-  const at = email.indexOf("@");
-  return normalizeUsername(at > 0 ? email.slice(0, at) : email);
-}
-
 /** 返回第一条不满足的规则；null 表示合法。文案和后端一样逐条说清。 */
 export function validateUsername(raw: string): string | null {
   const value = normalizeUsername(raw);

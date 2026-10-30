@@ -6,7 +6,7 @@
 三条容易写错的纪律：
 
 - **响应体里没有 token**：JWT 只进 HttpOnly cookie（§2.4）。测试钉死这一点。
-- **失败不区分** "邮箱不存在"和"密码错"：同一个 detail（§2.12）。
+- **失败不区分** "用户名不存在"和"密码错"：同一个 detail（§2.12）。
 - **cookie 只在 `session_cookie.py` 里写/清**：这里只调用策略，不自己拼属性。
 """
 
@@ -73,12 +73,12 @@ async def initialize(
 ) -> UserResponse:
     """**只在没有 admin 时**可用；已有 admin 再打就是 409 `admin_already_exists`。
 
-    邮箱 / 用户名 / 口令不合规时，服务层直接抛**具体**的 422（`invalid_email` /
-    `invalid_username` / `password_too_short` …）——这里不再提前拦一道，
-    否则用户拿到的是 pydantic 的 `Request validation failed`。
+    用户名 / 口令不合规时，服务层直接抛**具体**的 422（`invalid_username` /
+    `password_too_short` …）——这里不再提前拦一道，否则用户拿到的是
+    pydantic 的 `Request validation failed`。
     """
     user, token, _expires_in = await service.initialize(
-        email=body.email, username=body.username, password=body.password, settings=settings
+        username=body.username, password=body.password, settings=settings
     )
     _issue_cookies(response, request, settings, token=token)
     return UserResponse(**user_to_wire(user))
@@ -94,10 +94,10 @@ async def login_local(
 ) -> LoginResponse:
     """登录响应体只有 `expires_in` 和 `needs_setup`——**没有 token 字符串**。
 
-    `identifier` 是**邮箱或用户名**（`2.4 的两个登录标识）。
+    登录只认 **username + password**。
     """
     user, token, expires_in = await service.login_local(
-        identifier=body.identifier,
+        username=body.username,
         password=body.password,
         peer_ip=client_ip(request),
         settings=settings,
@@ -116,11 +116,10 @@ async def register(
 ) -> UserResponse:
     """公开；`auth.allow_registration` 为假时 403 `registration_closed`。
 
-    邮箱已注册 → 409 `user_already_exists`；用户名被占 → 409 `username_taken`。
-    两个 code 分开，用户才知道该改哪一个。
+    用户名被占 → 409 `username_taken`。
     """
     user, token, _expires_in = await service.register(
-        email=body.email, username=body.username, password=body.password, settings=settings
+        username=body.username, password=body.password, settings=settings
     )
     _issue_cookies(response, request, settings, token=token)
     return UserResponse(**user_to_wire(user))

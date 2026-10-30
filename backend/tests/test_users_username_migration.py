@@ -145,6 +145,26 @@ def test_the_column_becomes_not_null(upgraded) -> None:
     assert username[3] == 1, "username 必须 NOT NULL（槽位 3 是 notnull 标志）"
 
 
+def test_email_becomes_nullable_and_new_users_need_no_address(upgraded) -> None:
+    engine, cfg, _path = upgraded
+
+    command.upgrade(cfg, "head")
+
+    with engine.connect() as conn:
+        columns = {row[1]: row for row in conn.execute(text("PRAGMA table_info(users)"))}
+    assert columns["email"][3] == 0, "email must be nullable after 0010"
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO users (id, email, username, system_role, needs_setup, disabled,"
+                " token_version, created_at, updated_at)"
+                " VALUES ('id-no-email', NULL, 'no-email', 'user', 0, 0, 0,"
+                " CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+
 def test_the_unique_constraints_survive_the_table_rebuild(upgraded) -> None:
     engine, cfg, _path = upgraded
 

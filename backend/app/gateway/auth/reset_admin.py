@@ -33,7 +33,7 @@ def _secure_write(path: Path, content: str) -> None:
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
 
 
-async def reset_admin(*, email: str | None, credentials_file: Path) -> int:
+async def reset_admin(*, username: str | None, credentials_file: Path) -> int:
     """返回进程退出码：0 成功，2 认证关闭，3 没有 admin。"""
     app_config = get_app_config()
     if not app_config.auth.enabled:
@@ -45,8 +45,8 @@ async def reset_admin(*, email: str | None, credentials_file: Path) -> int:
         store = make_user_store(get_session_factory())
         service = AuthService(store)
 
-        user = await store.get_by_email(email) if email else None
-        if user is None and email is None:
+        user = await store.get_by_username(username) if username else None
+        if user is None and username is None:
             admin_id = await store.first_admin_id()
             user = await store.get(admin_id) if admin_id else None
         if user is None:
@@ -62,7 +62,7 @@ async def reset_admin(*, email: str | None, credentials_file: Path) -> int:
         )
         _secure_write(
             credentials_file,
-            f"email: {user['email']}\npassword: {password}\n"
+            f"username: {user['username']}\npassword: {password}\n"
             "note: needs_setup=true — you must change this password on first login.\n",
         )
         # 只打路径：stdout 可能进日志、进 CI 输出、进工单。
@@ -74,14 +74,14 @@ async def reset_admin(*, email: str | None, credentials_file: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Reset an admin password offline (M9 §2.7).")
-    parser.add_argument("--email", default=None, help="target account; default: the first admin")
+    parser.add_argument("--username", default=None, help="target account; default: the first admin")
     parser.add_argument(
         "--credentials-file",
         default=DEFAULT_CREDENTIALS_FILE,
         help=f"where to write the new password (mode 0600); default {DEFAULT_CREDENTIALS_FILE}",
     )
     args = parser.parse_args(argv)
-    return asyncio.run(reset_admin(email=args.email, credentials_file=Path(args.credentials_file)))
+    return asyncio.run(reset_admin(username=args.username, credentials_file=Path(args.credentials_file)))
 
 
 if __name__ == "__main__":

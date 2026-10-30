@@ -41,7 +41,7 @@ def test_a_broken_config_says_503_not_unauthenticated(monkeypatch) -> None:
     assert protected.status_code == 503
     assert protected.json()["code"] == "auth_unavailable"
 
-    login = client.post("/api/v1/auth/login/local", json={"email": "a@b.com", "password": "x"})
+    login = client.post("/api/v1/auth/login/local", json={"username": "a", "password": "x"})
     assert login.status_code == 503
     assert login.json()["code"] == "auth_unavailable"
     assert "$DEEPSEEK_API_KEY" not in login.text, "配置细节不回显给客户端"

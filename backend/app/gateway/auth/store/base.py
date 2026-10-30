@@ -52,7 +52,8 @@ class UserStore(abc.ABC):
     async def get(self, user_id: str) -> dict | None: ...
 
     @abc.abstractmethod
-    async def get_by_email(self, email: str) -> dict | None: ...
+    async def get_by_email(self, email: str) -> dict | None:
+        """Legacy/profile lookup only; login never uses email."""
 
     @abc.abstractmethod
     async def get_by_username(self, username: str) -> dict | None: ...
@@ -75,7 +76,7 @@ class UserStore(abc.ABC):
         self,
         *,
         user_id: str,
-        email: str,
+        email: str | None,
         username: str,
         password_hash: str | None,
         system_role: str = "user",
@@ -84,7 +85,7 @@ class UserStore(abc.ABC):
 
     @abc.abstractmethod
     async def create_first_admin(
-        self, *, user_id: str, email: str, username: str, password_hash: str | None
+        self, *, user_id: str, email: str | None, username: str, password_hash: str | None
     ) -> dict | None:
         """**只在零 admin 时**插入。返回 None = 已经有 admin（并发调用者的 409）。"""
 

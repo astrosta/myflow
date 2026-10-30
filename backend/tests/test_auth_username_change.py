@@ -29,7 +29,7 @@ def _signed_in(**kwargs):
     """一个已登录的 harness + 它的管理员身份。"""
     harness = make_auth_app(**kwargs)
     admin = asyncio.run(harness.seed_admin())
-    assert harness.login(ADMIN_EMAIL, ADMIN_PASSWORD).status_code == 200
+    assert harness.login(ADMIN_USERNAME, ADMIN_PASSWORD).status_code == 200
     return harness, admin
 
 
@@ -232,7 +232,7 @@ def test_setup_required_must_change_the_password_first() -> None:
         harness.service.admin_reset_password(actor_id=admin["id"], user_id=user["id"])
     )
     harness.clear_cookies()
-    assert harness.login(USER_EMAIL, new_password).status_code == 200
+    assert harness.login(USER_USERNAME, new_password).status_code == 200
 
     blocked = harness.patch(PATH, json={"username": "renamed"})
     body = _body(blocked)

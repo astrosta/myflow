@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, updateUsername } from "./auth";
+import { ApiError, loginLocal, register, updateUsername } from "./auth";
 
 /**
  * 前后端**协议**测试（M9 §2.12）。
@@ -32,6 +32,40 @@ function stubFetch(payload: unknown, status = 200) {
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+describe("username/password auth payloads", () => {
+  it("登录只发 username + password", async () => {
+    const calls = stubFetch({ expires_in: 60, needs_setup: false });
+
+    await loginLocal("alice", "secret", true);
+
+    const call = calls.at(0);
+    if (!call) throw new Error("没有发出请求");
+    expect(call.url).toBe("/api/v1/auth/login/local");
+    expect(call.init.method).toBe("POST");
+    expect(JSON.parse(String(call.init.body))).toEqual({
+      username: "alice",
+      password: "secret",
+      remember_me: true,
+    });
+  });
+
+  it("注册只发 username + password", async () => {
+    const calls = stubFetch(USER);
+
+    await register("alice", "secret");
+
+    const call = calls.at(0);
+    if (!call) throw new Error("没有发出请求");
+    expect(call.url).toBe("/api/v1/auth/register");
+    expect(call.init.method).toBe("POST");
+    expect(JSON.parse(String(call.init.body))).toEqual({
+      username: "alice",
+      password: "secret",
+    });
+  });
+});
+
 
 describe("updateUsername", () => {
   it("发 PATCH /api/v1/auth/me，body 只有 username", async () => {

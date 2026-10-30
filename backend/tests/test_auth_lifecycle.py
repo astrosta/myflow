@@ -22,6 +22,7 @@ from backend.app.gateway.auth.models import PAT_SCOPE_MENU
 from fakes.auth_app import (
     ACCESS_COOKIE_NAME,
     ADMIN_EMAIL,
+    ADMIN_USERNAME,
     ADMIN_PASSWORD,
     USER_EMAIL,
     USER_PASSWORD,
@@ -170,10 +171,10 @@ def test_login_limit_is_counted_per_peer_ip() -> None:
     harness = make_auth_app(max_login_attempts=2, lockout_seconds=300)
     asyncio.run(harness.seed_admin())
 
-    assert harness.login(ADMIN_EMAIL, "wrong-1").status_code == 401
-    assert harness.login(ADMIN_EMAIL, "wrong-2").status_code == 401
+    assert harness.login(ADMIN_USERNAME, "wrong-1").status_code == 401
+    assert harness.login(ADMIN_USERNAME, "wrong-2").status_code == 401
 
-    locked = harness.login(ADMIN_EMAIL, ADMIN_PASSWORD)  # 口令对也不行
+    locked = harness.login(ADMIN_USERNAME, ADMIN_PASSWORD)  # 口令对也不行
     assert locked.status_code == 429
     assert locked.json()["code"] == "login_rate_limited"
 
@@ -187,20 +188,20 @@ def test_x_real_ip_is_only_trusted_from_a_configured_proxy(monkeypatch) -> None:
     for _ in range(2):
         harness.client.post(
             "/api/v1/auth/login/local",
-            json={"email": ADMIN_EMAIL, "password": "wrong"},
+            json={"username": ADMIN_USERNAME, "password": "wrong"},
             headers={"X-Real-IP": "10.0.0.9"},
         )
 
     other = harness.client.post(
         "/api/v1/auth/login/local",
-        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
         headers={"X-Real-IP": "10.0.0.10"},
     )
     assert other.status_code == 200
 
     same = harness.client.post(
         "/api/v1/auth/login/local",
-        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
         headers={"X-Real-IP": "10.0.0.9"},
     )
     assert same.status_code == 429
@@ -214,7 +215,7 @@ def test_an_untrusted_peer_cannot_forge_x_real_ip(monkeypatch) -> None:
     for address in ("10.0.0.1", "10.0.0.2"):
         harness.client.post(
             "/api/v1/auth/login/local",
-            json={"email": ADMIN_EMAIL, "password": "wrong"},
+            json={"username": ADMIN_USERNAME, "password": "wrong"},
             headers={"X-Real-IP": address},
         )
 
@@ -222,7 +223,7 @@ def test_an_untrusted_peer_cannot_forge_x_real_ip(monkeypatch) -> None:
     assert (
         harness.client.post(
             "/api/v1/auth/login/local",
-            json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+            json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
             headers={"X-Real-IP": "10.0.0.3"},
         ).status_code
         == 429
@@ -233,10 +234,10 @@ def test_a_successful_login_clears_the_counter() -> None:
     harness = make_auth_app(max_login_attempts=3, lockout_seconds=300)
     asyncio.run(harness.seed_admin())
 
-    assert harness.login(ADMIN_EMAIL, "wrong").status_code == 401
-    assert harness.login(ADMIN_EMAIL, ADMIN_PASSWORD).status_code == 200
-    assert harness.login(ADMIN_EMAIL, "wrong").status_code == 401
-    assert harness.login(ADMIN_EMAIL, ADMIN_PASSWORD).status_code == 200
+    assert harness.login(ADMIN_USERNAME, "wrong").status_code == 401
+    assert harness.login(ADMIN_USERNAME, ADMIN_PASSWORD).status_code == 200
+    assert harness.login(ADMIN_USERNAME, "wrong").status_code == 401
+    assert harness.login(ADMIN_USERNAME, ADMIN_PASSWORD).status_code == 200
 
 
 # --- §2.15 PAT 的业务规则 ---

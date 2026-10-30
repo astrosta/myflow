@@ -11,7 +11,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -51,9 +51,8 @@ class UserRow(Base):
     （`make_safe_user_id(users.id)`）。改邮箱、改用户名都**不能让桶名跟着变**（§2.2）——
     用户名比邮箱更危险：它看起来"本来就是 id"，很容易被顺手拿去拼路径。
 
-    `email` 与 `username` 是**两个独立的登录标识**（各自 unique、各自小写归一）。
-    登录接受 `identifier`：带 `@` 当邮箱查，否则当用户名查——两个字符集不重叠
-    （用户名不允许 `@`），所以这个判断永远不歧义。
+    `username` 是**唯一的登录标识**（unique、小写归一）。`email` 仅为兼容旧账号和
+    管理资料保留，可空，不参与登录；新注册不再要求邮箱。
 
     `system_role` **没有**唯一索引：§2.7 提到的"admin 部分唯一索引"会禁止第二个 admin，
     而 §2.13 明确要求"不能把最后一个 admin 降级"——那前提就是可以有多个 admin。
@@ -63,8 +62,9 @@ class UserRow(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    email: Mapped[str] = mapped_column(String(254), nullable=False, unique=True, index=True)
-    #: 登录标识之一，也是"给人看的名字"。写入时小写归一（§2.4）。
+    #: 仅资料字段，已不再作为登录标识；新注册可以不填。
+    email: Mapped[str | None] = mapped_column(String(254), nullable=True, unique=True, index=True)
+    #: 唯一登录标识，也是"给人看的名字"。写入时小写归一（§2.4）。
     username: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     system_role: Mapped[str] = mapped_column(String(16), nullable=False, default=DEFAULT_ROLE)
@@ -173,27 +173,14 @@ def normalize_username(raw: str) -> str:
     return value
 
 
-def normalize_identifier(raw: str) -> str:
-    """登录标识：带 `@` 当邮箱，否则当用户名。返回的是**规范化之后**的查库键。"""
-    if not isinstance(raw, str):
-        raise InvalidUsername(f"identifier must be a string, got {type(raw).__name__}")
-    if "@" in raw:
-        return normalize_email(raw)
-    return normalize_username(raw)
-
-
 class LoginRequest(BaseModel):
-    """登录只认 **identifier**：邮箱或用户名。"""
+    """登录只认 **username + password**。"""
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
 
-    #: 旧的 `email` 字段名仍然接受，新客户端只发 `identifier`。
-    #: 上界是**防超大 body**用的，不是业务规则——"太长"由领域层报具体错误。
-    identifier: str = Field(
-        min_length=1, max_length=_FIELD_GUARD, validation_alias=AliasChoices("identifier", "email")
-    )
-    #: 登录只比对 hash，不做策略校验：100 字节的口令该得到"密码不对"，
-    #: 空口令也一样（`verify_password` 返回 False）——而不是一句"格式错"。
+    #: 用户名上界是防超大 body；真正的形状规则由 normalize_username 报。
+    username: str = Field(min_length=1, max_length=_FIELD_GUARD)
+    #: 登录只比对 hash，不做策略校验：空口令也会得到"密码不对"。
     password: str = Field(max_length=_PASSWORD_GUARD)
     remember_me: bool = False
 
@@ -203,16 +190,15 @@ class _RegistrationRequest(BaseModel):
 
     模型层的 `max_length` 会先抛 pydantic 的 `Request validation failed`，
     用户只知道"错了"、不知道"错在哪"。所以这里的上界给得**比业务规则宽**，
-    让 `normalize_email` / `normalize_username` / `validate_password_policy`
-    去报 `invalid_email` / `invalid_username` / `password_too_short`。
+    让 `normalize_username` / `validate_password_policy` 去报
+    `invalid_username` / `password_too_short`。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    # 连 `min_length=1` 都不加：空串是**规则**问题，让 `normalize_*` 报
-    # `invalid_email` / `invalid_username` / `invalid_password`（说清是哪一条），
-    # 而不是 pydantic 那句"Request validation failed"。
-    email: str = Field(max_length=_FIELD_GUARD)
+    # 连 `min_length=1` 都不加：空串是**规则**问题，让 `normalize_username` /
+    # `validate_password_policy` 报 `invalid_username` / `password_too_short`
+    # （说清是哪一条），而不是 pydantic 那句"Request validation failed"。
     username: str = Field(max_length=_FIELD_GUARD)
     password: str = Field(max_length=_PASSWORD_GUARD)
 
@@ -251,7 +237,7 @@ class UserResponse(BaseModel):
     """没有 `password_hash`，没有 `token_version`，没有 `disabled`。"""
 
     id: str
-    email: str
+    email: str | None = None
     username: str
     system_role: Literal["admin", "user"]
 
@@ -278,7 +264,7 @@ class OkResponse(BaseModel):
 def user_to_wire(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"],
-        "email": row["email"],
+        "email": row.get("email"),
         "username": row["username"],
         "system_role": row["system_role"],
     }

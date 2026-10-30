@@ -7,7 +7,7 @@ import { ApiError } from "@/core/api/auth";
  *
  * 1. **按 `code` 判断，不按 `detail`**：detail 是给人看的英文措辞，随时可能变。
  * 2. 只有"服务端比前端更清楚细节"的那几个才直接展示 detail ——
- *    邮箱是哪条规则没过、口令差几位、超了几个字节，前端算不出来。
+ *    用户名是哪条规则没过、口令差几位、超了几个字节，前端算不出来。
  * 3. 每个失败都要给出**下一步**：去注册 / 找管理员 / 稍后重试。
  */
 
@@ -23,9 +23,9 @@ const SHOW_SERVER_DETAIL = new Set([
 
 const TEXTS: Record<string, string> = {
   // 登录（`auth.local.specific_errors=true` 时后端会分得这么细）
-  invalid_credentials: "邮箱或密码不对",
-  // 登录标识是邮箱**或**用户名，所以文案不指名是哪一个（后端也不指名）
-  account_not_found: "这个账号还没有注册",
+  invalid_credentials: "用户名或密码不对",
+  // 登录标识只有用户名；没注册时后端也只回显用户名
+  account_not_found: "这个用户名还没有注册",
   // 旧版后端用的名字；留着是为了"前端先上线、后端后重启"的窗口期
   email_not_registered: "这个账号还没有注册",
   wrong_password: "密码不对，再试一次",
@@ -33,7 +33,7 @@ const TEXTS: Record<string, string> = {
   account_deleted: "账号正在删除流程里，回收期内管理员可以恢复",
   login_rate_limited: "尝试次数太多，稍后再试",
   // 注册 / 初始化
-  user_already_exists: "这个邮箱已经注册过了，直接登录即可",
+  user_already_exists: "这个账号已经注册过了，直接登录即可",
   username_taken: "这个用户名被占用了，换一个",
   registration_closed: "这个部署没有开放自助注册，请联系管理员建号",
   admin_already_exists: "已经初始化过了，直接登录即可",
@@ -72,7 +72,7 @@ export function authErrorMessage(error: unknown): string {
 /**
  * 登录失败时要不要顺手给一个"去注册"的入口。
  *
- * 只在后端**明确说了"这个邮箱没有账号"**时才给——`specific_errors=false` 的部署
+ * 只在后端**明确说了"这个用户名没有账号"**时才给——`specific_errors=false` 的部署
  * 会把它收敛成 invalid_credentials，那时这里返回 false，UI 也就不会替用户
  * 断言"你没注册过"。
  */

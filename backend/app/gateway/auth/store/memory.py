@@ -69,7 +69,7 @@ class MemoryUserStore(UserStore):
         self,
         *,
         user_id: str,
-        email: str,
+        email: str | None,
         username: str,
         password_hash: str | None,
         system_role: str = "user",
@@ -77,7 +77,7 @@ class MemoryUserStore(UserStore):
     ) -> dict:
         if user_id in self._users:
             raise UserAlreadyExistsError(f"user {user_id!r} already exists", field="id")
-        if any(row["email"] == email for row in self._users.values()):
+        if email is not None and any(row["email"] == email for row in self._users.values()):
             raise UserAlreadyExistsError(f"email {email!r} already exists", field="email")
         if any(row["username"] == username for row in self._users.values()):
             raise UserAlreadyExistsError(f"username {username!r} is taken", field="username")
@@ -99,7 +99,7 @@ class MemoryUserStore(UserStore):
         return deepcopy(row)
 
     async def create_first_admin(
-        self, *, user_id: str, email: str, username: str, password_hash: str | None
+        self, *, user_id: str, email: str | None, username: str, password_hash: str | None
     ) -> dict | None:
         if await self.active_admin_count() > 0:
             return None

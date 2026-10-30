@@ -15,8 +15,9 @@ import { apiFetch, apiUrl } from "./base";
 
 export interface AuthUser {
   id: string;
-  email: string;
-  /** 登录标识之一，也是"给人看的名字"（`2.4）。改它不换桶。 */
+  /** 旧账号可能保留邮箱；新注册账号为 null。 */
+  email: string | null;
+  /** 唯一登录标识，也是"给人看的名字"（§2.4）。改它不换桶。 */
   username: string;
   system_role: "admin" | "user";
 }
@@ -132,27 +133,24 @@ export async function fetchCurrentUser(): Promise<AuthUser | null> {
   }
 }
 
-/**
- * 登录。`identifier` 是**邮箱或用户名**（`2.4 的两个登录标识）——
- * 两者都不含歧义：用户名不允许 `@`，所以后端按"有没有 @"分派到不同的 unique 索引。
- */
+/** 登录只认用户名 + 密码。 */
 export function loginLocal(
-  identifier: string,
+  username: string,
   password: string,
   rememberMe = false,
 ): Promise<LoginResponse> {
   return request<LoginResponse>("/v1/auth/login/local", {
     method: "POST",
-    body: JSON.stringify({ identifier, password, remember_me: rememberMe }),
+    body: JSON.stringify({ username, password, remember_me: rememberMe }),
   });
 }
 
 /** 首次初始化：只在库里还没有 admin 时可用，否则 409 admin_already_exists */
 /** 自助注册；`auth.allow_registration` 为假时 403 registration_closed */
-export function register(email: string, username: string, password: string): Promise<AuthUser> {
+export function register(username: string, password: string): Promise<AuthUser> {
   return request<AuthUser>("/v1/auth/register", {
     method: "POST",
-    body: JSON.stringify({ email, username, password }),
+    body: JSON.stringify({ username, password }),
   });
 }
 

@@ -109,7 +109,7 @@ class SqlUserStore(UserStore):
         self,
         *,
         user_id: str,
-        email: str,
+        email: str | None,
         username: str,
         password_hash: str | None,
         system_role: str = "user",
@@ -150,18 +150,20 @@ class SqlUserStore(UserStore):
 
     @staticmethod
     async def _collision(
-        session, *, user_id: str, email: str, username: str
+        session, *, user_id: str, email: str | None, username: str
     ) -> UserAlreadyExistsError | None:
         if await session.get(UserRow, user_id) is not None:
             return UserAlreadyExistsError(f"user {user_id!r} already exists", field="id")
-        if await session.scalar(select(UserRow.id).where(UserRow.email == email)) is not None:
+        if email is not None and await session.scalar(
+            select(UserRow.id).where(UserRow.email == email)
+        ) is not None:
             return UserAlreadyExistsError(f"email {email!r} already exists", field="email")
         if await session.scalar(select(UserRow.id).where(UserRow.username == username)) is not None:
             return UserAlreadyExistsError(f"username {username!r} is taken", field="username")
         return None
 
     async def create_first_admin(
-        self, *, user_id: str, email: str, username: str, password_hash: str | None
+        self, *, user_id: str, email: str | None, username: str, password_hash: str | None
     ) -> dict | None:
         """**条件插入**：`INSERT ... SELECT ... WHERE NOT EXISTS (admin)`。
 

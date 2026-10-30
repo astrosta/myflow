@@ -39,13 +39,12 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     asyncio.run(close_engine())
 
 
-async def _seed_admin(email: str) -> dict:
+async def _seed_admin(username: str) -> dict:
     store = make_user_store(get_session_factory())
     service = AuthService(store)
     app_config = get_app_config()
     user, _token, _expires = await service.initialize(
-        email=email,
-        username=email.split("@", 1)[0],
+        username=username,
         password=OLD_PASSWORD,
         settings=AuthSettings.from_config(app_config),
     )
@@ -55,10 +54,10 @@ async def _seed_admin(email: str) -> dict:
 def test_reset_admin_writes_a_credential_file_and_prints_only_the_path(
     config: Path, capsys, tmp_path: Path
 ) -> None:
-    seed = asyncio.run(_boot_and_seed("admin@example.com"))
+    seed = asyncio.run(_boot_and_seed("admin"))
     credentials = tmp_path / "creds.txt"
 
-    code = asyncio.run(reset_admin.reset_admin(email=None, credentials_file=credentials))
+    code = asyncio.run(reset_admin.reset_admin(username=None, credentials_file=credentials))
 
     assert code == 0
     out = capsys.readouterr().out
@@ -89,7 +88,7 @@ def test_reset_admin_writes_a_credential_file_and_prints_only_the_path(
 def test_reset_admin_refuses_when_there_is_no_admin(config: Path, capsys, tmp_path: Path) -> None:
     asyncio.run(_init_and_close())
 
-    code = asyncio.run(reset_admin.reset_admin(email=None, credentials_file=tmp_path / "creds.txt"))
+    code = asyncio.run(reset_admin.reset_admin(username=None, credentials_file=tmp_path / "creds.txt"))
 
     assert code == 3
     assert "no admin account found" in capsys.readouterr().err
@@ -102,7 +101,7 @@ def test_reset_admin_refuses_when_auth_is_off(tmp_path: Path, monkeypatch, capsy
     path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
     monkeypatch.setenv("MYFLOW_CONFIG_PATH", str(path))
 
-    code = asyncio.run(reset_admin.reset_admin(email=None, credentials_file=tmp_path / "creds.txt"))
+    code = asyncio.run(reset_admin.reset_admin(username=None, credentials_file=tmp_path / "creds.txt"))
 
     assert code == 2
     assert "auth.enabled=false" in capsys.readouterr().err
@@ -114,10 +113,10 @@ async def _init_and_close() -> None:
     await close_engine()
 
 
-async def _boot_and_seed(email: str) -> dict:
+async def _boot_and_seed(username: str) -> dict:
     """种一个 admin，然后把引擎关掉——`reset_admin` 自己会再开一次。"""
     await init_engine_from_config(get_app_config().database)
     try:
-        return await _seed_admin(email)
+        return await _seed_admin(username)
     finally:
         await close_engine()

@@ -16,11 +16,10 @@ from backend.app.gateway.app import create_app
 from backend.app.gateway.auth import AuthSettings
 from backend.app.gateway.auth_middleware import PUBLIC_EXACT_PATHS
 from fakes.auth_app import (
-    ADMIN_EMAIL,
     ADMIN_PASSWORD,
+    ADMIN_USERNAME,
     TEST_SECRET,
-    USER_EMAIL,
-    default_username,
+    USER_USERNAME,
     make_auth_app,
 )
 
@@ -97,7 +96,7 @@ def test_login_response_carries_no_token_string() -> None:
     harness = make_auth_app()
     asyncio.run(harness.seed_admin())
 
-    response = harness.login(ADMIN_EMAIL, ADMIN_PASSWORD)
+    response = harness.login(ADMIN_USERNAME, ADMIN_PASSWORD)
 
     assert response.status_code == 200
     body = response.json()
@@ -112,12 +111,12 @@ def test_login_failures_name_the_specific_reason() -> None:
     harness = make_auth_app()
     asyncio.run(harness.seed_admin())
 
-    unknown = harness.login("nobody@example.com", ADMIN_PASSWORD)
+    unknown = harness.login("nobody", ADMIN_PASSWORD)
     assert unknown.status_code == 401
     assert unknown.json()["code"] == "account_not_found"
-    assert "nobody@example.com" in unknown.json()["detail"]
+    assert "nobody" in unknown.json()["detail"]
 
-    wrong = harness.login(ADMIN_EMAIL, "wrong-password")
+    wrong = harness.login(ADMIN_USERNAME, "wrong-password")
     assert wrong.status_code == 401
     assert wrong.json()["code"] == "wrong_password"
     assert "wrong-password" not in wrong.text  # 口令永不回显
@@ -128,8 +127,8 @@ def test_the_enumeration_safe_mode_collapses_every_reason() -> None:
     harness = make_auth_app(specific_errors=False)
     asyncio.run(harness.seed_admin())
 
-    unknown = harness.login("nobody@example.com", ADMIN_PASSWORD)
-    wrong = harness.login(ADMIN_EMAIL, "wrong-password")
+    unknown = harness.login("nobody", ADMIN_PASSWORD)
+    wrong = harness.login(ADMIN_USERNAME, "wrong-password")
 
     assert unknown.status_code == wrong.status_code == 401
     assert unknown.json()["code"] == wrong.json()["code"] == "invalid_credentials"
@@ -140,25 +139,25 @@ def test_setup_status_and_initialize_are_one_shot() -> None:
     harness = make_auth_app()
     assert harness.client.get("/api/v1/auth/setup-status").json() == {"needs_setup": True}
 
-    first = harness.initialize(ADMIN_EMAIL, ADMIN_PASSWORD)
+    first = harness.initialize(ADMIN_USERNAME, ADMIN_PASSWORD)
     assert first.status_code == 201
     assert first.json()["system_role"] == "admin"
-    assert first.json()["username"] == default_username(ADMIN_EMAIL)
+    assert first.json()["username"] == ADMIN_USERNAME
     assert harness.client.get("/api/v1/auth/setup-status").json() == {"needs_setup": False}
 
-    second = harness.initialize("other@example.com", ADMIN_PASSWORD)
+    second = harness.initialize("otheradmin", ADMIN_PASSWORD)
     assert second.status_code == 409
     assert second.json()["code"] == "admin_already_exists"
 
 
 def test_registration_follows_the_switch() -> None:
     closed = make_auth_app(allow_registration=False)
-    denied = closed.register(USER_EMAIL, "user-password")
+    denied = closed.register(USER_USERNAME, "user-password")
     assert denied.status_code == 403
     assert denied.json()["code"] == "registration_closed"
 
     opened = make_auth_app(allow_registration=True)
-    created = opened.register(USER_EMAIL, "user-password", username="Alice")
+    created = opened.register("Alice", "user-password")
     assert created.status_code == 201
     assert created.json()["system_role"] == "user"
     assert created.json()["username"] == "alice", "用户名写入时小写归一"
@@ -168,7 +167,7 @@ def test_a_weak_password_is_422_without_echoing_it() -> None:
     harness = make_auth_app(allow_registration=True)
 
     weak = "zqx"
-    short = harness.register(USER_EMAIL, weak)
+    short = harness.register(USER_USERNAME, weak)
     assert short.status_code == 422
     assert short.json()["code"] == "password_too_short"
     assert "at least 8" in short.json()["detail"] and "got 3" in short.json()["detail"]
@@ -176,7 +175,7 @@ def test_a_weak_password_is_422_without_echoing_it() -> None:
 
     # 超过 bcrypt 的 72 字节上限：说清超了几个字节，同样不回显口令
     over_long = "p" * 100
-    too_long = harness.register(USER_EMAIL, over_long)
+    too_long = harness.register(USER_USERNAME, over_long)
     assert too_long.status_code == 422
     assert too_long.json()["code"] == "password_too_long"
     assert "72 bytes" in too_long.json()["detail"] and "100 bytes" in too_long.json()["detail"]
@@ -187,7 +186,7 @@ def test_extra_fields_are_rejected() -> None:
     harness = make_auth_app()
     response = harness.client.post(
         "/api/v1/auth/login/local",
-        json={"identifier": ADMIN_EMAIL, "password": ADMIN_PASSWORD, "is_admin": True},
+        json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD, "is_admin": True},
     )
 
     assert response.status_code == 422
@@ -219,7 +218,7 @@ def test_needs_setup_only_allows_me_and_change_password() -> None:
         harness.service.admin_reset_password(actor_id=admin["id"], user_id=user["id"])
     )
     harness.clear_cookies()
-    assert harness.login(USER_EMAIL, new_password).status_code == 200
+    assert harness.login(USER_USERNAME, new_password).status_code == 200
 
     blocked = harness.client.get("/api/threads")
     assert blocked.status_code == 403
@@ -232,7 +231,7 @@ def test_needs_setup_only_allows_me_and_change_password() -> None:
     )
     assert changed.status_code == 200
     harness.clear_cookies()
-    assert harness.login(USER_EMAIL, "brand-new-password").status_code == 200
+    assert harness.login(USER_USERNAME, "brand-new-password").status_code == 200
     assert harness.client.get("/api/threads").status_code == 200
 
 
@@ -343,7 +342,7 @@ def test_a_stale_cookie_cannot_lock_the_auth_pages() -> None:
     assert browser.get("/api/v1/auth/setup-status").json() == {"needs_setup": False}
     assert browser.get("/api/v1/auth/providers").status_code == 200
 
-    failed = browser.login("nobody@example.com", ADMIN_PASSWORD)
+    failed = browser.login("nobody", ADMIN_PASSWORD)
     assert failed.status_code == 401
     assert failed.json()["code"] == "account_not_found"
 
@@ -353,7 +352,7 @@ def test_a_stale_cookie_cannot_lock_the_auth_pages() -> None:
     assert blocked.json()["code"] == "unauthenticated"
 
     # 正确登录照常成功，响应里带来的是一枚**新的** cookie
-    signed_in = browser.login(ADMIN_EMAIL, ADMIN_PASSWORD)
+    signed_in = browser.login(ADMIN_USERNAME, ADMIN_PASSWORD)
     assert signed_in.status_code == 200
     issued = [v for v in signed_in.headers.get_list("set-cookie") if v.startswith("access_token=")]
     assert issued, "登录必须重新种 cookie"

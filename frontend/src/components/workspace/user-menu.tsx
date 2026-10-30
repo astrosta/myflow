@@ -58,7 +58,7 @@ export function UserMenu() {
         </span>
         <span
           className="min-w-0 flex-1 truncate text-sm text-neutral-700"
-          title={user.username + " · " + user.email}
+          title={user.email ? user.username + " · " + user.email : user.username}
         >
           {user.username}
         </span>

@@ -246,15 +246,13 @@ M4 时代的数据都在 `users/default/`，换名字等于让老用户"数据�
 
 | 情形 | HTTP | `code` | detail 里有什么 |
 |---|---|---|---|
-| 邮箱形状不对 | 422 | `invalid_email` | 哪条规则没过（缺 @、域名没有点、有空格…），并回显你刚敲的值 |
 | 用户名形状不对 | 422 | `invalid_username` | 是哪一条（3-32 位 / 字符集 / 首尾 / 保留字） |
 | 用户名被占 | 409 | `username_taken` | 是哪个用户名，让你换一个 |
 | 口令太短 | 422 | `password_too_short` | 最少 8 字符 + 实际几位 |
 | 口令太长 | 422 | `password_too_long` | 上限 72 **字节**（UTF-8）+ 实际字节数 |
-| 邮箱已注册 | 409 | `user_already_exists` | 是哪个邮箱，并提示直接登录 |
 | 自助注册关闭 | 403 | `registration_closed` | 让管理员建号 |
 | 已有 admin 再走 setup | 409 | `admin_already_exists` | 提示去登录（**不点名**现有 admin，这条路由公开） |
-| 没这个账号 | 401 | `account_not_found` | 回显你敲的**标识**（邮箱或用户名），提示先注册。不说是哪一种没注册 |
+| 没这个账号 | 401 | `account_not_found` | 回显你敲的用户名，提示先注册 |
 | 密码不对 | 401 | `wrong_password` | 只说不对，**永不回显口令** |
 | 账号被禁用 / 在回收期 | 403 | `account_disabled` / `account_deleted` | 找管理员恢复。**只在口令正确时才给这个答案** |
 | 失败次数超限 | 429 | `login_rate_limited` | 剩余秒数 + 响应头 `Retry-After` |
@@ -264,23 +262,20 @@ M4 时代的数据都在 `users/default/`，换名字等于让老用户"数据�
 两条不变量：**明文口令永不回显**（也不进日志、不进库）；
 **账号状态（禁用 / 回收期）只在口令正确之后才透露**——不知道口令的人不该读到"这个账号存在且被禁用了"。
 
-想要"不透露某个邮箱（或用户名）是否注册"就把 `auth.local.specific_errors` 设成 `false`：
+想要"不透露某个用户名是否注册"就把 `auth.local.specific_errors` 设成 `false`：
 登录的四种失败（没这个账号 / 密码错 / 被禁用 / 回收期）会收敛成同一个 401 `invalid_credentials`
 和同一句 detail。代价是用户不知道为什么失败。
 
-### 用户名：第二个登录标识
+### 用户名：唯一登录标识
 
-`users.username` 不是"显示名"，它是一个**登录标识**（§2.4）：
+`users.username` 不是"显示名"，它是**唯一登录标识**（§2.4）：
 
 - **形状**：3-32 字符，小写字母/数字/下划线/点/连字符，首尾必须是字母或数字；
   `default` / `anonymous` / `auth-disabled` / `system` / `internal` 是保留字。
 - **大小写不敏感**：`Alice` 存成 `alice`，登录时敲 `ADMIN` 也进得去。
-- **两个标识各自唯一**：邮箱撞车 409 `user_already_exists`，用户名撞车 409
-  `username_taken`——要改的字段不同，code 也不同。
-- **改用户名不换桶**：桶名只来自 `users.id`（§2.2）。这条比改邮箱更容易写错，
-  因为用户名看起来"本来就是 id"。
-- **旧库自动回填**：`0003_users_username` 从邮箱 local part 派生（撞名加 `-2`），
-  再建唯一索引、置 NOT NULL。升级前不用手工准备数据。
+- **用户名唯一且大小写不敏感**：撞名是 409 `username_taken`。
+- **改用户名不换桶**：桶名只来自 `users.id`（§2.2）。
+- **邮箱不再是登录标识**：`users.email` 仅保留旧账号资料，可为空；新注册不要求邮箱。
 
 改名的入口是 **`PATCH /api/v1/auth/me`**：body `{"username": "..."}` → `UserResponse`。
 仅会话（PAT → 403 `session_required`）、**不动令牌**（别的设备不用重新登录）、
@@ -324,7 +319,7 @@ X-MyFlow-Owner-User-Id:  <owner 的存储 ID>
 
 - 没有 admin 时服务**不**自动建号，只提示访问 `/setup`（`GET /api/v1/auth/setup-status`）。
 - `POST /api/v1/auth/initialize` 只在零 admin 时可用，并发输家拿 409 `admin_already_exists`。
-- 忘记密码：`uv run python -m backend.app.gateway.auth.reset_admin [--email ...] [--credentials-file ...]`
+- 忘记密码：`uv run python -m backend.app.gateway.auth.reset_admin [--username ...] [--credentials-file ...]`
   → 随机口令、`token_version += 1`、`needs_setup=true`，凭据写进 `0600` 文件，
   **stdout 只打路径不打明文**。
 
@@ -390,9 +385,9 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `POST` | `/api/admin/skills/reviews/{submission_id}/approve` / `reject` | 批准/驳回提交（`admin`） |
 | `POST` | `/api/admin/skills/{skill_id}/unpublish` / `activate` | 下架/切换公共激活版本（`admin`） |
 | `GET` | `/api/v1/auth/setup-status` | 库里有没有 admin（公开） |
-| `POST` | `/api/v1/auth/initialize` | 建第一个 admin（公开，且只在零 admin 时；要 email + username + password） |
-| `POST` | `/api/v1/auth/login/local` | 本地登录（公开，响应体不含 token）。`identifier` = **邮箱或用户名**，旧的 `email` 字段名仍接受 |
-| `POST` | `/api/v1/auth/register` | 自助注册（公开，受 `auth.allow_registration` 控制；同样要 username） |
+| `POST` | `/api/v1/auth/initialize` | 建第一个 admin（公开，且只在零 admin 时；要 username + password） |
+| `POST` | `/api/v1/auth/login/local` | 本地登录（公开，响应体不含 token）。body 为 `username` + `password` |
+| `POST` | `/api/v1/auth/register` | 自助注册（公开，受 `auth.allow_registration` 控制；username + password） |
 | `POST` | `/api/v1/auth/logout` | 清 cookie（公开，幂等） |
 | `GET` | `/api/v1/auth/providers` | 有哪些登录方式（公开；OIDC 不在 M9） |
 | `GET` | `/api/v1/auth/me` | 当前用户（含 `username`；**仅会话**，PAT → 403 `session_required`） |

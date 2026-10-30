@@ -9,12 +9,12 @@ function apiError(code: string | null, detail = "server detail", status = 401, r
 
 describe("authErrorMessage", () => {
   it("把后端的 code 翻成人话，而不是把英文 detail 甩给用户", () => {
-    expect(authErrorMessage(apiError("invalid_credentials"))).toBe("邮箱或密码不对");
-    expect(authErrorMessage(apiError("account_not_found"))).toBe("这个账号还没有注册");
+    expect(authErrorMessage(apiError("invalid_credentials"))).toBe("用户名或密码不对");
+    expect(authErrorMessage(apiError("account_not_found"))).toBe("这个用户名还没有注册");
     // 旧版后端的名字仍然翻译（前端先上线、后端后重启的窗口期）
     expect(authErrorMessage(apiError("email_not_registered"))).toBe("这个账号还没有注册");
     expect(authErrorMessage(apiError("wrong_password"))).toBe("密码不对，再试一次");
-    expect(authErrorMessage(apiError("user_already_exists"))).toBe("这个邮箱已经注册过了，直接登录即可");
+    expect(authErrorMessage(apiError("user_already_exists"))).toBe("这个账号已经注册过了，直接登录即可");
     expect(authErrorMessage(apiError("username_taken", "…", 409))).toBe("这个用户名被占用了，换一个");
     expect(authErrorMessage(apiError("account_disabled", "…", 403))).toContain("管理员");
     expect(authErrorMessage(apiError("unauthenticated"))).toBe("登录状态已失效，请重新登录");

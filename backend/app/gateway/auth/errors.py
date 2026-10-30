@@ -44,10 +44,10 @@ class AuthUnavailable(CodedError):
 
 
 class InvalidCredentials(CodedError):
-    """**收敛形态**：邮箱不存在 / 密码错 / 账号禁用都长这样。
+    """**收敛形态**：用户名不存在 / 密码错 / 账号禁用都长这样。
 
     只在 `auth.local.specific_errors=false` 时使用——那是"宁可让用户多点两次，
-    也不让人探测某个邮箱有没有注册"的部署选择。默认（true）走下面那几个具体错误。
+    也不让人探测某个用户名有没有注册"的部署选择。默认（true）走下面那几个具体错误。
     """
 
     status_code: ClassVar[int] = 401
@@ -55,11 +55,9 @@ class InvalidCredentials(CodedError):
 
 
 class AccountNotFound(CodedError):
-    """登录标识（邮箱**或**用户名）在库里没有账号。
+    """登录用户名在库里没有账号。
 
-    告诉用户"去注册"，而不是让他反复试密码。名字里**不出现** email：
-    用户敲的可能是用户名，而且"是邮箱没注册还是用户名没注册"这件事不该被回答——
-    说了等于把两个命名空间都交出去探测。
+    告诉用户"去注册"，而不是让他反复试密码。
     """
 
     status_code: ClassVar[int] = 401
@@ -67,7 +65,7 @@ class AccountNotFound(CodedError):
 
 
 class WrongPassword(CodedError):
-    """邮箱对、口令错。**不告诉用户"第几位错了"**——口令本身永远不回显。"""
+    """用户名对、口令错。**不告诉用户"第几位错了"**——口令本身永远不回显。"""
 
     status_code: ClassVar[int] = 401
     code: ClassVar[str] = "wrong_password"
@@ -105,7 +103,7 @@ class InvalidUsername(CodedError):
 
 
 class UsernameTaken(CodedError):
-    """用户名被占了。和"邮箱已注册"分开报——用户要改的字段不一样。"""
+    """用户名被占了。"""
 
     status_code: ClassVar[int] = 409
     code: ClassVar[str] = "username_taken"
