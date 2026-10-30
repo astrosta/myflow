@@ -490,6 +490,41 @@ git commit -m "feat(memory): add DB-backed profile and personalization"
 
 ---
 
+### Task 10: Middleware capture path
+
+**Files:**
+- Create: `backend/packages/harness/agentkit/agents/middlewares/openviking_memory_middleware.py`
+- Test: `backend/tests/test_openviking_middleware.py`
+
+**Interfaces:**
+- Produces: `OpenVikingMemoryMiddleware(facade, user_id=None, agent_name=None)`.
+- `abefore_agent` classifies the latest real user message, stores `capture_decision` in `runtime.context`, and publishes a human message when CAPTURE.
+- `aafter_model` publishes the newest visible AI message when the stored decision is CAPTURE.
+- `awrap_tool_call` publishes a returned ToolMessage after the handler succeeds.
+
+- [ ] **Step 1: Write failing tests with a fake facade**
+- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 3: Implement the middleware**
+- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 5: Commit**
+
+### Task 11: Profile HTTP API
+
+**Files:**
+- Create: `backend/app/gateway/routers/openviking_profile.py`
+- Test: `backend/tests/test_openviking_profile_api.py`
+
+**Interfaces:**
+- Produces: `router` with GET/PATCH/DELETE `/memory/profile`.
+- Uses `ProfileService` injected on `app.state.profile_service`; returns `{fields, etag, updated_at}`.
+- ETag conflicts return 409 `profile_conflict`; unknown fields return 422.
+
+- [ ] **Step 1: Write failing route tests**
+- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 3: Implement the router**
+- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 5: Commit**
+
 ## Verification
 
 - `.venv/Scripts/python.exe -m pytest backend/tests/test_openviking_contracts.py backend/tests/test_openviking_policy.py backend/tests/test_openviking_adapter.py backend/tests/test_openviking_schema.py backend/tests/test_openviking_store.py backend/tests/test_openviking_session.py backend/tests/test_openviking_worker.py backend/tests/test_openviking_profile.py -q`
