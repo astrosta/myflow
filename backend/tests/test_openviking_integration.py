@@ -13,6 +13,7 @@ from agentkit.agents.memory.openviking.adapter import MemoryMessageAdapter
 from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
 from agentkit.agents.memory.openviking.facade import MemoryFacade
 from agentkit.agents.memory.openviking.profile import PersonalizationService, ProfileService
+from agentkit.agents.memory.openviking.recall import RecallService
 from agentkit.agents.memory.openviking.session import SessionManager
 from agentkit.agents.memory.openviking.store import CaptureDedupStore, MemorySyncStore
 from agentkit.agents.memory.openviking.stream import InMemoryCaptureStream, MemoryMessagePublisher
@@ -50,6 +51,24 @@ class Client:
     async def batch_add_messages(self, session_id: str, messages: list[dict]) -> dict:
         self.appended.extend(messages)
         return {"messages": [{"id": "ov-1"}]}
+
+    async def find(self, **kwargs) -> dict:
+        return {
+            "memories": [
+                {
+                    "uri": "viking://user/u_hash/memories/preferences/style.md",
+                    "abstract": "喜欢简洁",
+                    "score": 0.7,
+                    "level": 0,
+                }
+            ]
+        }
+
+    async def read(self, uri: str) -> str:
+        return "content"
+
+    async def overview(self, uri: str) -> str:
+        return "overview"
 
 
 @pytest_asyncio.fixture
@@ -89,6 +108,7 @@ async def facade(tmp_path: Path):
         worker=worker,
         profile=profile,
         personalization=personalization,
+        recall=RecallService(client),
     )
     yield service, client, stream
     await engine.dispose()
@@ -113,3 +133,6 @@ async def test_facade_profile(facade) -> None:
     assert view.fields["identity.preferred_name"] == "小王"
     personalization = await service.get_personalization("u1")
     assert personalization.identity.content == ""
+
+    hits = await service.search("u1", "style", memory_types=["preferences"], limit=5)
+    assert hits[0].memory_type == "preferences"
