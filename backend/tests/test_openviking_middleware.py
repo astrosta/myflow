@@ -7,12 +7,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from agentkit.agents.memory.openviking.contracts import (
-    PersonalizationDocument,
-    PersonalizationView,
-    SessionRef,
-    TurnDecision,
-)
+from agentkit.agents.memory.openviking.contracts import SessionRef, TurnDecision
 from agentkit.agents.middlewares.openviking_memory_middleware import OpenVikingMemoryMiddleware
 from agentkit.runtime.run_finalizers import (
     clear_run_finalizers,
@@ -27,9 +22,6 @@ class FakeFacade:
         self.ai: list = []
         self.tool: list = []
         self.turn_ends: list = []
-        self.profile_fields: dict = {}
-        self.profile_etag = "etag-1"
-        self.profile_error: Exception | None = None
         self.publish_error: Exception | None = None
         self.ref = SessionRef(
             user_id="u1",
@@ -46,17 +38,6 @@ class FakeFacade:
 
     async def resolve_capture_context(self, user_id: str, thread_id: str) -> SessionRef:
         return self.ref
-
-    async def get_personalization(self, user_id):
-        if self.profile_error is not None:
-            raise self.profile_error
-        return PersonalizationView(
-            profile_fields=dict(self.profile_fields),
-            identity=PersonalizationDocument(content="", source="identity.md", sha256="i"),
-            soul=PersonalizationDocument(content="", source="soul.md", sha256="s"),
-            profile_etag=self.profile_etag,
-            digest="digest",
-        )
 
     async def publish_human(self, session, turn_id, message):
         if self.publish_error is not None:
@@ -134,38 +115,21 @@ async def test_tool_message_is_published_after_handler() -> None:
 
 
 @pytest.mark.asyncio
-async def test_profile_is_injected_and_replaced_by_etag() -> None:
+async def test_middleware_does_not_inject_a_profile_message() -> None:
     facade = FakeFacade()
-    facade.profile_fields = {"identity.preferred_name": "小王"}
     middleware = OpenVikingMemoryMiddleware(facade)
     context = {"user_id": "u1", "thread_id": "t1", "run_id": "r1"}
     human = HumanMessage(content="我住杭州", id="h1")
 
     update = await middleware.abefore_agent({"messages": [human]}, runtime(context))
-    assert update is not None
-    messages = update["messages"]
-    assert messages[0].id == "__user_profile__"
-    assert messages[-1] is human
-    assert messages[0].additional_kwargs["memory_profile"] is True
-    assert messages[0].additional_kwargs["memory_profile_etag"] == "etag-1"
-    assert "小王" in messages[0].content
-    assert "<memory-context" in messages[0].content
 
-    again = await middleware.abefore_agent({"messages": messages}, runtime(context))
-    assert again is None
-
-    facade.profile_etag = "etag-2"
-    facade.profile_fields = {"identity.preferred_name": "小李"}
-    changed = await middleware.abefore_agent({"messages": messages}, runtime(context))
-    assert changed is not None
-    assert changed["messages"][0].additional_kwargs["memory_profile_etag"] == "etag-2"
-    assert len([m for m in changed["messages"] if m.id == "__user_profile__"]) == 1
+    assert update is None
+    assert facade.human == [human]
 
 
 @pytest.mark.asyncio
-async def test_profile_failure_and_publish_failure_do_not_break_the_turn() -> None:
+async def test_publish_failure_does_not_break_the_turn() -> None:
     facade = FakeFacade()
-    facade.profile_error = RuntimeError("db down")
     facade.publish_error = RuntimeError("redis down")
     middleware = OpenVikingMemoryMiddleware(facade)
     context = {"user_id": "u1", "thread_id": "t1", "run_id": "r1"}

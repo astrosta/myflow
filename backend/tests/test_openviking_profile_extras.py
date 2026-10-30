@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.memory.openviking.contracts import MemoryHit
 from agentkit.agents.memory.openviking.onboarding import OnboardingService
-from agentkit.agents.memory.openviking.profile import ProfileService
+from agentkit.agents.memory.openviking.profile import ProfileService, render_profile_prompt
 from agentkit.agents.memory.openviking.suggestions import (
     ProfileSuggester,
     ProfileSuggestionStore,
@@ -49,6 +49,24 @@ async def stack(tmp_path: Path):
     suggestions = ProfileSuggester(store, profile, facade)
     yield profile, onboarding, suggestions, facade
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_profile_prompt_uses_user_profile_tag(stack) -> None:
+    profile, _onboarding, _suggestions, _facade = stack
+    snapshot = await profile.get_snapshot("u1")
+    snapshot = await profile.patch(
+        "u1",
+        {"identity.preferred_name": "小王"},
+        etag=snapshot.etag,
+    )
+
+    rendered = render_profile_prompt(snapshot)
+
+    assert rendered.startswith('<user_profile source="memory_profile_documents"')
+    assert rendered.endswith("</user_profile>")
+    assert snapshot.etag in rendered
+    assert "小王" in rendered
 
 
 @pytest.mark.asyncio

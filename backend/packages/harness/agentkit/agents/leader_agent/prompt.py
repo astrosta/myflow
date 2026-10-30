@@ -27,6 +27,7 @@ SYSTEM_PROMPT_TEMPLATE = """
 你是 {agent_name}，一个开源超级智能体。
 </role>
 {soul}
+{user_profile}
 {thinking_style}
 {skills_section}
 {subagent_section}
@@ -44,10 +45,12 @@ def apply_prompt_template(
     user_id: str | None = None,
     available_skills: frozenset[str] | None = None,
     subagent_policy: SubagentPolicy | None = None,
+    user_profile: str | None = None,
 ) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         agent_name=agent_name or "MyFlow",
         soul=_build_soul_section(app_config),
+        user_profile=user_profile or "",
         thinking_style=_build_thinking_style_section(),
         skills_section=_build_skills_section(
             app_config, user_id=user_id, available_skills=available_skills

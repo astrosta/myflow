@@ -70,19 +70,37 @@ class RenderedProfile:
 
 
 def render_profile_view(view: PersonalizationView, *, max_tokens: int = 1_800) -> RenderedProfile:
-    """Render only stable profile fields, in priority order, within a budget.
+    """Render only stable profile fields, in priority order, within a budget."""
 
-    Profile values are user data. They are rendered as labelled plain text and
-    wrapped by the caller in the memory envelope; internal field paths never
-    reach the model.
-    """
+    return render_profile_fields(view.profile_fields, max_tokens=max_tokens)
+
+
+def render_profile_prompt(view: ProfileView, *, max_tokens: int = 1_800) -> str:
+    """Render the DB profile as the system-prompt user_profile section."""
+
+    rendered = render_profile_fields(view.fields, max_tokens=max_tokens)
+    if not rendered.text:
+        return ""
+    return (
+        '<user_profile source="memory_profile_documents" etag="'
+        + escape(view.etag, quote=True)
+        + '">\n'
+        + escape(rendered.text, quote=False)
+        + "\n</user_profile>"
+    )
+
+
+def render_profile_fields(
+    fields: dict[str, Any], *, max_tokens: int = 1_800
+) -> RenderedProfile:
+    """Render profile values as labelled plain text within a character budget."""
 
     budget = max(1, int(max_tokens)) * 4
     lines: list[str] = []
     used = 0
     truncated = False
     for path in PROFILE_FIELD_PRIORITY:
-        value = view.profile_fields.get(path)
+        value = fields.get(path)
         if value in (None, "", []):
             continue
         if isinstance(value, (list, tuple)):

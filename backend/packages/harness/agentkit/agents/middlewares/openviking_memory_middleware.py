@@ -1,15 +1,16 @@
-"""Capture and personalization middleware for the OpenViking adapter.
+"""Capture middleware for the OpenViking adapter.
 
-Capture is deliberately best-effort: Redis, the OpenViking runtime or the
-profile database may be unavailable, and a memory outage must never fail the
-user's turn. Every side effect is guarded and logged; the gate decision is
-still stored so AI/tool hooks can follow the same turn policy.
+Capture is deliberately best-effort: Redis or the OpenViking runtime may be
+unavailable, and a memory outage must never fail the user's turn. Every side
+effect is guarded and logged; the gate decision is still stored so AI/tool
+hooks can follow the same turn policy.
+
+User profile rendering is intentionally not here: it happens while the lead
+agent graph is assembled and goes into the system prompt's <user_profile> tag.
 """
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import logging
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
@@ -18,23 +19,12 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agentkit.agents.memory.openviking.contracts import TurnDecision
-from agentkit.agents.memory.openviking.content import MemoryContentEnvelope
-from agentkit.agents.memory.openviking.profile import render_profile_view
 from agentkit.runtime.run_finalizers import (
     register_run_finalizer,
     unregister_run_finalizer,
 )
 
 logger = logging.getLogger(__name__)
-
-MEMORY_PROFILE_MESSAGE_ID = "__user_profile__"
-MEMORY_PROFILE_KEY = "memory_profile"
-MEMORY_PROFILE_ETAG_KEY = "memory_profile_etag"
-MEMORY_PROFILE_HASH_KEY = "memory_profile_sha256"
-MEMORY_PROFILE_TOKENS_KEY = "memory_profile_tokens"
-MEMORY_PROFILE_TRUNCATED_KEY = "memory_profile_truncated"
-_PROFILE_READ_TIMEOUT_SECONDS = 1.0
-
 
 class OpenVikingMemoryMiddleware(AgentMiddleware):
     def __init__(
@@ -52,7 +42,6 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         self._ended_turns: set[str] = set()
         self._registered_turns: set[str] = set()
         self._finalizer_callbacks: dict[str, Any] = {}
-        self._envelope = MemoryContentEnvelope()
 
     async def abefore_agent(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
         context = _context(runtime)
@@ -61,20 +50,19 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
 
         user_id = _text(context.get("user_id")) or self._user_id
         thread_id = _text(context.get("thread_id"))
-        updates = await self._inject_profile(state, context, user_id)
         if not user_id or not thread_id:
-            return updates
+            return None
 
         message = _latest_user(state.get("messages") or [])
         if message is None:
-            return updates
+            return None
         decision = self._facade.decide_capture(
             _text(message.content) or "",
             has_attachments=bool(state.get("uploaded_files")),
         )
         _put(context, "capture_decision", decision)
         if decision.disposition != "capture":
-            return updates
+            return None
         self._register_finalizer(context, decision)
 
         try:
@@ -83,63 +71,7 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
             await self._facade.publish_human(ref, _turn_id(context), message)
         except Exception:
             logger.warning("OpenViking human capture failed; continuing the turn", exc_info=True)
-        return updates
-
-    async def _inject_profile(
-        self,
-        state: dict[str, Any],
-        context: MutableMapping[str, Any],
-        user_id: str | None,
-    ) -> dict[str, Any] | None:
-        if not user_id:
-            return None
-        get_personalization = getattr(self._facade, "get_personalization", None)
-        if not callable(get_personalization):
-            return None
-
-        try:
-            view = await asyncio.wait_for(
-                get_personalization(user_id),
-                timeout=_PROFILE_READ_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            logger.warning("OpenViking profile injection failed; continuing without it", exc_info=True)
-            return None
-        config = getattr(self._facade, "config", None)
-        personalization = getattr(config, "personalization", None)
-        max_tokens = getattr(personalization, "max_tokens", 1_800)
-        rendered = render_profile_view(view, max_tokens=max_tokens)
-        if not rendered.text:
-            return None
-        content = self._envelope.wrap(
-            source="personalization",
-            text=rendered.text,
-            max_chars=max(1, len(rendered.text) + 1),
-        )
-        profile_message = HumanMessage(
-            content=content,
-            id=MEMORY_PROFILE_MESSAGE_ID,
-            additional_kwargs={
-                "hide_from_ui": True,
-                MEMORY_PROFILE_KEY: True,
-                MEMORY_PROFILE_ETAG_KEY: view.profile_etag,
-                MEMORY_PROFILE_HASH_KEY: hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                MEMORY_PROFILE_TOKENS_KEY: rendered.token_count,
-                MEMORY_PROFILE_TRUNCATED_KEY: rendered.truncated,
-            },
-        )
-        messages = list(state.get("messages") or [])
-        existing = _profile_message_index(messages)
-        if existing is not None:
-            if _same_profile(messages[existing], profile_message):
-                return None
-            messages[existing] = profile_message
-        else:
-            target = _latest_real_user_index(messages)
-            if target is None:
-                return None
-            messages.insert(target, profile_message)
-        return {"messages": messages}
+        return None
 
     async def aafter_model(self, state: dict[str, Any], runtime: Any) -> None:
         context = _context(runtime)
@@ -318,34 +250,6 @@ def _turn_id(context: MutableMapping[str, Any]) -> str:
     return str(value) if value else "run"
 
 
-def _profile_message_index(messages: list[Any]) -> int | None:
-    for index, message in enumerate(messages):
-        if getattr(message, "id", None) == MEMORY_PROFILE_MESSAGE_ID:
-            return index
-    return None
-
-
-def _latest_real_user_index(messages: list[Any]) -> int | None:
-    for index in reversed(range(len(messages))):
-        message = messages[index]
-        if not isinstance(message, HumanMessage):
-            continue
-        kwargs = getattr(message, "additional_kwargs", None) or {}
-        if kwargs.get("hide_from_ui") or kwargs.get("memory_profile"):
-            continue
-        return index
-    return None
-
-
-def _same_profile(left: Any, right: HumanMessage) -> bool:
-    if getattr(left, "content", None) != right.content:
-        return False
-    left_kwargs = getattr(left, "additional_kwargs", None) or {}
-    right_kwargs = right.additional_kwargs or {}
-    return left_kwargs.get(MEMORY_PROFILE_ETAG_KEY) == right_kwargs.get(MEMORY_PROFILE_ETAG_KEY)
-
-
 __all__ = [
-    "MEMORY_PROFILE_MESSAGE_ID",
     "OpenVikingMemoryMiddleware",
 ]

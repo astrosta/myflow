@@ -12,6 +12,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agentkit.agents.memory.openviking.client import OpenVikingClientFactory
+from agentkit.agents.memory.openviking.profile import render_profile_prompt
+from agentkit.agents.memory.openviking.profile_prompt import (
+    configure_profile_prompt_provider,
+)
 from agentkit.agents.memory.openviking.runtime import (
     OpenVikingMemoryRuntime,
     build_profile_services,
@@ -104,6 +108,7 @@ def start_profile_services(
     """
 
     if session_factory is None:
+        configure_profile_prompt_provider(None)
         app.state.profile_service = None
         app.state.onboarding_service = None
         app.state.suggestion_service = None
@@ -112,6 +117,14 @@ def start_profile_services(
     app.state.profile_service = services.profile
     app.state.onboarding_service = services.onboarding
     app.state.suggestion_service = services.suggestions
+
+    async def prompt(user_id: str) -> str:
+        return render_profile_prompt(
+            await services.profile.get_snapshot(user_id),
+            max_tokens=app_config.memory.openviking.personalization.max_tokens,
+        )
+
+    configure_profile_prompt_provider(prompt)
 
 
 async def stop_skill_runtime(app: FastAPI) -> None:
@@ -197,6 +210,14 @@ async def start_openviking_memory(
     app.state.profile_service = runtime.profile
     app.state.onboarding_service = runtime.onboarding
     app.state.suggestion_service = runtime.suggestions
+
+    async def prompt(user_id: str) -> str:
+        return render_profile_prompt(
+            await runtime.profile.get_snapshot(user_id),
+            max_tokens=runtime.config.personalization.max_tokens,
+        )
+
+    configure_profile_prompt_provider(prompt)
     configure_openviking_memory(runtime)
     logger.info("OpenViking long-term memory runtime started")
     return runtime, redis
@@ -213,6 +234,7 @@ async def stop_openviking_memory(
     finally:
         if redis is not None:
             await redis.aclose()
+        configure_profile_prompt_provider(None)
         configure_openviking_memory(None)
         app.state.openviking_memory = None
         app.state.profile_service = None
@@ -285,6 +307,7 @@ async def lifespan(app: FastAPI):
                                 app, openviking_runtime, openviking_redis
                             )
                         if openviking_runtime is None:
+                            configure_profile_prompt_provider(None)
                             app.state.profile_service = None
                             app.state.onboarding_service = None
                             app.state.suggestion_service = None

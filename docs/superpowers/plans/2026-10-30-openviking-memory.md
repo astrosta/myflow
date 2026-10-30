@@ -11,11 +11,12 @@
 **Spec:** `docs/plans/2026-10-29-openviking-memory-module-design.md`
 
 > **Implementation status:** core slice plus the explicit cutover are implemented on
-> `main`; 115 OpenViking tests, 2112 backend tests and 298 frontend tests pass.
+> `main`; 118 OpenViking tests, 2115 backend tests and 298 frontend tests pass.
 > The switch is `memory.openviking.enabled` (default `false`). It selects the
 > runtime, capture middleware, memory tools, identity/soul system prompt and
-> startup/shutdown path. The DB-backed profile, onboarding and suggestions
-> surfaces remain available when memory is off.
+> startup/shutdown path. The DB-backed profile is loaded during run assembly and
+> rendered into the system prompt's `<user_profile>` section; onboarding and
+> suggestions remain available when memory is off.
 > Profile suggestions/onboarding HTTP + UI, admin status/flush, and physical
 > deletion of the canonical runtime/code/tables (0006/0007 no-op, 0009 drop-only)
 > are implemented.

@@ -159,7 +159,25 @@ async def run_agent(
         rollback = await capture_rollback_point(ctx, thread_id)
         await bridge.publish(run_id, "metadata", {"run_id": run_id, "thread_id": thread_id})
 
-        assembly = _call_agent_factory(ctx.agent_factory, ctx.run_config, app_config=ctx.app_config,checkpointer=ctx.checkpointer)
+        profile_text = None
+        try:
+            factory_params = inspect.signature(ctx.agent_factory).parameters
+            if "profile_text" in factory_params:
+                from agentkit.agents.memory.openviking.profile_prompt import (
+                    load_profile_prompt,
+                )
+
+                profile_text = await load_profile_prompt(record.user_id or "")
+        except Exception:
+            logger.warning("Profile prompt loading failed; continuing without it", exc_info=True)
+
+        assembly = _call_agent_factory(
+            ctx.agent_factory,
+            ctx.run_config,
+            app_config=ctx.app_config,
+            checkpointer=ctx.checkpointer,
+            profile_text=profile_text,
+        )
         graph = unwrap_agent_graph(assembly)
         timeout_s = ctx.app_config.runs.timeout_seconds if ctx.app_config is not None else None
         deadline = asyncio.timeout(timeout_s) #开始计时
@@ -212,13 +230,22 @@ async def run_agent(
             spawn_detached(bridge.cleanup(run_id, delay=STREAM_RETENTION_SECONDS))
 
 
-def _call_agent_factory(factory: AgentFactory, run_config:dict, *, app_config, checkpointer) -> Any:
+def _call_agent_factory(
+    factory: AgentFactory,
+    run_config: dict,
+    *,
+    app_config,
+    checkpointer,
+    profile_text: str | None = None,
+) -> Any:
     params = inspect.signature(factory).parameters
     kwargs: dict[str, Any] = {}
     if "app_config" in params:
         kwargs["app_config"] = app_config
     if "checkpointer" in params:
         kwargs["checkpointer"] = checkpointer
+    if "profile_text" in params:
+        kwargs["profile_text"] = profile_text
     return factory(run_config, **kwargs)
 
 

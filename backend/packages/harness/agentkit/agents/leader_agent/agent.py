@@ -104,6 +104,7 @@ def assemble_agent(
     app_config: AppConfig | None = None, 
     checkpointer: Checkpointer | None = None,
     subagent_runtime: SubagentRuntime | None = None,
+    profile_text: str | None = None,
 ) -> AgentAssembly:
 
     cfg = (config or {}).get("configurable", {})
@@ -200,6 +201,7 @@ def assemble_agent(
         app_config=resolved_config,
         user_id=user_id,
         subagent_policy=policy,
+        user_profile=profile_text,
     )
 
     graph = _compile_agent(model=model, tools=tools, middleware=middleware, system_prompt=system_prompt, state_schema=ThreadState, checkpointer=checkpointer)
