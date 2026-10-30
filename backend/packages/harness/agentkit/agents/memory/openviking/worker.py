@@ -54,6 +54,16 @@ class TurnCaptureWorker:
             return "buffered"
 
         key = self._buffer_key(captured)
+        if captured.run_status == "interrupted":
+            # A cancelled turn is not part of the committed conversation
+            # record: acknowledge and drop its buffered messages without
+            # touching OpenViking or the sync state.
+            pending = self._buffers.pop(key, [])
+            for item in pending:
+                await self._stream.ack(item.stream_id, shard=item.stream_shard)
+            await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
+            return "discarded"
+
         result = await self._flush(key)
         if result == "retry":
             return "retry"

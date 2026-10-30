@@ -11,7 +11,7 @@
 **Spec:** `docs/plans/2026-10-29-openviking-memory-module-design.md`
 
 > **Implementation status:** core slice plus the explicit cutover are implemented on
-> `main`; 114 OpenViking tests, 2111 backend tests and 298 frontend tests pass.
+> `main`; 115 OpenViking tests, 2112 backend tests and 298 frontend tests pass.
 > The switch is `memory.openviking.enabled` (default `false`). It selects the
 > runtime, capture middleware, memory tools, identity/soul system prompt and
 > startup/shutdown path. The DB-backed profile, onboarding and suggestions

@@ -962,7 +962,7 @@ hi
 | ToolMessage | `wrap_tool_call` / tool 执行之后 | 工具结果或错误 |
 | turn_end | `after_agent` 或 run finalizer（以持久 `last_turn_end_id` 幂等） | 控制事件，不携带消息；用于 worker 刷新 turn buffer、携带 signals 并触发**显式** commit；append 由 turn_end 或 missing_turn_end_timeout 触发，commit 不是它的必要动作 |
 | run 异常/取消 | run worker 的 finally → run finalizer | 投递 turn_end，避免 worker 永远等不到结束；仍由显式信号或 idle auto-commit 负责 commit |
-| 用户取消 | 同上，turn_end.run_status=interrupted | 已投递的 human/ai/tool 按缓冲顺序 append；这是已发生对话的局部记录，不做 commit。正常 `after_agent` 会先注销 finalizer，避免重复 turn_end。 |
+| 用户取消 | 同上，turn_end.run_status=interrupted | worker 丢弃本轮 buffer 中的 human/ai/tool，逐个 XACK 后 XACK control；不 append、不 commit、不创建 dedup 行。正常 `after_agent` 会先注销 finalizer，避免重复 turn_end。 |
 
 所有投递都受同一个 run-context 门控约束：`capture_decision=SKIP` 时，human/AI/tool 都不投递；只有告别可投递无消息的 `SESSION_END` control event。
 

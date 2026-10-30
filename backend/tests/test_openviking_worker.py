@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 import pytest_asyncio
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.memory.openviking.adapter import MemoryMessageAdapter
@@ -196,12 +196,39 @@ async def test_buffered_messages_append_only_after_turn_end(stack) -> None:
     assert client.appended == []
     assert human.stream_id not in stream.acked
 
-    control = await publisher.publish_turn_end(ref, "r1", run_status="interrupted")
+    control = await publisher.publish_turn_end(ref, "r1")
     assert await worker.handle(control) == "flushed"
     assert len(client.appended) == 1
     assert human.stream_id in stream.acked
     assert control.stream_id in stream.acked
-    assert control.run_status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_end_discards_all_buffered_messages(stack) -> None:
+    client, _sync_store, dedup, sessions, stream, publisher, worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    human = await publisher.publish_human(ref, "r1", HumanMessage(content="我住杭州"), sequence=0)
+    ai = await publisher.publish_ai(
+        ref, "r1", AIMessage(content="正在查询", id="a1"), sequence=1
+    )
+    tool = await publisher.publish_tool(
+        ref,
+        "r1",
+        ToolMessage(content="partial result", tool_call_id="c1", name="shell"),
+        sequence=2,
+    )
+    for captured in (human, ai, tool):
+        assert await worker.handle(captured) == "buffered"
+
+    control = await publisher.publish_turn_end(ref, "r1", run_status="interrupted")
+
+    assert await worker.handle(control) == "discarded"
+    assert client.appended == []
+    assert all(item.stream_id in stream.acked for item in (human, ai, tool, control))
+    assert await dedup.state(human) == "missing"
+    assert await dedup.state(ai) == "missing"
+    assert await dedup.state(tool) == "missing"
 
 
 @pytest.mark.asyncio
