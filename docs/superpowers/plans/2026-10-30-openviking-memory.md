@@ -10,7 +10,7 @@
 
 **Spec:** `docs/plans/2026-10-29-openviking-memory-module-design.md`
 
-> **Implementation status:** core slice implemented on `feat/openviking-memory`; 51 new tests pass. Real Redis Streams transport and the SDK error wrapper are implemented; middleware wiring, profile HTTP routes, frontend and legacy deletion remain deferred.
+> **Implementation status:** core slice implemented on `feat/openviking-memory`; 59 new tests pass. Real Redis Streams transport, the SDK error wrapper, capture middleware, profile HTTP routes, recall and the content envelope are implemented; default-chain wiring, frontend and legacy deletion remain deferred.
 
 ## Global Constraints
 
@@ -502,11 +502,11 @@ git commit -m "feat(memory): add DB-backed profile and personalization"
 - `aafter_model` publishes the newest visible AI message when the stored decision is CAPTURE.
 - `awrap_tool_call` publishes a returned ToolMessage after the handler succeeds.
 
-- [ ] **Step 1: Write failing tests with a fake facade**
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement the middleware**
-- [ ] **Step 4: Run tests to verify they pass**
-- [ ] **Step 5: Commit**
+- [x] **Step 1: Write failing tests with a fake facade**
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement the middleware**
+- [x] **Step 4: Run tests to verify they pass**
+- [x] **Step 5: Commit**
 
 ### Task 11: Profile HTTP API
 
@@ -519,11 +519,11 @@ git commit -m "feat(memory): add DB-backed profile and personalization"
 - Uses `ProfileService` injected on `app.state.profile_service`; returns `{fields, etag, updated_at}`.
 - ETag conflicts return 409 `profile_conflict`; unknown fields return 422.
 
-- [ ] **Step 1: Write failing route tests**
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement the router**
-- [ ] **Step 4: Run tests to verify they pass**
-- [ ] **Step 5: Commit**
+- [x] **Step 1: Write failing route tests**
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement the router**
+- [x] **Step 4: Run tests to verify they pass**
+- [x] **Step 5: Commit**
 
 ## Verification
 
