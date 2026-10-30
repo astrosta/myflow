@@ -10,7 +10,7 @@
 
 **Spec:** `docs/plans/2026-10-29-openviking-memory-module-design.md`
 
-> **Implementation status:** core slice implemented on `feat/openviking-memory`; 59 new tests pass. Real Redis Streams transport, the SDK error wrapper, capture middleware, profile HTTP routes, recall and the content envelope are implemented; default-chain wiring, frontend and legacy deletion remain deferred.
+> **Implementation status:** core slice implemented on `feat/openviking-memory`; 61 new tests pass. Real Redis Streams transport, the SDK error wrapper, capture middleware, profile HTTP routes, recall, the content envelope and model tools are implemented; default-chain wiring, frontend and legacy deletion remain deferred.
 
 ## Global Constraints
 
