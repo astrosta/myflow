@@ -11,6 +11,8 @@ deferred_discovery 被刻意删掉了——两套渲染等于两套提示词契�
 
 from __future__ import annotations
 
+import base64
+import binascii
 from pathlib import Path
 from typing import Literal, Self
 
@@ -255,20 +257,28 @@ class SkillGitConfig(BaseModel):
         min_length=1,
         description="节点本地的 Git mirror 与 commit 内容缓存目录。",
     )
-    ssh_key_path: str = Field(
+    ssh_key: str = Field(
         default="",
-        description="pygit2 使用的 SSH 私钥路径；同名 .pub 存在时一起用于认证。",
-    )
-    known_hosts_path: str = Field(
-        default="",
-        description=(
-            "保留的 known_hosts 路径。pygit2/libgit2 不向证书回调暴露 SSH host key，"
-            "当前无法用它校验主机；生产环境优先使用 HTTPS 或受信网络。"
-        ),
+        repr=False,
+        description="base64 编码的 SSH 私钥内容；空表示不使用密钥认证。",
     )
     command_timeout_seconds: int = Field(
         default=120, ge=1, description="单次 libgit2 网络操作的超时时间。"
     )
+
+    @field_validator("ssh_key")
+    @classmethod
+    def _valid_ssh_key(cls, value: str) -> str:
+        compact = "".join(value.split())
+        if not compact:
+            return ""
+        try:
+            decoded = base64.b64decode(compact, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("skills.git.ssh_key must be base64-encoded") from exc
+        if b"PRIVATE KEY" not in decoded:
+            raise ValueError("skills.git.ssh_key must decode to a private key")
+        return compact
 
 
 class SkillReviewConfig(BaseModel):

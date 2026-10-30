@@ -259,8 +259,7 @@ skills:
     public_branch: main
     draft_ref_prefix: "refs/heads/myflow/drafts"
     cache_dir: .myflow/skills
-    ssh_key_path: $SKILLS_GIT_SSH_KEY_PATH  # pygit2 SSH 私钥；同名 .pub 可选
-    known_hosts_path: $SKILLS_GIT_KNOWN_HOSTS  # 保留兼容；pygit2 当前不校验 host key
+    ssh_key: ""  # base64 编码的 SSH 私钥内容；生产用 $SKILLS_GIT_SSH_KEY
     command_timeout_seconds: 120
 
   # 公共发布必须走人工审核；管理员可以批准自己的提交。

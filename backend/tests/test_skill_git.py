@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +35,27 @@ class GitFixture:
 
     def make_symlink_commit(self) -> str:
         return make_symlink_commit(self.remote)
+
+
+def test_base64_ssh_key_is_loaded_into_memory(tmp_path: Path) -> None:
+    private_key = (
+        b"-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        b"AAAA\n"
+        b"-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    encoded = base64.b64encode(private_key).decode("ascii")
+    repo = SkillGitRepository(
+        SkillGitConfig(
+            repository="https://example.invalid/skills.git",
+            ssh_key=encoded,
+        ),
+        tmp_path,
+    )
+
+    callbacks = repo._callbacks()
+
+    assert isinstance(callbacks.credentials, pygit2.KeypairFromMemory)
+    assert callbacks.credentials.credential_tuple[2] == private_key.decode("utf-8")
 
 
 @pytest.fixture(name="git_fixture")

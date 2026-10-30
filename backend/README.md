@@ -178,8 +178,8 @@ SOP 固定 `SKILL.md`"的约定在块前说一次，路径可推），
 （退回 BM25 / 融合顺序）并在 `retrieval.warnings` 里说明。加载即激活：
 结果里的 `path` 和 `read_file` 读 SKILL.md 走同一本 `skill_context` 台账。
 技能 Git 写入使用 **pygit2/libgit2**，运行时不依赖系统 `git` 可执行文件；仓库镜像、
-树/commit/push 都在进程内完成。SSH 私钥用 `skills.git.ssh_key_path`；`known_hosts_path`
-目前只保留配置兼容，libgit2 不暴露 SSH host key，生产环境建议优先使用 HTTPS。
+树/commit/push 都在进程内完成。SSH 认证使用 `skills.git.ssh_key`，值是 **base64 编码的
+OpenSSH 私钥内容**（通常从 `.env` 的 `SKILLS_GIT_SSH_KEY` 展开）；不会生成临时私钥文件。
 
 技能是**两层开关**：`skills.source: git` 时全局开关写 PostgreSQL 的 `skill_settings`
 （按内部 `skill_id`，admin），个人偏好仍写 `skills_prefs.json` 的

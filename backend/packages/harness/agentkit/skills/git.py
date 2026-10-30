@@ -10,6 +10,8 @@ object-by-object rather than through a working tree or archive extractor.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import os
 import shutil
@@ -120,6 +122,21 @@ class _RemoteCallbacks(pygit2.RemoteCallbacks):
 def _git_error(command: Sequence[str], exc: BaseException) -> GitCommandError:
     detail = str(exc).strip() or type(exc).__name__
     return GitCommandError(command, 1, detail)
+
+
+def _decode_ssh_key(encoded: str) -> str:
+    compact = "".join(encoded.split())
+    try:
+        decoded = base64.b64decode(compact, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("skills.git.ssh_key must be base64-encoded") from exc
+    try:
+        text = decoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("skills.git.ssh_key must decode to UTF-8") from exc
+    if "PRIVATE KEY" not in text:
+        raise ValueError("skills.git.ssh_key must decode to a private key")
+    return text
 
 
 def _validate_commit_id(commit: str) -> str:
@@ -315,6 +332,9 @@ class SkillGitRepository:
         self._timeout = float(config.command_timeout_seconds)
         self._ready_lock = asyncio.Lock()
         self._signature = pygit2.Signature(SERVICE_NAME, SERVICE_EMAIL)
+        self._ssh_private_key = (
+            _decode_ssh_key(self.config.ssh_key) if self.config.ssh_key else None
+        )
 
     def _repo(self) -> pygit2.Repository:
         try:
@@ -339,13 +359,11 @@ class SkillGitRepository:
 
     def _callbacks(self) -> _RemoteCallbacks:
         credentials: Any | None = None
-        if self.config.ssh_key_path:
-            private = Path(self.config.ssh_key_path)
-            public = Path(str(private) + ".pub")
-            credentials = pygit2.Keypair(
+        if self._ssh_private_key is not None:
+            credentials = pygit2.KeypairFromMemory(
                 self._ssh_username(),
-                str(public) if public.exists() else None,
-                str(private),
+                None,
+                self._ssh_private_key,
                 None,
             )
         return _RemoteCallbacks(timeout=self._timeout, credentials=credentials)

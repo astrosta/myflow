@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
@@ -55,8 +56,7 @@ def test_skills_config_keeps_filesystem_source_and_catalog_defaults():
     assert config.git.public_branch == "main"
     assert config.git.draft_ref_prefix == "refs/heads/myflow/drafts"
     assert config.git.cache_dir == ".myflow/skills"
-    assert config.git.ssh_key_path == ""
-    assert config.git.known_hosts_path == ""
+    assert config.git.ssh_key == ""
     assert config.git.command_timeout_seconds == 120
     assert config.review.require_admin is True
     assert config.review.allow_self_approval is True
@@ -65,6 +65,9 @@ def test_skills_config_keeps_filesystem_source_and_catalog_defaults():
     assert config.index.reconciliation_interval_minutes == 10
     assert config.retention.keep_versions_per_skill == 20
     assert config.retention.cache_ttl_days == 30
+
+    with pytest.raises(ValidationError, match="base64"):
+        SkillsConfig(git={"ssh_key": "not-a-key"})
 
 
 def _seed_skill_and_version(connection) -> None:
