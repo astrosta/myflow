@@ -207,7 +207,13 @@ class ParserConfig(BaseModel):
     max_download_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
 
 
-class EmbeddingConfig(BaseModel):
+class EmbeddingServiceConfig(BaseModel):
+    """Embedding service identity shared by the knowledge base and skill search.
+
+    enabled, batch size, retries, timeout and the instructions stay in each
+    consumer's section because they are runtime policies, not deployment facts.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     provider: Literal["openai_compatible"] = "openai_compatible"
@@ -218,23 +224,35 @@ class EmbeddingConfig(BaseModel):
     model: str = "Qwen/Qwen3-Embedding-8B"
     dimensions: int = Field(default=4096, ge=1, le=65536)
     max_input_tokens: int = Field(default=8192, ge=1, le=131072)
+    send_dimensions: bool = False
+
+
+class EmbeddingConfig(EmbeddingServiceConfig):
+    """Per-use embedding policy layered on top of the shared service config."""
+
     batch_size: int = Field(default=8, ge=1, le=512)
     timeout_seconds: float = Field(default=120.0, gt=0)
     max_retries: int = Field(default=2, ge=0, le=8)
-    send_dimensions: bool = False
     query_instruction: str = (
         "Given a question, retrieve passages from the user's knowledge base that answer it"
     )
     document_instruction: str = ""
 
 
-class MilvusConfig(BaseModel):
+class VectorStoreServiceConfig(BaseModel):
+    """Milvus connection shared by the knowledge base and skill projection."""
+
     model_config = ConfigDict(extra="forbid")
 
     provider: Literal["milvus"] = "milvus"
     uri: str = ""
     token: str = Field(default="", repr=False)
     db_name: str = ""
+
+
+class MilvusConfig(VectorStoreServiceConfig):
+    """One collection's schema and request policy on the shared Milvus service."""
+
     collection: str = "myflow_knowledge"
     metric_type: Literal["COSINE", "IP", "L2"] = "COSINE"
     index_type: str = "AUTOINDEX"
@@ -261,17 +279,22 @@ class KeywordRetrievalConfig(BaseModel):
     bm25_b: float = Field(default=0.75, ge=0, le=1)
 
 
-class RerankConfig(BaseModel):
-    """Cross-encoder rerank stage. Disabled unless the deployment configures an endpoint."""
+class RerankServiceConfig(BaseModel):
+    """Rerank endpoint shared by the knowledge base and skill search."""
 
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = False
     protocol: Literal["cohere", "tei"] = "cohere"
     base_url: str = ""
     path: str = "/rerank"
     api_key: str = Field(default="", repr=False)
     model: str = "Qwen/Qwen3-Reranker-8B"
+
+
+class RerankConfig(RerankServiceConfig):
+    """One rerank stage's switch, document budget, timeout and retries."""
+
+    enabled: bool = False
     max_document_chars: int = Field(default=4000, ge=200, le=100000)
     timeout_seconds: float = Field(default=60.0, gt=0)
     max_retries: int = Field(default=1, ge=0, le=5)

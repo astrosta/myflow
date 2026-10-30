@@ -174,7 +174,8 @@ SOP 固定 `SKILL.md`"的约定在块前说一次，路径可推），
 预算见 `skills.active_context`；正文还在消息里时默认不重复写（压缩之后它才是唯一副本）。
 `search_and_load_skills` 是两段式（本地 BM25 召回 `skills.search.candidate_k` → 可选精排
 `top_k`），默认只有本地通道；`skills.search.embedding` / `rerank` 不填地址就不发请求，
-失败也只降级（退回 BM25 / 融合顺序）并在 `retrieval.warnings` 里说明。加载即激活：
+地址和模型默认取顶层 `embedding` / `rerank`（section 里的同名字段可覆盖），失败也只降级
+（退回 BM25 / 融合顺序）并在 `retrieval.warnings` 里说明。加载即激活：
 结果里的 `path` 和 `read_file` 读 SKILL.md 走同一本 `skill_context` 台账。
 技能是**两层开关**：`skills.source: git` 时全局开关写 PostgreSQL 的 `skill_settings`
 （按内部 `skill_id`，admin），个人偏好仍写 `skills_prefs.json` 的
@@ -401,7 +402,15 @@ MCP **没有创建类路由**：`PUT /api/mcp/config`（整份替换 = 新建 + 
 
 `knowledge_base.enabled: true` 后，lifespan 建立知识库服务。**所有服务地址只来自
 config.yaml**，代码里没有默认端点；启用时缺 `parse.local.endpoint`（或云端
-`base_url` + `api_key`）、`embedding.base_url`、`vector_store.uri` 会拒绝启动。
+`base_url` + `api_key`）、顶层 `embedding.base_url`、顶层 `vector_store.uri`
+（或 knowledge_base section 内的显式覆盖）会拒绝启动。
+
+知识库与技能检索共用同一套 embedding / rerank / Milvus 连接，配置放在顶层
+`embedding`、`rerank`、`vector_store`；`knowledge_base.embedding`、
+`knowledge_base.vector_store`、`knowledge_base.retrieval.rerank` 和
+`skills.search.*` 只保留 collection、开关、超时、重试、指令等个性化字段，
+同名字段仍可覆盖顶层值。`chunking.tokenizer.model` 默认也取顶层
+`embedding.model`，需要局部 tokenizer 时再单独指定。
 
 MinerU 的**接口路径也是配置**：本地 `parse.local.file_parse_path`（默认 `/v1/file_parse`）、
 云端 `parse.cloud.file_urls_path`（默认 `/api/v4/file-urls/batch`）与
@@ -435,8 +444,8 @@ Agent 自动获得只读 `knowledge_search` 工具。工具把 `knowledge_base_t
 检索是混合检索（§7.4）：问题拆成 `query`（向量）与 `keyword_query`（BM25 关键词，
 可省略、缺省时复用 `query`），两路各取 `retrieval.candidate_k` 条后由 Milvus 
 `hybrid_search` + `RRFRanker(k=retrieval.rrf_k)` 融合；`retrieval.rerank.enabled=true`
-时再把融合候选送给 rerank 模型精排（`protocol: cohere | tei`，模型默认
-`Qwen/Qwen3-Reranker-8B`）。关键词通道或精排不可用时按设计文档降级，并在返回值里
+时再把融合候选送给 rerank 模型精排（`protocol: cohere | tei`，模型默认取顶层
+`rerank.model`）。关键词通道或精排不可用时按设计文档降级，并在返回值里
 如实标注 `retrieval_mode` 与 `reranked`。
 
 collection 需要 Milvus 2.5+ 的 BM25 能力：`content` 字段带 analyzer（默认 `chinese`）、

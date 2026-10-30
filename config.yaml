@@ -103,6 +103,35 @@ database:
   checkpoint_channel_mode: full   # full | delta，启动时冻结
   postgres_schema: ""             # 非空时钉 search_path
 
+# ------------------------------------------------------------
+# 检索服务通用配置：知识库和技能检索共用同一套 embedding / rerank /
+# Milvus 连接。各自的 collection、超时、开关与指令仍留在下面两个 section。
+# 这里的值可以被具体 section 覆盖。
+# ------------------------------------------------------------
+embedding:
+  provider: openai_compatible
+  protocol: openai            # openai | tei
+  base_url: $EMBEDDING_BASE_URL
+  path: /embeddings
+  api_key: $EMBEDDING_API_KEY
+  model: Qwen/Qwen3-Embedding-8B
+  dimensions: 4096
+  max_input_tokens: 8192
+  send_dimensions: false
+
+rerank:
+  protocol: cohere            # cohere | tei
+  base_url: $RERANK_BASE_URL
+  path: /rerank
+  api_key: $RERANK_API_KEY
+  model: Qwen/Qwen3-Reranker-8B
+
+vector_store:
+  provider: milvus
+  uri: "http://192.168.154.141:19530"   # 当前环境已配置，无鉴权
+  token: ""
+  db_name: ""
+
 run_events:
   backend: db          # memory | db | jsonl          startup-only
   max_trace_content: 10240 # 仅 db：category=trace 超此字节截断
@@ -211,37 +240,22 @@ skills:
       name_weight: 3.0            # 命中技能名/描述的额外倍数
 
     embedding:                    # 可选语义召回（bi-encoder）
-      enabled: false              # 打开时 base_url 必填
-      base_url: $EMBEDDING_BASE_URL
-      path: /embeddings
-      api_key: $EMBEDDING_API_KEY
-      model: Qwen/Qwen3-Embedding-8B
-      dimensions: 4096
+      enabled: false              # 打开时共用配置的 embedding.base_url 必填
       batch_size: 8
       timeout_seconds: 30
       max_retries: 1
       query_instruction: "Given a task description, retrieve the skill whose operating procedure applies"
 
     rerank:                       # 可选精排（cross-encoder）；失败自动回退融合顺序
-      enabled: false              # 打开时 base_url 与 model 必填
-      protocol: cohere            # cohere | tei
-      base_url: $RERANK_BASE_URL
-      path: /rerank
-      api_key: $RERANK_API_KEY
-      model: Qwen/Qwen3-Reranker-8B
+      enabled: false              # 打开时共用配置的 rerank.base_url 与 model 必填
       max_document_chars: 4000
       timeout_seconds: 30
       max_retries: 1
 
-    # active projection 的 Milvus 连接。投影是"当前激活状态"的物化视图，不是知识库
-    # 那张表：collection 固定 myflow_skills_active，绝不能和 myflow_knowledge 共用。
-    # uri/token/db_name 留空＝沿用 knowledge_base.vector_store 的连接参数（只借连接，
-    # 不借 collection——collection 是检索契约，不是部署参数）。
+    # active projection 的 Milvus collection。投影是"当前激活状态"的物化视图，
+    # 不是知识库那张表：collection 固定 myflow_skills_active，绝不能和
+    # myflow_knowledge 共用。连接参数来自顶层 vector_store。
     vector_store:
-      provider: milvus
-      uri: ""                     # 留空＝沿用知识库的 Milvus 连接
-      token: ""
-      db_name: ""
       collection: myflow_skills_active
       metric_type: COSINE
       index_type: AUTOINDEX
@@ -306,7 +320,7 @@ knowledge_base:
   chunking:
     tokenizer:
       provider: qwen             # qwen | approximate
-      model: Qwen/Qwen3-Embedding-8B
+      # model 默认取顶层 embedding.model；需要单独指定时再写在这里。
       path: ""                  # 可选：本地 tokenizer 目录
       local_files_only: false
     min_chunk_tokens: 32
@@ -338,27 +352,16 @@ knowledge_base:
         chunk_size_tokens: 512
         chunk_overlap_tokens: 64
 
+  # 服务地址、模型和维度来自顶层 embedding；这里只保留知识库自己的策略。
   embedding:
-    provider: openai_compatible
-    protocol: openai            # openai | tei
-    base_url: $EMBEDDING_BASE_URL                # 必填：Qwen3-Embedding-8B 服务地址
-    path: /embeddings
-    api_key: $EMBEDDING_API_KEY
-    model: Qwen/Qwen3-Embedding-8B
-    dimensions: 4096
-    max_input_tokens: 8192
     batch_size: 8
     timeout_seconds: 120
     max_retries: 2
-    send_dimensions: false
     query_instruction: "Given a question, retrieve passages from the user's knowledge base that answer it"
     document_instruction: ""
 
+  # 连接参数来自顶层 vector_store；collection 是知识库自己的检索契约。
   vector_store:
-    provider: milvus
-    uri: "http://192.168.154.141:19530"   # 必填；当前环境已配置，无鉴权
-    token: ""
-    db_name: ""
     collection: myflow_knowledge
     metric_type: COSINE
     index_type: AUTOINDEX
@@ -382,12 +385,7 @@ knowledge_base:
 
     # 精排：开关关掉时直接用 RRF 融合顺序。
     rerank:
-      enabled: false                # 打开时下面的 base_url 与 model 必填
-      protocol: cohere              # cohere | tei（vLLM/Jina/Cohere 走 cohere，TEI 走 tei）
-      base_url: $RERANK_BASE_URL                  # 精排服务地址，例如 http://127.0.0.1:8000/rerank 的 host
-      path: /rerank
-      api_key: $RERANK_API_KEY                   # 可写 $RERANK_API_KEY
-      model: Qwen/Qwen3-Reranker-8B
+      enabled: false                # 打开时顶层 rerank.base_url 与 model 必填
       max_document_chars: 4000
       timeout_seconds: 60
       max_retries: 1

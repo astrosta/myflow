@@ -1,3 +1,4 @@
+import copy
 import os
 from pathlib import Path
 from typing import Any, Self
@@ -10,7 +11,12 @@ from agentkit.config.auth_config import AuthConfig
 from agentkit.config.checkpointer_config import CheckpointerConfig
 from agentkit.config.database_config import DatabaseConfig
 from agentkit.config.file_signature import ConfigSignature, get_config_signature
-from agentkit.config.knowledge_config import KnowledgeBaseConfig
+from agentkit.config.knowledge_config import (
+    EmbeddingServiceConfig,
+    KnowledgeBaseConfig,
+    RerankServiceConfig,
+    VectorStoreServiceConfig,
+)
 from agentkit.config.llm_call_config import LlmCallConfig
 from agentkit.config.memory_config import MemoryConfig
 from agentkit.config.model_config import ModelConfig
@@ -30,6 +36,45 @@ from agentkit.config.tool_config import ToolConfig
 from agentkit.subagents.config import INHERIT_MODEL
 
 
+_SHARED_SERVICE_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "embedding": (
+        ("knowledge_base", "embedding"),
+        ("skills", "search", "embedding"),
+    ),
+    "rerank": (
+        ("knowledge_base", "retrieval", "rerank"),
+        ("skills", "search", "rerank"),
+    ),
+    "vector_store": (
+        ("knowledge_base", "vector_store"),
+        ("skills", "search", "vector_store"),
+    ),
+}
+
+
+def _merge_common_service(
+    data: dict[str, Any],
+    path: tuple[str, ...],
+    common: dict[str, Any],
+) -> None:
+    """Merge shared service defaults under a consumer section; explicit values win."""
+    node = data
+    for key in path[:-1]:
+        child = node.get(key)
+        if child is None:
+            child = {}
+            node[key] = child
+        elif not isinstance(child, dict):
+            return
+        node = child
+
+    leaf = node.get(path[-1])
+    if leaf is None:
+        node[path[-1]] = dict(common)
+    elif isinstance(leaf, dict):
+        node[path[-1]] = {**common, **leaf}
+
+
 class AppConfig(BaseModel):
     config_version: int = Field(default=0)
     log_level: str = Field(default="info", description=format_field_description("log_level"))
@@ -44,6 +89,11 @@ class AppConfig(BaseModel):
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    # Shared by knowledge_base and skills.search; each section keeps only its own
+    # enabled/collection/timeout/instruction overrides.
+    embedding: EmbeddingServiceConfig = Field(default_factory=EmbeddingServiceConfig)
+    rerank: RerankServiceConfig = Field(default_factory=RerankServiceConfig)
+    vector_store: VectorStoreServiceConfig = Field(default_factory=VectorStoreServiceConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
     run_events: RunEventsConfig = Field(default_factory=RunEventsConfig)
     stream_bridge: StreamBridgeConfig = Field(default_factory=StreamBridgeConfig)
@@ -83,8 +133,36 @@ class AppConfig(BaseModel):
     @classmethod
     def _drop_null_config_sections(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            return{k: v for k, v in data.items() if v is not None}
+            return {k: v for k, v in data.items() if v is not None}
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_shared_service_defaults(cls, data: Any) -> Any:
+        """Apply top-level embedding/rerank/vector_store defaults to both consumers.
+
+        The shared sections are deployment facts (endpoint, token, model). The
+        consumer sections keep their own policy fields and may still override a
+        shared value explicitly.
+        """
+        if not isinstance(data, dict):
+            return data
+        patched = copy.deepcopy(data)
+        for key, paths in _SHARED_SERVICE_PATHS.items():
+            common = patched.get(key)
+            if not isinstance(common, dict) or not common:
+                continue
+            for path in paths:
+                _merge_common_service(patched, path, common)
+            if key == "embedding":
+                model = common.get("model")
+                if isinstance(model, str) and model.strip():
+                    _merge_common_service(
+                        patched,
+                        ("knowledge_base", "chunking", "tokenizer"),
+                        {"model": model},
+                    )
+        return patched
 
     @model_validator(mode="after")
     def _build_name_indexes(self) -> "AppConfig":
