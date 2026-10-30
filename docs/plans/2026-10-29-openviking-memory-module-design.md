@@ -70,6 +70,18 @@
 13. **无旧数据、无迁移、无回滚。** 当前不存在旧记忆数据；不写迁移脚本，不保留旧表兼容层，不承诺回滚到旧记忆模块。P5 直接删除旧表/旧代码前，必须有旧表计数为 0 的检查 + PostgreSQL/OpenViking 备份；回退只回到空记忆状态。
 14. **待决项登记。** 所有 P1-x 必须在 §15.1 登记，包含 owner、决策问题、截止 Phase 和验收方式；未关闭项不得写入 P3/§13.4 的通过条件。
 
+### 0.2 显式迁移开关（2026-10-30）
+
+`memory.openviking.enabled` 是唯一的长期记忆权威开关，默认 `false`。它同时决定：
+
+- lifespan 是否启动 OpenViking runtime；
+- lead agent 是否挂 OpenViking capture middleware；
+- 是否注册 `memory_search` / `memory_read` / `memory_overview`；
+- 是否渲染 identity/soul 系统提示段；
+- 是否挂 admin status/flush。
+
+`/api/memory/profile`、onboarding 和 suggestions 是 DB-backed 画像 surface，开关为 `false` 时仍可用（suggestions 没有 OpenViking 索引，返回空）。开关是 startup-only；不要在同一进程运行中热切换。旧 canonical runtime、旧 canonical 表已退役：fresh bootstrap 不再创建，migration 0009 删除既有表；`false` 不再是 canonical fallback。开关为 `true` 时缺少 Redis URL、database 或至少 32 字符的 `user_id_salt` 必须启动失败；不能静默降级。
+
 ## 1. 背景、目标与非目标
 
 ### 1.1 当前实现
@@ -697,14 +709,14 @@ memory_capture_dedup
   ov_message_ids      text                       -- append 返回/对账得到的 OpenViking message ids（JSON，可为空）
   attempts            int         not null default 0
   created_at          timestamptz not null
-  appended_at         timestamptz                -- append 成功确认时间；appended 状态必须非空
+  appended_at         timestamptz                -- append 成功确认时间；正常 appended 必须非空
   primary key (user_id, thread_id, session_epoch, session_incarnation, message_id)
   index (state, created_at)
   check (state in ('pending', 'appending', 'appended'))
   check (
     (state = 'pending' and lease_until is null and appended_at is null)
     or (state = 'appending' and lease_until is not null and appended_at is null)
-    or (state = 'appended' and appended_at is not null)
+    or (state = 'appended' and lease_until is null)
   )
 ```
 
@@ -719,6 +731,7 @@ memory_capture_dedup
 - `memory_sync_state` 的 `last_stream_id/last_message_id` 只用于观测高水位；`last_turn_end_id` 用于 turn_end 持久幂等；session 生命周期由 `session_started_at/last_message_at/last_commit_at/last_auto_commit_at` 维护；
 - `memory_capture_dedup` 是 **at-least-once** 去重：worker 先 `pending`，拿到租约后 `appending`，append 成功后标 `appended`（写 `appended_at`）并清租约，再 `XACK`。append 成功但状态更新失败时，行只能停在 `pending/appending`，重启后只对这些不确定行按 `source_message_ids` 对账 OpenViking live/archive；已存在则直接标 appended，无法对账则重试并告警——**不再声称“绝不重复 append”**；
 - **正常 `appended` 行不做启动对账**：它是终态，不是待处理队列。启动只扫描 `state IN ('pending','appending')`，以及 `state='appended' AND appended_at IS NULL` 的异常行；不得对全表/全量 appended 调 `get_session_context` 或 archive；
+- 上表的 check 允许 `state='appended' AND appended_at IS NULL`，这是 append 成功但 DB 标记失败时唯一能保留的对账入口；正常写入 `mark_appended` 必须同时写 `appended_at`，不允许把该异常当正常终态；
 - `memory_capture_dedup` 只存消息 ID/hash/状态/租约，不存消息正文；保留期不小于 session retention（默认 30 天），按 `created_at` 清理；
 - `memory_sync_state.deleted_at` 是 thread 删除 tombstone；有 tombstone 时 `MemoryMessagePublisher` 和新 worker 都拒绝该 thread 的新消息。
 - **单 worker 约束**：部署只启动一个 `memory_worker` 进程；它持有 Redis singleton lease，内部按 shard 建 consumer 循环。禁止多实例横向扩容；扩容必须先做 shard 级所有权和 dedup 租约。
@@ -950,7 +963,8 @@ hi
 | AI message | `after_model` | 每次模型产出的可见 AI 消息；tool-call AI 也记录 |
 | ToolMessage | `wrap_tool_call` / tool 执行之后 | 工具结果或错误 |
 | turn_end | `after_agent` 或 run finalizer（以持久 `last_turn_end_id` 幂等） | 控制事件，不携带消息；用于 worker 刷新 turn buffer、携带 signals 并触发**显式** commit；append 由 turn_end 或 missing_turn_end_timeout 触发，commit 不是它的必要动作 |
-| run 异常 | finalizer | 投递 turn_end，避免 worker 永远等不到结束；仍由显式信号或 idle auto-commit 负责 commit |
+| run 异常/取消 | run worker 的 finally → run finalizer | 投递 turn_end，避免 worker 永远等不到结束；仍由显式信号或 idle auto-commit 负责 commit |
+| 用户取消 | 同上，turn_end.run_status=interrupted | 已投递的 human/ai/tool 按缓冲顺序 append；这是已发生对话的局部记录，不做 commit。正常 `after_agent` 会先注销 finalizer，避免重复 turn_end。 |
 
 所有投递都受同一个 run-context 门控约束：`capture_decision=SKIP` 时，human/AI/tool 都不投递；只有告别可投递无消息的 `SESSION_END` control event。
 

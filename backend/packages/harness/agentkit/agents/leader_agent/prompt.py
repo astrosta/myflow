@@ -47,7 +47,7 @@ def apply_prompt_template(
 ) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         agent_name=agent_name or "MyFlow",
-        soul=_build_soul_section(),
+        soul=_build_soul_section(app_config),
         thinking_style=_build_thinking_style_section(),
         skills_section=_build_skills_section(
             app_config, user_id=user_id, available_skills=available_skills
@@ -61,9 +61,29 @@ def apply_prompt_template(
     )
 
 
-def _build_soul_section() -> str:
-    """Static soul copy. M1 leaves the slot empty."""
-    return ""
+def _build_soul_section(app_config: AppConfig | None = None) -> str:
+    """Assistant identity and principles from project files.
+
+    Only the lead agent renders these, and only when the OpenViking switch owns
+    long-term memory. They are static project files, not per-user data and not
+    OpenViking memory.
+    """
+
+    if app_config is None or not app_config.memory.openviking.enabled:
+        return ""
+    personalization = app_config.memory.openviking.personalization
+    if not personalization.enabled:
+        return ""
+    from agentkit.agents.memory.openviking.profile import (
+        read_assistant_personalization,
+        render_assistant_personalization,
+    )
+
+    value = read_assistant_personalization(
+        identity_path=personalization.identity_file,
+        soul_path=personalization.soul_file,
+    )
+    return render_assistant_personalization(value)
 
 
 def _build_thinking_style_section() -> str:
@@ -192,13 +212,13 @@ knowledge_search 工具，再作答。意图明确时请选择 knowledge_base_ty
 
 def _build_memory_section(app_config: AppConfig | None = None) -> str:
     """M10 §2.8.2：one static sentence. Profile fields are already injected."""
-    if app_config is None or not app_config.memory.enabled:
+    if app_config is None or not app_config.memory.openviking.enabled:
         return ""
     return """
 ## 长期记忆
 
-用户画像（如果存在）已经注入。对于画像中没有的长尾事实，使用 memory_search 工具检索；
-不要要求用户重复此前对话中已经告诉过你的信息。""".strip()
+用户画像（如果存在）由个性化层注入。对于画像中没有的长尾事实，使用 memory_search 工具检索；
+需要正文时使用 memory_read，需要摘要时使用 memory_overview。不要要求用户重复已经告诉过你的信息。""".strip()
 
 
 def _build_critical_reminders_section() -> str:

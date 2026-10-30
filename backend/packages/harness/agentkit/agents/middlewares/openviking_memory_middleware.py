@@ -1,12 +1,16 @@
-"""Capture middleware for the additive OpenViking adapter.
+"""Capture and personalization middleware for the OpenViking adapter.
 
-This middleware is intentionally not wired into the default chain yet. It is
-small enough to test independently and can be enabled once the runtime
-configuration and worker lifecycle are cut over.
+Capture is deliberately best-effort: Redis, the OpenViking runtime or the
+profile database may be unavailable, and a memory outage must never fail the
+user's turn. Every side effect is guarded and logged; the gate decision is
+still stored so AI/tool hooks can follow the same turn policy.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import logging
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
@@ -14,6 +18,22 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agentkit.agents.memory.openviking.contracts import TurnDecision
+from agentkit.agents.memory.openviking.content import MemoryContentEnvelope
+from agentkit.agents.memory.openviking.profile import render_profile_view
+from agentkit.runtime.run_finalizers import (
+    register_run_finalizer,
+    unregister_run_finalizer,
+)
+
+logger = logging.getLogger(__name__)
+
+MEMORY_PROFILE_MESSAGE_ID = "__user_profile__"
+MEMORY_PROFILE_KEY = "memory_profile"
+MEMORY_PROFILE_ETAG_KEY = "memory_profile_etag"
+MEMORY_PROFILE_HASH_KEY = "memory_profile_sha256"
+MEMORY_PROFILE_TOKENS_KEY = "memory_profile_tokens"
+MEMORY_PROFILE_TRUNCATED_KEY = "memory_profile_truncated"
+_PROFILE_READ_TIMEOUT_SECONDS = 1.0
 
 
 class OpenVikingMemoryMiddleware(AgentMiddleware):
@@ -28,28 +48,98 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         self._facade = facade
         self._user_id = user_id
         self._agent_name = agent_name
-        self._seen: set[int | str] = set()
+        self._seen: set[tuple[str, int | str]] = set()
+        self._ended_turns: set[str] = set()
+        self._registered_turns: set[str] = set()
+        self._finalizer_callbacks: dict[str, Any] = {}
+        self._envelope = MemoryContentEnvelope()
 
-    async def abefore_agent(self, state: dict[str, Any], runtime: Any) -> None:
+    async def abefore_agent(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
         context = _context(runtime)
         if context.get("subagent_name"):
-            return
-        user_id = context.get("user_id") or self._user_id
-        thread_id = context.get("thread_id")
+            return None
+
+        user_id = _text(context.get("user_id")) or self._user_id
+        thread_id = _text(context.get("thread_id"))
+        updates = await self._inject_profile(state, context, user_id)
         if not user_id or not thread_id:
-            return
+            return updates
 
         message = _latest_user(state.get("messages") or [])
         if message is None:
-            return
-        text = _text(message.content)
-        decision = self._facade.decide_capture(text, has_attachments=bool(state.get("uploaded_files")))
+            return updates
+        decision = self._facade.decide_capture(
+            _text(message.content) or "",
+            has_attachments=bool(state.get("uploaded_files")),
+        )
         _put(context, "capture_decision", decision)
         if decision.disposition != "capture":
-            return
+            return updates
+        self._register_finalizer(context, decision)
 
-        ref = await self._facade.resolve_capture_context(user_id, thread_id)
-        await self._facade.publish_human(ref, _turn_id(context), message)
+        try:
+            ref = await self._facade.resolve_capture_context(user_id, thread_id)
+            _put(context, "capture_ref", ref)
+            await self._facade.publish_human(ref, _turn_id(context), message)
+        except Exception:
+            logger.warning("OpenViking human capture failed; continuing the turn", exc_info=True)
+        return updates
+
+    async def _inject_profile(
+        self,
+        state: dict[str, Any],
+        context: MutableMapping[str, Any],
+        user_id: str | None,
+    ) -> dict[str, Any] | None:
+        if not user_id:
+            return None
+        get_personalization = getattr(self._facade, "get_personalization", None)
+        if not callable(get_personalization):
+            return None
+
+        try:
+            view = await asyncio.wait_for(
+                get_personalization(user_id),
+                timeout=_PROFILE_READ_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.warning("OpenViking profile injection failed; continuing without it", exc_info=True)
+            return None
+        config = getattr(self._facade, "config", None)
+        personalization = getattr(config, "personalization", None)
+        max_tokens = getattr(personalization, "max_tokens", 1_800)
+        rendered = render_profile_view(view, max_tokens=max_tokens)
+        if not rendered.text:
+            return None
+        content = self._envelope.wrap(
+            source="personalization",
+            text=rendered.text,
+            max_chars=max(1, len(rendered.text) + 1),
+        )
+        profile_message = HumanMessage(
+            content=content,
+            id=MEMORY_PROFILE_MESSAGE_ID,
+            additional_kwargs={
+                "hide_from_ui": True,
+                MEMORY_PROFILE_KEY: True,
+                MEMORY_PROFILE_ETAG_KEY: view.profile_etag,
+                MEMORY_PROFILE_HASH_KEY: hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                MEMORY_PROFILE_TOKENS_KEY: rendered.token_count,
+                MEMORY_PROFILE_TRUNCATED_KEY: rendered.truncated,
+            },
+        )
+        messages = list(state.get("messages") or [])
+        existing = _profile_message_index(messages)
+        if existing is not None:
+            if _same_profile(messages[existing], profile_message):
+                return None
+            messages[existing] = profile_message
+        else:
+            target = _latest_real_user_index(messages)
+            if target is None:
+                return None
+            messages.insert(target, profile_message)
+        return {"messages": messages}
 
     async def aafter_model(self, state: dict[str, Any], runtime: Any) -> None:
         context = _context(runtime)
@@ -59,13 +149,13 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         if not isinstance(decision, TurnDecision) or decision.disposition != "capture":
             return
         message = _latest_ai(state.get("messages") or [])
-        if message is None or not self._mark_seen(message):
+        if message is None or not self._mark_seen(context, message):
             return
-        ref = await self._facade.resolve_capture_context(
-            context.get("user_id") or self._user_id or "",
-            context.get("thread_id") or "",
-        )
-        await self._facade.publish_ai(ref, _turn_id(context), message)
+        try:
+            ref = await self._capture_ref(context)
+            await self._facade.publish_ai(ref, _turn_id(context), message)
+        except Exception:
+            logger.warning("OpenViking AI capture failed; continuing the turn", exc_info=True)
 
     async def awrap_tool_call(
         self,
@@ -79,22 +169,93 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         if context.get("subagent_name"):
             return result
         decision = context.get("capture_decision")
-        if isinstance(decision, TurnDecision) and decision.disposition != "capture":
+        if not isinstance(decision, TurnDecision) or decision.disposition != "capture":
             return result
-        if not self._mark_seen(result):
+        if not self._mark_seen(context, result):
             return result
-        ref = await self._facade.resolve_capture_context(
-            context.get("user_id") or self._user_id or "",
-            context.get("thread_id") or "",
-        )
-        await self._facade.publish_tool(ref, _turn_id(context), result)
+        try:
+            ref = await self._capture_ref(context)
+            await self._facade.publish_tool(ref, _turn_id(context), result)
+        except Exception:
+            logger.warning("OpenViking tool capture failed; continuing the turn", exc_info=True)
         return result
 
-    def _mark_seen(self, message: Any) -> bool:
-        key: int | str = getattr(message, "id", None) or id(message)
+    async def aafter_agent(self, state: dict[str, Any], runtime: Any) -> None:
+        context = _context(runtime)
+        if context.get("subagent_name"):
+            return
+        decision = context.get("capture_decision")
+        if not isinstance(decision, TurnDecision):
+            return
+        turn_id = _turn_id(context)
+        await self._finish_turn(context, turn_id, decision, "success")
+
+    def _register_finalizer(
+        self, context: MutableMapping[str, Any], decision: TurnDecision
+    ) -> None:
+        turn_id = _turn_id(context)
+        key = f"{context.get('thread_id') or ''}:{turn_id}"
+        if key in self._registered_turns:
+            return
+        self._registered_turns.add(key)
+
+        async def finalize(status: str) -> None:
+            await self._finish_turn(context, turn_id, decision, status)
+
+        self._finalizer_callbacks[turn_id] = finalize
+        register_run_finalizer(turn_id, finalize)
+
+    async def _finish_turn(
+        self,
+        context: MutableMapping[str, Any],
+        turn_id: str,
+        decision: TurnDecision,
+        run_status: str,
+    ) -> None:
+        key = f"{context.get('thread_id') or ''}:{turn_id}"
+        if key in self._ended_turns:
+            return
+        if decision.disposition != "capture":
+            return
+        try:
+            ref = await self._capture_ref(context)
+            await self._facade.publish_turn_end(
+                ref,
+                turn_id,
+                decision,
+                run_status=run_status,
+            )
+        except Exception:
+            logger.warning("OpenViking turn-end capture failed; continuing", exc_info=True)
+            return
+        self._ended_turns.add(key)
+        callback = self._finalizer_callbacks.pop(turn_id, None)
+        if callback is not None:
+            unregister_run_finalizer(turn_id, callback)
+        if len(self._ended_turns) > 5_000:
+            self._ended_turns.clear()
+
+    async def _capture_ref(self, context: MutableMapping[str, Any]) -> Any:
+        ref = context.get("capture_ref")
+        if ref is not None:
+            return ref
+        user_id = _text(context.get("user_id")) or self._user_id or ""
+        thread_id = _text(context.get("thread_id")) or ""
+        ref = await self._facade.resolve_capture_context(user_id, thread_id)
+        _put(context, "capture_ref", ref)
+        return ref
+
+    def _mark_seen(self, context: MutableMapping[str, Any], message: Any) -> bool:
+        turn_id = _turn_id(context)
+        key: tuple[str, int | str] = (
+            turn_id,
+            getattr(message, "id", None) or id(message),
+        )
         if key in self._seen:
             return False
         self._seen.add(key)
+        if len(self._seen) > 5_000:
+            self._seen.clear()
         return True
 
 
@@ -157,4 +318,34 @@ def _turn_id(context: MutableMapping[str, Any]) -> str:
     return str(value) if value else "run"
 
 
-__all__ = ["OpenVikingMemoryMiddleware"]
+def _profile_message_index(messages: list[Any]) -> int | None:
+    for index, message in enumerate(messages):
+        if getattr(message, "id", None) == MEMORY_PROFILE_MESSAGE_ID:
+            return index
+    return None
+
+
+def _latest_real_user_index(messages: list[Any]) -> int | None:
+    for index in reversed(range(len(messages))):
+        message = messages[index]
+        if not isinstance(message, HumanMessage):
+            continue
+        kwargs = getattr(message, "additional_kwargs", None) or {}
+        if kwargs.get("hide_from_ui") or kwargs.get("memory_profile"):
+            continue
+        return index
+    return None
+
+
+def _same_profile(left: Any, right: HumanMessage) -> bool:
+    if getattr(left, "content", None) != right.content:
+        return False
+    left_kwargs = getattr(left, "additional_kwargs", None) or {}
+    right_kwargs = right.additional_kwargs or {}
+    return left_kwargs.get(MEMORY_PROFILE_ETAG_KEY) == right_kwargs.get(MEMORY_PROFILE_ETAG_KEY)
+
+
+__all__ = [
+    "MEMORY_PROFILE_MESSAGE_ID",
+    "OpenVikingMemoryMiddleware",
+]

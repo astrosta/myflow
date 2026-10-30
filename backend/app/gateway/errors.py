@@ -211,6 +211,11 @@ class MemoryRequestInvalid(Exception):
     code: ClassVar[str] = "invalid_memory_request"
 
 
+class MemoryRuntimeUnavailable(Exception):
+    status_code: ClassVar[int] = 503
+    code: ClassVar[str] = "memory_runtime_unavailable"
+
+
 class MemoryNotFoundAPI(Exception):
     status_code: ClassVar[int] = 404
     code: ClassVar[str] = "memory_not_found"
@@ -264,6 +269,7 @@ def install_error_handlers(app: FastAPI) -> None:
         InvalidMemoryProfile,
         MemoryRequestInvalid,
         MemoryNotFoundAPI,
+        MemoryRuntimeUnavailable,
         MemoryKindUnsupported,
         MemoryCorrupted,
         KnowledgeError,

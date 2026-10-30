@@ -391,3 +391,13 @@ knowledge_base:
       max_document_chars: 4000
       timeout_seconds: 60
       max_retries: 1
+
+# ------------------------------------------------------------
+# 长期记忆权威开关。false = 不做长期记忆（画像表单仍可用）；
+# true = OpenViking。旧 canonical runtime 已退役，不再作为 false 的 fallback。
+# 这是 startup-only 开关；打开前必须配置 redis_url 和至少 32 字符的
+# user_id_salt（建议用环境变量注入），否则进程会拒绝启动。
+# ------------------------------------------------------------
+memory:
+  openviking:
+    enabled: false

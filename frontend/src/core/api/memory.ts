@@ -11,7 +11,33 @@ export interface ProfileFieldView {
 export interface ProfileView {
   schema_version: number;
   revision: number;
+  etag?: string;
+  updated_at?: string;
   fields: Record<string, ProfileFieldView>;
+}
+
+export interface OnboardingView {
+  status: "not_started" | "seen" | "snoozed" | "completed" | "dismissed";
+  should_show: boolean;
+  profile_field_count: number;
+  snooze_until: string | null;
+  dismissed_at: string | null;
+  updated_at: string;
+}
+
+export type OnboardingAction = "seen" | "snooze" | "dismiss" | "complete";
+
+export interface ProfileSuggestion {
+  id: string;
+  field_path: string;
+  value: unknown;
+  evidence_uri: string;
+  evidence_quote: string;
+  confidence: number;
+  reason: string;
+  status: string;
+  profile_etag: string;
+  expires_at: string;
 }
 
 export interface PendingItem {
@@ -97,6 +123,47 @@ export function patchProfile(
     method: "PATCH",
     body: JSON.stringify({ fields, expected_revision: expectedRevision }),
   });
+}
+
+export function getOnboarding(): Promise<OnboardingView> {
+  return request<OnboardingView>("/memory/profile/onboarding");
+}
+
+export function updateOnboarding(action: OnboardingAction): Promise<OnboardingView> {
+  return request<OnboardingView>("/memory/profile/onboarding", {
+    method: "POST",
+    body: JSON.stringify({ action }),
+  });
+}
+
+export function listProfileSuggestions(): Promise<{ items: ProfileSuggestion[] }> {
+  return request<{ items: ProfileSuggestion[] }>("/memory/profile/suggestions");
+}
+
+export function acceptProfileSuggestion(
+  id: string,
+  etag?: string,
+): Promise<{ suggestion: ProfileSuggestion; profile: ProfileView }> {
+  return request<{ suggestion: ProfileSuggestion; profile: ProfileView }>(
+    "/memory/profile/suggestions/" + encodeURIComponent(id) + "/accept",
+    {
+      method: "POST",
+      body: JSON.stringify(etag ? { etag } : {}),
+    },
+  );
+}
+
+export function dismissProfileSuggestion(
+  id: string,
+  etag?: string,
+): Promise<ProfileSuggestion> {
+  return request<ProfileSuggestion>(
+    "/memory/profile/suggestions/" + encodeURIComponent(id) + "/dismiss",
+    {
+      method: "POST",
+      body: JSON.stringify(etag ? { etag } : {}),
+    },
+  );
 }
 
 export function clearProfileField(fieldPath: string): Promise<{ cleared: string }> {

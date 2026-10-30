@@ -21,8 +21,6 @@ from agentkit.agents.middlewares.durable_context_middleware import DurableContex
 from agentkit.agents.middlewares.dynamic_context_middleware import DynamicContextMiddleware
 from agentkit.agents.middlewares.input_sanitization_middleware import InputSanitizationMiddleware
 from agentkit.agents.middlewares.llm_error_handling_middleware import LLMErrorHandlingMiddleware
-from agentkit.agents.middlewares.memory_middleware import MemoryMiddleware
-from agentkit.agents.middlewares.task_classifier import TaskClassifierMiddleware
 from agentkit.agents.middlewares.pii_middleware import PIIMiddleware, PIIOutputMiddleware
 from agentkit.agents.middlewares.skill_activation_middleware import SkillActivationMiddleware
 from agentkit.agents.middlewares.skill_tool_policy_middleware import SkillToolPolicyMiddleware
@@ -159,43 +157,32 @@ def build_middlewares(
             snapshot=snapshot,
         )
     )
+    openviking_enabled = resolved.memory.openviking.enabled
     if resolved.summarization.enabled:
         summarization = create_summarization_middleware(
             app_config=resolved, run_model_name=model_name
         )
         if summarization is not None:
-            # M10 §2.6.1：压缩丢掉的消息在压缩前入队，而不是等下一轮。
-            from agentkit.agents.memory.manager import get_memory_manager
-            from agentkit.agents.memory.summarization_hook import MemorySummarizationHook
-
-            try:
-                manager = get_memory_manager(app_config=resolved)
-                if manager.ingestors:
-                    summarization.before_summarization.append(
-                        MemorySummarizationHook(
-                            manager,
-                            user_id=user_id,
-                            thread_id=(config or {}).get("configurable", {}).get("thread_id"),
-                        )
-                    )
-            except Exception:
-                logger.warning("Memory summarization hook was not attached", exc_info=True)
+            # Conversation compaction is independent from long-term memory and
+            # never enters the OpenViking capture stream.
             chain.append(summarization)
     # SLOT: TodoList if is_plan_mode
     chain.append(TitleMiddleware(app_config=resolved))
-    if resolved.memory.enabled and resolved.memory.task_classifier.enabled:
-        chain.append(
-            TaskClassifierMiddleware(
-                config=resolved.memory,
-                app_config=resolved,
-                user_id=user_id,
-            )
+    if openviking_enabled:
+        from agentkit.agents.memory.openviking.runtime import get_openviking_memory_runtime
+        from agentkit.agents.middlewares.openviking_memory_middleware import (
+            OpenVikingMemoryMiddleware,
         )
-    # M10 §2.6.1 / §2.8.1：画像注入与轮次入队。after_model 反序，所以它在 Title 之后注册、
-    # 在 Title 之前跑——标题生成失败不影响记忆入队。
-    # 注意参数类型：它吃的是 MemoryConfig（`resolved.memory`），不是整个 AppConfig——
-    # 传错就是 `'AppConfig' object has no attribute 'enabled'`，一发送就炸。
-    chain.append(MemoryMiddleware(config=resolved.memory, user_id=user_id))
+
+        runtime = get_openviking_memory_runtime()
+        if runtime is not None:
+            chain.append(
+                OpenVikingMemoryMiddleware(runtime.facade, user_id=user_id)
+            )
+        else:
+            logger.warning(
+                "memory.openviking.enabled=true but the OpenViking runtime is not initialized"
+            )
     # 输出侧脱敏最后注册：after_model 反序，因此它在 Memory/Title 之前跑，模型
     # 写回的 AI 文本和 tool_calls 参数先变成 handle，Memory 再看到脱敏/去 handle 视图。
     chain.append(PIIOutputMiddleware(app_config=resolved))

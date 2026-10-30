@@ -152,13 +152,17 @@ class MemoryCaptureDedupRow(Base):
             "state in ('pending', 'appending', 'appended')",
             name="ck_capture_dedup_state",
         ),
+        # An appended row normally has appended_at set. The anomaly
+        # `appended_at IS NULL` is intentionally representable so startup
+        # reconciliation can find and repair the append-success/DB-failure
+        # window without the constraint rejecting the row.
         CheckConstraint(
             "("
             "state = 'pending' and lease_until is null and appended_at is null"
             ") or ("
             "state = 'appending' and lease_until is not null and appended_at is null"
             ") or ("
-            "state = 'appended' and appended_at is not null"
+            "state = 'appended' and lease_until is null"
             ")",
             name="ck_capture_dedup_state_fields",
         ),

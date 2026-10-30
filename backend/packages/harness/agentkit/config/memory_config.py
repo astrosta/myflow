@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from agentkit.config.openviking_memory import OpenVikingMemoryConfig
 from agentkit.config.reload_boundary import format_field_description
 
 logger = logging.getLogger(__name__)
@@ -233,6 +234,12 @@ class MemoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    # Explicit long-term-memory authority switch. False disables long-term
+    # memory (the DB-backed profile form still works); true enables OpenViking.
+    # The legacy canonical runtime is retired and is not a fallback.
+    openviking: OpenVikingMemoryConfig = Field(
+        default_factory=lambda: OpenVikingMemoryConfig(enabled=False)
+    )
     canonical_store: Literal["postgres"] = "postgres"
     backend_class: str = Field(
         default="langmem",

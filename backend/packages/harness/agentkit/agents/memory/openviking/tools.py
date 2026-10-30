@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from typing import Any
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool, tool
 
+from agentkit.agents.memory.openviking.config import DEFAULT_MEMORY_TYPES as ALLOWED_MEMORY_TYPES
 from agentkit.agents.memory.openviking.contracts import MemoryHit
 from agentkit.runtime.user_context import resolve_runtime_user_id
 
-DEFAULT_MEMORY_TYPES = ["preferences", "entities", "events"]
+DEFAULT_SEARCH_TYPES = ["preferences", "entities", "events"]
 MAX_LIMIT = 20
 MAX_READ_CHARS = 16_000
 
@@ -33,16 +35,29 @@ def make_memory_search_tool(facade: Any) -> BaseTool:
         user_id = resolve_runtime_user_id(_context(runtime))
         if not user_id:
             return _error("missing_user", "缺少用户身份，长期记忆不可用")
+        types = list(memory_types or DEFAULT_SEARCH_TYPES)
+        invalid = sorted(set(types) - set(ALLOWED_MEMORY_TYPES))
+        if invalid:
+            return _error("invalid_memory_type", f"invalid memory_type: {invalid[0]}")
+        if (since or until or time_field) and types != ["events"]:
+            return _error(
+                "time_filter_requires_events",
+                "since/until/time_field require memory_types == ['events']",
+            )
         try:
             hits = await facade.search(
                 user_id,
                 query,
-                memory_types=memory_types or DEFAULT_MEMORY_TYPES,
+                memory_types=types,
                 limit=max(1, min(int(limit), MAX_LIMIT)),
                 since=since,
                 until=until,
                 time_field=time_field,
             )
+        except ValueError as exc:
+            message = str(exc)
+            code = "invalid_memory_type" if "memory_type" in message else "memory_search_failed"
+            return _error(code, message)
         except Exception as exc:
             return _error("memory_search_failed", str(exc))
         return json.dumps(
@@ -106,7 +121,7 @@ def _context(runtime: Any) -> dict[str, Any]:
     if runtime is None:
         return {}
     context = getattr(runtime, "context", None)
-    return dict(context) if isinstance(context, dict) else {}
+    return dict(context) if isinstance(context, Mapping) else {}
 
 
 def _hit(hit: MemoryHit) -> dict[str, Any]:

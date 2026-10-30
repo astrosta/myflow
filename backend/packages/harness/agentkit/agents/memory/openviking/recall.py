@@ -18,9 +18,21 @@ class RecallClient(Protocol):
     async def overview(self, uri: str) -> str: ...
 
 
+class RecallClientResolver(Protocol):
+    async def client_for(self, ov_user: str) -> RecallClient: ...
+
+
 class RecallService:
-    def __init__(self, client: RecallClient) -> None:
+    def __init__(
+        self,
+        client: RecallClient | None = None,
+        *,
+        resolver: RecallClientResolver | None = None,
+    ) -> None:
+        if client is None and resolver is None:
+            raise ValueError("RecallService requires client or resolver")
         self._client = client
+        self._resolver = resolver
         self._envelope = MemoryContentEnvelope()
 
     async def search(
@@ -56,7 +68,8 @@ class RecallService:
                 options["time_field"] = time_field
 
         targets = [f"viking://user/{ov_user}/memories/{item}" for item in types]
-        result = await self._client.find(
+        client = await self._client_for(ov_user)
+        result = await client.find(
             query=query,
             target_uri=targets,
             limit=limit,
@@ -88,12 +101,14 @@ class RecallService:
 
     async def read(self, ov_user: str, uri: str, *, max_chars: int = 8_000) -> str:
         target = self._validate_uri(ov_user, uri)
-        content = await self._client.read(target)
+        client = await self._client_for(ov_user)
+        content = await client.read(target)
         return self._envelope.wrap(source=target, text=content, max_chars=max_chars)
 
     async def overview(self, ov_user: str, uri: str) -> str:
         target = self._validate_uri(ov_user, uri)
-        content = await self._client.overview(target)
+        client = await self._client_for(ov_user)
+        content = await client.overview(target)
         return self._envelope.wrap(source=target, text=content, max_chars=4_000)
 
     @staticmethod
@@ -113,6 +128,12 @@ class RecallService:
         if any(segment in denied for segment in segments[2:]):
             raise ValueError("managed namespace is not readable")
         return uri
+
+    async def _client_for(self, ov_user: str) -> RecallClient:
+        if self._resolver is not None:
+            return await self._resolver.client_for(ov_user)
+        assert self._client is not None
+        return self._client
 
 
 def _memory_type(uri: str) -> str | None:
@@ -138,4 +159,4 @@ def _float(value: Any) -> float | None:
         return None
 
 
-__all__ = ["RecallClient", "RecallService"]
+__all__ = ["RecallClient", "RecallClientResolver", "RecallService"]

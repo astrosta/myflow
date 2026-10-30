@@ -140,6 +140,25 @@ memory:
       max_fold_depth: 2
       max_clusters_per_run: 10
       cooldown_days: 7
+  # 显式切换长期记忆权威：false = 不做长期记忆（只保留 DB-backed 画像表单）；
+  # true = OpenViking 负责 capture / append / 检索。旧 canonical runtime 已退役，
+  # 不再作为 false 的 fallback。默认必须保持 false。
+  openviking:
+    enabled: false
+    url: http://127.0.0.1:1933
+    account: myflow
+    root_api_key: ""          # 生产用 $OPENVIKING_ROOT_API_KEY
+    user_id_salt: ""          # 生产用 $MYFLOW_MEMORY_ID_SALT（至少 32 字符；true 时必填）
+    required: false
+    # Session 只用 idle-only auto-commit；0 表示关闭 token/message 阈值。
+    # memory_policy.memory_types 固定只启用 8 类自动记忆，显式排除
+    # profile / identity / soul（它们是 OpenViking 内置类型）。
+    capture_stream:
+      redis_url: ""            # 生产用 $MYFLOW_REDIS_URL
+      shard_count: 64
+      claim_idle_ms: 60000
+    capture:
+      missing_turn_end_timeout_seconds: 86400
   backend_config:
     # extraction_model: deepseek-reasoner   # 留空则抽取停用（画像仍可手工维护）
     # embedding_model: ...      # 配置后 store 才会建向量索引；缺省降级词法

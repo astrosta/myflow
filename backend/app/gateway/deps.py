@@ -10,7 +10,9 @@ from agentkit.agents.memory.canonical.service import (
     get_memory_service as get_canonical_memory_service,
 )
 from agentkit.agents.memory.manager import MemoryManager, get_memory_manager
+from agentkit.agents.memory.openviking.onboarding import OnboardingService
 from agentkit.agents.memory.openviking.profile import ProfileService
+from agentkit.agents.memory.openviking.suggestions import ProfileSuggester
 from agentkit.config import get_app_config
 from agentkit.config.knowledge_config import KnowledgeBaseConfig
 from agentkit.knowledge.errors import KnowledgeDisabled
@@ -38,7 +40,11 @@ __all__ = [
     "get_knowledge_service_optional",
     "get_memory_manager_service",
     "get_memory_service",
+    "get_openviking_onboarding_service",
+    "get_openviking_onboarding_service_optional",
+    "has_openviking_active_run",
     "get_openviking_profile_service",
+    "get_openviking_suggestion_service",
     "get_skill_author_service",
     "get_skill_review_service",
     "get_request_id",
@@ -107,10 +113,45 @@ def get_memory_manager_service(request: Request) -> MemoryManager:
     return manager
 
 
+async def has_openviking_active_run(request: Request, user_id: str) -> bool:
+    """Ask the gateway run store whether the user has an active operation."""
+
+    services = getattr(request.app.state, "run_services", None)
+    store = getattr(services, "run_store", None)
+    if store is None:
+        return False
+    try:
+        rows = await store.list_inflight()
+    except Exception:
+        return False
+    return any(str(row.get("user_id") or "") == user_id for row in rows)
+
+
 def get_openviking_profile_service(request: Request) -> ProfileService:
     service = getattr(request.app.state, "profile_service", None)
     if not isinstance(service, ProfileService):
         raise RuntimeError("OpenViking ProfileService is not initialized")
+    return service
+
+
+def get_openviking_onboarding_service_optional(
+    request: Request,
+) -> OnboardingService | None:
+    service = getattr(request.app.state, "onboarding_service", None)
+    return service if isinstance(service, OnboardingService) else None
+
+
+def get_openviking_onboarding_service(request: Request) -> OnboardingService:
+    service = getattr(request.app.state, "onboarding_service", None)
+    if not isinstance(service, OnboardingService):
+        raise RuntimeError("OpenViking OnboardingService is not initialized")
+    return service
+
+
+def get_openviking_suggestion_service(request: Request) -> ProfileSuggester:
+    service = getattr(request.app.state, "suggestion_service", None)
+    if not isinstance(service, ProfileSuggester):
+        raise RuntimeError("OpenViking ProfileSuggester is not initialized")
     return service
 
 

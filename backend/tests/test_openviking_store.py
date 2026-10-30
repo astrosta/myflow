@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.memory.openviking.contracts import CapturedMessage
+from agentkit.agents.memory.openviking.models import MemoryCaptureDedupRow
 from agentkit.agents.memory.openviking.store import CaptureDedupStore, MemorySyncStore
 from agentkit.persistence.base import Base
 
@@ -56,6 +59,38 @@ async def test_dedup_lifecycle_and_uncertain_scope(factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reserve_is_idempotent_under_concurrency(factory) -> None:
+    store = CaptureDedupStore(factory)
+    item = captured()
+
+    states = await asyncio.gather(*(store.reserve(item) for _ in range(8)))
+
+    assert states == ["pending"] * 8
+    assert len(await store.uncertain()) == 1
+
+
+@pytest.mark.asyncio
+async def test_appended_without_timestamp_is_retried_not_treated_as_terminal(factory) -> None:
+    store = CaptureDedupStore(factory)
+    item = captured()
+    await store.reserve(item)
+    await store.mark_appending(item, lease_seconds=60)
+    await store.mark_appended(item)
+    async with factory() as session:
+        row = await session.get(
+            MemoryCaptureDedupRow,
+            ("u1", "t1", 1, "i1", "m1"),
+        )
+        row.appended_at = None
+        row.state = "appended"
+        row.lease_until = None
+        await session.commit()
+
+    assert await store.reserve(item) == "pending"
+    assert await store.mark_appending(item, lease_seconds=60) is True
+
+
+@pytest.mark.asyncio
 async def test_uncertain_contains_pending_and_invalid_appended(factory) -> None:
     store = CaptureDedupStore(factory)
     pending = captured("pending")
@@ -78,6 +113,12 @@ async def test_sync_store_get_or_create_and_delete(factory) -> None:
         stream_shard=7,
     )
     assert row.session_epoch == 1
+    await store.record_append("u1", "t1", message_id="m1", stream_id="1-0")
+    row = await store.get("u1", "t1")
+    assert row.last_message_id == "m1"
+    assert row.last_stream_id == "1-0"
+    assert row.last_message_at is not None
+    assert row.last_append_at is not None
     await store.set_state("u1", "t1", "appended")
     assert (await store.get("u1", "t1")).state == "appended"
     await store.mark_deleted("u1", "t1")

@@ -7,6 +7,7 @@ still import the package.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
@@ -51,6 +52,25 @@ class OpenVikingSessionClient:
         except Exception as exc:
             _raise_mapped(exc)
 
+    async def commit_session(
+        self, session_id: str, *, keep_recent_count: int = 0
+    ) -> dict[str, Any]:
+        try:
+            return await self._sdk.commit_session(
+                session_id, keep_recent_count=keep_recent_count
+            )
+        except Exception as exc:
+            _raise_mapped(exc)
+
+    async def find(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._sdk.find(**kwargs)
+
+    async def read(self, uri: str) -> str:
+        return await self._sdk.read(uri)
+
+    async def overview(self, uri: str) -> str:
+        return await self._sdk.overview(uri)
+
 
 def _raise_mapped(exc: Exception) -> None:
     code = str(getattr(exc, "code", "") or type(exc).__name__).upper()
@@ -59,6 +79,46 @@ def _raise_mapped(exc: Exception) -> None:
     if "ALREADY_EXISTS" in code:
         raise SessionAlreadyExists(str(exc)) from exc
     raise exc
+
+
+class OpenVikingClientFactory:
+    """Per-user client cache for one process/event loop.
+
+    The factory is not thread-safe by itself; the runtime owns it on the
+    gateway loop. It keeps one initialized SDK client per OpenViking user.
+    """
+
+    def __init__(self, config: OpenVikingMemoryConfig, *, builder: Any = None) -> None:
+        self._config = config
+        self._builder = builder or build_async_client
+        self._clients: dict[str, OpenVikingSessionClient] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    async def client_for(self, ov_user: str) -> OpenVikingSessionClient:
+        cached = self._clients.get(ov_user)
+        if cached is not None:
+            return cached
+        # A user can have threads on several shards, so two worker loops may
+        # request the same client concurrently. Keep one builder per user.
+        lock = self._locks.setdefault(ov_user, asyncio.Lock())
+        async with lock:
+            cached = self._clients.get(ov_user)
+            if cached is not None:
+                return cached
+            sdk = await self._builder(self._config, ov_user=ov_user)
+            client = OpenVikingSessionClient(sdk)
+            self._clients[ov_user] = client
+            return client
+
+    async def close(self) -> None:
+        for client in list(self._clients.values()):
+            close = getattr(client._sdk, "close", None)
+            if close is not None:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+        self._clients.clear()
+        self._locks.clear()
 
 
 async def build_async_client(config: OpenVikingMemoryConfig, *, ov_user: str) -> Any:
@@ -85,4 +145,4 @@ async def build_async_client(config: OpenVikingMemoryConfig, *, ov_user: str) ->
     return client
 
 
-__all__ = ["OpenVikingSessionClient", "build_async_client"]
+__all__ = ["OpenVikingClientFactory", "OpenVikingSessionClient", "build_async_client"]

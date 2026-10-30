@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from agentkit.agents.memory.openviking.client import OpenVikingSessionClient
+from agentkit.agents.memory.openviking.client import OpenVikingClientFactory, OpenVikingSessionClient
 from agentkit.agents.memory.openviking.session import SessionAlreadyExists, SessionNotFound
 
 
@@ -47,6 +49,23 @@ class FakeSDK:
         self._maybe_fail()
         return {"messages": [{"id": "ov-1"}]}
 
+    async def commit_session(self, session_id: str, *, keep_recent_count: int = 0) -> dict:
+        self.calls.append(("commit", session_id, keep_recent_count))
+        self._maybe_fail()
+        return {"session_id": session_id}
+
+    async def find(self, **kwargs) -> dict:
+        self.calls.append(("find", kwargs))
+        return {"memories": []}
+
+    async def read(self, uri: str) -> str:
+        self.calls.append(("read", uri))
+        return "body"
+
+    async def overview(self, uri: str) -> str:
+        self.calls.append(("overview", uri))
+        return "overview"
+
 
 @pytest.mark.asyncio
 async def test_wrapper_maps_not_found_and_already_exists() -> None:
@@ -61,3 +80,56 @@ async def test_wrapper_maps_not_found_and_already_exists() -> None:
     sdk.fail = None
     await client.batch_add_messages("s1", [{"role": "user", "parts": []}])
     assert sdk.calls[-1][0] == "batch"
+    await client.commit_session("s1")
+    assert sdk.calls[-1] == ("commit", "s1", 0)
+    await client.find(query="q", target_uri="viking://user/u/memories/preferences", limit=5)
+    assert sdk.calls[-1][0] == "find"
+    await client.read("viking://user/u/memories/preferences/a.md")
+    await client.overview("viking://user/u/memories/preferences/a.md")
+    assert sdk.calls[-1][0] == "overview"
+
+
+@pytest.mark.asyncio
+async def test_factory_caches_per_user() -> None:
+    from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
+
+    built: list[str] = []
+
+    async def builder(config, *, ov_user):
+        built.append(ov_user)
+        return FakeSDK()
+
+    factory = OpenVikingClientFactory(
+        OpenVikingMemoryConfig(user_id_salt="s" * 32),
+        builder=builder,
+    )
+    first = await factory.client_for("u1")
+    second = await factory.client_for("u1")
+    third = await factory.client_for("u2")
+    assert first is second
+    assert first is not third
+    assert built == ["u1", "u2"]
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_factory_builds_one_client_under_concurrent_first_use() -> None:
+    from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
+
+    built: list[str] = []
+
+    async def builder(config, *, ov_user):
+        built.append(ov_user)
+        await asyncio.sleep(0)
+        return FakeSDK()
+
+    factory = OpenVikingClientFactory(
+        OpenVikingMemoryConfig(user_id_salt="s" * 32),
+        builder=builder,
+    )
+
+    clients = await asyncio.gather(*(factory.client_for("u1") for _ in range(8)))
+
+    assert len({id(client) for client in clients}) == 1
+    assert built == ["u1"]
+    await factory.close()

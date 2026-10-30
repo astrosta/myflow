@@ -10,7 +10,16 @@
 
 **Spec:** `docs/plans/2026-10-29-openviking-memory-module-design.md`
 
-> **Implementation status:** core slice implemented on `feat/openviking-memory`; 61 new tests pass. Real Redis Streams transport, the SDK error wrapper, capture middleware, profile HTTP routes, recall, the content envelope and model tools are implemented; default-chain wiring, frontend and legacy deletion remain deferred.
+> **Implementation status:** core slice plus the explicit cutover are implemented on
+> `feat/openviking-memory`; 114 OpenViking tests, 2220 backend tests and 301
+> frontend tests pass.
+> The switch is `memory.openviking.enabled` (default `false`). It selects the
+> runtime, capture middleware, memory tools, identity/soul system prompt and
+> startup/shutdown path. The DB-backed profile, onboarding and suggestions
+> surfaces remain available when memory is off.
+> Profile suggestions/onboarding HTTP + UI, admin status/flush, canonical table
+> retirement (fresh bootstrap exclusion + migration 0009) are implemented.
+> Only live OpenViking/Redis integration remains out of scope.
 
 ## Global Constraints
 
@@ -533,7 +542,6 @@ git commit -m "feat(memory): add DB-backed profile and personalization"
 
 ## Out of Scope / Deferred
 
-- Deleting canonical memory tables/code and migration 0009.
-- Frontend profile/suggestions/onboarding pages.
-- Real Redis Streams adapter and real `openviking-sdk` client factory (Task 9 can add a thin adapter; real service integration is Phase 0).
-- Admin status/flush endpoints.
+- Live OpenViking Server + real Redis Streams integration (the user explicitly excluded final integration).
+- Optional LLM-assisted suggestion ranking; the implemented suggester is deterministic by design.
+- Physical deletion of historical canonical Python modules; they are no longer assembled or mounted, and their tables are excluded from fresh bootstrap and dropped by 0009.

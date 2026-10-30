@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -49,6 +51,10 @@ class FakeClient:
         self.calls.append(("delete", session_id))
         self.sessions.pop(session_id, None)
 
+    async def commit_session(self, session_id: str, *, keep_recent_count: int = 0) -> dict:
+        self.calls.append(("commit", session_id, keep_recent_count))
+        return {"session_id": session_id}
+
 
 @pytest_asyncio.fixture
 async def manager():
@@ -74,6 +80,18 @@ async def test_resolve_does_not_create_openviking_session(manager) -> None:
     assert ref.ov_session_id.startswith("mf-s-")
     assert ref.ov_user.startswith("u_")
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_resolution_uses_one_incarnation(manager) -> None:
+    session_manager, _store, _client, _config = manager
+
+    refs = await asyncio.gather(
+        *(session_manager.resolve_capture_context("u1", "t1") for _ in range(8))
+    )
+
+    assert len({ref.ov_session_id for ref in refs}) == 1
+    assert len({ref.session_incarnation for ref in refs}) == 1
 
 
 @pytest.mark.asyncio
@@ -118,6 +136,22 @@ async def test_memory_policy_mismatch_fails_closed(manager) -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_memory_type_allowlist_fails_closed(manager) -> None:
+    session_manager, _store, client, config = manager
+    ref = await session_manager.resolve_capture_context("u1", "t1")
+    policy = config.session.memory_policy()
+    policy.pop("memory_types")
+    client.sessions[ref.ov_session_id] = {
+        "session_id": ref.ov_session_id,
+        "memory_policy": policy,
+        "auto_commit_policy": config.session_create_options()["auto_commit_policy"],
+    }
+
+    with pytest.raises(SessionPolicyMismatch):
+        await session_manager.ensure_session(ref)
+
+
+@pytest.mark.asyncio
 async def test_auto_policy_mismatch_is_updated(manager) -> None:
     session_manager, _store, client, config = manager
     ref = await session_manager.resolve_capture_context("u1", "t1")
@@ -131,6 +165,17 @@ async def test_auto_policy_mismatch_is_updated(manager) -> None:
 
     assert [call[0] for call in client.calls] == ["get", "update"]
     assert client.sessions[ref.ov_session_id]["auto_commit_policy"] == config.session_create_options()["auto_commit_policy"]
+
+
+@pytest.mark.asyncio
+async def test_commit_marks_the_sync_state_done(manager) -> None:
+    session_manager, store, client, _config = manager
+    ref = await session_manager.resolve_capture_context("u1", "t1")
+
+    await session_manager.commit(ref)
+
+    assert client.calls[-1] == ("commit", ref.ov_session_id, 0)
+    assert (await store.get("u1", "t1")).state == "done"
 
 
 @pytest.mark.asyncio

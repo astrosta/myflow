@@ -47,7 +47,10 @@ def test_get_patch_conflict_and_clear(client) -> None:
     initial = client.get("/api/memory/profile")
     assert initial.status_code == 200
     body = initial.json()
-    assert body["fields"]["identity.preferred_name"] == "小王"
+    assert body["fields"]["identity.preferred_name"]["value"] == "小王"
+    assert body["fields"]["identity.preferred_name"]["source"] == "user_manual"
+    assert body["schema_version"] == 1
+    assert isinstance(body["revision"], int)
     etag = body["etag"]
 
     patched = client.patch(
@@ -55,7 +58,7 @@ def test_get_patch_conflict_and_clear(client) -> None:
         json={"fields": {"communication.tone": "direct"}, "etag": etag},
     )
     assert patched.status_code == 200
-    assert patched.json()["fields"]["communication.tone"] == "direct"
+    assert patched.json()["fields"]["communication.tone"]["value"] == "direct"
 
     stale = client.patch(
         "/api/memory/profile",
@@ -70,14 +73,44 @@ def test_get_patch_conflict_and_clear(client) -> None:
     )
     assert invalid.status_code == 422
 
+    # The existing profile page still sends expected_revision and no body on
+    # DELETE; both compatibility paths must keep working during cutover.
+    legacy = client.patch(
+        "/api/memory/profile",
+        json={
+            "fields": {"communication.verbosity": "concise"},
+            "expected_revision": patched.json()["revision"],
+        },
+    )
+    assert legacy.status_code == 200
+    assert legacy.json()["fields"]["communication.verbosity"]["value"] == "concise"
+
+    stale_revision = client.patch(
+        "/api/memory/profile",
+        json={
+            "fields": {"communication.verbosity": "balanced"},
+            "expected_revision": patched.json()["revision"],
+        },
+    )
+    assert stale_revision.status_code == 409
+
     deleted = client.request(
         "DELETE",
         "/api/memory/profile/identity.preferred_name",
-        json={"etag": patched.json()["etag"]},
     )
     assert deleted.status_code == 200
     assert "identity.preferred_name" not in deleted.json()["fields"]
 
-    cleared = client.request("DELETE", "/api/memory/profile", json={"etag": deleted.json()["etag"]})
+    cleared = client.request("DELETE", "/api/memory/profile")
     assert cleared.status_code == 200
     assert cleared.json()["fields"] == {}
+
+
+def test_legacy_navigation_endpoints_are_empty_not_404(client) -> None:
+    pending = client.get("/api/memory/pending")
+    candidates = client.get("/api/memory/skill-candidates")
+
+    assert pending.status_code == 200
+    assert pending.json() == {"items": [], "next_cursor": None}
+    assert candidates.status_code == 200
+    assert candidates.json() == []

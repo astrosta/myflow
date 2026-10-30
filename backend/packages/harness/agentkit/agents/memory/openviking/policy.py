@@ -89,6 +89,16 @@ def _is_pure_emoji_or_punctuation(value: str) -> bool:
     return not without_emoji.strip() or bool(_PUNCTUATION.fullmatch(without_emoji))
 
 
+def validate_extra_skip_tokens(tokens: tuple[str, ...]) -> None:
+    extra = tuple(token.strip().casefold() for token in tokens if token.strip())
+    bad_extra = sorted(set(extra) & _TASK_CONTEXT_TOKENS)
+    if bad_extra:
+        raise ValueError(
+            "extra_skip_tokens cannot contain task-context tokens: "
+            + ", ".join(bad_extra)
+        )
+
+
 def classify_turn(
     user_text: str,
     *,
@@ -103,13 +113,8 @@ def classify_turn(
     because they may carry the actual task even when the text is social.
     """
 
+    validate_extra_skip_tokens(extra_skip_tokens)
     extra = tuple(token.strip().casefold() for token in extra_skip_tokens if token.strip())
-    bad_extra = sorted(set(extra) & _TASK_CONTEXT_TOKENS)
-    if bad_extra:
-        raise ValueError(
-            "extra_skip_tokens cannot contain task-context tokens: "
-            + ", ".join(bad_extra)
-        )
 
     if has_attachments:
         return TurnDecision("capture", reason="attachments")

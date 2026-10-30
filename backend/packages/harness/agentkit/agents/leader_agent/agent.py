@@ -42,6 +42,7 @@ class AgentCacheKey:
     user_id: str
     app_config: AppConfig
     checkpointer: Any
+    personalization_digest: str = ""
 
     def __eq__(self, other: object) -> bool:
         return (
@@ -50,10 +51,19 @@ class AgentCacheKey:
             and self.user_id == other.user_id
             and self.app_config is other.app_config
             and self.checkpointer is other.checkpointer
+            and self.personalization_digest == other.personalization_digest
         )
 
     def __hash__(self) -> int:
-        return hash((self.assembly_inputs, self.user_id, id(self.app_config), id(self.checkpointer)))
+        return hash(
+            (
+                self.assembly_inputs,
+                self.user_id,
+                id(self.app_config),
+                id(self.checkpointer),
+                self.personalization_digest,
+            )
+        )
 
 
 def agent_cache_key(
@@ -68,7 +78,22 @@ def agent_cache_key(
         user_id=user_id,
         app_config=app_config,
         checkpointer=checkpointer,
+        personalization_digest=_personalization_digest(app_config),
     )
+
+
+def _personalization_digest(app_config: AppConfig) -> str:
+    if not app_config.memory.openviking.enabled:
+        return ""
+    personalization = app_config.memory.openviking.personalization
+    if not personalization.enabled:
+        return ""
+    from agentkit.agents.memory.openviking.profile import read_assistant_personalization
+
+    return read_assistant_personalization(
+        identity_path=personalization.identity_file,
+        soul_path=personalization.soul_file,
+    ).digest
 
 def make_agent(config: RunnableConfig):
     return assemble_agent(config).graph
@@ -142,21 +167,17 @@ def assemble_agent(
         from agentkit.tools.builtin.task_tool import make_task_tool
 
         tools = [*tools, make_task_tool(dispatcher=runtime, app_config=resolved_config)]
-    if resolved_config.memory.enabled:
-        # M10 §2.8.2：read-only memory_search. Its closure is bound to the process manager
-        # so tests and embedded hosts can inject a manager without touching a global.
-        from agentkit.agents.memory.canonical.service import get_memory_service
-        from agentkit.agents.memory.manager import get_memory_manager
-        from agentkit.agents.memory.tools import TOOL_NAME as MEMORY_TOOL_NAME
-        from agentkit.agents.memory.tools import make_memory_search_tool
+    if resolved_config.memory.openviking.enabled:
+        from agentkit.agents.memory.openviking.runtime import get_openviking_memory_runtime
 
-        try:
-            service = get_memory_service()
-            manager = service or get_memory_manager(app_config=resolved_config)
-            if MEMORY_TOOL_NAME not in {tool.name for tool in tools}:
-                tools = [*tools, make_memory_search_tool(manager)]
-        except Exception:
-            logger.warning("memory_search was not attached", exc_info=True)
+        runtime = get_openviking_memory_runtime()
+        if runtime is not None:
+            existing_names = {tool.name for tool in tools}
+            tools = [*tools, *(tool for tool in runtime.tools if tool.name not in existing_names)]
+        else:
+            logger.warning(
+                "memory.openviking.enabled=true but the OpenViking runtime is not initialized"
+            )
     if resolved_config.knowledge_base.enabled:
         # Identity is read from runtime.context inside the tool, never from model args.
         from agentkit.knowledge.tool import TOOL_NAME as KNOWLEDGE_TOOL_NAME

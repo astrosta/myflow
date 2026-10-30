@@ -12,6 +12,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from agentkit.agents.middlewares.provenance import read_provenance
 from agentkit.privacy import PIIRedactor
 
 
@@ -39,6 +40,8 @@ class MemoryMessageAdapter:
         if kwargs.get("memory_recall") or kwargs.get("personalization"):
             return False
         if kwargs.get("memory_profile") or kwargs.get("memory_provenance"):
+            return False
+        if read_provenance(message) is not None:
             return False
         if getattr(message, "name", None) == "summary":
             return False

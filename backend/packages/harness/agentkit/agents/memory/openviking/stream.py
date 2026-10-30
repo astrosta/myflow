@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from langchain_core.messages import BaseMessage
@@ -91,6 +92,39 @@ class MemoryMessagePublisher:
     ) -> CapturedMessage:
         return await self._publish(session, turn_id, "tool", "assistant", message, sequence)
 
+    async def publish_turn_end(
+        self,
+        session: SessionRef,
+        turn_id: str,
+        *,
+        signals: tuple[str, ...] = (),
+        run_status: str | None = None,
+        has_tool_error: bool = False,
+        has_recovery: bool = False,
+    ) -> CapturedMessage:
+        captured = CapturedMessage(
+            user_id=session.user_id,
+            thread_id=session.thread_id,
+            turn_id=turn_id,
+            message_id=f"turn_end:{turn_id}",
+            session_epoch=session.session_epoch,
+            session_incarnation=session.session_incarnation,
+            sequence=0,
+            kind="control",
+            role=None,
+            message={},
+            stream_shard=session.stream_shard,
+            signals=tuple(signals),  # type: ignore[arg-type]
+            run_status=run_status,  # type: ignore[arg-type]
+            has_tool_error=has_tool_error,
+            has_recovery=has_recovery,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        result = await self._stream.publish(captured)
+        if result.stream_id is None:
+            raise RuntimeError("capture stream did not return a stream id")
+        return replace(captured, stream_id=result.stream_id)
+
     async def _publish(
         self,
         session: SessionRef,
@@ -114,6 +148,7 @@ class MemoryMessagePublisher:
             role=role,  # type: ignore[arg-type]
             message=snapshot,
             stream_shard=session.stream_shard,
+            created_at=datetime.now(UTC).isoformat(),
         )
         result = await self._stream.publish(captured)
         if result.stream_id is None:
@@ -142,12 +177,14 @@ class RedisCaptureStream:
         group: str,
         consumer: str,
         maxlen: int = 100_000,
+        claim_idle_ms: int = 60_000,
     ) -> None:
         self._redis = redis
         self._key_prefix = key_prefix
         self._group = group
         self._consumer = consumer
         self._maxlen = maxlen
+        self._claim_idle_ms = max(1, int(claim_idle_ms))
 
     def key(self, shard: int) -> str:
         return f"{self._key_prefix}:{shard}"
@@ -185,7 +222,7 @@ class RedisCaptureStream:
         self,
         shard: int,
         *,
-        min_idle_ms: int = 60_000,
+        min_idle_ms: int | None = None,
         count: int = 100,
     ) -> list[CapturedMessage]:
         await self._ensure_group(shard)
@@ -193,7 +230,7 @@ class RedisCaptureStream:
             self.key(shard),
             self._group,
             self._consumer,
-            min_idle_time=min_idle_ms,
+            min_idle_time=self._claim_idle_ms if min_idle_ms is None else min_idle_ms,
             start_id="0-0",
             count=count,
         )

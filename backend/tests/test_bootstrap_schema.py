@@ -82,6 +82,29 @@ def test_empty_database_creates_schema_then_stamps_head(
     _run(scenario)
 
 
+def test_fresh_bootstrap_does_not_create_legacy_canonical_tables(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        engine = await _engine(tmp_path)
+        try:
+            await bootstrap_schema(engine, backend="sqlite")
+            async with engine.connect() as conn:
+                names = {
+                    row[0]
+                    for row in (
+                        await conn.execute(
+                            text("SELECT name FROM sqlite_master WHERE type = 'table'")
+                        )
+                    ).all()
+                }
+            assert "memory_records" not in names
+            assert "memory_profiles" not in names
+            assert "memory_profile_documents" in names
+        finally:
+            await engine.dispose()
+
+    _run(scenario)
+
+
 def test_checkpoint_tables_alone_still_count_as_empty(tmp_path: Path) -> None:
     async def scenario() -> None:
         engine = await _engine(tmp_path)

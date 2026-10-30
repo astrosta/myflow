@@ -47,6 +47,17 @@ def test_ai_tool_call_keeps_id_and_name() -> None:
     assert parts[0]["tool_status"] == "pending"
 
 
+def test_provenance_messages_are_not_recordable() -> None:
+    from agentkit.agents.middlewares.provenance import ContentKind, provenance_kwargs
+
+    message = HumanMessage(
+        content="injected",
+        additional_kwargs=provenance_kwargs(ContentKind.MEMORY, "profile_context"),
+    )
+
+    assert MemoryMessageAdapter().is_recordable(message) is False
+
+
 def test_system_and_empty_are_not_recordable() -> None:
     adapter = MemoryMessageAdapter()
 

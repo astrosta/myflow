@@ -262,29 +262,19 @@ def test_manager_clear_removes_profile_and_records(stack) -> None:
     assert manager.list_records(scope, kind=MemoryKind.SEMANTIC, include_history=True).items == []
 
 
-def test_assembly_passes_memory_config_not_app_config() -> None:
-    """回归：`MemoryMiddleware(config=...)` 吃的是 MemoryConfig。
+def test_assembly_does_not_attach_canonical_memory() -> None:
+    """The canonical middleware is retained for direct tests, not assembly."""
 
-    曾经把整个 AppConfig 传进去，`before_agent` 一读 `config.enabled` 就
-    AttributeError，表现是"发送消息失败了"。
-    """
     from agentkit.agents.middlewares.memory_middleware import MemoryMiddleware
     from agentkit.agents.middlewares.assembly import build_middlewares
     from agentkit.config import AppConfig
-    from agentkit.config.memory_config import MemoryConfig
 
     app_config = AppConfig.model_validate(
         {"models": [{"name": "flash", "use": "langchain_openai:ChatOpenAI"}], "memory": {"enabled": True}}
     )
     chain = build_middlewares({}, "flash", app_config=app_config, user_id="alice")
-    middlewares = [item for item in chain if isinstance(item, MemoryMiddleware)]
-    assert len(middlewares) == 1
 
-    resolved = middlewares[0]._resolved_config()
-    assert isinstance(resolved, MemoryConfig)
-    # 这一行就是线上炸掉的那次读取
-    assert resolved.enabled is True
-    assert resolved.profile.injection_enabled is True
+    assert not any(isinstance(item, MemoryMiddleware) for item in chain)
 
 
 def test_profile_injection_middleware_replaces_not_appends(stack) -> None:

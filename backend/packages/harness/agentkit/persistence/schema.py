@@ -54,8 +54,29 @@ from agentkit.skills.store.model import (
     SkillVersionRow,
 )
 
+#: Retained in metadata only for migration downgrade/tests. Production
+#: bootstrap excludes these tables; migration 0009 drops them from existing
+#: databases.
+LEGACY_CANONICAL_MEMORY_TABLES = frozenset(
+    {
+        "memory_profiles",
+        "memory_records",
+        "memory_record_versions",
+        "memory_episode_sessions",
+        "memory_ingest_jobs",
+        "memory_consolidation_jobs",
+        "memory_skill_candidates",
+        "memory_conflicts",
+        "memory_mutation_ledger",
+        "memory_index_outbox",
+        "memory_scope_meta",
+        "memory_projection_state",
+    }
+)
+
 __all__ = [
     "Base",
+    "LEGACY_CANONICAL_MEMORY_TABLES",
     "KnowledgeBaseRow",
     "KnowledgeDocumentRow",
     "MemoryCaptureDedupRow",

@@ -23,6 +23,7 @@ from agentkit.persistence.events.base import RunEventStore
 from agentkit.runtime.events.catalog import SUBAGENT_END_EVENT
 from agentkit.runtime.events.journal import RunJournal
 from agentkit.runtime.runs.manager import RunManager, RunRecord
+from agentkit.runtime.run_finalizers import finish_run_finalizers
 from agentkit.runtime.runs.schemas import RunStartOutcome, RunStatus
 from agentkit.runtime.runs.usage import UsageCollector
 from agentkit.runtime.stream_bridge.base import StreamBridge
@@ -183,6 +184,13 @@ async def run_agent(
 
     finally:
         record.finalizing = True
+        # Cancellation does not run after_agent. Close run-scoped capture turns
+        # before the run is persisted, with a bounded best-effort timeout.
+        with suppress(Exception):
+            await finish_run_finalizers(
+                record.run_id,
+                status=getattr(terminal, "value", str(terminal)),
+            )
         # §17：先把这次 run 的子代理收干净，再走 M3 的收尾。顺序有讲究：取消派发之后隔离循环
         # 才可能把**最后一次**用量交回来（§7.5），而 totals 是在 _finalize 里算的——反过来就
         # 会把取消那一刻已经烧掉的 token 漏掉。清理等不到也不能挡住 run 的终态。

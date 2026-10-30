@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from langchain_core.messages import BaseMessage
 
 from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
@@ -19,8 +21,10 @@ from agentkit.agents.memory.openviking.profile import PersonalizationService, Pr
 from agentkit.agents.memory.openviking.recall import RecallService
 from agentkit.agents.memory.openviking.session import SessionManager
 from agentkit.agents.memory.openviking.store import CaptureDedupStore, MemorySyncStore
-from agentkit.agents.memory.openviking.stream import InMemoryCaptureStream, MemoryMessagePublisher
+from agentkit.agents.memory.openviking.stream import CaptureStream, MemoryMessagePublisher
 from agentkit.agents.memory.openviking.worker import TurnCaptureWorker
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryFacade:
@@ -31,7 +35,7 @@ class MemoryFacade:
         sync_store: MemorySyncStore,
         dedup: CaptureDedupStore,
         sessions: SessionManager,
-        stream: InMemoryCaptureStream,
+        stream: CaptureStream,
         publisher: MemoryMessagePublisher,
         worker: TurnCaptureWorker,
         profile: ProfileService,
@@ -85,6 +89,20 @@ class MemoryFacade:
     ) -> CapturedMessage:
         return await self._publisher.publish_tool(session, turn_id, message)
 
+    async def publish_turn_end(
+        self,
+        session: SessionRef,
+        turn_id: str,
+        decision: TurnDecision,
+        **metadata: object,
+    ) -> CapturedMessage:
+        return await self._publisher.publish_turn_end(
+            session,
+            turn_id,
+            signals=decision.signals,
+            **metadata,
+        )
+
     async def process(self, captured: CapturedMessage) -> str:
         return await self._worker.process(captured)
 
@@ -127,12 +145,56 @@ class MemoryFacade:
             raise RuntimeError("OpenViking recall is not configured")
         return await self._recall.overview(self._sessions.ov_user(user_id), uri)
 
+    async def count_uncertain(self, *, limit: int = 100) -> int:
+        """Return only rows that startup may need to reconcile.
+
+        Normal `appended` rows are terminal and are intentionally excluded;
+        this is the bounded startup scan from the design, not a full-table
+        reconciliation.
+        """
+
+        return len(await self._dedup.uncertain(limit=limit))
+
+    async def open_session_count(self, *, user_id: str | None = None) -> int:
+        return len(await self._sync_store.list_active(user_id=user_id, limit=500))
+
+    async def flush(self, *, user_id: str | None = None) -> int:
+        """Commit active sessions; failures stay retryable and do not stop the sweep."""
+
+        rows = await self._sync_store.list_active(user_id=user_id)
+        flushed = 0
+        for row in rows:
+            ref = SessionRef(
+                user_id=row.user_id,
+                thread_id=row.thread_id,
+                ov_user=row.ov_user,
+                ov_session_id=row.ov_session_id,
+                stream_shard=row.stream_shard,
+                session_epoch=row.session_epoch,
+                session_incarnation=row.session_incarnation,
+            )
+            try:
+                await self._sessions.ensure_session(ref)
+                await self._sessions.commit(ref)
+            except Exception:
+                logger.warning(
+                    "OpenViking commit flush failed for %s/%s",
+                    row.user_id,
+                    row.thread_id,
+                    exc_info=True,
+                )
+                continue
+            flushed += 1
+        return flushed
+
     async def status(self) -> MemoryStatus:
-        pending = len(getattr(self._stream, "pending", []))
+        stream = self._stream
+        pending = getattr(stream, "pending", [])
         return MemoryStatus(
             healthy=True,
             degraded=False,
-            pending_stream_messages=pending,
+            pending_stream_messages=len(pending) if isinstance(pending, list) else 0,
+            pending_missing_turn_ends=await self.count_uncertain(),
         )
 
 

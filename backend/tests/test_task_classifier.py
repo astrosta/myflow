@@ -294,7 +294,7 @@ def test_disabled_classifier_does_not_run():
     assert classifier.calls == []
 
 
-def test_assembly_places_classifier_before_memory_when_enabled():
+def test_assembly_does_not_attach_the_retired_classifier_or_memory():
     app_config = AppConfig.model_validate(
         {
             "models": [{"name": "flash", "use": "langchain_openai:ChatOpenAI"}],
@@ -303,17 +303,6 @@ def test_assembly_places_classifier_before_memory_when_enabled():
     )
     chain = build_middlewares({}, "flash", app_config=app_config, user_id="u1")
     names = [type(item).__name__ for item in chain]
-    assert "TaskClassifierMiddleware" in names
-    assert names.index("TaskClassifierMiddleware") < names.index("MemoryMiddleware")
 
-
-def test_assembly_omits_classifier_when_memory_disabled():
-    app_config = AppConfig.model_validate(
-        {
-            "models": [{"name": "flash", "use": "langchain_openai:ChatOpenAI"}],
-            "memory": {"enabled": False},
-        }
-    )
-    chain = build_middlewares({}, "flash", app_config=app_config, user_id="u1")
-    assert all(type(item).__name__ != "TaskClassifierMiddleware" for item in chain)
-    assert any(isinstance(item, MemoryMiddleware) for item in chain)
+    assert "TaskClassifierMiddleware" not in names
+    assert not any(isinstance(item, MemoryMiddleware) for item in chain)

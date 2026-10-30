@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from agentkit.agents.memory.openviking.profile import (
     PersonalizationService,
     ProfileConflict,
     ProfileService,
+    render_profile_view,
 )
 from agentkit.persistence.base import Base
 
@@ -57,6 +59,32 @@ async def test_profile_seed_patch_and_etag_conflict(profile) -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_first_reads_create_one_row(profile) -> None:
+    service, _tmp = profile
+
+    views = await asyncio.gather(*(service.get_snapshot("u1") for _ in range(8)))
+
+    assert {view.etag for view in views} == {views[0].etag}
+    assert all(view.fields["identity.preferred_name"] == "小王" for view in views)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_patches_with_the_same_etag_have_one_winner(profile) -> None:
+    service, _tmp = profile
+    first = await service.get_snapshot("u1")
+
+    results = await asyncio.gather(
+        service.patch("u1", {"communication.tone": "direct"}, etag=first.etag),
+        service.patch("u1", {"communication.tone": "friendly"}, etag=first.etag),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(item, ProfileConflict) for item in results) == 1
+    final = await service.get_snapshot("u1")
+    assert final.fields["communication.tone"] in {"direct", "friendly"}
+
+
+@pytest.mark.asyncio
 async def test_profile_clear_and_delete(profile) -> None:
     service, _tmp = profile
     first = await service.get_snapshot("u1")
@@ -65,6 +93,22 @@ async def test_profile_clear_and_delete(profile) -> None:
 
     cleared = await service.clear("u1", etag=after.etag)
     assert cleared.fields == {}
+
+
+@pytest.mark.asyncio
+async def test_profile_rendering_uses_labels_and_priority(profile) -> None:
+    service, _tmp = profile
+    view = await service.get_snapshot("u1")
+
+    rendered = render_profile_view(
+        type("View", (), {"profile_fields": view.fields})(),
+        max_tokens=100,
+    )
+
+    assert "希望被称呼为：小王" in rendered.text
+    assert "identity.preferred_name" not in rendered.text
+    assert rendered.text.index("希望被称呼为") < rendered.text.index("主要语言")
+    assert rendered.token_count > 0
 
 
 @pytest.mark.asyncio

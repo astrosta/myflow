@@ -71,6 +71,35 @@ async def test_search_tool_maps_hits_and_user() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_tool_rejects_invalid_type_and_mixed_time_filter() -> None:
+    facade = FakeFacade()
+    tool = make_memory_search_tool(facade)
+
+    invalid = json.loads(
+        await tool.ainvoke(
+            {
+                "query": "style",
+                "memory_types": ["profile"],
+                "runtime": runtime({"user_id": "u1"}),
+            }
+        )
+    )
+    assert invalid["error"] == "invalid_memory_type"
+
+    mixed = json.loads(
+        await tool.ainvoke(
+            {
+                "query": "style",
+                "memory_types": ["preferences", "events"],
+                "since": "2026-01-01",
+                "runtime": runtime({"user_id": "u1"}),
+            }
+        )
+    )
+    assert mixed["error"] == "time_filter_requires_events"
+
+
+@pytest.mark.asyncio
 async def test_read_and_overview_tools_require_user() -> None:
     facade = FakeFacade()
     read = make_memory_read_tool(facade)

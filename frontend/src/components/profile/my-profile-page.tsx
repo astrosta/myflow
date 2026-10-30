@@ -6,11 +6,18 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  acceptProfileSuggestion,
   clearProfileField,
+  dismissProfileSuggestion,
+  getOnboarding,
   getProfile,
+  listProfileSuggestions,
   MemoryApiError,
   patchProfile,
+  updateOnboarding,
+  type OnboardingAction,
   type ProfileFieldView,
+  type ProfileSuggestion,
   type ProfileView,
 } from "@/core/api/memory";
 
@@ -54,6 +61,17 @@ function formatValue(field: ProfileFieldView): string {
 export function MyProfilePage() {
   const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ["memory", "profile"], queryFn: getProfile });
+  const openviking = Boolean(query.data?.etag);
+  const onboarding = useQuery({
+    queryKey: ["memory", "onboarding"],
+    queryFn: getOnboarding,
+    enabled: openviking,
+  });
+  const suggestions = useQuery({
+    queryKey: ["memory", "suggestions"],
+    queryFn: listProfileSuggestions,
+    enabled: openviking,
+  });
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +83,8 @@ export function MyProfilePage() {
       queryClient.setQueryData(["memory", "profile"], next);
       setEditing(null);
       setError(null);
+      void queryClient.invalidateQueries({ queryKey: ["memory", "onboarding"] });
+      void queryClient.invalidateQueries({ queryKey: ["memory", "suggestions"] });
     },
     onError: (cause) => setError(readableError(cause)),
   });
@@ -73,6 +93,38 @@ export function MyProfilePage() {
     mutationFn: (path: string) => clearProfileField(path),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["memory", "profile"] });
+      void queryClient.invalidateQueries({ queryKey: ["memory", "suggestions"] });
+      setError(null);
+    },
+    onError: (cause) => setError(readableError(cause)),
+  });
+
+  const onboardingAction = useMutation({
+    mutationFn: (action: OnboardingAction) => updateOnboarding(action),
+    onSuccess: (next) => {
+      queryClient.setQueryData(["memory", "onboarding"], next);
+      setError(null);
+    },
+    onError: (cause) => setError(readableError(cause)),
+  });
+
+  const acceptSuggestion = useMutation({
+    mutationFn: (suggestion: ProfileSuggestion) =>
+      acceptProfileSuggestion(suggestion.id, query.data?.etag),
+    onSuccess: (result) => {
+      queryClient.setQueryData(["memory", "profile"], result.profile);
+      void queryClient.invalidateQueries({ queryKey: ["memory", "suggestions"] });
+      void queryClient.invalidateQueries({ queryKey: ["memory", "onboarding"] });
+      setError(null);
+    },
+    onError: (cause) => setError(readableError(cause)),
+  });
+
+  const dismissSuggestion = useMutation({
+    mutationFn: (suggestion: ProfileSuggestion) =>
+      dismissProfileSuggestion(suggestion.id, query.data?.etag),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["memory", "suggestions"] });
       setError(null);
     },
     onError: (cause) => setError(readableError(cause)),
@@ -92,6 +144,7 @@ export function MyProfilePage() {
 
   const profile = query.data;
   const entries = Object.entries(profile?.fields ?? {});
+  const suggestionItems = suggestions.data?.items ?? [];
 
   return (
     <div className="h-full overflow-y-auto bg-white">
@@ -107,12 +160,91 @@ export function MyProfilePage() {
             {error}
           </p>
         ) : null}
+        {onboarding.data?.should_show ? (
+          <section className="mt-4 rounded-xl border border-sky-200 bg-sky-50/50 p-4" aria-label="完善画像">
+            <h2 className="text-sm font-semibold text-neutral-900">让助手更懂你</h2>
+            <p className="mt-1 text-xs leading-relaxed text-neutral-600">
+              补充称呼、语言、沟通偏好或工作角色，之后对话会更贴合你的习惯。不填也不影响使用。
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button
+                onClick={() => document.getElementById("profile-fields")?.scrollIntoView({ behavior: "smooth" })}
+                size="sm"
+                type="button"
+                variant="primary"
+              >
+                去填写
+              </Button>
+              <Button
+                disabled={onboardingAction.isPending}
+                onClick={() => onboardingAction.mutate("snooze")}
+                size="sm"
+                type="button"
+              >
+                稍后
+              </Button>
+              <Button
+                disabled={onboardingAction.isPending}
+                onClick={() => onboardingAction.mutate("dismiss")}
+                size="sm"
+                type="button"
+              >
+                不再提醒
+              </Button>
+            </div>
+          </section>
+        ) : null}
+        {suggestionItems.length > 0 ? (
+          <section className="mt-5" aria-label="画像建议">
+            <div className="flex items-baseline justify-between gap-3">
+              <h2 className="text-xs font-medium text-neutral-500">发现的画像信息</h2>
+              <p className="text-[11px] text-neutral-400">确认后才会写入画像</p>
+            </div>
+            <ul className="mt-3 space-y-2">
+              {suggestionItems.map((suggestion) => (
+                <li className="rounded-lg border border-amber-200 bg-amber-50/40 p-4" key={suggestion.id}>
+                  <p className="text-xs font-medium text-neutral-500">
+                    {LABELS[suggestion.field_path] ?? suggestion.field_path}
+                  </p>
+                  <p className="mt-1 text-sm text-neutral-900">{formatSuggestionValue(suggestion.value)}</p>
+                  <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">
+                    {suggestion.reason} · 置信度 {Math.round(suggestion.confidence * 100)}%
+                  </p>
+                  {suggestion.evidence_quote ? (
+                    <blockquote className="mt-2 line-clamp-2 border-l-2 border-amber-200 pl-3 text-xs text-neutral-500">
+                      {suggestion.evidence_quote}
+                    </blockquote>
+                  ) : null}
+                  <div className="mt-3 flex gap-2">
+                    <Button
+                      disabled={acceptSuggestion.isPending || dismissSuggestion.isPending}
+                      onClick={() => acceptSuggestion.mutate(suggestion)}
+                      size="sm"
+                      type="button"
+                      variant="primary"
+                    >
+                      接受
+                    </Button>
+                    <Button
+                      disabled={acceptSuggestion.isPending || dismissSuggestion.isPending}
+                      onClick={() => dismissSuggestion.mutate(suggestion)}
+                      size="sm"
+                      type="button"
+                    >
+                      忽略
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
         {entries.length === 0 ? (
           <p className="mt-8 rounded-lg border border-dashed border-neutral-300 px-5 py-10 text-center text-sm text-neutral-500">
             还没有画像信息。
           </p>
         ) : (
-          <ul className="mt-5 divide-y divide-neutral-100">
+          <ul className="mt-5 divide-y divide-neutral-100" id="profile-fields">
             {entries.map(([path, field]) => (
               <li className="py-4" key={path}>
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -178,6 +310,11 @@ export function MyProfilePage() {
       </div>
     </div>
   );
+}
+
+function formatSuggestionValue(value: unknown): string {
+  if (Array.isArray(value)) return value.join(", ");
+  return String(value ?? "");
 }
 
 function normalize(path: string, value: string): unknown {

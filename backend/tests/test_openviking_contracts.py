@@ -7,6 +7,7 @@ from agentkit.agents.memory.openviking.config import (
     OpenVikingMemoryConfig,
     idle_only_auto_commit_policy,
 )
+from agentkit.config.memory_config import MemoryConfig
 
 
 def test_idle_only_policy_disables_thresholds() -> None:
@@ -34,6 +35,21 @@ def test_default_config_uses_explicit_session_policy() -> None:
     assert options["memory_policy"]["peer"] == {"enabled": False}
     assert options["memory_policy"]["self"] == {"enabled": True}
     assert options["memory_policy"]["memory_types"] == list(DEFAULT_MEMORY_TYPES)
+
+
+def test_openviking_switch_defaults_off_and_can_be_enabled() -> None:
+    assert OpenVikingMemoryConfig().enabled is False
+    assert MemoryConfig().openviking.enabled is False
+    enabled = MemoryConfig(openviking={"enabled": True, "user_id_salt": "s" * 32})
+    assert enabled.openviking.enabled is True
+    assert enabled.openviking.session_create_options()["auto_commit_policy"]["idle_timeout_seconds"] == 86400
+
+
+def test_extra_skip_tokens_are_validated_at_config_load() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="task-context"):
+        OpenVikingMemoryConfig(capture={"extra_skip_tokens": ("好的",)})
 
 
 def test_retention_dedup_ttl_cannot_be_shorter_than_session_ttl() -> None:

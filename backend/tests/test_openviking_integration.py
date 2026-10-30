@@ -26,6 +26,7 @@ class Client:
         self.config = config
         self.sessions: dict[str, dict] = {}
         self.appended: list[dict] = []
+        self.committed: list[tuple[str, int]] = []
 
     async def get_session(self, session_id: str, *, auto_create: bool = False) -> dict:
         if session_id not in self.sessions:
@@ -51,6 +52,10 @@ class Client:
     async def batch_add_messages(self, session_id: str, messages: list[dict]) -> dict:
         self.appended.extend(messages)
         return {"messages": [{"id": "ov-1"}]}
+
+    async def commit_session(self, session_id: str, *, keep_recent_count: int = 0) -> dict:
+        self.committed.append((session_id, keep_recent_count))
+        return {"session_id": session_id, "status": "accepted"}
 
     async def find(self, **kwargs) -> dict:
         return {
@@ -124,6 +129,17 @@ async def test_facade_capture_and_append(facade) -> None:
     captured = await service.publish_human(ref, "r1", HumanMessage(content="我住杭州"))
     assert await service.process(captured) == "appended"
     assert client.appended[0]["message_kind"] == "user_query"
+    status = await service.status()
+    assert status.pending_missing_turn_ends == 0
+
+
+@pytest.mark.asyncio
+async def test_facade_flush_commits_active_sessions(facade) -> None:
+    service, client, _stream = facade
+    await service.resolve_capture_context("u1", "t1")
+
+    assert await service.flush() == 1
+    assert client.committed[0][1] == 0
 
 
 @pytest.mark.asyncio

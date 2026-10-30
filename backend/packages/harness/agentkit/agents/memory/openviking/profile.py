@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path
 from typing import Any
 
 import yaml
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentkit.agents.memory.openviking.contracts import (
@@ -41,6 +44,65 @@ _FIELD_TO_KEY = {
 }
 _KEY_TO_FIELD = {key: field for field, key in _FIELD_TO_KEY.items()}
 _EMPTY_BODY = "# 用户画像\n\n> 用户身份（profile）。助手身份在 identity.md，助手原则在 soul.md。\n"
+_PROFILE_LABELS = {
+    "identity.preferred_name": "希望被称呼为",
+    "identity.pronouns": "代词",
+    "identity.locale": "地区",
+    "identity.timezone": "时区",
+    "communication.language": "主要语言",
+    "communication.tone": "偏好语气",
+    "communication.verbosity": "详细程度",
+    "communication.format": "偏好格式",
+    "work.role": "工作角色",
+    "work.domains": "工作领域",
+    "work.tools": "常用工具",
+    "work.expertise": "专业水平",
+    "accessibility.needs": "无障碍需求",
+    "boundaries": "边界",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedProfile:
+    text: str
+    token_count: int
+    truncated: bool
+
+
+def render_profile_view(view: PersonalizationView, *, max_tokens: int = 1_800) -> RenderedProfile:
+    """Render only stable profile fields, in priority order, within a budget.
+
+    Profile values are user data. They are rendered as labelled plain text and
+    wrapped by the caller in the memory envelope; internal field paths never
+    reach the model.
+    """
+
+    budget = max(1, int(max_tokens)) * 4
+    lines: list[str] = []
+    used = 0
+    truncated = False
+    for path in PROFILE_FIELD_PRIORITY:
+        value = view.profile_fields.get(path)
+        if value in (None, "", []):
+            continue
+        if isinstance(value, (list, tuple)):
+            rendered = "、".join(str(item) for item in value if str(item).strip())
+        else:
+            rendered = str(value).strip()
+        if not rendered:
+            continue
+        line = f"- {_PROFILE_LABELS.get(path, path)}：{rendered}"
+        if used + len(line) + 1 > budget:
+            truncated = True
+            break
+        lines.append(line)
+        used += len(line) + 1
+    text = "\n".join(lines)
+    return RenderedProfile(
+        text=text,
+        token_count=max(1, (len(text) + 3) // 4) if text else 0,
+        truncated=truncated,
+    )
 
 
 class ProfileService:
@@ -56,18 +118,10 @@ class ProfileService:
         async with self._session_factory() as session:
             row = await session.get(MemoryProfileDocumentRow, user_id)
             if row is None:
-                content = self._seed_content()
-                row = MemoryProfileDocumentRow(
-                    user_id=user_id,
-                    schema_version=1,
-                    content=content,
-                    etag=_etag(content),
-                    created_at=_now(),
-                    updated_at=_now(),
-                )
-                session.add(row)
-                await session.commit()
-                await session.refresh(row)
+                await self._insert_seed(session, user_id)
+                row = await session.get(MemoryProfileDocumentRow, user_id)
+            if row is None:  # pragma: no cover - defensive, insert is atomic
+                raise RuntimeError("profile row disappeared during first read")
             return _view(row)
 
     async def patch(self, user_id: str, fields: dict[str, Any], *, etag: str) -> ProfileView:
@@ -86,9 +140,7 @@ class ProfileService:
                 else:
                     current[path] = validate_profile_value(path, value)
             content = _render_content(current)
-            row.content = content
-            row.etag = _etag(content)
-            row.updated_at = _now()
+            await _replace_content(session, user_id, etag, content)
             await session.commit()
             await session.refresh(row)
             return _view(row)
@@ -105,9 +157,7 @@ class ProfileService:
             fields = _parse_fields(row.content)
             fields.pop(field_path, None)
             content = _render_content(fields)
-            row.content = content
-            row.etag = _etag(content)
-            row.updated_at = _now()
+            await _replace_content(session, user_id, etag, content)
             await session.commit()
             await session.refresh(row)
             return _view(row)
@@ -120,9 +170,7 @@ class ProfileService:
             if row.etag != etag:
                 raise ProfileConflict("profile etag conflict")
             content = _render_content({})
-            row.content = content
-            row.etag = _etag(content)
-            row.updated_at = _now()
+            await _replace_content(session, user_id, etag, content)
             await session.commit()
             await session.refresh(row)
             return _view(row)
@@ -133,24 +181,56 @@ class ProfileService:
         row = await session.get(MemoryProfileDocumentRow, user_id)
         if row is not None:
             return row
-        content = self._seed_content()
-        row = MemoryProfileDocumentRow(
-            user_id=user_id,
-            schema_version=1,
-            content=content,
-            etag=_etag(content),
-            created_at=_now(),
-            updated_at=_now(),
-        )
-        session.add(row)
-        await session.flush()
+        await self._insert_seed(session, user_id)
+        row = await session.get(MemoryProfileDocumentRow, user_id)
+        if row is None:  # pragma: no cover - defensive, insert is atomic
+            raise RuntimeError("profile row disappeared while creating it")
         return row
+
+    async def _insert_seed(self, session: AsyncSession, user_id: str) -> None:
+        """Create the first profile row without racing a concurrent GET.
+
+        `SELECT` followed by `INSERT` is a duplicate-key race on a user's
+        first profile read. `ON CONFLICT DO NOTHING` makes the winner
+        irrelevant and keeps GET idempotent, as the profile contract requires.
+        """
+
+        content = self._seed_content()
+        now = _now()
+        values = {
+            "user_id": user_id,
+            "schema_version": 1,
+            "content": content,
+            "etag": _etag(content),
+            "created_at": now,
+            "updated_at": now,
+        }
+        dialect = session.get_bind().dialect.name
+        if dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert
+
+            statement = insert(MemoryProfileDocumentRow).values(**values)
+            statement = statement.on_conflict_do_nothing(index_elements=["user_id"])
+        elif dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+
+            statement = insert(MemoryProfileDocumentRow).values(**values)
+            statement = statement.on_conflict_do_nothing(index_elements=["user_id"])
+        else:  # pragma: no cover - supported deployments are SQLite/PostgreSQL
+            from sqlalchemy import insert
+
+            statement = insert(MemoryProfileDocumentRow).values(**values)
+        await session.execute(statement)
+        await session.commit()
 
     def _seed_content(self) -> str:
         try:
-            return self._seed_path.read_text(encoding="utf-8")
+            raw = self._seed_path.read_text(encoding="utf-8")
         except OSError:
-            return _render_content({})
+            raw = ""
+        # Seed frontmatter is parsed and re-rendered so the first etag is the
+        # canonical etag, not a hash of arbitrary whitespace in the template.
+        return _render_content(_parse_fields(raw))
 
 
 class PersonalizationService:
@@ -179,6 +259,66 @@ class PersonalizationService:
             profile_etag=snapshot.etag,
             digest=digest,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantPersonalization:
+    identity: PersonalizationDocument
+    soul: PersonalizationDocument
+    digest: str
+
+
+def read_assistant_personalization(
+    *,
+    identity_path: str | Path,
+    soul_path: str | Path,
+    max_chars: int = 8_192,
+) -> AssistantPersonalization:
+    identity = _read_document(Path(identity_path), max_chars=max_chars)
+    soul = _read_document(Path(soul_path), max_chars=max_chars)
+    missing = f"{int(not identity.content)}:{int(not soul.content)}"
+    digest = hashlib.sha256(
+        f"{identity.sha256}:{soul.sha256}:{missing}".encode("utf-8")
+    ).hexdigest()
+    return AssistantPersonalization(identity=identity, soul=soul, digest=digest)
+
+
+def render_assistant_personalization(value: AssistantPersonalization) -> str:
+    sections: list[str] = []
+    if value.identity.content.strip():
+        sections.append(
+            '<assistant-identity source="' + escape(value.identity.source, quote=True) + '">\n'
+            + escape(value.identity.content.strip(), quote=False)
+            + "\n</assistant-identity>"
+        )
+    if value.soul.content.strip():
+        sections.append(
+            '<assistant-soul source="' + escape(value.soul.source, quote=True) + '">\n'
+            + escape(value.soul.content.strip(), quote=False)
+            + "\n</assistant-soul>"
+        )
+    return "\n\n".join(sections)
+
+
+async def _replace_content(
+    session: AsyncSession,
+    user_id: str,
+    expected_etag: str,
+    content: str,
+) -> None:
+    """Compare-and-swap the row; a stale etag must lose atomically."""
+
+    statement = (
+        update(MemoryProfileDocumentRow)
+        .where(
+            MemoryProfileDocumentRow.user_id == user_id,
+            MemoryProfileDocumentRow.etag == expected_etag,
+        )
+        .values(etag=_etag(content), content=content, updated_at=_now())
+    )
+    result = await session.execute(statement)
+    if result.rowcount != 1:
+        raise ProfileConflict("profile etag conflict")
 
 
 def _parse_fields(content: str) -> dict[str, Any]:
@@ -226,11 +366,13 @@ def _view(row: MemoryProfileDocumentRow) -> ProfileView:
     )
 
 
-def _read_document(path: Path) -> PersonalizationDocument:
+def _read_document(path: Path, *, max_chars: int | None = None) -> PersonalizationDocument:
     try:
         content = path.read_text(encoding="utf-8")
     except OSError:
         content = ""
+    if max_chars is not None and len(content) > max_chars:
+        content = content[:max_chars]
     return PersonalizationDocument(
         content=content,
         source=str(path),

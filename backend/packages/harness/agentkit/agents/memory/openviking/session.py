@@ -33,6 +33,10 @@ class SessionPolicyMismatch(Exception):
     pass
 
 
+class ClientResolver(Protocol):
+    async def client_for(self, ov_user: str) -> "SessionClient": ...
+
+
 class SessionClient(Protocol):
     async def get_session(self, session_id: str, *, auto_create: bool = False) -> dict[str, Any]: ...
 
@@ -48,6 +52,10 @@ class SessionClient(Protocol):
         self, session_id: str, messages: list[dict[str, Any]]
     ) -> dict[str, Any]: ...
 
+    async def commit_session(
+        self, session_id: str, *, keep_recent_count: int = 0
+    ) -> dict[str, Any]: ...
+
 
 def _hmac_hex(salt: str, value: str) -> str:
     if len(salt) < 32:
@@ -59,11 +67,18 @@ class SessionManager:
     def __init__(
         self,
         sync_store: MemorySyncStore,
-        client: SessionClient,
-        config: OpenVikingMemoryConfig,
+        client: SessionClient | None = None,
+        config: OpenVikingMemoryConfig | None = None,
+        *,
+        resolver: ClientResolver | None = None,
     ) -> None:
+        if config is None:
+            raise ValueError("SessionManager requires config")
+        if client is None and resolver is None:
+            raise ValueError("SessionManager requires client or resolver")
         self._sync_store = sync_store
         self._client = client
+        self._resolver = resolver
         self._config = config
 
     def ov_user(self, user_id: str) -> str:
@@ -102,33 +117,44 @@ class SessionManager:
         return self._ref_from_row(row)
 
     async def ensure_session(self, ref: SessionRef) -> SessionRef:
+        client = await self._client_for(ref.ov_user)
         try:
-            response = await self._client.get_session(ref.ov_session_id, auto_create=False)
+            response = await client.get_session(ref.ov_session_id, auto_create=False)
         except SessionNotFound:
             try:
-                response = await self._client.create_session(
+                response = await client.create_session(
                     ref.ov_session_id,
                     options=self._config.session_create_options(),
                 )
             except SessionAlreadyExists:
-                response = await self._client.get_session(ref.ov_session_id, auto_create=False)
+                response = await client.get_session(ref.ov_session_id, auto_create=False)
         except SessionAlreadyExists:
-            response = await self._client.get_session(ref.ov_session_id, auto_create=False)
+            response = await client.get_session(ref.ov_session_id, auto_create=False)
 
         self._validate_memory_policy(response)
-        await self._ensure_auto_policy(ref, response)
+        await self._ensure_auto_policy(client, ref, response)
         return ref
 
     async def append_messages(
         self, ref: SessionRef, messages: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        return await self._client.batch_add_messages(ref.ov_session_id, messages)
+        client = await self._client_for(ref.ov_user)
+        return await client.batch_add_messages(ref.ov_session_id, messages)
 
     async def delete_session(self, user_id: str, thread_id: str) -> None:
         row = await self._sync_store.get(user_id, thread_id)
         if row is not None:
-            await self._client.delete_session(row.ov_session_id)
+            client = await self._client_for(row.ov_user)
+            await client.delete_session(row.ov_session_id)
         await self._sync_store.mark_deleted(user_id, thread_id)
+
+    async def commit(self, ref: SessionRef) -> dict[str, Any]:
+        client = await self._client_for(ref.ov_user)
+        response = await client.commit_session(ref.ov_session_id, keep_recent_count=0)
+        await self._sync_store.mark_committed(
+            ref.user_id, ref.thread_id, reason="admin_flush"
+        )
+        return response
 
     async def recover_after_not_found(self, user_id: str, thread_id: str) -> SessionRef:
         row = await self._sync_store.get(user_id, thread_id)
@@ -161,20 +187,32 @@ class SessionManager:
         if self._enabled(actual.get("working_memory")) is not expected["working_memory"]["enabled"]:
             raise SessionPolicyMismatch("session working_memory policy mismatch")
         actual_types = actual.get("memory_types")
-        if actual_types is not None and set(actual_types) != set(expected["memory_types"]):
+        # Omitting memory_types falls back to the server templates, which
+        # enable profile/identity/soul by default. Treat omission as mismatch.
+        if not isinstance(actual_types, list) or set(actual_types) != set(
+            expected["memory_types"]
+        ):
             raise SessionPolicyMismatch("session memory_types mismatch")
 
-    async def _ensure_auto_policy(self, ref: SessionRef, response: dict[str, Any]) -> None:
+    async def _ensure_auto_policy(
+        self, client: SessionClient, ref: SessionRef, response: dict[str, Any]
+    ) -> None:
         expected = self._config.session_create_options()["auto_commit_policy"]
         actual = response.get("auto_commit_policy")
         if actual == expected:
             return
-        updated = await self._client.update_session_config(
+        updated = await client.update_session_config(
             ref.ov_session_id,
             options={"auto_commit_policy": expected},
         )
         if updated.get("auto_commit_policy") != expected:
             raise SessionPolicyMismatch("session auto_commit_policy mismatch")
+
+    async def _client_for(self, ov_user: str) -> SessionClient:
+        if self._resolver is not None:
+            return await self._resolver.client_for(ov_user)
+        assert self._client is not None
+        return self._client
 
     @staticmethod
     def _enabled(value: Any) -> bool | None:
@@ -186,6 +224,7 @@ class SessionManager:
 
 
 __all__ = [
+    "ClientResolver",
     "SessionAlreadyExists",
     "SessionClient",
     "SessionManager",

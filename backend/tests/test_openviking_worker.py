@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import pytest_asyncio
 from langchain_core.messages import HumanMessage
@@ -13,7 +15,7 @@ from agentkit.agents.memory.openviking.contracts import CapturedMessage
 from agentkit.agents.memory.openviking.session import SessionManager
 from agentkit.agents.memory.openviking.store import CaptureDedupStore, MemorySyncStore
 from agentkit.agents.memory.openviking.stream import InMemoryCaptureStream, MemoryMessagePublisher
-from agentkit.agents.memory.openviking.worker import TurnCaptureWorker
+from agentkit.agents.memory.openviking.worker import TurnCaptureWorker, WorkerSupervisor
 from agentkit.persistence.base import Base
 
 
@@ -155,3 +157,102 @@ async def test_stale_appending_row_is_retried(stack) -> None:
 
     assert await worker.process(captured) == "appended"
     assert len(client.appended) == 1
+
+
+class ReplayStream:
+    """Reads the same entry twice, like a PEL replay after a failed attempt."""
+
+    def __init__(self, captured: CapturedMessage) -> None:
+        self.captured = captured
+        self.acks: list[str] = []
+
+    async def read(self, shard: int, *, block_ms: int = 0) -> list[CapturedMessage]:
+        return [self.captured]
+
+    async def claim(self, shard: int) -> list[CapturedMessage]:
+        return [self.captured]
+
+    async def ack(self, stream_id: str, *, shard: int | None = None) -> None:
+        self.acks.append(stream_id)
+
+
+class RetryThenAppendWorker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def process(self, captured: CapturedMessage) -> str:
+        self.calls += 1
+        return "retry" if self.calls == 1 else "appended"
+
+
+@pytest.mark.asyncio
+async def test_buffered_messages_append_only_after_turn_end(stack) -> None:
+    client, _sync_store, _dedup, sessions, stream, publisher, worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    human = await publisher.publish_human(ref, "r1", HumanMessage(content="我住杭州"), sequence=0)
+
+    assert await worker.handle(human) == "buffered"
+    assert client.appended == []
+    assert human.stream_id not in stream.acked
+
+    control = await publisher.publish_turn_end(ref, "r1", run_status="interrupted")
+    assert await worker.handle(control) == "flushed"
+    assert len(client.appended) == 1
+    assert human.stream_id in stream.acked
+    assert control.stream_id in stream.acked
+    assert control.run_status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_buffered_messages_without_turn_end_are_not_appended(stack) -> None:
+    client, _sync_store, _dedup, sessions, stream, publisher, worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    human = await publisher.publish_human(ref, "r1", HumanMessage(content="我住杭州"), sequence=0)
+
+    assert await worker.handle(human) == "buffered"
+    assert client.appended == []
+    assert human.stream_id not in stream.acked
+
+
+@pytest.mark.asyncio
+async def test_missing_turn_end_timeout_appends_without_committing(stack) -> None:
+    client, sync_store, dedup, sessions, stream, publisher, _worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    worker = TurnCaptureWorker(
+        MemoryMessageAdapter(),
+        stream,
+        dedup,
+        sessions,
+        sync_store,
+        missing_turn_end_timeout_seconds=1,
+    )
+    captured = await publisher.publish_human(
+        ref,
+        "r1",
+        HumanMessage(content="我住杭州"),
+        sequence=0,
+    )
+    captured = replace(captured, created_at="2000-01-01T00:00:00+00:00")
+
+    assert await worker.handle(captured) == "buffered"
+    assert await worker.sweep_expired() == ["flushed"]
+    assert len(client.appended) == 1
+    assert captured.stream_id in stream.acked
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_remember_a_retry_forever(stack) -> None:
+    _client, _sync_store, _dedup, sessions, _stream, publisher, _worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    captured = await publisher.publish_human(ref, "r1", HumanMessage(content="hi"), sequence=0)
+    stream = ReplayStream(captured)
+    worker = RetryThenAppendWorker()
+    supervisor = WorkerSupervisor(stream, worker, shards=1, poll_seconds=0.01)
+
+    await supervisor.run_once(0)
+    await supervisor.run_once(0)
+
+    assert worker.calls >= 2
