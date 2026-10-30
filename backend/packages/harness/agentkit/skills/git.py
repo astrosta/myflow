@@ -124,6 +124,41 @@ def _git_error(command: Sequence[str], exc: BaseException) -> GitCommandError:
     return GitCommandError(command, 1, detail)
 
 
+def _libgit2_supports_ssh() -> bool:
+    """libgit2's SSH transport is a build-time feature, not guaranteed by the wheel."""
+
+    return bool(int(pygit2.features) & (1 << 2))
+
+
+def _normalize_remote_url(url: str) -> str:
+    """Turn scp-style SSH URLs into the form libgit2 accepts.
+
+    libgit2 rejects git@host:path with an unsupported URL protocol error; the
+    equivalent ssh://git@host/path works.  Local paths (including Windows
+    drive paths) and URLs that already carry a scheme are left untouched.
+    """
+
+    value = url.strip()
+    if not value or "://" in value:
+        return value
+    if value.startswith(("/", "./", "../", "\\")):
+        return value
+    if len(value) >= 2 and value[0].isalpha() and value[1] == ":":
+        return value
+    if ":" not in value:
+        return value
+    authority, path = value.split(":", 1)
+    if not authority or not path:
+        return value
+    if "@" in authority:
+        user, host = authority.rsplit("@", 1)
+    else:
+        user, host = "git", authority
+    if not user or not host:
+        return value
+    return f"ssh://{user}@{host}/{path.lstrip('/')}"
+
+
 def _decode_ssh_key(encoded: str) -> str:
     compact = "".join(encoded.split())
     try:
@@ -326,6 +361,7 @@ class SkillGitRepository:
         self.config = config
         self.cache_dir = Path(cache_dir)
         repository = config.repository.strip()
+        self.remote_url = _normalize_remote_url(repository)
         repo_id = hashlib.sha256(repository.encode("utf-8")).hexdigest()
         self.repo_id = repo_id
         self.mirror_path = self.cache_dir / "repos" / f"{repo_id}.git"
@@ -335,6 +371,13 @@ class SkillGitRepository:
         self._ssh_private_key = (
             _decode_ssh_key(self.config.ssh_key) if self.config.ssh_key else None
         )
+        if self.remote_url.startswith("ssh://") and not _libgit2_supports_ssh():
+            raise GitCommandError(
+                ("pygit2", "ssh", self.remote_url),
+                1,
+                "this pygit2/libgit2 build has no SSH transport; "
+                "use a build with libssh2, or use an HTTPS repository",
+            )
 
     def _repo(self) -> pygit2.Repository:
         try:
@@ -344,18 +387,19 @@ class SkillGitRepository:
 
     def _remote(self, repo: pygit2.Repository) -> pygit2.Remote:
         try:
-            return repo.remotes["origin"]
+            remote = repo.remotes["origin"]
+            if remote.url != self.remote_url:
+                repo.remotes.set_url("origin", self.remote_url)
+                remote = repo.remotes["origin"]
+            return remote
         except (KeyError, pygit2.GitError) as exc:
             raise _git_error(("pygit2", "remote", "origin"), exc) from exc
 
     def _ssh_username(self) -> str:
-        repository = self.config.repository.strip()
-        if "://" in repository:
-            try:
-                return urlsplit(repository).username or "git"
-            except ValueError:
-                return "git"
-        return "git"
+        try:
+            return urlsplit(self.remote_url).username or "git"
+        except ValueError:
+            return "git"
 
     def _callbacks(self) -> _RemoteCallbacks:
         credentials: Any | None = None
@@ -433,7 +477,7 @@ class SkillGitRepository:
         self.mirror_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             repo = pygit2.clone_repository(
-                self.config.repository.strip(),
+                self.remote_url,
                 str(self.mirror_path),
                 bare=True,
                 callbacks=self._callbacks(),
@@ -443,9 +487,7 @@ class SkillGitRepository:
             shutil.rmtree(self.mirror_path, ignore_errors=True)
             if isinstance(exc, GitCommandError):
                 raise
-            raise _git_error(
-                ("pygit2", "clone", self.config.repository.strip()), exc
-            ) from exc
+            raise _git_error(("pygit2", "clone", self.remote_url), exc) from exc
 
     async def _fetch_ref(self, remote_ref: str, local_ref: str) -> bool:
         _validate_ref(remote_ref)

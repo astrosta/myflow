@@ -13,7 +13,12 @@ from fakes.git_repo import file_mode, make_bare_remote, make_symlink_commit, rem
 
 from agentkit.config.skills_config import SkillGitConfig
 from agentkit.skills.domain import InvalidSkillPackage, StagedFile
-from agentkit.skills.git import GitCommandError, GitCommit, SkillGitRepository
+from agentkit.skills.git import (
+    GitCommandError,
+    GitCommit,
+    SkillGitRepository,
+    _normalize_remote_url,
+)
 from agentkit.skills.package import build_package
 
 
@@ -35,6 +40,35 @@ class GitFixture:
 
     def make_symlink_commit(self) -> str:
         return make_symlink_commit(self.remote)
+
+
+def test_scp_style_ssh_urls_are_normalized_for_libgit2() -> None:
+    assert _normalize_remote_url("git@host.example:team/skills.git") == (
+        "ssh://git@host.example/team/skills.git"
+    )
+    assert _normalize_remote_url("host.example:team/skills.git") == (
+        "ssh://git@host.example/team/skills.git"
+    )
+    assert _normalize_remote_url("ssh://git@host.example/team/skills.git") == (
+        "ssh://git@host.example/team/skills.git"
+    )
+    assert _normalize_remote_url("https://host.example/team/skills.git") == (
+        "https://host.example/team/skills.git"
+    )
+    assert _normalize_remote_url("D:/work/skills.git") == "D:/work/skills.git"
+
+
+def test_ssh_requires_libgit2_ssh_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agentkit.skills.git as git_module
+
+    monkeypatch.setattr(git_module, "_libgit2_supports_ssh", lambda: False)
+    with pytest.raises(GitCommandError, match="no SSH transport"):
+        SkillGitRepository(
+            SkillGitConfig(repository="ssh://git@example.invalid/skills.git"),
+            tmp_path,
+        )
 
 
 def test_base64_ssh_key_is_loaded_into_memory(tmp_path: Path) -> None:
