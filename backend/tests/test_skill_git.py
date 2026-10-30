@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import pygit2
 import pytest
+from fakes.git_repo import file_mode, make_bare_remote, make_symlink_commit, remote_ref
 
 from agentkit.config.skills_config import SkillGitConfig
 from agentkit.skills.domain import InvalidSkillPackage, StagedFile
@@ -15,34 +16,8 @@ from agentkit.skills.git import GitCommandError, GitCommit, SkillGitRepository
 from agentkit.skills.package import build_package
 
 
-def _git(*args: str, cwd: Path | None = None, input_bytes: bytes | None = None) -> bytes:
-    completed = subprocess.run(
-        ["git", "-c", "core.autocrlf=false", *args],
-        cwd=cwd,
-        input=input_bytes,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise AssertionError(
-            f"git {' '.join(args)} failed: {completed.stderr.decode('utf-8', 'replace')}"
-        )
-    return completed.stdout
-
-
 def _make_remote(tmp_path: Path) -> Path:
-    remote = tmp_path / "remote.git"
-    _git("init", "--bare", "--initial-branch=main", str(remote))
-    seed = tmp_path / "seed"
-    _git("init", "--initial-branch=main", str(seed))
-    _git("config", "user.name", "Test Fixture", cwd=seed)
-    _git("config", "user.email", "fixture@example.invalid", cwd=seed)
-    (seed / "README.md").write_bytes(b"# tests\n")
-    _git("add", "README.md", cwd=seed)
-    _git("commit", "-m", "seed", cwd=seed)
-    _git("remote", "add", "origin", str(remote), cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
-    return remote
+    return make_bare_remote(tmp_path)
 
 
 @dataclass
@@ -53,55 +28,12 @@ class GitFixture:
     draft: GitCommit
 
     async def delete_draft_ref(self) -> None:
-        _git(
-            "--git-dir",
-            str(self.remote),
-            "update-ref",
-            "-d",
-            "refs/heads/myflow/drafts/u1",
+        pygit2.Repository(str(self.remote)).references.delete(
+            "refs/heads/myflow/drafts/u1"
         )
 
     def make_symlink_commit(self) -> str:
-        blob = _git(
-            "--git-dir",
-            str(self.remote),
-            "hash-object",
-            "-w",
-            "--stdin",
-            input_bytes=b"../../outside",
-        ).strip()
-        tree = _git(
-            "--git-dir",
-            str(self.remote),
-            "mktree",
-            input_bytes=(
-                b"100644 blob " + _git(
-                    "--git-dir", str(self.remote), "hash-object", "-w", "--stdin",
-                    input_bytes=b"---\nname: evil\ndescription: x\n---\n",
-                ).strip() + b"\tSKILL.md\n"
-                b"120000 blob " + blob + b"\tlink\n"
-            ),
-        ).strip()
-        commit = _git(
-            "--git-dir",
-            str(self.remote),
-            "-c",
-            "user.name=Malicious Fixture",
-            "-c",
-            "user.email=malicious@example.invalid",
-            "commit-tree",
-            tree.decode(),
-            "-m",
-            "malicious",
-        ).strip().decode()
-        _git(
-            "--git-dir",
-            str(self.remote),
-            "update-ref",
-            "refs/heads/malicious",
-            commit,
-        )
-        return commit
+        return make_symlink_commit(self.remote)
 
 
 @pytest.fixture(name="git_fixture")
@@ -155,25 +87,17 @@ async def test_save_draft_pushes_private_tree(git_fixture: GitFixture):
         await git_fixture.repo.read_file(commit.commit, "users/u1/s1/scripts/run.sh")
         == b"echo ok\n"
     )
-    remote_head = _git(
-        "--git-dir",
-        str(git_fixture.remote),
-        "rev-parse",
-        "refs/heads/myflow/drafts/u1",
-    ).strip().decode()
-    assert remote_head == commit.commit
+    assert remote_ref(git_fixture.remote, "refs/heads/myflow/drafts/u1") == commit.commit
     assert await git_fixture.repo.head(commit.ref) == commit.commit
 
 
 @pytest.mark.asyncio
 async def test_save_and_publish_preserve_the_executable_bit(git_fixture: GitFixture):
-    draft_mode = _git(
-        "--git-dir",
-        str(git_fixture.remote),
-        "ls-tree",
+    draft_mode = file_mode(
+        git_fixture.remote,
         git_fixture.draft.commit,
         "users/u1/s1/scripts/run.sh",
-    ).split()[0]
+    )
     assert draft_mode == b"100755"
 
     public = await git_fixture.repo.publish_public(
@@ -182,13 +106,11 @@ async def test_save_and_publish_preserve_the_executable_bit(git_fixture: GitFixt
         source_path="users/u1/s1",
         message="approve",
     )
-    public_mode = _git(
-        "--git-dir",
-        str(git_fixture.remote),
-        "ls-tree",
+    public_mode = file_mode(
+        git_fixture.remote,
         public.commit,
         "public/foo/scripts/run.sh",
-    ).split()[0]
+    )
     assert public_mode == b"100755"
 
 

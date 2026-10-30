@@ -1,10 +1,10 @@
 """Restricted Git writer for the skill catalog.
 
-This module is the only place in the application allowed to mutate Git.  Every
-command is an argument vector executed without a shell, under a fixed service
-identity, with hooks and interactive prompts disabled.  Content entering or
-leaving Git is validated as an exact file set; archives are unpacked by a small
-strict extractor rather than by tarfile.extractall.
+This module is the only place in the application allowed to mutate Git.  It
+uses pygit2/libgit2 directly, so the deployment does not need a git executable,
+hooks, credential helpers, or an interactive prompt.  Content entering or
+leaving Git is validated as an exact file set; trees are read and written
+object-by-object rather than through a working tree or archive extractor.
 """
 
 from __future__ import annotations
@@ -12,15 +12,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import shlex
 import shutil
-import subprocess
-import tarfile
 import tempfile
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import asynccontextmanager
+import time
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any
+from urllib.parse import urlsplit
+
+import pygit2
 
 from agentkit.config.skills_config import SkillGitConfig
 from agentkit.skills.domain import InvalidSkillPackage, StagedFile
@@ -29,8 +31,8 @@ from agentkit.skills.package import validate_skill_path
 SERVICE_NAME = "MyFlow Skills Service"
 SERVICE_EMAIL = "skills-service@myflow.local"
 
-# The archive limit bounds one materialized commit.  It is deliberately higher
-# than one skill package because a public commit contains every active skill.
+# The limits bound one materialized commit.  They are deliberately higher than
+# one skill package because a public commit contains every active skill.
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_FILES = 10_000
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -39,6 +41,8 @@ _HEX = frozenset("0123456789abcdefABCDEF")
 _REF_FORBIDDEN = frozenset(" ~^:?*[\\")
 _SKILL_FILE = "SKILL.md"
 _NUL = b"\x00"
+_TREE_MODE = 0o040000
+_BLOB_MODES = frozenset({0o100644, 0o100755})
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,15 +55,19 @@ class GitCommit:
 
 
 class GitCommandError(RuntimeError):
-    """A git subprocess failed; stderr is retained for diagnostics."""
+    """A libgit2 operation failed; the detail is retained for diagnostics.
+
+    The historical name and the command/returncode/stderr shape are kept so
+    callers and tests that report the failed operation remain compatible.
+    """
 
     def __init__(self, command: Sequence[str], returncode: int, stderr: str) -> None:
         self.command = tuple(command)
         self.returncode = returncode
         self.stderr = stderr
         shown = " ".join(self.command)
-        detail = stderr.strip() or "no stderr"
-        super().__init__(f"git command failed ({returncode}): {shown}: {detail}")
+        detail = stderr.strip() or "no detail"
+        super().__init__(f"git operation failed ({returncode}): {shown}: {detail}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +75,51 @@ class _TreeEntry:
     path: str
     mode: str
     oid: str
+
+
+class _RemoteCallbacks(pygit2.RemoteCallbacks):
+    """Credentials plus a wall-clock timeout for one remote operation.
+
+    libgit2 has no per-operation timeout.  Progress callbacks are the only
+    interruption point it exposes, so a stalled transfer fails through this
+    callback instead of hanging forever.  The push_update_reference callback
+    also records server-side rejections, which pygit2 otherwise does not expose.
+    """
+
+    def __init__(self, *, timeout: float, credentials: Any | None = None) -> None:
+        super().__init__(credentials=credentials)
+        self._timeout = float(timeout)
+        self._deadline = time.monotonic() + self._timeout if self._timeout > 0 else None
+        self.rejections: list[tuple[str, str]] = []
+
+    def _check_timeout(self) -> None:
+        if self._deadline is not None and time.monotonic() > self._deadline:
+            raise GitCommandError(
+                ("pygit2", "network"),
+                -1,
+                f"timed out after {self._timeout:g} seconds",
+            )
+
+    def sideband_progress(self, string: str) -> None:
+        self._check_timeout()
+
+    def transfer_progress(self, stats: Any) -> None:
+        self._check_timeout()
+
+    def push_transfer_progress(
+        self, objects_pushed: int, total_objects: int, bytes_pushed: int
+    ) -> None:
+        self._check_timeout()
+
+    def push_update_reference(self, refname: str, message: str | None) -> None:
+        self._check_timeout()
+        if message:
+            self.rejections.append((refname, message))
+
+
+def _git_error(command: Sequence[str], exc: BaseException) -> GitCommandError:
+    detail = str(exc).strip() or type(exc).__name__
+    return GitCommandError(command, 1, detail)
 
 
 def _validate_commit_id(commit: str) -> str:
@@ -145,24 +198,24 @@ def _source_directory(source_path: str) -> str:
     return path
 
 
-def _safe_tar_parts(name: str) -> tuple[str, ...]:
+def _safe_tree_parts(name: str) -> tuple[str, ...]:
     if not isinstance(name, str) or not name or "\x00" in name:
-        raise InvalidSkillPackage("archive entry has an invalid name")
+        raise InvalidSkillPackage("Git tree entry has an invalid name")
     if "\\" in name:
-        raise InvalidSkillPackage(f"archive entry uses a backslash: {name!r}")
+        raise InvalidSkillPackage(f"Git tree entry uses a backslash: {name!r}")
     posix = PurePosixPath(name)
     windows = PureWindowsPath(name)
     if posix.is_absolute() or windows.is_absolute() or windows.drive:
-        raise InvalidSkillPackage(f"archive entry is absolute: {name!r}")
+        raise InvalidSkillPackage(f"Git tree entry is absolute: {name!r}")
     raw = name[:-1] if name.endswith("/") else name
     parts = tuple(raw.split("/"))
     for part in parts:
         if part in ("", ".", ".."):
-            raise InvalidSkillPackage(f"archive entry escapes its root: {name!r}")
+            raise InvalidSkillPackage(f"Git tree entry escapes its root: {name!r}")
         if any(ord(char) < 0x20 or ord(char) == 0x7F for char in part):
-            raise InvalidSkillPackage(f"archive entry has control characters: {name!r}")
+            raise InvalidSkillPackage(f"Git tree entry has control characters: {name!r}")
         if ":" in part:
-            raise InvalidSkillPackage(f"archive entry uses a drive or stream: {name!r}")
+            raise InvalidSkillPackage(f"Git tree entry uses a drive or stream: {name!r}")
     return parts
 
 
@@ -182,46 +235,69 @@ def _prepare_directory(root: Path, parts: Sequence[str]) -> Path:
     return current
 
 
-def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.exists():
-        if not path.is_dir():
-            path.unlink()
+def _tree_mode(executable: bool) -> int:
+    return 0o100755 if executable else 0o100644
+
+
+def _build_file_tree(repo: pygit2.Repository, files: Sequence[tuple[str, bytes, bool]]) -> Any:
+    """Build the tree for one exact directory without touching a worktree."""
+
+    builder = repo.TreeBuilder()
+    directories: dict[str, list[tuple[str, bytes, bool]]] = {}
+    file_names: set[str] = set()
+    for path, data, executable in files:
+        head, separator, rest = path.partition("/")
+        if not head:
+            raise InvalidSkillPackage("skill file path must be non-empty")
+        if separator:
+            if head in file_names:
+                raise InvalidSkillPackage(f"path is both a file and a directory: {head!r}")
+            directories.setdefault(head, []).append((rest, data, executable))
         else:
-            shutil.rmtree(path)
+            if head in file_names:
+                raise InvalidSkillPackage(f"duplicate skill path: {path!r}")
+            if head in directories:
+                raise InvalidSkillPackage(f"path is both a file and a directory: {head!r}")
+            file_names.add(head)
+            builder.insert(head, repo.create_blob(data), _tree_mode(executable))
+
+    for name, children in directories.items():
+        if name in file_names:
+            raise InvalidSkillPackage(f"path is both a file and a directory: {name!r}")
+        builder.insert(name, _build_file_tree(repo, children), _TREE_MODE)
+    return builder.write()
 
 
-def _write_exact_directory(
-    root: Path,
-    directory: str,
-    files: Sequence[tuple[str, bytes, str]],
-) -> None:
-    """Replace one directory with exactly the supplied relative files."""
+def _replace_tree_directory(
+    repo: pygit2.Repository,
+    base_tree: pygit2.Tree,
+    parts: Sequence[str],
+    new_tree: Any,
+) -> Any:
+    """Replace one directory subtree while preserving every sibling entry."""
 
-    dir_path = validate_skill_path(directory)
-    parent_parts = dir_path.split("/")[:-1]
-    parent = _prepare_directory(root, parent_parts)
-    target = parent / dir_path.split("/")[-1]
-    _remove_path(target)
-    target.mkdir()
+    if not parts:
+        return new_tree
+    builder = repo.TreeBuilder(base_tree)
+    name = parts[0]
+    if len(parts) == 1:
+        builder.insert(name, new_tree, _TREE_MODE)
+        return builder.write()
 
-    seen: set[str] = set()
-    for relative, data, mode in files:
-        rel = validate_skill_path(relative)
-        if rel in seen:
-            raise InvalidSkillPackage(f"duplicate skill path: {rel!r}")
-        seen.add(rel)
-        if not isinstance(data, bytes):
-            raise InvalidSkillPackage(f"file content must be bytes: {rel!r}")
-        parts = rel.split("/")
-        holder = _prepare_directory(target, parts[:-1])
-        destination = holder / parts[-1]
-        if destination.is_symlink() or destination.exists():
-            raise InvalidSkillPackage(f"duplicate skill path: {rel!r}")
-        with destination.open("xb") as handle:
-            handle.write(data)
-        os.chmod(destination, 0o755 if mode == "executable" else 0o644)
+    try:
+        entry = base_tree[name]
+    except KeyError:
+        child = repo.TreeBuilder().write()
+    else:
+        if int(entry.filemode) != _TREE_MODE:
+            raise InvalidSkillPackage(f"tree path component is not a directory: {name!r}")
+        child = entry.id
+    child_tree = repo[child]
+    if not isinstance(child_tree, pygit2.Tree):
+        raise InvalidSkillPackage(f"tree path component is not a tree: {name!r}")
+    replacement = _replace_tree_directory(repo, child_tree, parts[1:], new_tree)
+    builder.insert(name, replacement, _TREE_MODE)
+    return builder.write()
 
 
 class SkillGitRepository:
@@ -236,275 +312,256 @@ class SkillGitRepository:
         repo_id = hashlib.sha256(repository.encode("utf-8")).hexdigest()
         self.repo_id = repo_id
         self.mirror_path = self.cache_dir / "repos" / f"{repo_id}.git"
-        self._hooks_dir = self.cache_dir / "hooks"
-        self._hooks_dir.mkdir(parents=True, exist_ok=True)
-        self._timeout = config.command_timeout_seconds
+        self._timeout = float(config.command_timeout_seconds)
         self._ready_lock = asyncio.Lock()
-        self._env = self._build_environment()
-        self._prefix = (
-            "git",
-            "--no-pager",
-            "--literal-pathspecs",
-            "-c",
-            f"core.hooksPath={self._hooks_dir}",
-            "-c",
-            "core.autocrlf=false",
-            "-c",
-            "core.safecrlf=false",
-            "-c",
-            "advice.detachedHead=false",
-            "-c",
-            "commit.gpgsign=false",
-        )
+        self._signature = pygit2.Signature(SERVICE_NAME, SERVICE_EMAIL)
 
-    # ------------------------------------------------------------------
-    # subprocess plumbing
-    # ------------------------------------------------------------------
-
-    def _build_environment(self) -> dict[str, str]:
-        env = os.environ.copy()
-        env.update(
-            {
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_HOOKS_PATH": str(self._hooks_dir),
-                "GIT_AUTHOR_NAME": SERVICE_NAME,
-                "GIT_AUTHOR_EMAIL": SERVICE_EMAIL,
-                "GIT_COMMITTER_NAME": SERVICE_NAME,
-                "GIT_COMMITTER_EMAIL": SERVICE_EMAIL,
-                "GIT_PAGER": "cat",
-                "PAGER": "cat",
-            }
-        )
-        ssh = ["ssh", "-o", "BatchMode=yes"]
-        if self.config.ssh_key_path:
-            ssh.extend(["-i", self.config.ssh_key_path])
-        if self.config.known_hosts_path:
-            ssh.extend(
-                [
-                    "-o",
-                    f"UserKnownHostsFile={self.config.known_hosts_path}",
-                    "-o",
-                    "StrictHostKeyChecking=yes",
-                ]
-            )
-        if self.config.ssh_key_path or self.config.known_hosts_path:
-            env["GIT_SSH_COMMAND"] = " ".join(shlex.quote(item) for item in ssh)
-        return env
-
-    def _command(self, args: Sequence[str]) -> tuple[str, ...]:
-        return (*self._prefix, *args)
-
-    def _execute_sync(
-        self,
-        args: Sequence[str],
-        *,
-        cwd: Path | None,
-        input_bytes: bytes | None = None,
-    ) -> tuple[bytes, bytes, int]:
-        command = self._command(args)
+    def _repo(self) -> pygit2.Repository:
         try:
-            completed = subprocess.run(
-                command,
-                cwd=str(cwd) if cwd is not None else None,
-                input=input_bytes,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=self._env,
-                timeout=self._timeout,
-                shell=False,
-                check=False,
+            return pygit2.Repository(str(self.mirror_path))
+        except (KeyError, OSError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "open", str(self.mirror_path)), exc) from exc
+
+    def _remote(self, repo: pygit2.Repository) -> pygit2.Remote:
+        try:
+            return repo.remotes["origin"]
+        except (KeyError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "remote", "origin"), exc) from exc
+
+    def _ssh_username(self) -> str:
+        repository = self.config.repository.strip()
+        if "://" in repository:
+            try:
+                return urlsplit(repository).username or "git"
+            except ValueError:
+                return "git"
+        return "git"
+
+    def _callbacks(self) -> _RemoteCallbacks:
+        credentials: Any | None = None
+        if self.config.ssh_key_path:
+            private = Path(self.config.ssh_key_path)
+            public = Path(str(private) + ".pub")
+            credentials = pygit2.Keypair(
+                self._ssh_username(),
+                str(public) if public.exists() else None,
+                str(private),
+                None,
             )
-        except subprocess.TimeoutExpired as exc:
-            stderr = (exc.stderr or b"").decode("utf-8", "replace")
-            raise GitCommandError(command, -1, f"timed out: {stderr}") from exc
-        except OSError as exc:
-            raise GitCommandError(command, 127, str(exc)) from exc
-        return completed.stdout or b"", completed.stderr or b"", completed.returncode
+        return _RemoteCallbacks(timeout=self._timeout, credentials=credentials)
 
-    async def _execute(
-        self,
-        *args: str,
-        cwd: Path | None = None,
-        input_bytes: bytes | None = None,
-    ) -> tuple[bytes, bytes, int]:
-        return await asyncio.to_thread(
-            self._execute_sync, args, cwd=cwd, input_bytes=input_bytes
-        )
+    def _fetch_all_heads(self, repo: pygit2.Repository) -> None:
+        try:
+            remote = self._remote(repo)
+            remote.fetch(
+                ["+refs/heads/*:refs/heads/*"],
+                callbacks=self._callbacks(),
+            )
+        except GitCommandError:
+            raise
+        except (KeyError, OSError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "fetch", "refs/heads/*"), exc) from exc
 
-    async def _git(
-        self,
-        *args: str,
-        cwd: Path | None = None,
-        input_bytes: bytes | None = None,
-    ) -> bytes:
-        stdout, stderr, returncode = await self._execute(
-            *args, cwd=cwd, input_bytes=input_bytes
-        )
-        if returncode != 0:
+    def _commit_or_none(self, repo: pygit2.Repository, commit: str) -> pygit2.Commit | None:
+        try:
+            obj = repo.revparse_single(commit)
+        except (KeyError, ValueError, pygit2.GitError):
+            return None
+        return obj if isinstance(obj, pygit2.Commit) else None
+
+    def _commit_or_raise(self, repo: pygit2.Repository, commit: str) -> pygit2.Commit:
+        found = self._commit_or_none(repo, commit)
+        if found is None:
             raise GitCommandError(
-                self._command(args),
-                returncode,
-                stderr.decode("utf-8", "replace"),
+                ("pygit2", "rev-parse", commit),
+                1,
+                f"commit not found: {commit}",
             )
-        return stdout
+        return found
 
-    # ------------------------------------------------------------------
-    # mirror and worktrees
-    # ------------------------------------------------------------------
+    def _ensure_commit_available_sync(self, commit: str) -> None:
+        repo = self._repo()
+        if self._commit_or_none(repo, commit) is not None:
+            return
+        self._fetch_all_heads(repo)
+        if self._commit_or_none(repo, commit) is None:
+            raise GitCommandError(
+                ("pygit2", "fetch", commit),
+                1,
+                f"commit not found after fetch: {commit}",
+            )
 
     async def ensure_ready(self) -> None:
         async with self._ready_lock:
-            if self.mirror_path.exists():
-                if not self.mirror_path.is_dir() or self.mirror_path.is_symlink():
-                    raise GitCommandError(
-                        self._command(("rev-parse",)),
-                        1,
-                        f"mirror path is not a directory: {self.mirror_path}",
-                    )
-                stdout, stderr, returncode = await self._execute(
-                    "rev-parse", "--is-bare-repository", cwd=self.mirror_path
-                )
-                if returncode != 0 or stdout.strip() != b"true":
-                    raise GitCommandError(
-                        self._command(("rev-parse", "--is-bare-repository")),
-                        returncode,
-                        stderr.decode("utf-8", "replace") or "not a bare repository",
-                    )
-                return
+            await asyncio.to_thread(self._ensure_ready_sync)
 
-            self.mirror_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                await self._git(
-                    "clone",
-                    "--mirror",
-                    "--no-hardlinks",
-                    "--",
-                    self.config.repository.strip(),
-                    str(self.mirror_path),
+    def _ensure_ready_sync(self) -> None:
+        if self.mirror_path.exists():
+            if not self.mirror_path.is_dir() or self.mirror_path.is_symlink():
+                raise GitCommandError(
+                    ("pygit2", "open", str(self.mirror_path)),
+                    1,
+                    f"mirror path is not a directory: {self.mirror_path}",
                 )
-            except GitCommandError:
-                if self.mirror_path.exists():
-                    shutil.rmtree(self.mirror_path, ignore_errors=True)
+            repo = self._repo()
+            if not repo.is_bare:
+                raise GitCommandError(
+                    ("pygit2", "open", str(self.mirror_path)),
+                    1,
+                    "mirror is not a bare repository",
+                )
+            return
+
+        self.mirror_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            repo = pygit2.clone_repository(
+                self.config.repository.strip(),
+                str(self.mirror_path),
+                bare=True,
+                callbacks=self._callbacks(),
+            )
+            self._fetch_all_heads(repo)
+        except Exception as exc:
+            shutil.rmtree(self.mirror_path, ignore_errors=True)
+            if isinstance(exc, GitCommandError):
                 raise
-            # A mirror clone refuses an explicit push refspec.  The object
-            # database is still a complete bare mirror; only the push syntax is
-            # relaxed so a worker can publish exactly one draft/public ref.
-            await self._git(
-                "config", "remote.origin.mirror", "false", cwd=self.mirror_path
-            )
-            await self._git(
-                "config",
-                "remote.origin.fetch",
-                "+refs/heads/*:refs/heads/*",
-                cwd=self.mirror_path,
-            )
+            raise _git_error(
+                ("pygit2", "clone", self.config.repository.strip()), exc
+            ) from exc
 
     async def _fetch_ref(self, remote_ref: str, local_ref: str) -> bool:
         _validate_ref(remote_ref)
         _validate_ref(local_ref)
-        stdout, stderr, returncode = await self._execute(
-            "ls-remote", "--exit-code", "origin", remote_ref, cwd=self.mirror_path
-        )
-        if returncode == 2 or (returncode == 0 and not stdout.strip()):
-            await self._git("update-ref", "-d", local_ref, cwd=self.mirror_path)
+        return await asyncio.to_thread(self._fetch_ref_sync, remote_ref, local_ref)
+
+    def _fetch_ref_sync(self, remote_ref: str, local_ref: str) -> bool:
+        repo = self._repo()
+        try:
+            remote = self._remote(repo)
+            heads = remote.list_heads(callbacks=self._callbacks())
+        except GitCommandError:
+            raise
+        except (KeyError, OSError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "list-heads", remote_ref), exc) from exc
+
+        if remote_ref not in {head.name for head in heads}:
+            try:
+                repo.references.delete(local_ref)
+            except (KeyError, pygit2.GitError):
+                pass
             return False
-        if returncode != 0:
-            raise GitCommandError(
-                self._command(("ls-remote", "--exit-code", "origin", remote_ref)),
-                returncode,
-                stderr.decode("utf-8", "replace"),
-            )
-        await self._git(
-            "fetch",
-            "--no-tags",
-            "origin",
-            f"+{remote_ref}:{local_ref}",
-            cwd=self.mirror_path,
-        )
+
+        try:
+            remote.fetch([f"+{remote_ref}:{local_ref}"], callbacks=self._callbacks())
+            repo.lookup_reference(local_ref)
+        except GitCommandError:
+            raise
+        except (KeyError, OSError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "fetch", remote_ref), exc) from exc
         return True
 
     async def _ensure_commit_available(self, commit: str) -> None:
         _validate_commit_id(commit)
-        _stdout, _stderr, returncode = await self._execute(
-            "cat-file", "-e", f"{commit}^{{commit}}", cwd=self.mirror_path
-        )
-        if returncode == 0:
-            return
-        await self._git(
-            "fetch",
-            "--no-tags",
-            "origin",
-            "+refs/heads/*:refs/heads/*",
-            cwd=self.mirror_path,
-        )
-        await self._git("cat-file", "-e", f"{commit}^{{commit}}", cwd=self.mirror_path)
+        await asyncio.to_thread(self._ensure_commit_available_sync, commit)
 
     async def _empty_base_commit(self) -> str:
-        tree = await self._git("mktree", cwd=self.mirror_path, input_bytes=b"")
-        commit = await self._git(
-            "commit-tree",
-            tree.decode("ascii").strip(),
-            "-m",
-            "myflow: initialize skill draft history",
-            cwd=self.mirror_path,
-        )
-        return commit.decode("ascii").strip()
+        return await asyncio.to_thread(self._empty_base_commit_sync)
 
-    @asynccontextmanager
-    async def _worktree(self, commit: str) -> AsyncIterator[Path]:
-        temporary = tempfile.TemporaryDirectory(prefix="myflow-skill-worktree-")
-        worktree = Path(temporary.name) / "tree"
-        added = False
+    def _empty_base_commit_sync(self) -> str:
+        repo = self._repo()
+        tree = repo.TreeBuilder().write()
+        ref = f"refs/myflow/empty/{uuid.uuid4().hex}"
         try:
-            await self._git(
-                "worktree",
-                "add",
-                "--detach",
-                str(worktree),
-                commit,
-                cwd=self.mirror_path,
+            commit = repo.create_commit(
+                ref,
+                self._signature,
+                self._signature,
+                "myflow: initialize skill draft history",
+                tree,
+                [],
             )
-            added = True
-            yield worktree
+        except (KeyError, OSError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "commit-tree", ref), exc) from exc
         finally:
-            if added and worktree.exists():
-                await self._execute(
-                    "worktree", "remove", "--force", str(worktree), cwd=self.mirror_path
-                )
-            await self._execute("worktree", "prune", cwd=self.mirror_path)
-            temporary.cleanup()
+            try:
+                repo.references.delete(ref)
+            except (KeyError, pygit2.GitError):
+                pass
+        return str(commit)
 
     async def _commit_and_push(
         self,
-        worktree: Path,
         *,
-        path: str,
+        base_commit: str,
+        directory: str,
+        files: Sequence[tuple[str, bytes, bool]],
         message: str,
         ref: str,
-        modes: Mapping[str, bool],
     ) -> str:
-        await self._git("add", "--all", "--", path, cwd=worktree)
-        # core.fileMode is false on Windows, so preserve the skill's declared
-        # executable bit explicitly instead of trusting the checkout.
-        for indexed_path in sorted(modes):
-            await self._git(
-                "update-index",
-                "--chmod=+x" if modes[indexed_path] else "--chmod=-x",
-                "--",
-                indexed_path,
-                cwd=worktree,
-            )
-        status = await self._git("status", "--porcelain", "--", path, cwd=worktree)
-        if status.strip():
-            await self._git("commit", "-m", message, cwd=worktree)
-        commit = (await self._git("rev-parse", "HEAD", cwd=worktree)).decode("ascii").strip()
-        await self._git("push", "--porcelain", "origin", f"HEAD:{ref}", cwd=worktree)
-        return commit
+        return await asyncio.to_thread(
+            self._commit_and_push_sync,
+            base_commit,
+            directory,
+            files,
+            message,
+            ref,
+        )
 
-    # ------------------------------------------------------------------
-    # public writes and reads
-    # ------------------------------------------------------------------
+    def _commit_and_push_sync(
+        self,
+        base_commit: str,
+        directory: str,
+        files: Sequence[tuple[str, bytes, bool]],
+        message: str,
+        ref: str,
+    ) -> str:
+        repo = self._repo()
+        base = self._commit_or_raise(repo, base_commit)
+        try:
+            file_tree = _build_file_tree(repo, files)
+            new_tree = _replace_tree_directory(
+                repo,
+                base.tree,
+                tuple(directory.split("/")),
+                file_tree,
+            )
+            if new_tree == base.tree.id:
+                commit_id = base.id
+            else:
+                commit_id = repo.create_commit(
+                    ref,
+                    self._signature,
+                    self._signature,
+                    message,
+                    new_tree,
+                    [base.id],
+                )
+            if self._reference_target(repo, ref) is None:
+                repo.references.create(ref, commit_id, force=True)
+            remote = self._remote(repo)
+            callbacks = self._callbacks()
+            remote.push([f"{ref}:{ref}"], callbacks=callbacks)
+            if callbacks.rejections:
+                detail = "; ".join(
+                    f"{name}: {reason}" for name, reason in callbacks.rejections
+                )
+                raise GitCommandError(("pygit2", "push", ref), 1, detail)
+        except GitCommandError:
+            raise
+        except (KeyError, OSError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "commit", ref), exc) from exc
+        return str(commit_id)
+
+    def _reference_target(self, repo: pygit2.Repository, ref: str) -> Any | None:
+        if ref == "HEAD":
+            try:
+                return repo.head.target
+            except (KeyError, pygit2.GitError):
+                return None
+        try:
+            return repo.lookup_reference(ref).target
+        except (KeyError, pygit2.GitError):
+            return None
 
     async def save_draft(
         self,
@@ -517,7 +574,7 @@ class SkillGitRepository:
         owner = _validate_ref_segment(owner_user_id, "owner_user_id")
         skill = _validate_path_segment(skill_id, "skill_id")
         message = _validate_message(message)
-        normalized: list[tuple[str, bytes, str]] = []
+        normalized: list[tuple[str, bytes, bool]] = []
         seen: set[str] = set()
         for staged in files:
             if not isinstance(staged, StagedFile):
@@ -528,7 +585,7 @@ class SkillGitRepository:
             if not isinstance(staged.content, bytes):
                 raise InvalidSkillPackage(f"file content must be bytes: {rel!r}")
             seen.add(rel)
-            normalized.append((rel, staged.content, staged.mode))
+            normalized.append((rel, staged.content, staged.mode == "executable"))
         if not normalized:
             raise InvalidSkillPackage("a saved draft must contain at least one file")
 
@@ -539,18 +596,13 @@ class SkillGitRepository:
         await self.ensure_ready()
         exists = await self._fetch_ref(ref, ref)
         base = await self.head(ref) if exists else await self._empty_base_commit()
-        async with self._worktree(base) as worktree:
-            _write_exact_directory(worktree, path, normalized)
-            commit = await self._commit_and_push(
-                worktree,
-                path=path,
-                message=message,
-                ref=ref,
-                modes={
-                    f"{path}/{rel}": mode == "executable"
-                    for rel, _data, mode in normalized
-                },
-            )
+        commit = await self._commit_and_push(
+            base_commit=base,
+            directory=path,
+            files=normalized,
+            message=message,
+            ref=ref,
+        )
         return GitCommit(commit=commit, ref=ref, path=path)
 
     async def publish_public(
@@ -572,13 +624,13 @@ class SkillGitRepository:
         await self.ensure_ready()
         if not await self._fetch_ref(ref, ref):
             raise GitCommandError(
-                self._command(("fetch", "origin", ref)), 2, f"public branch not found: {ref}"
+                ("pygit2", "fetch", ref), 2, f"public branch not found: {ref}"
             )
         await self._ensure_commit_available(source)
         entries = await self._tree_entries(source, source_dir)
         if not entries:
             raise InvalidSkillPackage(f"source tree has no files: {source}:{source_dir}")
-        payload: list[tuple[str, bytes, str]] = []
+        payload: list[tuple[str, bytes, bool]] = []
         for entry in entries:
             rel = entry.path
             if rel == source_dir:
@@ -588,33 +640,37 @@ class SkillGitRepository:
             else:
                 raise InvalidSkillPackage(f"tree entry escapes its source: {entry.path!r}")
             data = await self._read_blob(entry.oid)
-            payload.append((rel, data, "executable" if entry.mode == "100755" else "text"))
+            payload.append((rel, data, entry.mode == "100755"))
 
         base = await self.head(ref)
-        async with self._worktree(base) as worktree:
-            _write_exact_directory(worktree, path, payload)
-            commit = await self._commit_and_push(
-                worktree,
-                path=path,
-                message=message,
-                ref=ref,
-                modes={
-                    f"{path}/{rel}": mode == "executable"
-                    for rel, _data, mode in payload
-                },
-            )
+        commit = await self._commit_and_push(
+            base_commit=base,
+            directory=path,
+            files=payload,
+            message=message,
+            ref=ref,
+        )
         return GitCommit(commit=commit, ref=ref, path=path)
 
     async def head(self, ref: str) -> str:
         _validate_ref(ref)
-        stdout = await self._git(
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            f"{ref}^{{commit}}",
-            cwd=self.mirror_path,
-        )
-        return stdout.decode("ascii").strip()
+        return await asyncio.to_thread(self._head_sync, ref)
+
+    def _head_sync(self, ref: str) -> str:
+        repo = self._repo()
+        try:
+            if ref == "HEAD":
+                target = repo.head.target
+            else:
+                target = repo.lookup_reference(ref).target
+            obj = repo[target]
+            if not isinstance(obj, pygit2.Commit):
+                raise GitCommandError(("pygit2", "rev-parse", ref), 1, "ref is not a commit")
+        except GitCommandError:
+            raise
+        except (KeyError, OSError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "rev-parse", ref), exc) from exc
+        return str(target)
 
     async def list_tree(self, commit: str, path: str) -> list[str]:
         source = _validate_commit_id(commit)
@@ -672,10 +728,38 @@ class SkillGitRepository:
     async def read_file(self, commit: str, path: str) -> bytes:
         source = _validate_commit_id(commit)
         relative = validate_skill_path(path)
-        return await self._git(
-            "show",
-            f"{source}:{relative}",
-            cwd=self.mirror_path,
+        return await asyncio.to_thread(self._read_file_sync, source, relative)
+
+    def _read_file_sync(self, source: str, relative: str) -> bytes:
+        repo = self._repo()
+        commit = self._commit_or_raise(repo, source)
+        try:
+            node: Any = commit.tree
+            parts = relative.split("/")
+            for index, part in enumerate(parts):
+                entry = node[part]
+                if index == len(parts) - 1:
+                    if int(entry.filemode) not in _BLOB_MODES:
+                        raise KeyError(relative)
+                    blob = repo[entry.id]
+                    if not isinstance(blob, pygit2.Blob):
+                        raise KeyError(relative)
+                    return blob.data
+                if int(entry.filemode) != _TREE_MODE:
+                    raise KeyError(relative)
+                node = repo[entry.id]
+        except KeyError as exc:
+            raise GitCommandError(
+                ("pygit2", "show", f"{source}:{relative}"),
+                1,
+                f"path not found: {relative}",
+            ) from exc
+        except (OSError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "show", f"{source}:{relative}"), exc) from exc
+        raise GitCommandError(
+            ("pygit2", "show", f"{source}:{relative}"),
+            1,
+            f"path not found: {relative}",
         )
 
     async def materialize(self, commit: str, destination: Path) -> None:
@@ -684,52 +768,70 @@ class SkillGitRepository:
         await self._ensure_commit_available(source)
         await asyncio.to_thread(self._materialize_sync, source, Path(destination))
 
-    # ------------------------------------------------------------------
-    # tree and archive internals
-    # ------------------------------------------------------------------
-
     async def _tree_entries(self, commit: str, path: str) -> list[_TreeEntry]:
-        output = await self._git(
-            "ls-tree",
-            "-r",
-            "-z",
-            commit,
-            "--",
-            path,
-            cwd=self.mirror_path,
-        )
-        entries: list[_TreeEntry] = []
-        for record in output.split(b"\x00"):
-            if not record:
-                continue
+        return await asyncio.to_thread(self._tree_entries_sync, commit, path)
+
+    def _tree_entries_sync(self, commit: str, path: str) -> list[_TreeEntry]:
+        repo = self._repo()
+        root = self._commit_or_raise(repo, commit)
+        parts = validate_skill_path(path).split("/")
+        node: Any = root.tree
+        for index, part in enumerate(parts):
             try:
-                metadata, raw_path = record.split(b"\t", 1)
-                mode, kind, oid = metadata.split(b" ")
-                full_path = raw_path.decode("utf-8")
-            except (ValueError, UnicodeDecodeError) as exc:
-                raise InvalidSkillPackage("Git tree contains an invalid path") from exc
-            if kind != b"blob":
-                raise InvalidSkillPackage(f"Git tree contains a non-blob: {full_path!r}")
-            if mode not in (b"100644", b"100755"):
-                raise InvalidSkillPackage(
-                    f"Git tree contains a link or special file: {full_path!r}"
-                )
-            validated = validate_skill_path(full_path)
-            if validated != path and not validated.startswith(path + "/"):
-                raise InvalidSkillPackage(f"Git tree entry escapes its path: {validated!r}")
-            entries.append(
-                _TreeEntry(
-                    path=validated,
-                    mode=mode.decode("ascii"),
-                    oid=oid.decode("ascii"),
-                )
-            )
+                entry = node[part]
+            except KeyError:
+                return []
+            mode = int(entry.filemode)
+            if index == len(parts) - 1:
+                if mode in _BLOB_MODES:
+                    return [_TreeEntry(path=path, mode=f"{mode:o}", oid=str(entry.id))]
+                if mode != _TREE_MODE:
+                    raise InvalidSkillPackage(
+                        f"Git tree contains a link or special file: {path!r}"
+                    )
+                node = repo[entry.id]
+                break
+            if mode != _TREE_MODE:
+                return []
+            node = repo[entry.id]
+
+        entries: list[_TreeEntry] = []
+
+        def walk(tree: pygit2.Tree, prefix: str) -> None:
+            for item in tree:
+                name = item.name
+                full = f"{prefix}/{name}" if prefix else name
+                mode = int(item.filemode)
+                if mode == _TREE_MODE:
+                    child = repo[item.id]
+                    if not isinstance(child, pygit2.Tree):
+                        raise InvalidSkillPackage(f"Git tree contains an invalid tree: {full!r}")
+                    walk(child, full)
+                    continue
+                if mode not in _BLOB_MODES:
+                    raise InvalidSkillPackage(
+                        f"Git tree contains a link or special file: {full!r}"
+                    )
+                validated = validate_skill_path(full)
+                entries.append(_TreeEntry(path=validated, mode=f"{mode:o}", oid=str(item.id)))
+
+        walk(node, path)
         entries.sort(key=lambda entry: entry.path)
         return entries
 
     async def _read_blob(self, oid: str) -> bytes:
         _validate_commit_id(oid)
-        return await self._git("cat-file", "blob", oid, cwd=self.mirror_path)
+        return await asyncio.to_thread(self._read_blob_sync, oid)
+
+    def _read_blob_sync(self, oid: str) -> bytes:
+        repo = self._repo()
+        try:
+            obj = repo.revparse_single(oid)
+        except (KeyError, ValueError, pygit2.GitError) as exc:
+            raise _git_error(("pygit2", "cat-file", oid), exc) from exc
+        if not isinstance(obj, pygit2.Blob):
+            raise InvalidSkillPackage(f"Git object is not a blob: {oid!r}")
+        return obj.data
 
     def _materialize_sync(self, commit: str, destination: Path) -> None:
         if destination.is_symlink():
@@ -742,104 +844,60 @@ class SkillGitRepository:
                     f"materialize destination must be empty: {destination}"
                 )
 
-        descriptor, archive_name = tempfile.mkstemp(
-            prefix=".myflow-archive-", suffix=".tar", dir=str(parent)
-        )
-        os.close(descriptor)
-        archive = Path(archive_name)
+        repo = self._repo()
+        root = self._commit_or_raise(repo, commit)
         temporary = Path(tempfile.mkdtemp(prefix=".myflow-extract-", dir=str(parent)))
         try:
-            command = self._command(
-                (
-                    "archive",
-                    "--format=tar",
-                    "--output",
-                    str(archive),
-                    commit,
-                )
-            )
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=str(self.mirror_path),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=self._env,
-                    timeout=self._timeout,
-                    shell=False,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise GitCommandError(command, -1, "git archive timed out") from exc
-            except OSError as exc:
-                raise GitCommandError(command, 127, str(exc)) from exc
-            if completed.returncode != 0:
-                raise GitCommandError(
-                    command,
-                    completed.returncode,
-                    completed.stderr.decode("utf-8", "replace"),
-                )
-            if archive.stat().st_size > MAX_ARCHIVE_BYTES:
-                raise InvalidSkillPackage("Git archive exceeds the size limit")
-            self._extract_archive(archive, temporary)
+            entries = self._all_tree_entries(repo, root.tree)
+            if len(entries) > MAX_ARCHIVE_FILES:
+                raise InvalidSkillPackage("Git tree contains too many files")
+            total = 0
+            for entry in entries:
+                parts = _safe_tree_parts(entry.path)
+                data = self._read_blob_sync(entry.oid)
+                if len(data) > MAX_FILE_BYTES:
+                    raise InvalidSkillPackage(f"Git tree file is too large: {entry.path!r}")
+                total += len(data)
+                if total > MAX_ARCHIVE_BYTES:
+                    raise InvalidSkillPackage("Git tree exceeds the extracted size limit")
+                holder = _prepare_directory(temporary, parts[:-1])
+                target = holder / parts[-1]
+                if target.exists() or target.is_symlink():
+                    raise InvalidSkillPackage(f"duplicate Git tree entry: {entry.path!r}")
+                with target.open("xb") as handle:
+                    handle.write(data)
+                os.chmod(target, 0o755 if entry.mode == "100755" else 0o644)
             if destination.exists():
                 destination.rmdir()
             os.replace(temporary, destination)
         finally:
-            archive.unlink(missing_ok=True)
             if temporary.exists():
                 shutil.rmtree(temporary, ignore_errors=True)
 
-    def _extract_archive(self, archive: Path, root: Path) -> None:
-        files = 0
-        entries = 0
-        total = 0
-        seen: set[str] = set()
-        with tarfile.open(archive, mode="r:") as tar:
-            for member in tar:
-                entries += 1
-                if entries > MAX_ARCHIVE_FILES * 2:
-                    raise InvalidSkillPackage("Git archive contains too many entries")
-                parts = _safe_tar_parts(member.name)
-                key = "/".join(parts)
-                if key in seen:
-                    raise InvalidSkillPackage(f"duplicate archive entry: {member.name!r}")
-                seen.add(key)
-                if member.isdir():
-                    _prepare_directory(root, parts)
-                    continue
-                if not member.isreg():
-                    raise InvalidSkillPackage(
-                        f"archive entry is a link or device: {member.name!r}"
-                    )
-                if member.size < 0 or member.size > MAX_FILE_BYTES:
-                    raise InvalidSkillPackage(f"archive file is too large: {member.name!r}")
-                files += 1
-                if files > MAX_ARCHIVE_FILES:
-                    raise InvalidSkillPackage("Git archive contains too many files")
-                total += member.size
-                if total > MAX_ARCHIVE_BYTES:
-                    raise InvalidSkillPackage("Git archive exceeds the extracted size limit")
+    def _all_tree_entries(self, repo: pygit2.Repository, tree: pygit2.Tree) -> list[_TreeEntry]:
+        entries: list[_TreeEntry] = []
 
-                holder = _prepare_directory(root, parts[:-1])
-                target = holder / parts[-1]
-                if target.exists() or target.is_symlink():
-                    raise InvalidSkillPackage(f"duplicate archive entry: {member.name!r}")
-                source = tar.extractfile(member)
-                if source is None:
-                    raise InvalidSkillPackage(f"archive entry has no body: {member.name!r}")
-                with target.open("xb") as handle:
-                    remaining = member.size
-                    while remaining:
-                        chunk = source.read(min(1024 * 1024, remaining))
-                        if not chunk:
-                            raise InvalidSkillPackage(
-                                f"archive entry is truncated: {member.name!r}"
-                            )
-                        handle.write(chunk)
-                        remaining -= len(chunk)
-                executable = bool(member.mode & 0o111)
-                os.chmod(target, 0o755 if executable else 0o644)
+        def walk(current: pygit2.Tree, prefix: str) -> None:
+            for item in current:
+                name = item.name
+                full = f"{prefix}/{name}" if prefix else name
+                mode = int(item.filemode)
+                if mode == _TREE_MODE:
+                    child = repo[item.id]
+                    if not isinstance(child, pygit2.Tree):
+                        raise InvalidSkillPackage(f"Git tree contains an invalid tree: {full!r}")
+                    walk(child, full)
+                    continue
+                if mode not in _BLOB_MODES:
+                    raise InvalidSkillPackage(
+                        f"Git tree contains a link or special file: {full!r}"
+                    )
+                _safe_tree_parts(full)
+                entries.append(_TreeEntry(path=full, mode=f"{mode:o}", oid=str(item.id)))
+
+        walk(tree, "")
+        entries.sort(key=lambda entry: entry.path)
+        return entries
 
 
 __all__ = ["GitCommandError", "GitCommit", "SkillGitRepository"]

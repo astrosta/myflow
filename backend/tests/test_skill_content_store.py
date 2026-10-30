@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from fakes.git_repo import make_bare_remote
 
 from agentkit.config.skills_config import SkillGitConfig
 from agentkit.skills.content import SkillContentStore
@@ -27,31 +27,8 @@ from agentkit.skills.types import Skill, SkillCategory
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 
 
-def _git(*args: str, cwd: Path | None = None) -> bytes:
-    completed = subprocess.run(
-        ["git", "-c", "core.autocrlf=false", *args],
-        cwd=cwd,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise AssertionError(completed.stderr.decode("utf-8", "replace"))
-    return completed.stdout
-
-
 def _make_remote(tmp_path: Path) -> Path:
-    remote = tmp_path / "remote.git"
-    _git("init", "--bare", "--initial-branch=main", str(remote))
-    seed = tmp_path / "seed"
-    _git("init", "--initial-branch=main", str(seed))
-    _git("config", "user.name", "Test Fixture", cwd=seed)
-    _git("config", "user.email", "fixture@example.invalid", cwd=seed)
-    (seed / "README.md").write_bytes(b"# tests\n")
-    _git("add", "README.md", cwd=seed)
-    _git("commit", "-m", "seed", cwd=seed)
-    _git("remote", "add", "origin", str(remote), cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
-    return remote
+    return make_bare_remote(tmp_path)
 
 
 def _skill(

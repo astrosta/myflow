@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,6 +48,7 @@ from backend.app.gateway.skills_catalog import (
     configure_skill_runtime,
     reset_skill_runtime,
 )
+from fakes.git_repo import make_bare_remote
 from fakes.skill_tree import write_app_config
 
 LIMITS = {"max_files": 20, "max_file_bytes": 4096, "max_package_bytes": 16384}
@@ -61,33 +61,8 @@ def valid_skill_bytes(name: str, description: str = "PDF") -> bytes:
     ).encode()
 
 
-def _git(*args: str, cwd: Path | None = None) -> bytes:
-    completed = subprocess.run(
-        ["git", "-c", "core.autocrlf=false", *args],
-        cwd=cwd,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise AssertionError(
-            f"git {' '.join(args)} failed: {completed.stderr.decode('utf-8', 'replace')}"
-        )
-    return completed.stdout
-
-
 def _make_remote(tmp_path: Path) -> Path:
-    remote = tmp_path / "remote.git"
-    _git("init", "--bare", "--initial-branch=main", str(remote))
-    seed = tmp_path / "seed"
-    _git("init", "--initial-branch=main", str(seed))
-    _git("config", "user.name", "Test Fixture", cwd=seed)
-    _git("config", "user.email", "fixture@example.invalid", cwd=seed)
-    (seed / "README.md").write_bytes(b"# tests\n")
-    _git("add", "README.md", cwd=seed)
-    _git("commit", "-m", "seed", cwd=seed)
-    _git("remote", "add", "origin", str(remote), cwd=seed)
-    _git("push", "origin", "main", cwd=seed)
-    return remote
+    return make_bare_remote(tmp_path)
 
 
 class FakeProjection:
