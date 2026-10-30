@@ -29,7 +29,6 @@ def _config() -> AppConfig:
             "checkpointer": {"type": "memory"},
             "run_events": {"backend": "memory"},
             "auth": {"enabled": False},
-            "memory": {"enabled": False},
             "pii": {"enabled": False},
             "knowledge_base": {"enabled": False},
             "stream_bridge": {"backend": "memory"},

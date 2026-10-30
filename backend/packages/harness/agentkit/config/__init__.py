@@ -21,14 +21,7 @@ from agentkit.config.extensions_config import (
 )
 from agentkit.config.knowledge_config import KnowledgeBaseConfig
 from agentkit.config.llm_call_config import LlmCallConfig
-from agentkit.config.memory_config import (
-    MemoryConfig,
-    MemoryFoldingConfig,
-    MemoryIngestConfig,
-    MemoryMaintenanceConfig,
-    MemoryProfileConfig,
-    MemoryTaskClassifierConfig,
-)
+from agentkit.config.memory_config import MemoryConfig
 from agentkit.config.model_config import ModelConfig, ReasoningEffortOption
 from agentkit.config.pii_config import PIIConfig
 from agentkit.config.runs_config import RunsConfig
@@ -80,11 +73,6 @@ __all__ = [
     "McpUserAuthConfig",
     "SkillToggleConfig",
     "MemoryConfig",
-    "MemoryFoldingConfig",
-    "MemoryIngestConfig",
-    "MemoryMaintenanceConfig",
-    "MemoryProfileConfig",
-    "MemoryTaskClassifierConfig",
     "ModelConfig",
     "PIIConfig",
     "ReasoningEffortOption",

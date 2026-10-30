@@ -10,9 +10,25 @@ from sqlalchemy import create_engine, inspect, text
 
 from agentkit.persistence.bootstrap import _head_revision
 from agentkit.persistence.migrations import __file__ as migrations_file
-from agentkit.persistence.schema import Base, LEGACY_CANONICAL_MEMORY_TABLES
+from agentkit.persistence.schema import Base
 
 MIGRATIONS_DIR = Path(migrations_file).resolve().parent
+LEGACY_CANONICAL_MEMORY_TABLES = frozenset(
+    {
+        "memory_profiles",
+        "memory_records",
+        "memory_record_versions",
+        "memory_episode_sessions",
+        "memory_ingest_jobs",
+        "memory_consolidation_jobs",
+        "memory_skill_candidates",
+        "memory_conflicts",
+        "memory_mutation_ledger",
+        "memory_index_outbox",
+        "memory_scope_meta",
+        "memory_projection_state",
+    }
+)
 
 
 def _config(db_path: Path) -> Config:
@@ -27,6 +43,8 @@ def test_0009_drops_legacy_tables_and_keeps_openviking_tables(tmp_path: Path) ->
     engine = create_engine(f"sqlite:///{db_path.as_posix()}")
     with engine.begin() as conn:
         Base.metadata.create_all(conn)
+        for name in LEGACY_CANONICAL_MEMORY_TABLES:
+            conn.execute(text(f"CREATE TABLE {name} (id INTEGER)"))
         conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
         conn.execute(
             text("INSERT INTO alembic_version (version_num) VALUES ('0008_openviking_memory')")

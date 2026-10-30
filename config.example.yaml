@@ -90,59 +90,12 @@ database:
   postgres_schema: ""             # 非空时钉 search_path
 
 # ------------------------------------------------------------
-# M10 §2 持久记忆。画像常驻注入；长尾事实用 memory_search 按需检索。
-# canonical 运行路径：PostgreSQL 权威 + Milvus 活跃投影；旧 BaseStore 仅保留迁移兼容。
-# backend_class 变更需要重启（manager 单例），其余字段每轮读取。
+# 长期记忆。画像/ onboarding 始终由 DB 支撑；下面的开关只控制
+# OpenViking 的 capture / append / 检索。旧 canonical runtime 已删除。
 # ------------------------------------------------------------
 memory:
-  enabled: true
-  backend_class: langmem        # langmem | noop | module:Class
-  profile:
-    injection_enabled: true
-    max_tokens: 800
-    refresh: thread_start       # thread_start | revision_delta
-  ingest:
-    debounce_seconds: 30
-    shutdown_flush_timeout_seconds: 30
-  task_classifier:
-    enabled: true
-    model: agent_default       # 默认继承 agents.default_model
-    timeout_seconds: 8
-    max_history_runs: 10       # 只取最近 N 个已完成 run 的 human/final-AI 对
-    max_input_tokens: 4000
-    uncertain_policy: continue # continue | new_task
-  maintenance:
-    enabled: true
-    interval_hours: 24
-    jitter_minutes: 60
-    max_users: 500
-    max_duration_seconds: 900
-    shadow: true                # 先 shadow；确认后再关闭
-    high_watermark: 200
-    target_count: 160
-    min_vitality: 0.15
-    min_age_days: 7
-    explicit_min_age_days: 30
-    explicit_consecutive_low_cycles: 2
-    max_evictions_per_run: 50
-    max_eviction_ratio: 0.10
-    archive_retention_days: 30
-    search_activity_window_days: 30
-    min_search_calls_per_window: 20
-    folding:
-      enabled: true
-      min_facts: 50
-      min_topic_fragments: 3
-      min_cluster_size: 3
-      max_cluster_size: 20
-      similarity_threshold: 0.82
-      max_summary_token_ratio: 0.80
-      max_fold_depth: 2
-      max_clusters_per_run: 10
-      cooldown_days: 7
-  # 显式切换长期记忆权威：false = 不做长期记忆（只保留 DB-backed 画像表单）；
-  # true = OpenViking 负责 capture / append / 检索。旧 canonical runtime 已退役，
-  # 不再作为 false 的 fallback。默认必须保持 false。
+  # false = 不做长期记忆（只保留 DB-backed 画像表单）；
+  # true = OpenViking。默认必须保持 false。
   openviking:
     enabled: false
     url: http://127.0.0.1:1933
@@ -159,13 +112,7 @@ memory:
       claim_idle_ms: 60000
     capture:
       missing_turn_end_timeout_seconds: 86400
-  backend_config:
-    # extraction_model: deepseek-reasoner   # 留空则抽取停用（画像仍可手工维护）
-    # embedding_model: ...      # 配置后 store 才会建向量索引；缺省降级词法
-    # embedding_dimensions: 1536
-    # embedding_version: v1
-    retrieval_adapter: lexical # vector | lexical；vector 必须有 embedding 配置
-    token_counting: char       # tiktoken | char
+
 
 # ------------------------------------------------------------
 # PII / 敏感信息边界。只覆盖文本 HumanMessage 和模型输出；多模态、文件、

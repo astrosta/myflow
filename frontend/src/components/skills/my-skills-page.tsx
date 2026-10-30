@@ -16,7 +16,6 @@ import {
   type SkillListItem,
 } from "@/core/api/skills";
 import { useSession } from "@/core/auth/use-session";
-import { SkillSuggestions } from "@/components/memory/skill-suggestions";
 
 import { CreateSkillDialog } from "./create-skill-dialog";
 import { SkillStatusBadge } from "./skill-status-badge";
@@ -140,8 +139,6 @@ export function MySkillsPage() {
             </Button>
           </div>
         </header>
-
-        <SkillSuggestions />
 
         {loading ? (
           <div className="mt-5 grid gap-3 sm:grid-cols-2" aria-busy="true" aria-label="加载技能列表">

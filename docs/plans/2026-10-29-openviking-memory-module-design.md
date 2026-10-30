@@ -1,9 +1,8 @@
 # OpenViking 记忆模块重构设计（薄适配版）
 
-> 状态：目标设计（Proposed，未实施）
+> 状态：已实施（canonical legacy 已删除）
 > 日期：2026-10-29；修订：2026-10-30
 > 方案：A 方案——薄适配 + OpenViking 原生记忆
-> 取代：[2026-10-26-agent-memory-module-design.md](2026-10-26-agent-memory-module-design.md) 的目标记忆口径
 > 适用版本：OpenViking Server `0.4.19`（镜像 digest 在 Phase 0 锁定）；Python 客户端 `openviking-sdk==0.1.17`（PyPI 最新 SDK；`0.4.19` 是 Server 版本，不存在同号 SDK）
 > 修订（2026-10-29）：`profile.md` 改为 PostgreSQL `memory_profile_documents`；`identity.md` / `soul.md` 仍是项目内本地文件，三者都不由 MyFlow 写入 OpenViking。`profile` 是用户身份，`identity` 是助手身份，`soul` 是助手原则。OpenViking 只承载自动抽取的记忆类型：`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools` / `skills`。前端只保留“我的画像”结构化表单，用于修改/删除 `profile`。
 > 修订（2026-10-29，写入/注入方式）：`before_agent` 负责抓取门控；CAPTURE 后 human / AI / ToolMessage 每产生一条就按顺序写入 Redis Stream，worker 按 OpenViking Sessions API 的 `role/parts` 契约转换并 append/commit。`identity.md` / `soul.md` 渲染进 lead agent 系统提示（替换当前直接返回空串的 `_build_soul_section()`）；DB `profile` 与 `preferences`/`entities` 索引走隐藏的 `<personalization-context>` 消息。`ProfileService` / `PersonalizationService` 属于 `agentkit/agents/memory/personalization/`，不经过 SDK。
@@ -21,7 +20,6 @@
 > - [OpenViking Agent 集成能力参考](https://docs.openviking.ai/en/agent-integrations/16-capability-reference)
 > - [OpenViking 部署](https://docs.openviking.ai/en/guides/03-deployment)
 > - [OpenViking GitHub](https://github.com/volcengine/OpenViking)
-> - [Agent 记忆模块实施规格（历史快照）](2026-10-26-agent-memory-module-spec.md)
 
 ## 0. 结论摘要
 
@@ -84,9 +82,9 @@
 
 ## 1. 背景、目标与非目标
 
-### 1.1 当前实现
+### 1.1 历史实现（已删除）
 
-现有 canonical 记忆模块已经实现：
+canonical 记忆模块在本设计落地后已被物理删除。下面只是被替代方案的记录：
 
 - PostgreSQL 作为权威存储：`memory_profiles`、`memory_records`、`memory_record_versions`、`memory_conflicts`、`memory_episode_sessions`、`memory_ingest_jobs`、`memory_index_outbox` 等；
 - Milvus 作为活跃检索投影；
@@ -94,7 +92,7 @@
 - `memory_search` 工具、画像注入、episode session、任务分类器、待确认记忆页、Skill 候选链路；
 - `/api/memory` v1（旧 BaseStore）与 v2（canonical）两套路由。
 
-代码规模约 9700 行（其中 `canonical` 约 5000 行），测试约 2900 行，20 个 memory 测试文件。
+该实现约 9700 行（其中 `canonical` 约 5000 行）、约 2900 行测试、20 个 memory 测试文件；当前仓库中已不再存在这些文件。
 
 ### 1.2 为什么要推倒重做
 

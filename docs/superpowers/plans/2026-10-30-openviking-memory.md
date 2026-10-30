@@ -4,21 +4,21 @@
 
 **Goal:** 在 MyFlow 中落地 OpenViking 薄适配记忆层：显式 session policy、idle-only auto-commit、单 worker、at-least-once dedup/reconcile、无压缩捕获、无自动召回。
 
-**Architecture:** 新增独立的 `agentkit.agents.memory.openviking` 包，先与现有 canonical memory 共存，不删除旧模块。新包只负责 wire adapter、capture stream、dedup、session、worker 和 facade；profile/identity/soul 仍由 MyFlow 自己的服务处理。旧模块删除放到后续 P5 计划，避免本次改动同时承担迁移和新链路风险。
+**Architecture:** `agentkit.agents.memory.openviking` 是唯一长期记忆运行时；canonical 包、路由、测试和旧配置已物理删除。新包负责 wire adapter、capture stream、dedup、session、worker 和 facade；profile/identity/soul 仍由 MyFlow 自己的服务处理。
 
 **Tech Stack:** Python 3.12、Pydantic 2、SQLAlchemy 2 async、Redis Streams、LangChain Core message types、pytest/pytest-asyncio。OpenViking Server 0.4.19，客户端 `openviking-sdk==0.1.17`（SDK 没有 0.4.19）。
 
 **Spec:** `docs/plans/2026-10-29-openviking-memory-module-design.md`
 
 > **Implementation status:** core slice plus the explicit cutover are implemented on
-> `feat/openviking-memory`; 114 OpenViking tests, 2220 backend tests and 301
-> frontend tests pass.
+> `main`; 114 OpenViking tests, 2111 backend tests and 298 frontend tests pass.
 > The switch is `memory.openviking.enabled` (default `false`). It selects the
 > runtime, capture middleware, memory tools, identity/soul system prompt and
 > startup/shutdown path. The DB-backed profile, onboarding and suggestions
 > surfaces remain available when memory is off.
-> Profile suggestions/onboarding HTTP + UI, admin status/flush, canonical table
-> retirement (fresh bootstrap exclusion + migration 0009) are implemented.
+> Profile suggestions/onboarding HTTP + UI, admin status/flush, and physical
+> deletion of the canonical runtime/code/tables (0006/0007 no-op, 0009 drop-only)
+> are implemented.
 > Only live OpenViking/Redis integration remains out of scope.
 
 ## Global Constraints
@@ -32,7 +32,7 @@
 - 单 `memory_worker`；每个 shard 单 consumer；singleton lease。
 - 正常 `appended` 是终态，不做启动全量对账；只处理 `pending/appending` 和 `appended_at IS NULL`。
 - 工具输出只允许脱敏、截断后的摘要/hash；ToolMessage wire `message_kind=tool_transport`。
-- 不修改现有 canonical memory 的运行时行为；本计划只新增模块、表、配置和测试。
+- canonical memory 已退役；本计划完成后不再保留其运行时、路由、表定义、配置或测试。
 
 ## Review Focus
 
@@ -544,4 +544,3 @@ git commit -m "feat(memory): add DB-backed profile and personalization"
 
 - Live OpenViking Server + real Redis Streams integration (the user explicitly excluded final integration).
 - Optional LLM-assisted suggestion ranking; the implemented suggester is deterministic by design.
-- Physical deletion of historical canonical Python modules; they are no longer assembled or mounted, and their tables are excluded from fresh bootstrap and dropped by 0009.

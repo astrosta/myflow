@@ -40,41 +40,6 @@ export interface ProfileSuggestion {
   expires_at: string;
 }
 
-export interface PendingItem {
-  id: string;
-  content: string;
-  confidence: number;
-  evidence_tier: string | null;
-  evidence_quote: string | null;
-  source: string;
-  created_at: string;
-  updated_at: string;
-  revision: number;
-}
-
-export interface PendingPage {
-  items: PendingItem[];
-  next_cursor: string | null;
-}
-
-export interface SkillCandidate {
-  id: string;
-  status: string;
-  revision: number;
-  private_name: string;
-  description: string | null;
-  trigger_text: string;
-  package_sha256: string;
-  source_episode_ids: string[];
-  created_at: string;
-}
-
-export interface ConfirmCandidateInput {
-  expected_revision: number;
-  package_sha256: string;
-  idempotency_key: string;
-}
-
 export class MemoryApiError extends Error {
   readonly status: number;
   readonly code: string | null;
@@ -166,55 +131,9 @@ export function dismissProfileSuggestion(
   );
 }
 
-export function clearProfileField(fieldPath: string): Promise<{ cleared: string }> {
-  return request<{ cleared: string }>(
+export function clearProfileField(fieldPath: string): Promise<ProfileView> {
+  return request<ProfileView>(
     "/memory/profile/" + encodeURIComponent(fieldPath),
     { method: "DELETE" },
-  );
-}
-
-export function listPending(): Promise<PendingPage> {
-  return request<PendingPage>("/memory/pending");
-}
-
-export function promoteSemantic(id: string, expectedRevision: number): Promise<unknown> {
-  return request("/memory/items/semantic/" + encodeURIComponent(id) + "/promote", {
-    method: "POST",
-    body: JSON.stringify({ expected_revision: expectedRevision }),
-  });
-}
-
-export function deleteMemoryItem(kind: string, id: string): Promise<{ deleted: string }> {
-  return request<{ deleted: string }>(
-    "/memory/items/" + encodeURIComponent(kind) + "/" + encodeURIComponent(id),
-    { method: "DELETE" },
-  );
-}
-
-export function listSkillCandidates(): Promise<SkillCandidate[]> {
-  return request<SkillCandidate[]>("/memory/skill-candidates");
-}
-
-export function confirmSkillCandidate(
-  id: string,
-  input: ConfirmCandidateInput,
-): Promise<{ candidate_id: string; skill_id: string; version_id: string }> {
-  return request("/memory/skill-candidates/" + encodeURIComponent(id) + "/confirm", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-export function rejectSkillCandidate(
-  id: string,
-  expectedRevision: number,
-  reason: string,
-): Promise<SkillCandidate> {
-  return request<SkillCandidate>(
-    "/memory/skill-candidates/" + encodeURIComponent(id) + "/reject",
-    {
-      method: "POST",
-      body: JSON.stringify({ expected_revision: expectedRevision, reason }),
-    },
   );
 }

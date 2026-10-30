@@ -95,16 +95,11 @@ async def _installed_revision(engine: AsyncEngine) -> str | None:
 
 
 async def _create_all(engine: AsyncEngine) -> None:
+    import agentkit.persistence.schema  # noqa: F401 - register owned models
     from agentkit.persistence.base import Base
-    from agentkit.persistence.schema import LEGACY_CANONICAL_MEMORY_TABLES
 
     def _create(sync_conn) -> None:
-        tables = [
-            table
-            for name, table in Base.metadata.tables.items()
-            if name not in LEGACY_CANONICAL_MEMORY_TABLES
-        ]
-        Base.metadata.create_all(sync_conn, tables=tables)
+        Base.metadata.create_all(sync_conn)
 
     async with engine.begin() as conn:
         await conn.run_sync(_create)

@@ -57,8 +57,6 @@ export interface SidebarProps {
   reviewActive?: boolean;
   /** 当前是否在「我的画像」 */
   profileActive?: boolean;
-  /** 当前是否在「待确认记忆」 */
-  pendingActive?: boolean;
   /**
    * 当前会话是不是管理员；只决定要不要画「审核」入口。
    *
@@ -81,7 +79,6 @@ export function Sidebar({
   skillsActive = false,
   reviewActive = false,
   profileActive = false,
-  pendingActive = false,
   isAdmin = false,
   className,
 }: SidebarProps) {
@@ -141,14 +138,6 @@ export function Sidebar({
         >
           <UserIcon className="shrink-0" size={15} />
           我的画像
-        </Link>
-        <Link
-          aria-current={pendingActive ? "page" : undefined}
-          className={navItemClass(pendingActive)}
-          href="/workspace/memory/pending"
-        >
-          <BookOpenIcon className="shrink-0" size={15} />
-          待确认记忆
         </Link>
         {/**
          * 「审核」只对管理员画出来：普通用户看不到这个链接。

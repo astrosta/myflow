@@ -13,9 +13,6 @@ STARTUP_ONLY_FIELDS: dict[str,str] = {
     "database.postgres_url": "连接串在引擎和 checkpointer 池创建时捕获",
     "database.postgres_schema": "search_path 钉在 connect_args 上",
     "database.checkpoint_channel_mode": "编译进图的通道表，跨进程必须一致",
-    "memory.backend_class": (
-        "get_memory_manager() 单例按 backend_class 构造；换后端必须先 reset_memory_manager()"
-    ),
     "database.pool_size": "ORM 连接池在 create_async_engine 时定容",
     "run_events.backend": "make_run_event_store() 在 lifespan 里构造一次",
     "stream_bridge.backend": "create_stream_bridge() 在 lifespan 里构造一次；换后端要重建单例",

@@ -84,8 +84,9 @@ _SERVER_OWNED_MESSAGE_KEYS = PROVENANCE_KEYS | SUBAGENT_TOOL_MESSAGE_KEYS | {
     "hide_from_ui",
     "dynamic_context_reminder",
     "reminder_date",
-    # M10 §2.8.1 / §2.8.3：画像注入标记只能由 MemoryMiddleware 盖。
+    # 画像注入标记只能由服务端 OpenViking capture middleware 盖。
     "memory_profile",
+    "memory_profile_etag",
     "memory_profile_revision",
     "memory_profile_sha256",
     "memory_profile_tokens",

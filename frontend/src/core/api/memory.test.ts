@@ -13,7 +13,6 @@ import {
   listProfileSuggestions,
   MemoryApiError,
   patchProfile,
-  promoteSemantic,
   updateOnboarding,
 } from "./memory";
 
@@ -52,13 +51,6 @@ describe("memory API client", () => {
       status: 409,
       code: "memory_conflict",
     });
-  });
-
-  it("promotes with the visible revision", async () => {
-    mockedFetch.mockResolvedValue(json({ id: "p1" }));
-    await promoteSemantic("p1", 3);
-    const [, init] = mockedFetch.mock.calls[0]!;
-    expect(JSON.parse(String(init?.body))).toEqual({ expected_revision: 3 });
   });
 
   it("uses onboarding and suggestion endpoints", async () => {

@@ -5,11 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from uuid import uuid4
 
-from agentkit.agents.memory.canonical.service import (
-    MemoryService,
-    get_memory_service as get_canonical_memory_service,
-)
-from agentkit.agents.memory.manager import MemoryManager, get_memory_manager
 from agentkit.agents.memory.openviking.onboarding import OnboardingService
 from agentkit.agents.memory.openviking.profile import ProfileService
 from agentkit.agents.memory.openviking.suggestions import ProfileSuggester
@@ -38,8 +33,6 @@ __all__ = [
     "get_knowledge_config",
     "get_knowledge_service",
     "get_knowledge_service_optional",
-    "get_memory_manager_service",
-    "get_memory_service",
     "get_openviking_onboarding_service",
     "get_openviking_onboarding_service_optional",
     "has_openviking_active_run",
@@ -93,24 +86,6 @@ def require_authenticated(request: Request) -> AuthResult:
     if auth is None or not auth.is_authenticated:
         raise Unauthenticated("authentication required")
     return auth
-
-
-def get_memory_service(request: Request) -> MemoryService | None:
-    """Canonical service, or None when memory is disabled/unavailable."""
-    service = getattr(request.app.state, "memory_service", None)
-    if isinstance(service, MemoryService):
-        return service
-    return get_canonical_memory_service()
-
-
-def get_memory_manager_service(request: Request) -> MemoryManager:
-    """Resolve the process manager (lifespan-owned when running the real app)."""
-    manager = getattr(request.app.state, "memory_manager", None)
-    if not isinstance(manager, MemoryManager):
-        manager = get_memory_manager()
-    request.state.memory_manager = manager
-    request.state.memory_maintenance = getattr(request.app.state, "memory_maintenance", None)
-    return manager
 
 
 async def has_openviking_active_run(request: Request, user_id: str) -> bool:

@@ -1,12 +1,11 @@
-"""Drop the legacy canonical memory tables.
+"""Drop the retired canonical memory tables.
 
 Revision ID: 0009_drop_canonical_memory
 Revises: 0008_openviking_memory
 
-The OpenViking adapter (0008) is the long-term memory authority after this
-revision. The canonical tables are empty in the supported cutover; this
-migration intentionally does not copy or transform rows. Downgrade recreates
-the schema for local recovery only, not the data.
+The runtime code is gone. This migration removes any tables left in databases
+created before the OpenViking cutover. Downgrade is intentionally unavailable:
+the canonical schema is permanently retired.
 """
 
 from __future__ import annotations
@@ -14,16 +13,11 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-import agentkit.agents.memory.canonical.models  # noqa: F401 - downgrade metadata
-from agentkit.persistence.base import Base
-
 revision = "0009_drop_canonical_memory"
 down_revision = "0008_openviking_memory"
 branch_labels = None
 depends_on = None
 
-# Reverse dependency order; the canonical schema has no FK constraints today,
-# but dropping leaves in this order keeps the migration safe if one is added.
 _TABLES = (
     "memory_index_outbox",
     "memory_projection_state",
@@ -51,6 +45,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    for name in reversed(_TABLES):
-        Base.metadata.tables[name].create(bind, checkfirst=True)
+    return

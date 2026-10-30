@@ -7,18 +7,13 @@ from types import SimpleNamespace
 import pytest
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.store.memory import InMemoryStore
 
-from agentkit.agents.memory.backends.langmem.backend import LangMemBackend
-from agentkit.agents.memory.manager import MemoryManager
-from agentkit.agents.memory.types import MemoryScope
 from agentkit.agents.middlewares.pii_middleware import (
     PII_VAULT_CONTEXT_KEY,
     PIIMiddleware,
     PIIOutputMiddleware,
 )
 from agentkit.config.app_config import AppConfig
-from agentkit.config.memory_config import MemoryConfig
 from agentkit.privacy import (
     PIIRedactor,
     PIIUnresolvedToken,
@@ -192,45 +187,3 @@ def test_output_middleware_redacts_ai_content_and_tool_args() -> None:
     assert "alice@example.com" not in message.content
     assert message.tool_calls[0]["args"]["to"] == token
     assert "alice@example.com" not in str(message.additional_kwargs)
-
-
-def test_semantic_service_rejects_direct_unredacted_pii() -> None:
-    from agentkit.agents.memory.resolver import MemoryResolver
-    from agentkit.agents.memory.services.semantic import SemanticMemoryService
-    from agentkit.agents.memory.types import MemoryProposal
-
-    service = SemanticMemoryService(LangMemBackend(InMemoryStore()), MemoryResolver())
-    with pytest.raises(ValueError, match="PII"):
-        service.write(
-            MemoryScope("alice"),
-            [
-                MemoryProposal(
-                    id="pii",
-                    kind="semantic",
-                    payload={"content": "email alice@example.com", "source": "inferred"},
-                )
-            ],
-        )
-
-
-def test_memory_manager_ingests_only_memory_view() -> None:
-    backend = LangMemBackend(InMemoryStore())
-    seen: list[str] = []
-
-    class Capture:
-        def extract(self, _scope, messages):
-            seen.extend(str(message.content) for message in messages)
-            return []
-
-    manager = MemoryManager(
-        backend,
-        ingestors=[Capture()],
-        config=MemoryConfig(),
-    )
-    vault = PIIVault()
-    token = PIIRedactor(vault).redact_text("alice@example.com")
-    manager.ingest_now(MemoryScope("alice", thread_id="t1"), [HumanMessage(content=token)])
-    assert seen
-    assert "[[PII:" not in seen[0]
-    assert "alice@example.com" not in seen[0]
-    assert "[REDACTED]" in seen[0]

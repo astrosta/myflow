@@ -1,73 +1,23 @@
-"""Long-term memory: backend, services, manager, middleware, and tools."""
+"""Shared long-term-memory profile schema.
 
-from agentkit.agents.memory.backend import MemoryBackend
-from agentkit.agents.memory.manager import (
-    MemoryManager,
-    configure_memory_store,
-    get_memory_manager,
-    reset_memory_manager,
-)
-from agentkit.agents.memory.resolver import MemoryResolver
-from agentkit.agents.memory.services.base import MemoryTypeService
-from agentkit.agents.memory.services.profile import ProfileService
-from agentkit.agents.memory.services.semantic import SemanticMemoryService
+The legacy canonical runtime and its manager/backend/services were removed.
+OpenViking lives in the sibling openviking package.
+"""
+
 from agentkit.agents.memory.types import (
-    MemoryConflict,
-    MemoryConflictError,
-    MemoryCorruptionError,
-    MemoryExport,
-    MemoryHit,
-    MemoryInstruction,
-    MemoryKind,
-    MemoryKindNotSupported,
-    MemoryKindSpec,
-    MemoryManagerError,
-    MemoryNotFoundError,
-    MemoryProposal,
-    MemoryQuery,
-    MemoryReadError,
-    MemoryRecord,
-    MemoryScope,
-    MemorySearchPage,
-    MemoryStats,
-    MemoryWriteError,
-    ProfilePatch,
-    ProfileSnapshot,
-    SemanticPayload,
-    UserProfile,
+    EXPLICIT_ONLY_FIELDS,
+    PROFILE_FIELD_PATHS,
+    PROFILE_FIELD_PRIORITY,
+    SENSITIVE_VALUE_PATTERNS,
+    looks_like_secret,
+    validate_profile_value,
 )
 
 __all__ = [
-    "MemoryBackend",
-    "MemoryConflict",
-    "MemoryConflictError",
-    "MemoryCorruptionError",
-    "MemoryExport",
-    "MemoryHit",
-    "MemoryInstruction",
-    "MemoryKind",
-    "MemoryKindNotSupported",
-    "MemoryKindSpec",
-    "MemoryManager",
-    "MemoryManagerError",
-    "MemoryNotFoundError",
-    "MemoryProposal",
-    "MemoryQuery",
-    "MemoryReadError",
-    "MemoryRecord",
-    "MemoryResolver",
-    "MemoryScope",
-    "MemorySearchPage",
-    "MemoryStats",
-    "MemoryTypeService",
-    "MemoryWriteError",
-    "ProfilePatch",
-    "ProfileService",
-    "ProfileSnapshot",
-    "SemanticMemoryService",
-    "SemanticPayload",
-    "UserProfile",
-    "configure_memory_store",
-    "get_memory_manager",
-    "reset_memory_manager",
+    "EXPLICIT_ONLY_FIELDS",
+    "PROFILE_FIELD_PATHS",
+    "PROFILE_FIELD_PRIORITY",
+    "SENSITIVE_VALUE_PATTERNS",
+    "looks_like_secret",
+    "validate_profile_value",
 ]
