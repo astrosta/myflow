@@ -192,7 +192,9 @@ sandbox:
 # ------------------------------------------------------------
 subagents:
   timeout_seconds: 1800      # 内置子代理默认墙钟上限（秒）
-  max_turns: null            # null = 用该类型自己的值（general-purpose=150，bash=60）
+  max_turns: null            # 模型调用次数上限；null = 用该类型自己的值
+                             # （general-purpose=150，bash=60，knowledge-researcher=12，
+                             #  memory-researcher=10，skill-finder=8）。执行器按图节点换算 recursion_limit。
   max_total_per_run: 6       # 一次父 run 累计委派上限，1–50
   token_budget:
     enabled: true
@@ -200,13 +202,17 @@ subagents:
     # 显式写了就永远以显式值为准。
     warn_threshold: 0.7
   agents: {}                 # 按名字覆盖 builtin / custom：timeout_seconds / max_turns / model / token_budget
+  # 内置检索子代理随功能开关出现：knowledge-researcher（knowledge_base.enabled）、
+  # memory-researcher（memory.openviking.enabled）、skill-finder（skills.search.enabled）。
+  # 它们使用 lead 不再直接持有的检索工具；子代理不可用时检索工具退回 lead 直连。
+  # 委派默认开启（run 未显式传 subagent_enabled 时按 true 处理）；allowed_subagents: [] 可关闭。
   custom_agents: {}          # 自定义类型，例如：
   # researcher:
   #   description: "深度调研一个主题，给出带来源的结论"     # 会进提示词的发现列表
   #   system_prompt: "你是调研员，只回结论不回过程。"
   #   tools: null              # null = 继承 lead 当时持有的全部工具
   #   disallowed_tools: [task, ask_clarification]   # 默认就是 [task]：M8 不做嵌套委派
-  #   skills: null             # null = 全部启用技能；[] = 禁用技能
+  #   skills: null             # 暂未生效（子代理链没有技能中间件）
   #   model: inherit           # inherit = 跟 lead 同名；否则必须是 models[].name
   #   max_turns: 80
   #   timeout_seconds: 900
@@ -402,7 +408,7 @@ knowledge_base:
       operations:
         strategy: procedure
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
       faq:
         strategy: qa_pair
         chunk_size_tokens: 384
@@ -410,7 +416,7 @@ knowledge_base:
       security:
         strategy: clause
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
       api:
         strategy: api_reference
         chunk_size_tokens: 768
@@ -418,7 +424,7 @@ knowledge_base:
       legal:                        # 法律法规：按“第X条”切分，条号进 section
         strategy: legal_clause
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
 
   # 服务地址、模型和维度来自顶层 embedding；这里只保留知识库自己的策略。
   embedding:

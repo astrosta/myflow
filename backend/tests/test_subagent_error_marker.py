@@ -71,7 +71,7 @@ def test_the_fallback_marker_maps_to_failed(scripted) -> None:
     message = _run()
 
     assert message.additional_kwargs["subagent_status"] == "failed"
-    assert "provider" in message.additional_kwargs["subagent_error"]
+    assert "模型调用失败" in message.additional_kwargs["subagent_error"]
     assert message.status == "error"
 
 
@@ -92,7 +92,7 @@ def test_an_empty_answer_without_a_marker_is_a_failure(scripted) -> None:
     message = _run()
 
     assert message.additional_kwargs["subagent_status"] == "failed"
-    assert "without producing an answer" in message.additional_kwargs["subagent_error"]
+    assert "没有产出结论" in message.additional_kwargs["subagent_error"]
 
 
 def test_the_marker_only_counts_on_the_last_assistant_message(monkeypatch) -> None:

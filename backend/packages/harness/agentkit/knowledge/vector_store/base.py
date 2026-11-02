@@ -5,7 +5,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol
 
-from agentkit.knowledge.models import KnowledgeChunk, KnowledgeDocument, SearchHit
+from agentkit.knowledge.models import (
+    KnowledgeChunk,
+    KnowledgeDocument,
+    KnowledgeParentChunk,
+    SearchHit,
+)
 
 
 class VectorStore(Protocol):
@@ -19,7 +24,16 @@ class VectorStore(Protocol):
         document: KnowledgeDocument,
         chunks: Sequence[KnowledgeChunk],
         vectors: Sequence[Sequence[float]],
+        parents: Sequence[KnowledgeParentChunk] = (),
     ) -> None: ...
+
+    async def get_parents(
+        self, *, user_id: str, parent_ids: Sequence[str]
+    ) -> dict[str, str]: ...
+
+    async def list_chunks(
+        self, *, user_id: str, document_id: str
+    ) -> list[KnowledgeChunk]: ...
 
     async def delete_document(self, *, user_id: str, document_id: str) -> None: ...
 

@@ -162,7 +162,10 @@ agentkit/
 │   └── builtins/
 │       ├── __init__.py              ★  # BUILTIN_SUBAGENTS
 │       ├── general_purpose.py       ★
-│       └── bash_agent.py            ★
+│       ├── bash_agent.py            ★
+│       ├── knowledge_researcher.py  ★  # 2026-11-02：知识库检索子代理
+│       ├── memory_researcher.py     ★  # 2026-11-02：长期记忆检索子代理
+│       └── skill_finder.py          ★  # 2026-11-02：技能检索子代理
 ├── agents/
 │   ├── thread_state.py              # 填满 DelegationEntry / merge_delegations
 │   └── middlewares/

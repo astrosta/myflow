@@ -39,6 +39,9 @@ def _config(
             "models": models
             or [{"name": "deepseek-reasoner", "use": "langchain_deepseek:ChatDeepSeek"}],
             "sandbox": {"use": use, "allow_host_bash": allow_host_bash},
+            # 检索子代理（knowledge/memory/skills）另有用例覆盖；这里关掉技能检索，
+            # 让断言只描述 general-purpose 与 bash 的发现顺序。
+            "skills": {"search": {"enabled": False}},
             "subagents": subagents,
         }
     )
@@ -68,7 +71,13 @@ def _names(tools: list[BaseTool]) -> list[str]:
 
 
 def test_builtin_order_is_the_discovery_order() -> None:
-    assert list(BUILTIN_SUBAGENTS) == ["general-purpose", "bash"]
+    assert list(BUILTIN_SUBAGENTS) == [
+        "general-purpose",
+        "knowledge-researcher",
+        "memory-researcher",
+        "skill-finder",
+        "bash",
+    ]
     assert list_subagent_names(app_config=_host_bash_config(), allowed=None) == [
         "general-purpose",
         "bash",

@@ -66,7 +66,8 @@ SUBAGENT_TOOL_MESSAGE_KEYS = frozenset({
 })
 
 #: 工具结果正文的上限（§17.1）：子代理可以写很长，但 lead 的上下文不是垃圾桶。
-#: 全文照样进 ``subagent.end`` 事件与台账 brief——这里只是"回到对话里的那一段"。
+#: ToolMessage 截到这里；``subagent.end`` 另截 ``SUBAGENT_STEP_MAX_CHARS``，台账 brief 截到 2000。
+#: 超过本上限的全文哪里都找不到。
 SUBAGENT_RESULT_MAX_CHARS = 8192
 
 _HEADLINES: dict[str, str] = {
@@ -180,12 +181,15 @@ def format_subagent_result_message(
 ) -> str:
     """模型可见散文（§9.2）。运行时消费者**不许**解析这段文字当状态。
 
-    例：``Task Succeeded (capped: token budget; partial result). / Result: ...``
+    例：``任务成功（触发护栏上限：token 预算；结果为部分结果）。\\n结果：...``
     """
-    headline = _HEADLINES.get(status, "Task Failed")
-    if status == "completed" and stop_reason:
+    headline = _HEADLINES.get(status, "任务失败")
+    if stop_reason:
         label = _CAP_LABELS.get(stop_reason, stop_reason)
-        headline += f"（触发护栏上限：{label}；结果为部分结果）"
+        if status == "completed":
+            headline += f"（触发护栏上限：{label}；结果为部分结果）"
+        else:
+            headline += f"（触发护栏上限：{label}）"
     lines = [f"{headline}。"]
     if error:
         lines.append(f"原因：{error}")

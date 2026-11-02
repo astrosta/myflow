@@ -8,6 +8,39 @@ export interface ProfileFieldView {
   observed_at: string;
 }
 
+export interface ProfileFieldOption {
+  value: string;
+  label: string;
+}
+
+export type ProfileFieldKind =
+  | "text"
+  | "locale"
+  | "language"
+  | "choice"
+  | "multi_choice"
+  | "string_list";
+
+export interface ProfileFieldSpec {
+  path: string;
+  label: string;
+  group: string;
+  group_label: string;
+  kind: ProfileFieldKind;
+  description: string;
+  placeholder: string;
+  options: ProfileFieldOption[];
+  max_length: number;
+  max_items: number;
+  item_max_length: number;
+  explicit_only: boolean;
+}
+
+export interface ProfileSchemaView {
+  schema_version: number;
+  fields: ProfileFieldSpec[];
+}
+
 export interface ProfileView {
   schema_version: number;
   revision: number;
@@ -67,7 +100,7 @@ async function readError(response: Response): Promise<MemoryApiError> {
   return new MemoryApiError(response.status, code, detail);
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function memoryRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body !== undefined) headers.set("Content-Type", "application/json");
   const response = await apiFetch(apiUrl(path), { ...init, headers });
@@ -77,39 +110,50 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export function getProfile(): Promise<ProfileView> {
-  return request<ProfileView>("/memory/profile");
+  return memoryRequest<ProfileView>("/memory/profile");
+}
+
+export function getProfileSchema(): Promise<ProfileSchemaView> {
+  return memoryRequest<ProfileSchemaView>("/memory/profile/schema");
 }
 
 export function patchProfile(
   fields: Record<string, unknown>,
   expectedRevision: number,
 ): Promise<ProfileView> {
-  return request<ProfileView>("/memory/profile", {
+  return memoryRequest<ProfileView>("/memory/profile", {
     method: "PATCH",
     body: JSON.stringify({ fields, expected_revision: expectedRevision }),
   });
 }
 
+export function clearProfile(etag?: string): Promise<ProfileView> {
+  return memoryRequest<ProfileView>("/memory/profile", {
+    method: "DELETE",
+    body: JSON.stringify(etag ? { etag } : {}),
+  });
+}
+
 export function getOnboarding(): Promise<OnboardingView> {
-  return request<OnboardingView>("/memory/profile/onboarding");
+  return memoryRequest<OnboardingView>("/memory/profile/onboarding");
 }
 
 export function updateOnboarding(action: OnboardingAction): Promise<OnboardingView> {
-  return request<OnboardingView>("/memory/profile/onboarding", {
+  return memoryRequest<OnboardingView>("/memory/profile/onboarding", {
     method: "POST",
     body: JSON.stringify({ action }),
   });
 }
 
 export function listProfileSuggestions(): Promise<{ items: ProfileSuggestion[] }> {
-  return request<{ items: ProfileSuggestion[] }>("/memory/profile/suggestions");
+  return memoryRequest<{ items: ProfileSuggestion[] }>("/memory/profile/suggestions");
 }
 
 export function acceptProfileSuggestion(
   id: string,
   etag?: string,
 ): Promise<{ suggestion: ProfileSuggestion; profile: ProfileView }> {
-  return request<{ suggestion: ProfileSuggestion; profile: ProfileView }>(
+  return memoryRequest<{ suggestion: ProfileSuggestion; profile: ProfileView }>(
     "/memory/profile/suggestions/" + encodeURIComponent(id) + "/accept",
     {
       method: "POST",
@@ -122,7 +166,7 @@ export function dismissProfileSuggestion(
   id: string,
   etag?: string,
 ): Promise<ProfileSuggestion> {
-  return request<ProfileSuggestion>(
+  return memoryRequest<ProfileSuggestion>(
     "/memory/profile/suggestions/" + encodeURIComponent(id) + "/dismiss",
     {
       method: "POST",
@@ -132,7 +176,7 @@ export function dismissProfileSuggestion(
 }
 
 export function clearProfileField(fieldPath: string): Promise<ProfileView> {
-  return request<ProfileView>(
+  return memoryRequest<ProfileView>(
     "/memory/profile/" + encodeURIComponent(fieldPath),
     { method: "DELETE" },
   );

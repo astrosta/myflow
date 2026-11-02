@@ -3,6 +3,7 @@
 import { FormEvent, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Markdown } from "@/components/workspace/markdown";
 import {
   knowledgeRetrievalModeLabel,
   type KnowledgeSearchHit,
@@ -121,9 +122,7 @@ function SearchHitItem({ hit }: { hit: KnowledgeSearchHit }) {
         {hit.page > 0 ? <span>第 {hit.page} 页</span> : null}
         <span className="ml-auto tabular-nums">相关度 {hit.score.toFixed(3)}</span>
       </div>
-      <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-relaxed text-neutral-700">
-        {hit.content}
-      </p>
+      <Markdown className="knowledge-search-md mt-2" text={hit.content} />
     </article>
   );
 }

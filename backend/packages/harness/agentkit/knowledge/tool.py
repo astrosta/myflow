@@ -97,6 +97,7 @@ def make_knowledge_search_tool(service: KnowledgeService | None = None) -> BaseT
                     "section": hit.section,
                     "page": hit.page,
                     "chunk_index": hit.chunk_index,
+                    "parent_id": hit.parent_id,
                     "score": round(hit.score, 6),
                     "rrf_score": None if hit.rrf_score is None else round(hit.rrf_score, 6),
                     "rerank_score": (

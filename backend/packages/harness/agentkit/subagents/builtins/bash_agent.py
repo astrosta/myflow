@@ -17,7 +17,7 @@ from agentkit.subagents.config import (
     INHERIT_MODEL,
     SubagentConfig,
 )
-from agentkit.subagents.routing import ROUTING_BENEFITS, ROUTING_COST, ROUTING_VETOES
+from agentkit.subagents.routing import ROUTING_VETOES
 
 NAME = "bash"
 
@@ -29,19 +29,23 @@ TOOLS = ["bash", "ls", "read_file", "write_file", "str_replace"]
 
 DISALLOWED_TOOLS = ["task", "ask_clarification"]
 
-DESCRIPTION = (
-    "拥有独立上下文的沙箱命令子代理，适合执行时间长、输出嘈杂的命令工作："
-    "完整测试套件、构建、日志排查、全仓搜索——你不希望这些输出进入自己的上下文，"
-    f"只关心最终结论（{ROUTING_BENEFITS}）。常规的 git / 构建 / 测试 / 部署命令"
-    f"不足以成为委派理由：自己执行比 {ROUTING_COST} 更便宜。不要委派 {ROUTING_VETOES}。"
+_IDENTITY = (
+    "拥有独立上下文的沙箱命令子代理，适合执行时间长、输出嘈杂的命令："
+    "完整测试套件、构建、日志排查、全仓搜索。长输出留在它的上下文里，你只拿到结论。"
+    "常规的 git / 构建 / 测试 / 部署命令不足以成为委派理由：自己执行更快。"
 )
+
+DESCRIPTION = f"{_IDENTITY}{ROUTING_VETOES}"
+
+#: ``max_concurrent == 1`` 时用这一版："同一轮并行"的否决不成立。
+SEQUENTIAL_DESCRIPTION = _IDENTITY
 
 SYSTEM_PROMPT = """\
 你是一个沙箱子代理。lead 给了你一个偏命令行的任务，你在自己的上下文中执行：
 lead 只看得到你的最终回答，看不到完整命令输出。
 
 硬性规则：
-- 你没有 `task` 工具，也不能向用户提问（这里没有 `ask_clarification`）：
+- 你没有 `task` 工具，也不能向用户提问：
   自己执行任务；如果任务有歧义，采用最合理的理解，并说明你的假设。
 - 只做任务范围内的动作。优先使用只读命令，只写入任务要求的文件：
   lead 与你共享这个工作区，可能正在同时使用它。
@@ -55,13 +59,23 @@ lead 只看得到你的最终回答，看不到完整命令输出。
 BASH_SUBAGENT = SubagentConfig(
     name=NAME,
     description=DESCRIPTION,
+    sequential_description=SEQUENTIAL_DESCRIPTION,
     system_prompt=SYSTEM_PROMPT,
     tools=list(TOOLS),
     disallowed_tools=list(DISALLOWED_TOOLS),
-    skills=None,  # None = 全部启用技能
+    skills=None,  # 暂未生效：子代理链没有技能中间件
     model=INHERIT_MODEL,
     max_turns=MAX_TURNS,
     timeout_seconds=BUILTIN_SUBAGENT_TIMEOUT_SECONDS,  # 段落值 subagents.timeout_seconds 覆盖它
 )
 
-__all__ = ["BASH_SUBAGENT", "DESCRIPTION", "DISALLOWED_TOOLS", "MAX_TURNS", "NAME", "SYSTEM_PROMPT", "TOOLS"]
+__all__ = [
+    "BASH_SUBAGENT",
+    "DESCRIPTION",
+    "DISALLOWED_TOOLS",
+    "MAX_TURNS",
+    "NAME",
+    "SEQUENTIAL_DESCRIPTION",
+    "SYSTEM_PROMPT",
+    "TOOLS",
+]

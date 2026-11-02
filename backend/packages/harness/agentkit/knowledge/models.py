@@ -52,6 +52,22 @@ class KnowledgeChunk:
     content: str
     section: str = ""
     page: int = 0
+    #: Text sent to the dense embedding service. FAQ sets this to the question;
+    #: an empty value means "use content".
+    embedding_text: str = ""
+    #: Set only for children produced by the parent-child strategy.
+    parent_id: str | None = None
+    #: Transient parent body carried from chunking to ingestion; never persisted
+    #: in the child collection.
+    parent_content: str = ""
+
+
+@dataclass(slots=True)
+class KnowledgeParentChunk:
+    parent_id: str
+    content: str
+    section: str = ""
+    page: int = 0
 
 
 @dataclass(slots=True)
@@ -81,5 +97,6 @@ class SearchHit:
     knowledge_base_type: str = ""
     chunk_index: int = 0
     page: int = 0
+    parent_id: str = ""
     rrf_score: float | None = None
     rerank_score: float | None = None

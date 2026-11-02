@@ -22,6 +22,7 @@ from agentkit.runtime.user_context import resolve_runtime_user_id
 from agentkit.tools import get_available_tools
 
 from agentkit.subagents.policy import SubagentPolicy
+from agentkit.subagents.registry import get_subagent_config, list_subagent_names
 
 if TYPE_CHECKING:  # 运行时在 assemble_agent 里 import：subagents 那条链会绕回本模块
     from agentkit.subagents.runtime import SubagentRuntime
@@ -114,7 +115,17 @@ def assemble_agent(
     requested_model  = _resolve_runtime_option(cfg, "model_name", None, resolved_config.agents.default_model)
     thinking_enabled = _resolve_runtime_option(cfg, "thinking_enabled", None, False)
     requested_effort = _resolve_runtime_option(cfg, "reasoning_effort", None, None)
-    subagent_enabled = bool(_resolve_runtime_option(cfg, "subagent_enabled", None, False))
+    # 委派默认开启：检索（知识库/记忆/技能）只在子代理里执行（2026-11-02 设计）。
+    # 客户端显式传 subagent_enabled=false，或 agents.allowed_subagents: []，都会退回直连。
+    subagent_enabled = bool(_resolve_runtime_option(cfg, "subagent_enabled", None, True))
+    # 把"解析后的默认值"写回 run config：中间件层读的是 config.configurable，
+    # 只给工具层用默认值会出现"task 装上了、SubagentLimit 却没装"的错配。
+    if isinstance(config, dict):
+        configurable = config.get("configurable")
+        if configurable is None:
+            configurable = config["configurable"] = {}
+        if isinstance(configurable, dict):
+            configurable.setdefault("subagent_enabled", subagent_enabled)
 
     # 能力协商
     model_name = _effective_model_name(requested_model, resolved_config)
@@ -156,36 +167,73 @@ def assemble_agent(
         )
         _stamp_subagent_policy(config, policy)
 
-    # 组装工具
+    # 组装工具。检索类工具（知识库 / 记忆 / 技能）只有在"本次 run 可用、且在 tools 里点名
+    # 要它"的子代理存在时，才从 lead 移进 `task` 的 delegated_tools；否则留给 lead 直连。
+    # general-purpose 这类继承型子代理拿不到 delegated 工具，不能指望它兜底——按工具逐个
+    # 判断，白名单里没有检索子代理时用户才不会凭空失去检索能力（2026-11-02 检索子代理设计）。
     tools = get_available_tools(
         model_name=model_name,
         subagent_enabled=subagent_enabled,
         app_config=resolved_config,
     )
-    if runtime is not None and policy is not None and policy.enabled:
-        # task 是**闭包**，不是内置工具表里的静态对象：它要绑到那个共享 runtime 上。
-        # §16：[]（硬拒绝）时连工具都不装——看不见也调不动。
-        from agentkit.tools.builtin.task_tool import make_task_tool
-
-        tools = [*tools, make_task_tool(dispatcher=runtime, app_config=resolved_config)]
+    delegation_active = bool(subagent_enabled and policy is not None and policy.enabled)
+    available_subagents = (
+        list_subagent_names(app_config=resolved_config, allowed=policy.allowed)
+        if delegation_active and runtime is not None
+        else []
+    )
+    retrieval_tools: list = []
     if resolved_config.memory.openviking.enabled:
         from agentkit.agents.memory.openviking.runtime import get_openviking_memory_runtime
 
-        runtime = get_openviking_memory_runtime()
-        if runtime is not None:
-            existing_names = {tool.name for tool in tools}
-            tools = [*tools, *(tool for tool in runtime.tools if tool.name not in existing_names)]
+        memory_runtime = get_openviking_memory_runtime()
+        if memory_runtime is not None:
+            retrieval_tools.extend(memory_runtime.tools)
         else:
             logger.warning(
                 "memory.openviking.enabled=true but the OpenViking runtime is not initialized"
             )
     if resolved_config.knowledge_base.enabled:
         # Identity is read from runtime.context inside the tool, never from model args.
-        from agentkit.knowledge.tool import TOOL_NAME as KNOWLEDGE_TOOL_NAME
         from agentkit.knowledge.tool import make_knowledge_search_tool
 
-        if KNOWLEDGE_TOOL_NAME not in {tool.name for tool in tools}:
-            tools = [*tools, make_knowledge_search_tool()]
+        retrieval_tools.append(make_knowledge_search_tool())
+    skill_search_tool = next(
+        (tool for tool in tools if tool.name == "search_and_load_skills"), None
+    )
+    if skill_search_tool is not None:
+        retrieval_tools.append(skill_search_tool)
+    claimed = _claimed_tool_names(available_subagents, resolved_config) & {
+        tool.name for tool in retrieval_tools
+    }
+    if available_subagents:
+        from agentkit.tools.builtin.task_tool import make_task_tool
+
+        # task 是**闭包**：绑到共享 runtime，并把“只给子代理用”的检索工具带进 dispatch。
+        tools = [tool for tool in tools if tool.name not in claimed]
+        tools = [
+            *tools,
+            make_task_tool(
+                dispatcher=runtime,
+                app_config=resolved_config,
+                delegated_tools=[tool for tool in retrieval_tools if tool.name in claimed],
+            ),
+        ]
+    existing_names = {tool.name for tool in tools}
+    tools = [
+        *tools,
+        *(
+            tool
+            for tool in retrieval_tools
+            if tool.name not in claimed and tool.name not in existing_names
+        ),
+    ]
+    # 画像工具写的是 DB 画像，不是 OpenViking：只要网关装了 profile 服务就注册，
+    # 与 memory.openviking.enabled 解耦（开关关闭时用户仍可让助手记住称呼/语言）。
+    from agentkit.agents.memory.openviking.profile_tools import make_profile_tools
+
+    existing_names = {tool.name for tool in tools}
+    tools = [*tools, *(tool for tool in make_profile_tools() if tool.name not in existing_names)]
     # 过滤（将来 M9 的鉴权也在这里）必须看到**完整**的工具表，所以 task 在它之前就位
     tools = apply_tool_filter(tools, cfg=cfg)
 
@@ -194,10 +242,10 @@ def assemble_agent(
         config, app_config=resolved_config, user_id=user_id, subagent_policy=policy
     )
 
-    # 渲染系统提示词（§16：委派段读的是同一份快照）
+    # 渲染系统提示词（§16：委派段读的是同一份快照；没有 task 工具就不出现委派段）
     system_prompt = apply_prompt_template(
         agent_name=_resolve_runtime_option(cfg, "agent_name", None, None),
-        subagent_enabled=subagent_enabled,
+        subagent_enabled=bool(available_subagents),
         app_config=resolved_config,
         user_id=user_id,
         subagent_policy=policy,
@@ -214,6 +262,20 @@ class AgentAssembly:
 
 def unwrap_agent_graph(result: Any) -> Any:
     return result.graph if isinstance(result, AgentAssembly) else result
+
+
+def _claimed_tool_names(subagent_names: list[str], app_config: AppConfig) -> set[str]:
+    """可用子代理在 ``tools`` 里点名、且没被 ``disallowed_tools`` 扣掉的工具名。
+
+    ``tools=None``（继承 lead 当时的工具）不算认领：执行器不会把 delegated 工具给这类子代理。
+    """
+    claimed: set[str] = set()
+    for name in subagent_names:
+        config = get_subagent_config(name, app_config=app_config)
+        if config is None or config.tools is None:
+            continue
+        claimed.update(set(config.tools) - set(config.disallowed_tools or ()))
+    return claimed
 
 
 def _stamp_subagent_policy(config: RunnableConfig, policy: SubagentPolicy) -> None:

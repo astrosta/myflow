@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,18 @@ def test_custom_agent_tools_null_means_inherit() -> None:
 def test_custom_agent_requires_a_description() -> None:
     with pytest.raises(ValidationError):
         CustomSubagentConfig.model_validate({})
+
+
+def test_a_long_custom_description_is_accepted_with_a_warning(caplog) -> None:
+    long_text = "x" * 601
+    with caplog.at_level(logging.WARNING):
+        agent = CustomSubagentConfig.model_validate({"description": long_text})
+    assert agent.description == long_text
+    assert "600" in caplog.text
+
+
+def test_custom_agent_skills_field_is_documented_as_inert() -> None:
+    assert "暂未生效" in CustomSubagentConfig.model_fields["skills"].description
 
 
 def test_custom_agent_model_must_be_declared_or_inherit() -> None:

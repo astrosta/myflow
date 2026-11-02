@@ -8,6 +8,7 @@ from agentkit.knowledge.errors import (
     InvalidKnowledgeRequest,
     KnowledgeBaseNotFound,
     KnowledgeDisabled,
+    KnowledgeDocumentNotFound,
 )
 from agentkit.knowledge.service import status_from_config
 from fastapi import APIRouter, Depends, File, Path, Query, Request, UploadFile
@@ -26,6 +27,8 @@ from backend.app.gateway.models.request import (
 from backend.app.gateway.models.response import (
     KnowledgeBaseListResponse,
     KnowledgeBaseResponse,
+    KnowledgeChunkResponse,
+    KnowledgeChunksResponse,
     KnowledgeDeletedResponse,
     KnowledgeDocumentListResponse,
     KnowledgeDocumentResponse,
@@ -179,6 +182,50 @@ async def get_document(
     return knowledge_document_to_wire(document)
 
 
+@router.get(
+    "/bases/{base_id}/documents/{document_id}/chunks",
+    response_model=KnowledgeChunksResponse,
+)
+async def list_document_chunks(
+    base_id: KnowledgeId,
+    document_id: KnowledgeId,
+    request: Request,
+    caller: Annotated[RunCaller, Depends(require_scope("knowledge:read"))],
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> KnowledgeChunksResponse:
+    """One page of chunks for the document detail page.
+
+    Chunk bodies live in the vector store; metadata and ownership still come
+    from the SQL catalog.  The response is sorted by chunk_index regardless of
+    the vector store's row order.
+    """
+    service = get_knowledge_service(request)
+    document = await service.get_document(_user(caller), document_id)
+    if document.knowledge_base_id != base_id:
+        raise KnowledgeDocumentNotFound("Document not found")
+    chunks, total = await service.list_chunks(
+        _user(caller), document_id, offset=offset, limit=limit
+    )
+    end = offset + len(chunks)
+    return KnowledgeChunksResponse(
+        document_id=document.id,
+        chunks=[
+            KnowledgeChunkResponse(
+                chunk_id=f"{document.id}:{chunk.index}",
+                chunk_index=chunk.index,
+                section=chunk.section,
+                page=chunk.page,
+                content=chunk.content,
+                parent_id=chunk.parent_id or "",
+            )
+            for chunk in chunks
+        ],
+        count=total,
+        next_offset=end if end < total else None,
+    )
+
+
 @router.post(
     "/bases/{base_id}/documents/{document_id}/reindex",
     status_code=202,
@@ -251,6 +298,7 @@ async def search(
                 section=hit.section,
                 page=hit.page,
                 chunk_index=hit.chunk_index,
+                parent_id=hit.parent_id,
                 score=hit.score,
                 knowledge_base_id=hit.knowledge_base_id,
                 knowledge_base_name=hit.knowledge_base_name,

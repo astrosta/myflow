@@ -110,8 +110,12 @@ def test_faq_keeps_each_question_with_its_answer() -> None:
     assert len(chunks) == 2
     assert "如何重置密码" in chunks[0].content
     assert "重置密码" in chunks[0].content
+    assert "A:" in chunks[0].content
     assert "支持离线部署" in chunks[1].content
     assert chunks[0].section != chunks[1].section
+    # Only the question is embedded; the answer remains in the returned chunk.
+    assert chunks[0].embedding_text == "如何重置密码？"
+    assert chunks[1].embedding_text == "支持离线部署吗？"
 
 
 def test_security_chunks_do_not_merge_clauses() -> None:
@@ -179,6 +183,61 @@ def test_api_reference_keeps_endpoint_symbols_separate() -> None:
     assert "POST /users" in chunks[1].section
     assert "GET /users" not in chunks[1].content
     assert "POST /users" not in chunks[0].content
+
+
+def test_oversized_operations_step_uses_parent_child_without_overlap() -> None:
+    marker = "A" * 250
+    text = "# 发布流程\n\n## 回滚\n\n步骤一：执行回滚命令\n\n" + marker
+
+    chunks = chunk_document(
+        text,
+        KnowledgeBaseType.OPERATIONS,
+        _config(),
+        token_counter=CharCounter(),
+        document_id="doc-1",
+    )
+
+    assert len(chunks) > 1
+    assert {chunk.parent_id for chunk in chunks} == {"doc-1:p0"}
+    assert all(chunk.parent_content for chunk in chunks)
+    assert chunks[0].parent_content.startswith("发布流程 / 回滚")
+    # Config says overlap=10, but operations must force zero.
+    assert sum(chunk.content.count("A") for chunk in chunks) == len(marker)
+    assert [chunk.index for chunk in chunks] == list(range(len(chunks)))
+
+
+def test_oversized_legal_article_uses_parent_child() -> None:
+    body = "第一条 " + "法律条文内容。" * 30
+    text = "# 某某办法\n\n## 第一章 总则\n\n" + body
+
+    chunks = chunk_document(
+        text,
+        KnowledgeBaseType.LEGAL,
+        _config(),
+        token_counter=CharCounter(),
+        document_id="doc-2",
+    )
+
+    assert len(chunks) > 1
+    assert {chunk.parent_id for chunk in chunks} == {"doc-2:p0"}
+    assert "第一条" in chunks[0].parent_content
+    assert all("第一章 总则" in chunk.section for chunk in chunks)
+
+
+def test_short_operations_step_has_no_parent() -> None:
+    text = "# 发布流程\n\n## 回滚\n\n步骤一：停止服务。\n"
+
+    chunks = chunk_document(
+        text,
+        KnowledgeBaseType.OPERATIONS,
+        _config(),
+        token_counter=CharCounter(),
+        document_id="doc-3",
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].parent_id is None
+    assert chunks[0].parent_content == ""
 
 
 def test_fallback_chunks_when_structure_is_absent() -> None:

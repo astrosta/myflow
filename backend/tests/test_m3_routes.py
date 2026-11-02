@@ -84,6 +84,7 @@ EXPECTED_ROUTES = {
     ("POST", "/api/admin/skills/reindex"),
     # M10 §2.12：canonical memory（prefix=/memory，/api 由 create_app 加）
     ("GET", "/api/memory/profile"),
+    ("GET", "/api/memory/profile/schema"),
     ("PATCH", "/api/memory/profile"),
     ("DELETE", "/api/memory/profile/{field_path:path}"),
     ("DELETE", "/api/memory/profile"),
@@ -92,6 +93,12 @@ EXPECTED_ROUTES = {
     ("GET", "/api/memory/profile/suggestions"),
     ("POST", "/api/memory/profile/suggestions/{suggestion_id}/accept"),
     ("POST", "/api/memory/profile/suggestions/{suggestion_id}/dismiss"),
+    ("GET", "/api/memory/items/types"),
+    ("GET", "/api/memory/items"),
+    ("GET", "/api/memory/items/detail"),
+    ("GET", "/api/memory/items/content"),
+    ("PUT", "/api/memory/items/content"),
+    ("DELETE", "/api/memory/items"),
     ("GET", "/api/memory/pending"),
     ("GET", "/api/memory/skill-candidates"),
     # Knowledge base: per-user CRUD + nested documents + retrieval test.
@@ -104,6 +111,7 @@ EXPECTED_ROUTES = {
     ("GET", "/api/knowledge/bases/{base_id}/documents"),
     ("POST", "/api/knowledge/bases/{base_id}/documents"),
     ("GET", "/api/knowledge/bases/{base_id}/documents/{document_id}"),
+    ("GET", "/api/knowledge/bases/{base_id}/documents/{document_id}/chunks"),
     ("POST", "/api/knowledge/bases/{base_id}/documents/{document_id}/reindex"),
     ("DELETE", "/api/knowledge/bases/{base_id}/documents/{document_id}"),
     ("GET", "/api/knowledge/search"),

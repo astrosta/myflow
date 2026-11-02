@@ -88,6 +88,25 @@ def require_authenticated(request: Request) -> AuthResult:
     return auth
 
 
+def get_memory_library(request: Request):
+    """The OpenViking facade used by the memory management page.
+
+    Only processes that started the OpenViking runtime have it; a deployment with
+    long-term memory off answers 503 instead of pretending the page is empty.
+    """
+
+    from agentkit.agents.memory.openviking.runtime import get_openviking_memory_runtime
+    from backend.app.gateway.errors import MemoryRuntimeUnavailable
+
+    runtime = get_openviking_memory_runtime()
+    facade = getattr(runtime, "facade", None)
+    if facade is None or getattr(runtime, "library", None) is None:
+        raise MemoryRuntimeUnavailable(
+            "long-term memory is not enabled on this gateway"
+        )
+    return facade
+
+
 async def has_openviking_active_run(request: Request, user_id: str) -> bool:
     """Ask the gateway run store whether the user has an active operation."""
 

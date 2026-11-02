@@ -297,13 +297,15 @@ def test_render_marks_a_guardrail_cap_with_model_facing_guidance() -> None:
     assert LEDGER_HEADER in rendered
     assert "completed, turn_capped" in rendered
     assert GUARDRAIL_GUIDANCE in rendered
-    assert "提高该代理的预算（max_turns / token_budget）" in rendered
+    assert "缩小范围重新委派" in rendered
+    assert "max_turns" not in rendered
 
 
 def test_render_tells_the_model_not_to_delegate_again() -> None:
     rendered = render_delegation_ledger([_entry("call-1", DELEGATION_STATUS_IN_PROGRESS, description="scan")])
     assert IN_PROGRESS_GUIDANCE in rendered
     assert "不要再委派同一个任务" in rendered
+    assert "等待结果" not in rendered
 
 
 def test_render_shows_status_type_description_and_result() -> None:

@@ -100,6 +100,8 @@ def test_unknown_type_fails_and_lists_the_available_types() -> None:
     message = _tool_message(command)
     assert message.status == "error"
     assert message.additional_kwargs["subagent_status"] == "failed"
+    assert "未知或不允许的子代理类型" in message.content
+    assert "可用类型：" in message.content
     assert "general-purpose" in message.content and "bash" in message.content
     assert _entry(command)["status"] == "failed"
 
@@ -115,7 +117,9 @@ def test_a_type_outside_the_whitelist_is_rejected() -> None:
 
     assert dispatcher.dispatches == []
     assert "bash" in _tool_message(command).content
-    assert "researcher" not in _tool_message(command).content.split("Available types:")[-1]
+    listed = _tool_message(command).content.split("可用类型：")[-1]
+    assert "bash" in listed
+    assert "researcher" not in listed
 
 
 def test_an_empty_whitelist_disables_delegation() -> None:
@@ -123,7 +127,7 @@ def test_an_empty_whitelist_disables_delegation() -> None:
     command = _run(_tool(dispatcher), _runtime(allowed_subagents=[]))
 
     assert dispatcher.dispatches == []
-    assert "disabled for this run" in _tool_message(command).content
+    assert "本次运行已禁用委派" in _tool_message(command).content
 
 
 def test_a_malformed_whitelist_fails_closed() -> None:
@@ -140,7 +144,7 @@ def test_an_unresolvable_model_fails_the_delegation_without_dispatching() -> Non
     command = _run(tool, _runtime())
 
     assert dispatcher.dispatches == []
-    assert "cannot resolve the subagent model" in _tool_message(command).content
+    assert "无法解析子代理模型" in _tool_message(command).content
     assert _entry(command)["status"] == "failed"
 
 
@@ -376,7 +380,7 @@ def test_a_submission_failure_fails_the_delegation_and_cleans_up() -> None:
 
     message = _tool_message(command)
     assert message.additional_kwargs["subagent_status"] == "failed"
-    assert "subagent runtime is unavailable" in message.content
+    assert "子代理运行时不可用" in message.content
     holder = dispatcher.dispatch.holder
     assert holder.status is SubagentStatus.FAILED
     assert results.get(holder.task_id) is None
@@ -389,7 +393,7 @@ def test_a_failed_started_event_cancels_and_cleans_up() -> None:
     runtime.stream_error = RuntimeError("writer is gone")
     command = _run(_tool(dispatcher), runtime)
 
-    assert "could not report the subagent start" in _tool_message(command).content
+    assert "无法上报子代理已启动" in _tool_message(command).content
     holder = dispatcher.dispatch.holder
     assert holder.cancel_event.is_set()
     assert results.get(holder.task_id) is None

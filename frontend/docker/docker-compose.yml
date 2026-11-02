@@ -10,7 +10,9 @@
 #
 # 用法：
 #   cd frontend/docker
-#   docker compose up -d --build
+#   docker compose up -d --build frontend
+# 后端不在这个 compose 里时，用 GATEWAY_UPSTREAM 指向它（默认 host.docker.internal:8001）。
+# 网关容器同启：GATEWAY_UPSTREAM=myflow-gateway:8001 docker compose --profile with-gateway up -d
 #
 # 发布端口的安全约束（§7.3）：
 #   所有 published port **必须显式写绑定地址**。默认 127.0.0.1，只有显式设置
@@ -30,15 +32,14 @@ services:
       dockerfile: docker/Dockerfile
     image: myflow-frontend:local
     restart: unless-stopped
-    depends_on:
-      myflow-gateway:
-        condition: service_started
     environment:
       NODE_ENV: production
       # 浏览器侧的同源前缀；nginx 把 /api 反代到网关
       NEXT_PUBLIC_API_BASE_URL: /api
-      # 服务端（RSC / route handler）直连网关用，名字和 .env.example 保持一致
-      GATEWAY_INTERNAL_URL: http://myflow-gateway:8001
+      # nginx 上游。只起前端、后端在宿主机：host.docker.internal:8001 或 <宿主机IP>:8001
+      # 网关也在 compose 里时：myflow-gateway:8001
+      GATEWAY_UPSTREAM: ${GATEWAY_UPSTREAM:-host.docker.internal:8001}
+      GATEWAY_INTERNAL_URL: http://${GATEWAY_UPSTREAM:-host.docker.internal:8001}
     ports:
       # ✓ 显式绑定地址（BIND_HOST，默认 loopback）。
       # ✗ 绝不能写成 "${PORT:-2026}:2026"：那等于绑 0.0.0.0，整个局域网都能访问（§7.3）。
@@ -46,6 +47,8 @@ services:
       - "${BIND_HOST:-127.0.0.1}:${PORT:-2026}:2026"
 
   myflow-gateway:
+    # 默认不启动。需要同网络里的网关容器时：docker compose --profile with-gateway up -d
+    profiles: ["with-gateway"]
     # TODO(M3)：把 tag 换成 M3 实际发布的镜像。
     image: myflow-gateway:local
     restart: unless-stopped

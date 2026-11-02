@@ -14,6 +14,7 @@ from typing import Any
 from agentkit.agents.memory.openviking.adapter import MemoryMessageAdapter
 from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
 from agentkit.agents.memory.openviking.facade import MemoryFacade
+from agentkit.agents.memory.openviking.library import MemoryLibraryService
 from agentkit.agents.memory.openviking.onboarding import OnboardingService
 from agentkit.agents.memory.openviking.profile import PersonalizationService, ProfileService
 from agentkit.agents.memory.openviking.recall import RecallService
@@ -84,6 +85,7 @@ class OpenVikingMemoryRuntime:
         onboarding: OnboardingService,
         suggestions: ProfileSuggester,
         redis: Any = None,
+        library: MemoryLibraryService | None = None,
     ) -> None:
         self.config = config
         self.facade = facade
@@ -95,6 +97,7 @@ class OpenVikingMemoryRuntime:
         self.stream = stream
         self.client_factory = client_factory
         self.redis = redis
+        self.library = library
         self.tools = make_openviking_memory_tools(facade)
 
     @classmethod
@@ -158,6 +161,7 @@ class OpenVikingMemoryRuntime:
             soul_path=config.personalization.soul_file,
         )
         recall = RecallService(resolver=client_factory)
+        library = MemoryLibraryService(client_factory)
         facade = MemoryFacade(
             config=config,
             sync_store=sync_store,
@@ -169,6 +173,7 @@ class OpenVikingMemoryRuntime:
             profile=profile,
             personalization=personalization,
             recall=recall,
+            library=library,
         )
         onboarding = OnboardingService(session_factory, profile)
         suggestions = ProfileSuggester(
@@ -188,6 +193,7 @@ class OpenVikingMemoryRuntime:
             onboarding=onboarding,
             suggestions=suggestions,
             redis=redis,
+            library=library,
         )
 
     async def start(self) -> None:

@@ -2,8 +2,10 @@ import type { Metadata } from "next";
 
 import { ChatRoute } from "../../chat-route";
 
-// 聊天页的重样式（markdown 排版、代码高亮配色、流式动画）**只在这里**被引入。
+// 聊天页的重样式只在这里引入；Markdown 排版由 markdown.css 与知识库详情共享。
 // 放到根布局会让落地页也加载它（M5 §2 的静态根边界）。
+import "katex/dist/katex.min.css";
+import "../../markdown.css";
 import "../../chat.css";
 
 export const metadata: Metadata = {

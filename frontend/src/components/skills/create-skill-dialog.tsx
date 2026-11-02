@@ -36,7 +36,7 @@ export function CreateSkillDialog({ onClose, onCreated }: CreateSkillDialogProps
   }, [onClose]);
 
   const submit = async () => {
-    if (busy || !name.trim()) return;
+    if (busy || !name.trim() || !description.trim()) return;
     setBusy(true);
     setError(null);
     try {
@@ -102,9 +102,10 @@ export function CreateSkillDialog({ onClose, onCreated }: CreateSkillDialogProps
           </label>
 
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-neutral-700">说明（可选）</span>
+            <span className="text-xs font-medium text-neutral-700">说明（必填）</span>
             <input
               aria-label="技能说明"
+              aria-required="true"
               className={INPUT_CLASS}
               disabled={busy}
               maxLength={2000}
@@ -124,7 +125,12 @@ export function CreateSkillDialog({ onClose, onCreated }: CreateSkillDialogProps
             <Button disabled={busy} onClick={onClose} size="sm" type="button">
               取消
             </Button>
-            <Button disabled={busy || !name.trim()} size="sm" type="submit" variant="primary">
+            <Button
+              disabled={busy || !name.trim() || !description.trim()}
+              size="sm"
+              type="submit"
+              variant="primary"
+            >
               {busy ? "创建中…" : "创建"}
             </Button>
           </div>

@@ -206,6 +206,11 @@ class InvalidMemoryProfile(Exception):
     code: ClassVar[str] = "invalid_memory_profile"
 
 
+class InvalidMemoryURIAPI(Exception):
+    status_code: ClassVar[int] = 422
+    code: ClassVar[str] = "invalid_memory_uri"
+
+
 class MemoryRequestInvalid(Exception):
     status_code: ClassVar[int] = 422
     code: ClassVar[str] = "invalid_memory_request"
@@ -267,6 +272,7 @@ def install_error_handlers(app: FastAPI) -> None:
         ProfileConflictAPI,
         InvalidMemory,
         InvalidMemoryProfile,
+        InvalidMemoryURIAPI,
         MemoryRequestInvalid,
         MemoryNotFoundAPI,
         MemoryRuntimeUnavailable,

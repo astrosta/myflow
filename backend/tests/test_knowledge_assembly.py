@@ -42,7 +42,7 @@ def _assemble(monkeypatch, enabled: bool) -> dict:
         lambda **kwargs: (captured.update(kwargs) or SimpleNamespace(**kwargs)),
     )
     assemble_agent(
-        {"configurable": {"model_name": "m"}},
+        {"configurable": {"model_name": "m", "subagent_enabled": False}},
         app_config=_app(enabled),
         checkpointer=object(),
     )
@@ -53,7 +53,7 @@ def test_enabled_knowledge_attaches_tool_and_prompt(monkeypatch) -> None:
     captured = _assemble(monkeypatch, True)
     names = [item.name for item in captured["tools"]]
     assert "knowledge_search" in names
-    assert "## 知识库" in captured["system_prompt"]
+    assert "## 知识库" not in captured["system_prompt"]
 
 
 def test_disabled_knowledge_adds_nothing(monkeypatch) -> None:

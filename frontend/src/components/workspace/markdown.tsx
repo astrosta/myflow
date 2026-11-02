@@ -1,8 +1,10 @@
 "use client";
 
 import { memo } from "react";
+import rehypeKatex from "rehype-katex";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 
 import { cn } from "@/lib/utils";
 
@@ -18,7 +20,29 @@ import { cn } from "@/lib/utils";
  * memo 会被整体绕过，流式期间每个 token 都要重建整棵 markdown 树。
  */
 
-const REMARK_PLUGINS = [remarkGfm];
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+const REHYPE_PLUGINS = [rehypeKatex];
+
+/**
+ * remark-math 把同一行里的 `$$...$$` 当行内公式；检索文档里常见的
+ * `$$ formula $$` 独占一行时，作者通常想要的是 display math。这里只
+ * 改写代码围栏之外的独立行，其他位置保持原样。
+ */
+function normalizeDisplayMath(text: string): string {
+  let fenced = false;
+  return text
+    .split("\n")
+    .map((line) => {
+      if (/^\s*(```|~~~)/.test(line)) {
+        fenced = !fenced;
+        return line;
+      }
+      if (fenced) return line;
+      const match = /^[ \t]*\$\$[ \t]*(.+?)[ \t]*\$\$[ \t]*$/.exec(line);
+      return match ? "$$\n" + match[1] + "\n$$" : line;
+    })
+    .join("\n");
+}
 
 const COMPONENTS: Components = {
   a({ node, ...props }) {
@@ -47,8 +71,12 @@ export interface MarkdownProps {
 export const Markdown = memo(function Markdown({ text, className }: MarkdownProps) {
   return (
     <div className={cn("md-body", className)}>
-      <ReactMarkdown components={COMPONENTS} remarkPlugins={REMARK_PLUGINS}>
-        {text}
+      <ReactMarkdown
+        components={COMPONENTS}
+        rehypePlugins={REHYPE_PLUGINS}
+        remarkPlugins={REMARK_PLUGINS}
+      >
+        {normalizeDisplayMath(text)}
       </ReactMarkdown>
     </div>
   );

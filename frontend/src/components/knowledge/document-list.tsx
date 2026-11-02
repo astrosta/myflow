@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -53,9 +55,18 @@ export function DocumentList({ documents, busyId = null, onReindex, onDelete }: 
             return (
               <tr className="align-top" key={document.id}>
                 <td className="max-w-[260px] px-4 py-3">
-                  <span className="block truncate font-medium text-neutral-900" title={document.filename}>
+                  <Link
+                    className="block truncate font-medium text-neutral-900 hover:text-neutral-600 hover:underline"
+                    href={
+                      "/workspace/knowledge/" +
+                      encodeURIComponent(document.knowledge_base_id) +
+                      "/documents/" +
+                      encodeURIComponent(document.id)
+                    }
+                    title={document.filename}
+                  >
                     {document.filename}
-                  </span>
+                  </Link>
                   {document.status === "failed" && document.error_message ? (
                     <span
                       className="mt-1 block max-w-[260px] truncate text-[11px] text-red-600"

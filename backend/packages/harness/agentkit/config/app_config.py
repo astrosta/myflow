@@ -224,7 +224,7 @@ class AppConfig(BaseModel):
             if not Path.exists(Path(env_config_path)):
                 raise FileNotFoundError(f"Config file {env_config_path} does not exist")
             return Path(env_config_path)
-        elif file := existing_project_file(("config.yaml")):
+        elif file := existing_project_file(("config.yaml",)):
             return file
         else:
             raise FileNotFoundError("No config file found. Please set the MYFLOW_CONFIG_PATH environment variable or provide a config file path.")

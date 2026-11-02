@@ -92,7 +92,7 @@ def test_the_child_config_omits_every_coordinate_key() -> None:
         }
     }
 
-    child = ex.build_child_config(parent, max_turns=42)
+    child = ex.build_child_config(parent, recursion_limit=42)
 
     assert set(child["configurable"]) & set(CHECKPOINT_COORDINATE_KEYS) == set()
     assert child["recursion_limit"] == 42
@@ -108,13 +108,13 @@ def test_the_child_config_keeps_the_hidden_runtime_keys_and_the_rest() -> None:
         }
     }
 
-    child = ex.build_child_config(parent, max_turns=7)
+    child = ex.build_child_config(parent, recursion_limit=7)
 
     assert child["configurable"] == {"__pregel_checkpoint_ns": "tools:abc", "user_id": "user-1"}
 
 
 def test_a_missing_parent_config_still_yields_a_usable_child_config() -> None:
-    assert ex.build_child_config(None, max_turns=9) == {"configurable": {}, "recursion_limit": 9}
+    assert ex.build_child_config(None, recursion_limit=9) == {"configurable": {}, "recursion_limit": 9}
 
 
 # ---------------------------------------------------------------- §7.4 编译参数
@@ -303,14 +303,14 @@ def test_subagent_frames_never_reach_the_parent_messages_stream(subagent_stack) 
 def test_respecifying_the_coordinates_leaks_subagent_frames(subagent_stack, monkeypatch) -> None:
     """负例：显式重新提供坐标（哪怕值一样）会开启新的根血缘，帧就漏进父 run 了。"""
 
-    def broken(parent_config, *, max_turns):
+    def broken(parent_config, *, recursion_limit):
         configurable = (parent_config or {}).get("configurable") or {}
         return {
             "configurable": {
                 "thread_id": configurable.get("thread_id"),
                 "checkpoint_ns": configurable.get("checkpoint_ns", ""),
             },
-            "recursion_limit": max_turns,
+            "recursion_limit": recursion_limit,
         }
 
     monkeypatch.setattr(ex, "build_child_config", broken)

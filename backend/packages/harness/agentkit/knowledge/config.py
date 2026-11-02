@@ -54,12 +54,12 @@ class ChunkTypeConfig(BaseModel):
 def _default_chunk_types() -> dict[str, ChunkTypeConfig]:
     return {
         "technical": ChunkTypeConfig(strategy="heading_hierarchy", chunk_size_tokens=512, chunk_overlap_tokens=64),
-        "operations": ChunkTypeConfig(strategy="procedure", chunk_size_tokens=512, chunk_overlap_tokens=64),
+        "operations": ChunkTypeConfig(strategy="procedure", chunk_size_tokens=512, chunk_overlap_tokens=0),
         "faq": ChunkTypeConfig(strategy="qa_pair", chunk_size_tokens=384, chunk_overlap_tokens=0),
-        "security": ChunkTypeConfig(strategy="clause", chunk_size_tokens=512, chunk_overlap_tokens=64),
+        "security": ChunkTypeConfig(strategy="clause", chunk_size_tokens=512, chunk_overlap_tokens=0),
         "api": ChunkTypeConfig(strategy="api_reference", chunk_size_tokens=768, chunk_overlap_tokens=0),
-        # 法律条文：以“条”为边界，条内续写保留上下文；档位与安全合规一致。
-        "legal": ChunkTypeConfig(strategy="legal_clause", chunk_size_tokens=512, chunk_overlap_tokens=64),
+        # 法律条文：以“条”为边界；超长时走父子块，条内不使用 overlap。
+        "legal": ChunkTypeConfig(strategy="legal_clause", chunk_size_tokens=512, chunk_overlap_tokens=0),
     }
 
 

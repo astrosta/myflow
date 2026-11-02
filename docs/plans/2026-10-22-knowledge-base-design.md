@@ -9,6 +9,11 @@
 > 纯文本/Markdown 直接读取；每个用户可创建多个知识库，创建时选择知识库类型，不同类型
 > 使用不同分片策略；切片大小与重叠按 token 计量；检索时由模型通过工具参数选择知识库
 > 类型进行路由。
+> 2026-11-02 修订：lead 不再直接调用 `knowledge_search`，改为委派内置子代理
+> `knowledge-researcher`（它内部仍调同一个工具）；检索工具本身的契约不变。详见
+> `2026-11-02-retrieval-subagents-design.md`。
+> 第五轮改动（业务噪声清洗、FAQ 仅问题向量、四类文档父子块）见 §17；本轮要求
+> 删除现有知识库数据后重建，不保留旧 collection 兼容。
 > 参考：阿里云开发者社区《阿里云百炼 + Spring AI：企业级 RAG 知识库从0到1的完整搭建实战》
 > （https://developer.aliyun.com/article/1743969）。
 > 目标不是复刻它的托管知识库，而是沿用其“知识库创建 → 文档入库 → 解析清洗 → 分片 →
@@ -25,7 +30,8 @@
    文本清洗 → 按知识库类型分片 → Qwen3-Embedding-8B 向量化 → 写入 Milvus。
    上传接口立即返回，不阻塞浏览器。
 3. 知识库是**每个登录用户独立**的：知识库、文档、检索、删除都只能操作自己的数据。
-4. Agent 自动挂载只读工具 `knowledge_search`，把**知识库类型作为工具参数**，
+4. 检索工具 `knowledge_search` 只挂在内置子代理 `knowledge-researcher` 上（2026-11-02 起），
+   把**知识库类型作为工具参数**，
    由模型按问题语义路由到技术文档/运维手册/FAQ/安全合规/API 参考/法律法规库；按用户身份检索，
    返回知识库名、类型、文件名、章节/页码和片段。检索为「向量 + BM25 关键词」混合召回，
    RRF 融合后按配置决定是否 rerank 精排；问题拆成 `query`（语义）与 `keyword_query`
@@ -34,7 +40,8 @@
    分片参数**全部来自 `config.yaml`，代码里不写死任何可变服务地址；密钥不进入 API
    响应和日志。
 6. 切片大小和重叠统一用 **token** 计量，按 Qwen3 tokenizer 计数，默认采用 RAG 最佳实践
-   区间（512 token、10–15% 重叠），结构型内容（FAQ/API）按边界切分、默认不重叠。
+   区间（技术文档 512 token、10–15% 重叠），结构型内容（FAQ/API/运维/安全/法律）按边界切分、
+   不重叠；四类结构型文档超长时使用父子块（§17）。
 7. 失败可恢复：单份文档失败不影响其他文档；支持重新索引；服务重启后能识别中断任务。
 
 ### 1.2 非目标（本期不做）
@@ -44,8 +51,9 @@
 - 创建后修改知识库类型（类型决定分片策略，修改等价于重建，见 §6.3）。
 - 网页爬取、定时同步、外部数据源连接器。
 - 文档版本管理、增量更新、去重合并。
-- 更多召回通道（多向量、父子块、图谱）与多路（>2）融合；首版固定为「向量 + BM25」两路，
+- 更多召回通道（多向量、图谱）与多路（>2）融合；固定为「向量 + BM25」两路，
   融合算法固定为 RRF（`k` 可配），不提供加权求和等其它融合方式。
+  父子块仅用于 §17 指定的四类文档的超长章节，不作为通用第三路召回。
 - 独立任务队列（Celery / Redis Streams）。首版使用 Gateway 进程内后台任务，
   部署约束与后续迁移见 §11。
 
@@ -71,6 +79,10 @@
 | 重建策略 | 接受重索引期间旧向量短暂不可用 |
 | 文档入口 | 工作区新增“知识库”页面（列表 + 详情），不放在聊天输入框里 |
 | Agent 接入 | 自动挂载检索工具，类型路由 + 可选知识库名收窄 |
+| 业务噪声清洗 | 确定性删除目录页、前言、版权声明、免责声明、修订记录和重复块；原始上传文件保留 |
+| FAQ embedding | 只对问题 Q 生成 embedding；chunk 正文保存 Q+A 全文，BM25 继续索引全文 |
+| 父子块 | 仅运维手册/安全合规/API 参考/法律法规使用；这四类不重叠，章节超过最大 token 时父块存全文、子块存向量 |
+| 旧数据 | 本轮 schema 变更后删除现有知识库数据，重新上传或重建索引 |
 
 ## 2. 现状与落点
 
@@ -247,7 +259,7 @@ knowledge_base:
     max_chunk_tokens: 1024         # 任何类型都不得超过的硬上界
     separators: ["\n\n", "\n", "。", "！", "？", "；", ". ", "! ", "? ", "; ", "，", ", ", " "]
     types:
-      # 512 tokens、64 overlap ≈ 12.5%；FAQ/API 以结构边界为主，不重叠。
+      # 只有技术文档保留 64 overlap；其余结构型策略强制不重叠。
       technical:
         strategy: heading_hierarchy
         chunk_size_tokens: 512
@@ -255,7 +267,7 @@ knowledge_base:
       operations:
         strategy: procedure
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
       faq:
         strategy: qa_pair
         chunk_size_tokens: 384
@@ -263,11 +275,11 @@ knowledge_base:
       security:
         strategy: clause
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
       legal:
         strategy: legal_clause        # 按“第X条”切分，条号进 section
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
       api:
         strategy: api_reference
         chunk_size_tokens: 768
@@ -504,7 +516,8 @@ embedding 完全复用。云端未配置 API Key 时启动预检失败；不会�
 | `section` | VARCHAR(512) | 标题路径 / 条款号 / API 符号 |
 | `page` | INT64 | 页码，未知为 0 |
 | `chunk_index` | INT64 | 文档内顺序 |
-| `content` | VARCHAR(65535) | chunk 正文；`enable_analyzer=true`，analyzer 由配置决定 |
+| `parent_id` | VARCHAR(80) | 父子块的父块 ID；无父块时为空字符串 |
+| `content` | VARCHAR(65535) | chunk 正文；FAQ 为 Q+A 全文，`enable_analyzer=true`，analyzer 由配置决定 |
 | `sparse` | SPARSE_FLOAT_VECTOR | BM25 稀疏向量，由 Milvus Function 从 `content` 自动生成 |
 | `embedding` | FLOAT_VECTOR(4096) | Qwen3-Embedding-8B 向量 |
 | `created_at` | INT64 | Unix 秒 |
@@ -523,7 +536,13 @@ embedding 完全复用。云端未配置 API Key 时启动预检失败；不会�
 - 维度固定 4096，首次连接时校验，不一致直接报错并提示新建 collection；
 - 首次连接时校验 collection 是否含 `sparse` 字段：缺失说明是混合检索上线前建的老
   collection，关键词通道返回 `keyword_search_unavailable`，检索按 §7.4 降级为纯向量，
-  并在 `/status` 与日志中提示重建 collection（新建库名或删库重建）。
+  并在 `/status` 与日志中提示重建 collection（新建库名或删库重建）；
+- 本轮新增 `parent_id` 字段，并新增父 collection（默认 `{collection}_parents`）。
+  父 collection 只存父块全文和来源元数据，不参与向量召回；Milvus 要求 collection
+  至少有一个向量字段且拒绝小于 2 的维度，因此父 collection 使用固定的 2 维占位向量
+  （仅满足 schema，不参与检索、不产生 embedding 成本）。父 collection 字段：
+  `parent_id`(PK)、`user_id`、`knowledge_base_id`、`document_id`、`filename`、
+  `section`、`page`、`content`、`embedding` FLOAT_VECTOR(2)。
 
 ## 6. 入库管线
 
@@ -547,17 +566,25 @@ queued → parsing → chunking → embedding → ready
 2. 去除 HTML 注释、script/style 块和裸 HTML 标签；
 3. 去除 Markdown 图片语法与 data URI；保留图片 alt 文本（若有意义）；
 4. 去除重复出现的页眉/页脚候选行（短行且跨页重复；无法判断时不删）；
-5. 合并多余空行，去除行尾空格，保留 Markdown 标题、列表、表格和代码块；
-6. 清洗后长度低于阈值的文档直接 failed，错误信息说明“未提取到有效文本”，
+5. 删除业务噪声：标题为目录/目 录/Contents、前言/序言/Preface、版权声明/版权所有/
+   Copyright、免责声明/Legal Notice/Disclaimer、修订记录/更新记录/变更历史/版本历史/
+   Revision History/Changelog 的整节内容（从该标题到下一个同级或更高级标题之前）；
+6. 删除目录页：连续 3 行以上具有“标题 + 点线/空白 + 页码”特征的块；
+7. 删除重复块：按规范化空白后的块文本精确去重，首次出现保留；短于 40 个字符或
+   单行的块不参与去重，避免误删步骤编号、表头等；
+8. 合并多余空行，去除行尾空格，保留 Markdown 标题、列表、表格和代码块；
+9. 清洗后长度低于 20 字符的文档直接 failed，错误信息说明“未提取到有效文本”，
    不写入空向量。
 
 原则：清洗只做确定性、可回滚的文本规范化；不做摘要、不改写、不删除正文。
+业务噪声删除只作用于解析后的文本/切片/检索，上传的原文件始终保留。
 
 ### 6.3 按知识库类型分片
 
 知识库类型在创建时确定，入库时读取 `knowledge_bases.type` 选择分片器。
-分片器输出统一的 `KnowledgeChunk(index, content, section, page)`，后续 embedding
-不感知类型。每种策略都有独立单元测试，配置只调参数，不改变语义。
+分片器输出统一的 `KnowledgeChunk(index, content, section, page, embedding_text, parent_id)`，
+后续 embedding 不感知类型；`embedding_text` 只用于 FAQ 的问题向量，`parent_id` 只用于
+四类结构型文档的父子块。每种策略都有独立单元测试，配置只调参数，不改变语义。
 
 #### 默认 token 档位（最佳实践基线）
 
@@ -567,21 +594,28 @@ queued → parsing → chunking → embedding → ready
 | 类型 | chunk_size_tokens | chunk_overlap_tokens | 重叠比例 | 说明 |
 |---|---:|---:|---:|---|
 | 技术文档 | 512 | 64 | 12.5% | 段落/章节语义完整，适合 dense retrieval |
-| 运维手册 | 512 | 64 | 12.5% | 步骤为边界，重叠只在前一步骤内 |
-| FAQ | 384 | 0 | 0% | 一问一答自成语义，跨对重叠会引入噪声 |
-| 安全合规 | 512 | 64 | 12.5% | 条款为边界，条款内允许续写重叠 |
-| API 参考 | 768 | 0 | 0% | 接口/符号自包含，参数与示例不能串味 |
-| 法律法规 | 512 | 64 | 12.5% | 以“条”为边界，条内允许续写重叠；条不跨块合并 |
+| 运维手册 | 512 | 0 | 0% | 步骤为边界；超长步骤走父子块，不使用 overlap |
+| FAQ | 384 | 0 | 0% | 一问一答自成语义，跨对重叠会引入噪声；仅问题生成 embedding |
+| 安全合规 | 512 | 0 | 0% | 条款为边界；超长条款走父子块，不使用 overlap |
+| API 参考 | 768 | 0 | 0% | 接口/符号自包含，参数与示例不能串味；超长接口走父子块 |
+| 法律法规 | 512 | 0 | 0% | 以“条”为边界；超长条文走父子块，条不跨块合并 |
 
 依据：
 
 - Qwen3-Embedding-8B 上下文可达 32k，但检索质量并不要求把长文塞满；RAG 常用
   256–1024 token 的块，512 token 是多语言文档的稳健默认值；
-- 10–15% 重叠足以保留跨句/跨段上下文，又不会让索引体积和召回噪声明显上升；
+- 技术文档保留 10–15% 重叠以保留跨句/跨段上下文；
+- 运维、安全、API、法律四类按结构边界切分，强制 overlap=0，即使配置写了非零值也不生效；
 - FAQ 与 API 结构边界清晰，按结构切分比滑动窗口更准，因此不重叠；
 - `max_chunk_tokens=1024` 是硬上界：任何策略、任何代码块都不得超过；超过时
   按结构或行切分并保留标题/接口标识；
-- `min_chunk_tokens=32`：低于此值的碎片与相邻块合并，避免页码/空标题成为向量；
+- min_chunk_tokens=32：低于此值的碎片仅在同一可合并策略内合并；父子块的子块、
+  FAQ 问答对、条款/步骤块不跨边界合并；
+- 四类父子块文档：一个逻辑单元（章节/条款/步骤组/接口）超过 chunk_size_tokens 时，
+  该逻辑单元全文写入父 collection，按上限切出的子块写入子 collection 并带 parent_id；
+  未超限的逻辑单元仍直接成为普通 chunk，不创建父块；
+- 子块向量只来自子块正文；检索命中子块后由服务层用 parent_id 取回父块全文，
+  返回给 Agent 的 content 是父块全文，section/page/score 仍来自命中子块；
 - token 计数使用 Qwen3 tokenizer（`Qwen/Qwen3-Embedding-8B`）；不可用时回退到
   近似计数并在文档 metadata/日志标记 `tokenizer_fallback=true`，不静默假装精确。
 
@@ -608,15 +642,17 @@ queued → parsing → chunking → embedding → ready
 2. 识别告警行：`注意` / `警告` / `⚠` / `Important`，绑定到当前步骤；
 3. 以步骤为最小单位，保证“执行命令 + 预期结果 + 回滚/验证”尽量在同一块；
 4. 命令行、配置片段、代码围栏不切断；超长命令块整体保留并在下一块重复标题；
-5. `chunk_overlap_tokens` 默认 64，只在前一操作步骤的上下文内重叠。
+5. 不使用 overlap；单个步骤组超过 `chunk_size_tokens` 时，父块保存步骤组全文，
+   子块保存切分结果并带 `parent_id`。
 
 #### FAQ
 
 1. 先按标题识别“问题”边界，再在正文中识别 `Q:` / `问：` / `A:` / `答：`；
-2. 每个问答对生成一个 chunk，正文以问题开头，避免只检索到答案；
-3. 问答对超过 `chunk_size_tokens`（384）时按段落切分，每个子块重复问题；
-4. 没有识别到问答结构时回退到标题 + 段落切分，并在日志标注 fallback；
-5. 默认不跨问答对重叠（`chunk_overlap_tokens=0`）。
+2. 每个问答对生成一个 chunk，chunk 正文保存完整的 Q+A，供模型和前端展示；
+3. 只对问题 Q 生成 embedding；答案不参与向量计算；BM25 仍索引完整 Q+A 正文；
+4. 问答对超过 `chunk_size_tokens`（384）时按段落切分，每个子块重复问题并沿用问题 embedding；
+5. 没有识别到问答结构时回退到标题 + 段落切分，并在日志标注 fallback；
+6. 默认不跨问答对重叠（`chunk_overlap_tokens=0`）。
 
 #### 安全合规文档
 
@@ -624,7 +660,8 @@ queued → parsing → chunking → embedding → ready
 2. 每个条款独立成块，`section` 保存“文档标题 / 条款号”；
 3. 条款内的“要求、禁止、应当、不得、审计证据”等语义保持完整，不跨条款合并；
 4. 超长条款按段落切分时重复条款号；
-5. `chunk_overlap_tokens` 默认 64，只在同一合同/条款内部生效。
+5. 不使用 overlap；单个条款超过 `chunk_size_tokens` 时，父块保存条款全文，
+   子块保存切分结果并带 `parent_id`。
 
 #### 法律法规
 
@@ -634,8 +671,8 @@ queued → parsing → chunking → embedding → ready
    法规类问题的答案通常就是“某一条怎么规定的”，引用不能只落到文件名；
 3. 条内的款（`（一）`、`1.`）不单独成块，跟所属的条一起；超长时在条内按段落切，
    并在每个子块重复条号；
-4. 条款之间不合并（相邻两条拼在一起会让引用失准），`chunk_overlap_tokens` 默认 64
-   只在同一条内生效；
+4. 条款之间不合并（相邻两条拼在一起会让引用失准）；不使用 overlap；单条超过
+   `chunk_size_tokens` 时，父块保存条文全文，子块保存切分结果并带 `parent_id`；
 5. 没有识别到条号时回退到标题 + 段落切分并在日志标注 fallback，不丢正文。
 
 **与“安全合规文档”的分工**：`security` 是**内部**安全/合规要求与审计证据（公司制度、
@@ -646,10 +683,10 @@ queued → parsing → chunking → embedding → ready
 
 1. 识别接口标题：HTTP 方法 + 路径、函数签名、类名、OpenAPI operation；
 2. 一个接口/函数/类为一个 chunk，包含用途、参数表、返回值、错误码、示例；
-3. 参数表、JSON 示例、代码块保持原子；超长时按“参数/请求/响应/示例”分段，
-   每段重复接口标识；超过 1024 token 硬上界才继续按行切；
+3. 参数表、JSON 示例、代码块保持原子；超长接口先保存父块全文，再按
+   “参数/请求/响应/示例”切子块并带 `parent_id`；
 4. `section` 保存“接口方法 + 路径”或符号全名；
-5. 默认不跨接口重叠（`chunk_overlap_tokens=0`），避免参数串味。
+5. 不使用 overlap，避免参数串味。
 
 #### 公共规则
 
@@ -674,13 +711,17 @@ queued → parsing → chunking → embedding → ready
 - 按 `batch_size` 分批，失败按 `max_retries` 指数退避；
 - 校验每条向量维度 == 4096；不一致立即失败，不写 Milvus；
 - 只发送清洗后的 chunk 正文，不发送文件名、用户 ID 等元数据；
+- **FAQ 例外**：只发送问题 Q 生成 dense embedding；chunk 正文仍是 Q+A，
+  BM25 的 `content` 字段继续索引完整 Q+A；问题缺失时才退回正文；
 - 不在日志打印正文；只记录文档 ID、批次数、耗时、向量维度。
 
 ### 6.5 写入 Milvus
 
 - 先确保 collection 存在且维度为 4096；
 - 重建时删除 `user_id + document_id` 的旧 chunk，再批量 insert；
-- 写入字段包含 `knowledge_base_id/name/type`，供过滤和引用；
+- 写入字段包含 `knowledge_base_id/name/type/parent_id`，供过滤和引用；
+- 有父块时先写父 collection（父块全文，不生成 embedding），再写子 collection；
+  重建时同时删除该文档在两套 collection 中的旧行；
 - 不写 `sparse`：BM25 稀疏向量由 Milvus 的 Function 在插入时从 `content` 生成，
   客户端只写正文与稠密向量（见 §5.4）；
 - `flush=true` 时 insert 后 flush，保证上传完成即可检索；
@@ -811,7 +852,10 @@ keyword_query ───────────────────► Milvu
    `candidate_k` 条；融合后仍是 `candidate_k` 条候选。
 3. **精排**：`retrieval.rerank.enabled=true` 时，用 `query` 作 query、候选正文作
    documents 调用 rerank 模型，取 `top_k`；关闭时直接对融合结果取 `top_k`。
-4. **上下文预算**：`max_context_chars` 在最终 `top_k` 上生效，超出置 `truncated=true`。
+4. **父块回填**：命中子块且有 `parent_id` 时，用当前用户 + parent_id 批量取父块全文，
+   用父块全文替换返回的 `content`；`section/page/score` 仍取命中子块。父块缺失时
+   保留子块正文并记 warning，不阻断检索。
+5. **上下文预算**：`max_context_chars` 在最终 `top_k` 上生效，超出置 `truncated=true`。
 
 **为什么用 RRF 而不是加权求和**：COSINE 相似度（0~1）与 BM25（无上界）量纲不同，
 加权和的权重必须随语料重新调；RRF 只看名次，不需要归一化，是混合检索的稳健默认值。
@@ -1107,7 +1151,7 @@ keyword_query ───────────────────► Milvu
 - 创建知识库时必须选择类型：技术文档 / 运维手册 / FAQ / 安全合规 / API 参考 /
   法律法规（`legal`，按“第X条”切分，与内部合规的 `security` 分开）；
 - 不同类型使用不同分片策略，类型创建后不可修改；
-- 切片大小与重叠按 token 计量，采用 512 token / 64 overlap 基线，FAQ/API 按结构边界
+- 切片大小与重叠按 token 计量，技术文档采用 512 token / 64 overlap 基线，FAQ/API/运维/安全/法律按结构边界
   不重叠；
 - MinerU 同时支持本地服务和云端服务，通过配置切换，使用最新版接口；
 - MinerU 的服务地址与接口路径全部来自配置（云端 `file_urls_path` /
@@ -1121,7 +1165,8 @@ keyword_query ───────────────────► Milvu
 
 ### 13.2 仍需你确认
 
-1. **token 默认值**：技术文档/运维/安全 512/64，FAQ 384/0，API 768/0，硬上界 1024。
+1. **token 默认值**：技术文档 512/64，运维 512/0，安全 512/0，FAQ 384/0，API 768/0，
+   法律 512/0，硬上界 1024；四类结构型文档超限走父子块。
    是否按这套最佳实践基线执行？
 2. **知识库类型不可修改**：如果允许修改类型，需要重建该库全部文档；是否坚持不可改？
 3. **多 worker**：是否坚持单 Gateway worker？若要多 worker，首版就需要外部任务队列。
@@ -1210,4 +1255,116 @@ M3/M4 路由与配置测试失败不在本功能范围内，已在最终说明�
   “引用到条号”的要求；lead 的静态提示词同步。
 - 测试：分片（条号进 section、不跨条合并、无条号时回退）、路由（`/status` 六个类型）、
   提示词（含 `legal` 与内外分工）、工具描述、前端类型清单。
+
+
+## 17. 第四轮改动（2026-10-23：业务噪声清洗、FAQ 问题向量、父子块）
+
+> 状态：**已实现（2026-10-23）**。本轮是一次**破坏性 schema 变更**：部署时删除现有知识库数据
+> （SQL 元数据、上传文件、Milvus 子/父 collection），重新上传或重建索引；
+> 不保留旧 collection 的双读路径。
+
+### 17.1 业务噪声清洗
+
+在现有通用清洗（换行/NFKC/HTML/页脚页码）之后，增加确定性业务噪声清理，仍不改写正文：
+
+1. **整节删除**：标题命中目录、前言/序言、版权声明/版权所有、免责声明/法律声明、
+   修订记录/更新记录/变更历史/版本历史（中英文同义词）时，从该标题删到下一个同级
+   或更高级标题之前；标题本身一并删除。
+2. **目录页删除**：连续 3 行以上具有“条目标题 + 点线或连续空白 + 页码”特征的行块
+   整体删除；只命中零散一两行的不删，避免误删正文。
+3. **重复块删除**：按空白归一化后的块文本精确去重，保留首次出现；只对长度不短于
+   40 个字符的块生效，单行短块（步骤号、表头、页码等）不参与，避免误删结构。
+4. 代码围栏内不识别标题/目录/重复块；清洗只作用于解析后的文本、切片和检索，
+   **上传原文件永远保留**。
+5. 清洗规则是纯函数，单元测试覆盖：章节删除、目录块、重复块、代码围栏保护、
+   正文不被误删。实现放在 knowledge/text.py，不依赖 LLM。
+
+### 17.2 FAQ：只对问题生成 embedding
+
+- FAQ 分片仍保存完整 Q+A，前端和 Agent 返回的 content 也是 Q+A 全文。
+- KnowledgeChunk 增加 embedding_text；FAQ 分片把它设为问题文本 Q，其他类型留空。
+- ingestion 只把 embedding_text（为空时回退 content）送给 embedding 服务；
+  答案不参与 dense embedding。
+- Milvus 的 content 字段和 BM25 Function 不变，仍索引完整 Q+A；因此关键词通道
+  仍能命中答案中的命令、错误码等内容。
+- FAQ 超长切分时，每个子块重复 Q 并沿用 Q 的 embedding_text；无问答结构时回退
+  标题+段落切分，embedding_text 为空，回退为正文 embedding。
+
+### 17.3 四类文档：不重叠 + 父子块
+
+适用于 operations、security、api、legal 四类；technical 保持 512/64 与现有行为。
+
+- 这四类强制 overlap=0，即使 config.yaml 写了非零 overlap 也不生效；默认配置同步改为 0。
+- 逻辑单元定义：运维=步骤组，安全=条款，API=接口/符号章节，法律=条文。
+- 逻辑单元 token 数 <= max_tokens（chunk_size 与 max_chunk_tokens 取小）时：
+  直接生成普通 chunk，不创建父块。
+- 逻辑单元超过 max_tokens 时：
+  1. 父块 = 逻辑单元全文（含 section 标题前缀），写入父 collection；
+  2. 子块 = 按原有结构分隔符/句子在 max_tokens 内切分，overlap=0；
+  3. 每个子块写 parent_id，parent_id 在文档内唯一（document_id:pN）；
+  4. 子块才生成 embedding 并写入子 collection。
+- 不跨逻辑单元合并；父子块的子块不参与 min_chunk_tokens 合并；FAQ/条款/步骤
+  也不跨边界合并。技术文档保留原有小块合并。
+- 父 collection 默认名 {collection}_parents；父记录不生成 embedding，Milvus
+  schema 使用 2 维占位向量（Milvus 要求维度 2~32768）满足“collection 必须含
+  向量字段”的约束，不参与检索。
+- 重建/删除文档时同时清理子 collection 和父 collection 中该文档的行；
+  删除知识库时同样清理两套 collection。
+
+### 17.4 检索与返回
+
+1. 混合检索仍只查子 collection；父 collection 不参与向量或 BM25 召回。
+2. 命中子块后，服务层按当前 user_id + parent_id 批量取父块全文。
+3. 返回给 Agent/HTTP 的 content 用父块全文替换；section、page、score、chunk_index
+   仍来自命中的子块，便于引用定位。
+4. 父块缺失时保留子块正文并记 warning，不阻断检索；跨用户 parent_id 查询必须
+   带 user_id 过滤，不能只按 parent_id 查。
+5. 文档详情页仍按子块列表展示；每个子块可带 parent_id，但页面不展开父块全文，
+   避免同一父块在详情页重复显示。
+
+### 17.5 数据与部署
+
+- 子 collection 新增 parent_id 字段；父 collection 为新增 collection。
+- 本轮不做旧数据迁移、不双读：
+  1. 停止网关；
+  2. 删除现有知识库的 SQL 元数据、上传文件、Milvus 子/父 collection；
+  3. 部署新版本并重新上传或重建索引。
+- Milvus 侧由 `python -m backend.scripts.reset_knowledge_milvus` 处理（默认 dry-run，
+  `--apply` 才删；父 collection 先删，只读 `vector_store` 两个配置块，不需要模型 key）。
+- 启动/首次写入检测到旧子 collection 缺 parent_id 时必须报可操作的错误，
+  提示删除旧 collection，而不是静默写入错误 schema。
+
+### 17.6 必须补的测试
+
+- 清洗：各噪声章节、目录块、重复块、代码围栏、正文保留。
+- FAQ：embedding 请求只收到 Q；BM25/返回 content 仍是 Q+A；超长问答切分仍用 Q 向量。
+- 分片：四类 overlap=0；未超限无父块；超限生成父块和带 parent_id 的子块；
+  technical 仍允许 overlap。
+- Milvus fake：父子 collection 建表/写入/删除/查询；parent_id 过滤必须带 user_id。
+- 检索：命中子块返回父块全文；父块缺失回退子块。
+
+
+### 17.7 实现记录
+
+- 清洗：`text.py` 新增 `clean_business_noise` / `clean_document_text`；服务入库改走完整清洗链。
+- FAQ：`KnowledgeChunk.embedding_text` 接入 ingestion；FAQ 只提交问题给 embedding，正文仍为 Q+A。
+- 父子块：`chunk_document(document_id=...)` 对 operations/security/api/legal 生成父块和带
+  `parent_id` 的子块；四类强制 overlap=0；技术文档保持原有重叠和小块合并。
+- Milvus：子 collection 新增 `parent_id`；新增 `{collection}_parents` 父 collection 和
+  `get_parents` 查询；检索命中子块后在服务层回填父块全文；删除文档/知识库同时清理两套 collection。
+- 父 collection 占位向量必须是 2 维：Milvus 拒绝 dim<2（code 1100
+  `invalid dimension: 1. should be in range 2 ~ 32768`），1 维占位会让每次入库都以
+  `Milvus parent collection setup failed` 失败；父 collection 建表异常现在带底层错误消息，
+  便于定位 schema 问题。
+- 文档详情：`/documents/{id}/chunks` 返回每个子块的 `parent_id`，页面只显示“父块”标记，
+  不展开父块全文（避免同一父块重复显示）。
+- 旧 schema：检测到子 collection 缺少 `parent_id` 时返回可操作的 `KnowledgeUnavailable`，
+  要求删除旧 collection 后重新入库。
+- 运维：新增 `backend/scripts/reset_knowledge_milvus.py`（默认 dry-run，`--apply` 才删；
+  父 collection 先删；只读 `vector_store` 两个配置块，不展开模型 key），README 补“知识库
+  collection 重置”一节。
+- 顺带修 `AppConfig.resolve_config_path` 的 `existing_project_file(("config.yaml"))` 少逗号
+  问题——没有 `MYFLOW_CONFIG_PATH` 时它按字符逐个找文件，永远找不到 cwd 的 config.yaml。
+- 测试：新增清洗、Q-only embedding、四类 overlap/父子块、父 collection 读写/维度、父块回填、
+  重置脚本用例；后端全量 **2148 passed, 6 skipped**；前端 **318 passed**、typecheck/lint/build 通过。
 

@@ -230,6 +230,56 @@ describe("私有技能编辑器", () => {
     await waitFor(() => expect(mockedWithdraw).toHaveBeenCalledWith(SKILL_ID));
   });
 
+  it("未保存的草稿提交审核时提示先保存，不请求提交", async () => {
+    const unsaved = makeDraft(false);
+    unsaved.skill.version_id = null;
+    mockedGetDraft.mockResolvedValue(unsaved);
+
+    renderPage();
+
+    await screen.findByLabelText("文件内容");
+    fireEvent.click(screen.getByRole("button", { name: "提交审核" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("请先保存");
+    expect(mockedSubmit).not.toHaveBeenCalled();
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("服务端返回 no saved version 时也渲染友好提示", async () => {
+    mockedSubmit.mockRejectedValue(
+      new SkillApiError(409, "conflict", "skill 'skill-1' has no saved version", null),
+    );
+
+    renderPage();
+
+    await screen.findByLabelText("文件内容");
+    fireEvent.click(screen.getByRole("button", { name: "提交审核" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("请先保存");
+    expect(alert.textContent).not.toContain("no saved version");
+  });
+
+  it("提交成功后回到技能列表", async () => {
+    mockedSubmit.mockResolvedValue({
+      submission_id: "sub-1",
+      skill_id: SKILL_ID,
+      version_id: "ver-2",
+      status: "pending",
+      submitted_at: "2026-10-23T00:00:00Z",
+      owner_user_id: "u-alice",
+    });
+
+    renderPage();
+
+    await screen.findByLabelText("文件内容");
+    fireEvent.click(screen.getByRole("button", { name: "提交审核" }));
+
+    await waitFor(() => expect(mockedSubmit).toHaveBeenCalledWith(SKILL_ID));
+    await waitFor(() => expect(push).toHaveBeenCalledWith("/workspace/skills"));
+  });
+
   it("提交遇到 409 时把冲突原因渲染成告警", async () => {
     mockedSubmit.mockRejectedValue(
       new SkillApiError(409, "conflict", "已有待审核的提交，请先撤回", "trace-1"),
@@ -242,6 +292,20 @@ describe("私有技能编辑器", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("已有待审核的提交，请先撤回");
+  });
+
+  it("审核中删除草稿时提示先撤回，不打开确认框也不请求删除", async () => {
+    primeDraft(true);
+
+    renderPage();
+
+    await screen.findByLabelText("文件内容");
+    fireEvent.click(screen.getByRole("button", { name: "删除草稿" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("请先撤回审核");
+    expect(screen.queryByRole("dialog", { name: "删除草稿" })).toBeNull();
+    expect(mockedDelete).not.toHaveBeenCalled();
   });
 
   it("删除草稿先弹确认对话框，确认后调用 deleteSkill 并回到列表", async () => {

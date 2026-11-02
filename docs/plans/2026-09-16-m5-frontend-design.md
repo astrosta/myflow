@@ -7,6 +7,9 @@
 > [M9 生产化](2026-09-16-m9-production-design.md)
 >
 > 本文细化 M5（2 周，可与 M4 并行）。
+> 2026-11-02 修复：新会话的 `useStream` 必须传**解析后的** thread id（`threadId ?? createdThreadId`），
+> 不能直接传路由 prop。SDK 的 `threadId` 是受控的：prop 一直为 null 时，第二轮 submit 会再建一个
+> thread，后端按 thread 派生 sandbox_id，前端折叠到旧 `sandbox` 就抛 `Reducer conflict on "sandbox"`。
 
 ---
 
@@ -129,6 +132,15 @@ M1 §2 给 `ThreadState` 的每个字段定义了 reducer（去重合并、fail-
 否则前后端会显示出不同的状态。
 
 无关的帧要在调用 SDK 的状态改写器**之前**就拒掉。
+
+#### 3.2.1 `sandbox` 的 fail-closed 前提：一轮会话只能有一个 thread
+
+`mergeSandbox` 在多处写入不同 `sandbox_id` 时直接抛错（后端 reducer 同语义）。这条规则成立的
+前提是「同一个 thread 内 sandbox_id 稳定」——本地 provider 的 id 由 `local:<user>:<thread>`
+确定性派生。**破坏前提的典型方式是新会话里每轮都新建 thread**：`useStream({threadId})` 的
+`threadId` 是受控参数，只要传了这个键，SDK 就忽略自己建出来的本地 id；新会话首轮结束后路由
+prop 仍是 null（地址是 `history.replaceState` 换的，不重挂载），第二轮就会再建一个 thread。
+所以 `useStream` 必须拿 `effectiveThreadId`，并由 `use-chat.dom.test.tsx` 钉住这一行为。
 
 ### 3.3 节流用 SDK 自带的
 

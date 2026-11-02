@@ -20,16 +20,11 @@ def _app(enabled: bool) -> AppConfig:
     )
 
 
-def test_knowledge_section_explains_type_routing() -> None:
-    prompt = apply_prompt_template(app_config=_app(True))
-    assert "## 知识库" in prompt
-    assert "knowledge_search" in prompt
-    for value in ("technical", "operations", "faq", "security", "api", "legal"):
-        assert value in prompt
-    # 法规与内部安全合规要能分开路由：提示词里必须点明区别
-    assert "法律法规" in prompt
-    assert "内部" in prompt and "外部法规" in prompt
-    assert "引用" in prompt
+def test_knowledge_routing_is_not_in_the_lead_prompt() -> None:
+    prompt = apply_prompt_template(app_config=_app(True), subagent_enabled=True)
+    assert "## 知识库" not in prompt
+    assert "knowledge_search" not in prompt
+    assert "knowledge-researcher" in prompt
 
 
 def test_no_knowledge_section_when_disabled() -> None:

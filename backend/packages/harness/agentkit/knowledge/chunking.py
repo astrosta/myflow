@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from agentkit.knowledge.config import (
     ChunkingConfig,
@@ -243,18 +243,40 @@ def _pack_groups(
     return [chunk for chunk in chunks if chunk[0].strip()]
 
 
-def _faq_pairs(sections: list[_Section], fallback: str) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
+def _faq_question(section: _Section) -> str:
+    title = section.path[-1] if section.path else ""
+    match = _QUESTION_RE.match(title)
+    if match:
+        value = match.group(1).strip()
+        if value:
+            return value
+    if title and not re.match(r"^(?:常见问题|FAQ|问题列表)$", title, re.IGNORECASE):
+        return title
+    match = _QUESTION_RE.match(section.body)
+    if match:
+        value = match.group(1).strip()
+        if value:
+            return value
+    first = section.body.strip().split("\n", 1)[0].strip()
+    return first[:200]
+
+
+def _faq_pairs(sections: list[_Section], fallback: str) -> list[tuple[str, str, str]]:
+    pairs: list[tuple[str, str, str]] = []
     for section in sections:
         title = section.path[-1] if section.path else ""
         if _QUESTION_RE.match(title) or _QUESTION_RE.match(section.body):
-            pairs.append((section.title, section.body))
+            pairs.append((section.title, section.body, _faq_question(section)))
     if pairs:
         return pairs
     if sections:
         # FAQ documents often use "### 如何..." headings without an explicit Q:.
         # Every leaf section is one question/answer pair.
-        return [(section.title, section.body) for section in sections if section.body.strip()]
+        return [
+            (section.title, section.body, _faq_question(section))
+            for section in sections
+            if section.body.strip()
+        ]
     matches = list(_QUESTION_RE.finditer(fallback))
     if not matches:
         return []
@@ -262,7 +284,7 @@ def _faq_pairs(sections: list[_Section], fallback: str) -> list[tuple[str, str]]
         end = matches[index + 1].start() if index + 1 < len(matches) else len(fallback)
         block = fallback[match.start():end].strip()
         if block:
-            pairs.append((match.group(1).strip(), block))
+            pairs.append((match.group(1).strip(), block, match.group(1).strip()))
     return pairs
 
 
@@ -338,12 +360,31 @@ def _api_sections(sections: list[_Section], fallback: str) -> list[_Section]:
     return [section for section in source if section.body.strip()]
 
 
+_PARENT_TYPES = frozenset(
+    {
+        KnowledgeBaseType.OPERATIONS,
+        KnowledgeBaseType.SECURITY,
+        KnowledgeBaseType.API,
+        KnowledgeBaseType.LEGAL,
+    }
+)
+_NO_OVERLAP_TYPES = _PARENT_TYPES
+
+
+def _parent_text(section: str, content: str) -> str:
+    body = content.strip()
+    if section and not body.startswith(section):
+        return section + "\n\n" + body
+    return body
+
+
 def chunk_document(
     text: str,
     knowledge_type: KnowledgeBaseType | str,
     config: KnowledgeBaseConfig | ChunkingConfig,
     *,
     token_counter: TokenCounter | None = None,
+    document_id: str = "document",
 ) -> list[KnowledgeChunk]:
     resolved_type = knowledge_type if isinstance(knowledge_type, KnowledgeBaseType) else KnowledgeBaseType(knowledge_type)
     chunking = config.chunking if isinstance(config, KnowledgeBaseConfig) else config
@@ -355,68 +396,112 @@ def chunk_document(
     overlap = min(type_config.chunk_overlap_tokens, max_tokens - 1)
     sections = _sections(text)
     separators = chunking.separators
-    raw_chunks: list[tuple[str, str]] = []
+    chunks: list[KnowledgeChunk] = []
+    parent_seq = 0
+
+    def add_unit(unit: str, section: str, embedding_text: str = "") -> None:
+        nonlocal parent_seq
+        body = unit.strip()
+        if not body:
+            return
+        if resolved_type in _PARENT_TYPES and _count(counter, body) > max_tokens:
+            parent_id = f"{document_id or 'document'}:p{parent_seq}"
+            parent_seq += 1
+            parent = _parent_text(section, body)
+            children = _pack(body, section, max_tokens, 0, separators, counter)
+            for child_content, _child_section in children:
+                chunks.append(
+                    KnowledgeChunk(
+                        index=0,
+                        content=child_content.strip(),
+                        section=section,
+                        embedding_text=embedding_text,
+                        parent_id=parent_id,
+                        parent_content=parent,
+                    )
+                )
+            return
+        unit_overlap = 0 if resolved_type in _NO_OVERLAP_TYPES else overlap
+        for child_content, child_section in _pack(
+            body, section, max_tokens, unit_overlap, separators, counter
+        ):
+            chunks.append(
+                KnowledgeChunk(
+                    index=0,
+                    content=child_content.strip(),
+                    section=child_section,
+                    embedding_text=embedding_text,
+                )
+            )
 
     if resolved_type is KnowledgeBaseType.TECHNICAL:
         if sections:
             for section in sections:
-                raw_chunks.extend(_pack(section.body, section.title, max_tokens, overlap, separators, counter))
+                add_unit(section.body, section.title)
         else:
-            raw_chunks.extend(_pack(text, "", max_tokens, overlap, separators, counter))
+            add_unit(text, "")
     elif resolved_type is KnowledgeBaseType.OPERATIONS:
         groups = _operations_groups(sections, text)
         if groups:
             for section, section_groups in groups:
-                raw_chunks.extend(_pack_groups(section_groups, section, max_tokens, overlap, separators, counter))
+                for group in section_groups:
+                    add_unit(group, section)
         else:
-            raw_chunks.extend(_pack(text, "", max_tokens, overlap, separators, counter))
+            add_unit(text, "")
     elif resolved_type is KnowledgeBaseType.FAQ:
         pairs = _faq_pairs(sections, text)
         if pairs:
-            for section, pair_text in pairs:
-                raw_chunks.extend(_pack(pair_text, section, max_tokens, 0, separators, counter))
+            for section, pair_text, question in pairs:
+                add_unit(pair_text, section, question)
         else:
-            raw_chunks.extend(_pack(text, "", max_tokens, 0, separators, counter))
+            add_unit(text, "")
     elif resolved_type is KnowledgeBaseType.SECURITY:
         clauses = _security_clauses(sections, text)
         if clauses:
             for section, clause_text in clauses:
-                raw_chunks.extend(_pack(clause_text, section, max_tokens, overlap, separators, counter))
+                add_unit(clause_text, section)
         else:
-            raw_chunks.extend(_pack(text, "", max_tokens, overlap, separators, counter))
+            add_unit(text, "")
     elif resolved_type is KnowledgeBaseType.LEGAL:
         legal_clauses = _legal_clauses(sections, text)
         if legal_clauses:
             for section, clause_text in legal_clauses:
-                raw_chunks.extend(_pack(clause_text, section, max_tokens, overlap, separators, counter))
+                add_unit(clause_text, section)
         else:
-            raw_chunks.extend(_pack(text, "", max_tokens, overlap, separators, counter))
+            add_unit(text, "")
     else:
         api_sections = _api_sections(sections, text)
         if api_sections:
             for section in api_sections:
-                raw_chunks.extend(_pack(section.body, section.title, max_tokens, 0, separators, counter))
+                add_unit(section.body, section.title)
         else:
-            raw_chunks.extend(_pack(text, "", max_tokens, 0, separators, counter))
+            add_unit(text, "")
 
-    bounded: list[tuple[str, str]] = []
-    for content, section in raw_chunks:
-        if _count(counter, content) <= max_tokens:
-            bounded.append((content, section))
-        else:
-            bounded.extend((piece, section) for piece in counter.split(content, max_tokens))
-
-    merged = _merge_small(
-        [(content.strip(), section) for content, section in bounded if content.strip()],
-        min_tokens=chunking.min_chunk_tokens,
-        max_tokens=max_tokens,
-        counter=counter,
-    )
-    chunks: list[KnowledgeChunk] = []
-    for content, section in merged:
-        if not content:
+    # The recursive splitter already respects the hard cap, but keep this
+    # defensive bound for unusual counters/separators.
+    bounded: list[KnowledgeChunk] = []
+    for chunk in chunks:
+        if _count(counter, chunk.content) <= max_tokens:
+            bounded.append(chunk)
             continue
-        chunks.append(KnowledgeChunk(index=len(chunks), content=content, section=section))
+        for piece in counter.split(chunk.content, max_tokens):
+            bounded.append(replace(chunk, content=piece.strip()))
+    chunks = [chunk for chunk in bounded if chunk.content]
+
+    if resolved_type is KnowledgeBaseType.TECHNICAL:
+        merged = _merge_small(
+            [(chunk.content, chunk.section) for chunk in chunks],
+            min_tokens=chunking.min_chunk_tokens,
+            max_tokens=max_tokens,
+            counter=counter,
+        )
+        chunks = [
+            KnowledgeChunk(index=0, content=content, section=section)
+            for content, section in merged
+        ]
+
+    for index, chunk in enumerate(chunks):
+        chunk.index = index
     return chunks
 
 

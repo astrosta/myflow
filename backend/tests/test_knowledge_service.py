@@ -11,7 +11,7 @@ from agentkit.knowledge.errors import (
     KnowledgeDocumentNotFound,
     KnowledgeUnavailable,
 )
-from agentkit.knowledge.models import ParsedDocument, SearchHit
+from agentkit.knowledge.models import KnowledgeChunk, ParsedDocument, SearchHit
 from agentkit.knowledge.rerank import RerankScore
 from agentkit.knowledge.service import KnowledgeService
 from agentkit.knowledge.store.memory import MemoryKnowledgeStore
@@ -71,6 +71,11 @@ class FakeVectorStore:
         self.deleted_bases: list[str] = []
         self.searches: list[dict] = []
         self.hybrid_searches: list[dict] = []
+        self.chunk_lists: list[tuple[str, str]] = []
+        self.chunks: list[KnowledgeChunk] = []
+        self.parent_queries: list[tuple[str, ...]] = []
+        self.parent_map: dict[str, str] = {}
+        self.parent_hit_id = ""
 
     async def upsert_document(self, **kwargs) -> None:
         self.upserts.append(kwargs)
@@ -80,6 +85,14 @@ class FakeVectorStore:
 
     async def delete_base(self, *, user_id: str, knowledge_base_id: str) -> None:
         self.deleted_bases.append(knowledge_base_id)
+
+    async def list_chunks(self, *, user_id: str, document_id: str):
+        self.chunk_lists.append((user_id, document_id))
+        return list(self.chunks)
+
+    async def get_parents(self, *, user_id: str, parent_ids):
+        self.parent_queries.append(tuple(parent_ids))
+        return {parent_id: self.parent_map[parent_id] for parent_id in parent_ids if parent_id in self.parent_map}
 
     async def search(self, **kwargs):
         self.searches.append(kwargs)
@@ -97,14 +110,13 @@ class FakeVectorStore:
             *self._hits(score=0.9),
         ]
 
-    @staticmethod
-    def _hits(*, score: float):
+    def _hits(self, *, score: float):
         return [
             SearchHit(
                 chunk_id="d1:0", document_id="d1", filename="manual.md",
                 section="安装", content="内容" * 700, score=score,
                 knowledge_base_id="b1", knowledge_base_name="产品文档",
-                knowledge_base_type="technical",
+                knowledge_base_type="technical", parent_id=self.parent_hit_id,
             )
         ]
 
@@ -172,6 +184,112 @@ async def _service(
         reranker=reranker,
     )
     return service, store
+
+
+@pytest.mark.asyncio
+async def test_faq_embeds_only_the_question(tmp_path) -> None:
+    embedder = FakeEmbedder()
+    vector = FakeVectorStore()
+    service, store = await _service(tmp_path, embedder=embedder, vector=vector)
+    base = await service.create_base(user_id="u1", name="FAQ", knowledge_type="faq")
+    await service.add_documents(
+        user_id="u1",
+        base_id=base.id,
+        uploads=[
+            FakeUpload(
+                "faq.md",
+                ("## Q: 如何重置密码？\n\nA: 在设置页点击重置密码，然后检查邮箱。" * 3).encode(),
+            )
+        ],
+    )
+    await service.wait_for_idle(timeout=5)
+
+    document = (await store.list_documents("u1", base.id))[0]
+    assert document.status == "ready"
+    assert embedder.document_batches
+    assert embedder.document_batches[0]
+    assert all(item == "如何重置密码?" for item in embedder.document_batches[0])
+    chunk = vector.upserts[-1]["chunks"][0]
+    assert "如何重置密码" in chunk.content
+    assert "A:" in chunk.content
+
+
+@pytest.mark.asyncio
+async def test_oversized_operations_section_stores_parent_and_child_links(tmp_path) -> None:
+    vector = FakeVectorStore()
+    service, store = await _service(tmp_path, vector=vector)
+    base = await service.create_base(user_id="u1", name="运维", knowledge_type="operations")
+    await service.add_documents(
+        user_id="u1",
+        base_id=base.id,
+        uploads=[
+            FakeUpload(
+                "runbook.md",
+                ("# 回滚\n\n步骤一：执行回滚\n\n" + "命令输出。" * 1000).encode(),
+            )
+        ],
+    )
+    await service.wait_for_idle(timeout=5)
+
+    document = (await store.list_documents("u1", base.id))[0]
+    assert document.status == "ready"
+    upsert = vector.upserts[-1]
+    assert upsert["parents"]
+    assert all(chunk.parent_id for chunk in upsert["chunks"])
+    assert upsert["parents"][0].content.startswith("回滚")
+    assert "步骤一" in upsert["parents"][0].content
+    assert len(upsert["chunks"]) > 1
+
+
+@pytest.mark.asyncio
+async def test_search_replaces_child_content_with_parent_text(tmp_path) -> None:
+    vector = FakeVectorStore()
+    vector.parent_hit_id = "d1:p0"
+    vector.parent_map = {"d1:p0": "父块全文"}
+    config = _config(tmp_path, retrieval={"keyword": {"enabled": False}})
+    service, _store = await _service(tmp_path, vector=vector, config=config)
+    await service.create_base(user_id="u1", name="运维", knowledge_type="operations")
+
+    outcome = await service.search(user_id="u1", query="怎么回滚")
+
+    assert outcome.hits[0].content == "父块全文"
+    assert outcome.hits[0].parent_id == "d1:p0"
+    assert vector.parent_queries == [("d1:p0",)]
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_paginates_ready_documents_only(tmp_path) -> None:
+    vector = FakeVectorStore()
+    service, store = await _service(tmp_path, vector=vector)
+    base = await service.create_base(
+        user_id="u1", name="产品文档", knowledge_type="technical"
+    )
+    document = await store.create_document(
+        document_id="d1",
+        user_id="u1",
+        knowledge_base_id=base.id,
+        filename="manual.md",
+        stored_name="d1.md",
+        mime_type="text/markdown",
+        size_bytes=4,
+    )
+
+    assert await service.list_chunks("u1", "d1") == ([], 0)
+
+    vector.chunks = [
+        KnowledgeChunk(index=2, content="third", section="C", page=3),
+        KnowledgeChunk(index=0, content="first", section="A", page=1),
+        KnowledgeChunk(index=1, content="second", section="B", page=2),
+    ]
+    await store.update_document_status("u1", "d1", status="ready", chunk_count=3)
+
+    page, total = await service.list_chunks("u1", "d1", offset=1, limit=1)
+
+    assert total == 3
+    assert [chunk.index for chunk in page] == [1]
+    assert page[0].content == "second"
+    assert vector.chunk_lists == [("u1", "d1")]
+    assert document.id == "d1"
 
 
 @pytest.mark.asyncio

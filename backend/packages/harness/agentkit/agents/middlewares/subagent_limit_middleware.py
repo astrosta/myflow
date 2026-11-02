@@ -19,8 +19,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping
+from contextlib import suppress
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -30,12 +32,32 @@ from agentkit.subagents.config import TASK_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
-#: §10.3 的可见说明。写进**模型和用户都看得到**的那条 AI 消息里。
+#: 总量用尽时的可见说明。写进**模型和用户都看得到**的那条 AI 消息里。
 LIMIT_NOTICE = (
     "[已达子代理上限] 本次运行的子代理委派额度已用尽。"
-    "请继续使用已经收集到的子代理结果，直接完成剩余的简单工作，"
-    "或者总结剩余工作，不要再启动新的子代理。"
+    "请基于已有结果完成剩余工作，或向用户说明哪些没有做。"
 )
+
+
+def format_limit_notice(
+    *,
+    max_concurrent: int,
+    remaining: int,
+    dropped_labels: list[str],
+) -> str:
+    """区分单轮并行超限和本 run 总量用尽：只有后者才说"额度已用尽"。"""
+    labels = "；".join(dropped_labels) if dropped_labels else "未命名任务"
+    if remaining <= 0:
+        return (
+            f"[已达子代理上限] 本次运行的子代理委派额度已用尽。"
+            f"以下任务未执行：{labels}。"
+            "请基于已有结果完成剩余工作，或向用户说明哪些没有做。"
+        )
+    return (
+        f"[已达子代理上限] 本轮最多并行 {max_concurrent} 个子代理，"
+        f"已执行前 {max_concurrent} 个；以下任务未执行：{labels}。"
+        f"拿到结果后如仍需要，可以再委派（本次运行还剩 {remaining} 次），或自己完成。"
+    )
 
 
 class SubagentLimitMiddleware(AgentMiddleware[AgentState]):
@@ -80,15 +102,23 @@ class SubagentLimitMiddleware(AgentMiddleware[AgentState]):
         if not task_positions:
             return None
 
+        prior = _prior_delegations(state, runtime)
         allowed = min(
             self._max_concurrent,
-            max(0, self._max_total_per_run - _prior_delegations(state, runtime)),
+            max(0, self._max_total_per_run - prior),
         )
         if len(task_positions) <= allowed:
             return None
 
         dropped = set(task_positions[allowed:])
         kept = [call for index, call in enumerate(calls) if index not in dropped]
+        dropped_calls = [calls[index] for index in task_positions[allowed:]]
+        remaining = max(0, self._max_total_per_run - prior - allowed)
+        notice = format_limit_notice(
+            max_concurrent=self._max_concurrent,
+            remaining=remaining,
+            dropped_labels=[_call_label(call) for call in dropped_calls],
+        )
         logger.info(
             "SubagentLimitMiddleware: dropped %d of %d task call(s) (allowed=%d, max_concurrent=%d)",
             len(dropped),
@@ -97,7 +127,7 @@ class SubagentLimitMiddleware(AgentMiddleware[AgentState]):
             self._max_concurrent,
         )
         stripped = clone_ai_message_with_tool_calls(message, kept)
-        stripped = _with_notice(stripped, force_stop=allowed == 0)
+        stripped = _with_notice(stripped, notice, force_stop=allowed == 0)
         return {"messages": [stripped]}
 
 
@@ -130,15 +160,28 @@ def _run_id(runtime) -> str | None:
     return None
 
 
-def _with_notice(message, *, force_stop: bool) -> object:
+def _call_label(call: Mapping) -> str:
+    args = call.get("args") or {}
+    if isinstance(args, str):
+        with suppress(json.JSONDecodeError, TypeError, ValueError):
+            args = json.loads(args)
+    if not isinstance(args, Mapping):
+        args = {}
+    text = str(args.get("description") or args.get("prompt") or "").strip()
+    if not text:
+        return "未命名任务"
+    return " ".join(text.split())[:40]
+
+
+def _with_notice(message, notice: str, *, force_stop: bool) -> object:
     """把可见说明写进 AI 消息；``allowed == 0`` 时顺带把 ``finish_reason`` 拽成 stop。"""
     content = getattr(message, "content", "")
     if isinstance(content, str):
-        new_content: object = f"{content}\n\n{LIMIT_NOTICE}" if content.strip() else LIMIT_NOTICE
+        new_content: object = f"{content}\n\n{notice}" if content.strip() else notice
     elif isinstance(content, list):
-        new_content = [*content, {"type": "text", "text": LIMIT_NOTICE}]
+        new_content = [*content, {"type": "text", "text": notice}]
     else:
-        new_content = LIMIT_NOTICE
+        new_content = notice
     update: dict = {"content": new_content}
     if force_stop:
         update["response_metadata"] = {
@@ -148,4 +191,4 @@ def _with_notice(message, *, force_stop: bool) -> object:
     return message.model_copy(update=update)
 
 
-__all__ = ["LIMIT_NOTICE", "SubagentLimitMiddleware"]
+__all__ = ["LIMIT_NOTICE", "SubagentLimitMiddleware", "format_limit_notice"]

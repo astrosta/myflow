@@ -14,7 +14,12 @@ from agentkit.subagents.config import (
     INHERIT_MODEL,
     SubagentConfig,
 )
-from agentkit.subagents.routing import ROUTING_BENEFITS, ROUTING_COST, ROUTING_VETOES
+from agentkit.subagents.routing import (
+    ROUTING_COST,
+    ROUTING_ISOLATION_BENEFIT,
+    ROUTING_PARALLEL_BENEFIT,
+    ROUTING_VETOES,
+)
 
 NAME = "general-purpose"
 
@@ -24,13 +29,14 @@ MAX_TURNS = 150
 #: §5.2：禁止嵌套委派（M8 不做）与向用户提问（子代理没有这一轮对话的用户）。
 DISALLOWED_TOOLS = ["task", "ask_clarification"]
 
+_IDENTITY = "拥有独立上下文的通用子代理，继承你当时持有的工具，只交回最终结论。"
+
 DESCRIPTION = (
-    "拥有独立上下文的通用子代理，只把最终结论交回 lead。"
-    f"适合委派收益明确的独立、自包含子任务（{ROUTING_BENEFITS}）——"
-    "例如同时调查三个互不相关的问题，或中间产物会淹没上下文的整理工作。"
-    f"不要委派 {ROUTING_VETOES}。委派本身也有成本（{ROUTING_COST}），"
-    "一两步就能自己做完的事情直接做更划算。"
+    f"{_IDENTITY}{ROUTING_PARALLEL_BENEFIT}{ROUTING_ISOLATION_BENEFIT}{ROUTING_VETOES}{ROUTING_COST}"
 )
+
+#: ``max_concurrent == 1`` 时用这一版：并行收益和"同一轮并行"的否决都不成立。
+SEQUENTIAL_DESCRIPTION = f"{_IDENTITY}{ROUTING_ISOLATION_BENEFIT}{ROUTING_COST}"
 
 SYSTEM_PROMPT = """\
 你是一个通用子代理。lead 给了你一个自包含任务，你在自己的上下文中执行：
@@ -39,7 +45,7 @@ lead 只看得到你的最终回答，看不到你的中间步骤。
 硬性规则：
 - 你没有 `task` 工具，不能继续委派，也不能再创建其他助手：自己完成任务，
   绝不要说“我会转交给别人”。
-- 你不能向用户提问（这里没有 `ask_clarification`）。任务有歧义时，采用最合理的理解，
+- 你不能向用户提问。任务有歧义时，采用最合理的理解，
   完成工作，并在回答中说明你的假设。
 - 只做交给你的任务，不要开始无关工作。
 
@@ -52,13 +58,22 @@ lead 只看得到你的最终回答，看不到你的中间步骤。
 GENERAL_PURPOSE_SUBAGENT = SubagentConfig(
     name=NAME,
     description=DESCRIPTION,
+    sequential_description=SEQUENTIAL_DESCRIPTION,
     system_prompt=SYSTEM_PROMPT,
     tools=None,  # None = 继承 lead **dispatch 那一刻**持有的工具，再扣 disallowed_tools
     disallowed_tools=list(DISALLOWED_TOOLS),
-    skills=None,  # None = 全部启用技能
+    skills=None,  # 暂未生效：子代理链没有技能中间件
     model=INHERIT_MODEL,
     max_turns=MAX_TURNS,
     timeout_seconds=BUILTIN_SUBAGENT_TIMEOUT_SECONDS,  # 段落值 subagents.timeout_seconds 覆盖它
 )
 
-__all__ = ["DESCRIPTION", "DISALLOWED_TOOLS", "GENERAL_PURPOSE_SUBAGENT", "MAX_TURNS", "NAME", "SYSTEM_PROMPT"]
+__all__ = [
+    "DESCRIPTION",
+    "DISALLOWED_TOOLS",
+    "GENERAL_PURPOSE_SUBAGENT",
+    "MAX_TURNS",
+    "NAME",
+    "SEQUENTIAL_DESCRIPTION",
+    "SYSTEM_PROMPT",
+]

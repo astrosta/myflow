@@ -356,6 +356,19 @@ def test_create_returns_201_and_only_the_owner_can_read_the_draft(
     assert hidden.json()["code"] == "skill_not_found"
 
 
+def test_create_rejects_a_blank_description(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+
+    response = client.post(
+        "/api/skills", json={"name": "alice-tools", "description": "   "}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "invalid_request"
+    assert service.skills == {}
+
+
 def test_mine_lists_private_skills_for_the_caller_only(monkeypatch: pytest.MonkeyPatch) -> None:
     service = FakeAuthorService()
     alice_client, identity = _client(monkeypatch, service)

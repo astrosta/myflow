@@ -12,7 +12,7 @@
 
 1. 三者语义不混用：`profile` = 用户是谁，`identity` = 助手是谁，`soul` = 助手怎么做事。
 2. `identity.md` / `soul.md` 运行时**只读**；对话、记忆抽取、`EXPLICIT_REMEMBER`、`USER_CORRECTION` 都不会改写它们。
-3. `profile.md` 本文件只是**空模板**；首次创建用户 profile 时写入数据库表 `memory_profile_documents`，之后只由表单在 PostgreSQL 事务中写入（行级 etag = sha256）。
+3. `profile.md` 本文件只是**空模板**；首次创建用户 profile 时写入数据库表 `memory_profile_documents`，之后只由表单或内置工具 `update_user_profile` 在 PostgreSQL 事务中写入（行级 etag = sha256）。
 4. 数据库 profile 的 YAML frontmatter 是唯一数据源，正文只是渲染结果；手改正文不会生效，下一次写入会被重建。
 5. 三个文件都不加入 OpenViking 的 `memory_types`，不参与自动抽取，不产生 `memory_diff`。
 6. 文件缺失或 frontmatter 非法时，跳过对应段落并记 warning，不阻塞聊天；数据库 profile 行缺失时由种子模板创建。
@@ -24,9 +24,7 @@
 | 文件 key | field_path |
 |---|---|
 | `preferred_name` | `identity.preferred_name` |
-| `pronouns` | `identity.pronouns` |
 | `locale` | `identity.locale` |
-| `timezone` | `identity.timezone` |
 | `language` | `communication.language` |
 | `tone` | `communication.tone` |
 | `verbosity` | `communication.verbosity` |

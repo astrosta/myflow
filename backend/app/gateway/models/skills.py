@@ -24,6 +24,14 @@ class CreateDraftRequest(BaseModel):
     name: str = Field(pattern=_SKILL_NAME, max_length=64)
     description: str = Field(min_length=1, max_length=2000)
 
+    @field_validator("description")
+    @classmethod
+    def description_must_not_be_blank(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("description must not be blank")
+        return text
+
 
 class WriteFileRequest(BaseModel):
     """Text-file write into the private staging table.

@@ -227,3 +227,6 @@ extensions_config.json
 .extensions_config.json.lock
 skills_prefs.json
 .skills_prefs.json.lock
+
+# 运行时用户画像（按用户生成；模板在 config/personalization/profile.md）
+data/personalization/

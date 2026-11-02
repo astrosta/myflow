@@ -190,6 +190,7 @@ type WireSkill = Partial<SkillListItem> & {
   skill_id?: string | null;
   name?: string;
   description?: string | null;
+  category?: "public" | "custom" | "builtin";
   scope?: SkillScope;
   status?: string | null;
   enabled?: boolean;
@@ -202,13 +203,22 @@ type WireSkill = Partial<SkillListItem> & {
 function toSkillListItem(raw: WireSkill): SkillListItem {
   const skillId = raw.skill_id ?? raw.id ?? raw.name ?? "";
   const status = raw.status ?? "draft";
+  // filesystem 来源只有旧 M7 的 category；没有 scope 时用它还原目录语义，
+  // 否则公共页会把一条 public 行当成私有行过滤掉。
+  const scope =
+    raw.scope ??
+    (raw.category === "public"
+      ? "public"
+      : raw.category === "builtin"
+        ? "builtin"
+        : "private");
   return {
     ...raw,
     skill_id: skillId,
     id: raw.id ?? skillId,
     name: raw.name ?? "",
     description: raw.description ?? "",
-    scope: raw.scope ?? "private",
+    scope,
     owner_user_id: raw.owner_user_id ?? null,
     skill_version: raw.skill_version ?? null,
     version_id: raw.version_id ?? null,
@@ -226,9 +236,9 @@ const reviewPath = (submissionId: string) =>
   "/admin/skills/reviews/" + encodeURIComponent(submissionId);
 
 export async function listSkills(
-  scope: "effective" | "global" = "effective",
+  scope: "effective" | "global" | "public" = "effective",
 ): Promise<SkillListItem[]> {
-  const query = scope === "global" ? "?scope=global" : "";
+  const query = scope === "effective" ? "" : "?scope=" + scope;
   const body = await request<{ skills: WireSkill[] }>("/skills" + query);
   return body.skills.map(toSkillListItem);
 }

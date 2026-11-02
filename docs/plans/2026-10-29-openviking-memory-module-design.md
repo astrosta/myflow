@@ -8,6 +8,20 @@
 > 修订（2026-10-29，写入/注入方式）：`before_agent` 负责抓取门控；CAPTURE 后 human / AI / ToolMessage 每产生一条就按顺序写入 Redis Stream，worker 按 OpenViking Sessions API 的 `role/parts` 契约转换并 append/commit。`identity.md` / `soul.md` 渲染进 lead agent 系统提示（替换当前直接返回空串的 `_build_soul_section()`）；DB `profile` 在 run assembly 时拼进 `<user_profile>` 系统提示段；不再注入隐藏画像消息。`ProfileService` / `PersonalizationService` 属于 `agentkit/agents/memory/personalization/`，不经过 SDK。
 > 修订（2026-10-29，审计决策）：profile 改为 PostgreSQL；写入改为 before_agent 门控 + 按 thread 分片的 Redis Stream 异步抓取；取消数据迁移；`memory_search` 只返回 `find` 实际字段。
 > 修订（2026-10-29，审计结论）：写入改为按 thread 分片的 Redis Stream（同 thread 单分片串行）；新增 `memory_capture_dedup` 持久去重键；压缩窗口不再进入捕获链路；ProfileSuggester 改为持久化 suggestion 表；session 增加 incarnation/epoch 防跨会话污染；所有记忆注入统一走内容包裹与绝对 URI；当前无旧数据，不做迁移/回滚。
+> 修订（2026-11-02，检索子代理）：lead 不再直接持有 `memory_search` / `memory_read` /
+> `memory_overview`，改为委派内置子代理 `memory-researcher`（内部仍是这三个只读工具）。
+> 详见 `2026-11-02-retrieval-subagents-design.md`。
+> 修订（2026-11-02，记忆管理）：新增前端「记忆管理」页，按 `preferences` / `entities` / `events` /
+> `cases` / `trajectories` / `experiences` 六类筛选、查看、编辑、删除 OpenViking 记忆；全部读写
+> 直接调用 OpenViking 协议（`find` 无 query + filter、`overview`、`read`、`write`、`rm`），MyFlow 不
+> 保存记忆副本。撤销 §1.4“不实现前端记忆界面”的取舍；`profile` / `identity` / `soul` 与
+> `tools` / `skills` 仍不在该页展示。
+> 修订（2026-11-02，画像字段收敛）：删除 `identity.pronouns` 与 `identity.timezone`，画像字段从 14 个
+> 收敛为 12 个；`identity` 组只剩称呼与地区。库里旧行残留的 `pronouns` / `timezone` frontmatter 键会被
+> 忽略，并在下一次写入时丢弃（无需迁移）。
+> 修订（2026-11-02，画像全字段表单 + 写入工具）：`我的画像` 改为**始终展示全部受支持字段**
+> （无值即空白，可填写后一次保存）；新增内置工具 `update_user_profile`，只在用户**显式、持久**
+> 陈述画像信息时由模型调用，写入仍走 `ProfileService`（etag CAS）。原子抽取链路依旧不写画像。
 > 修订（2026-10-30，审计决议 v2）：删除压缩窗口捕获与自动召回；OpenViking session 使用 **idle-only auto-commit**（86400 秒）；创建 session 必须显式设置 8 类 `memory_policy` 与 idle-only `auto_commit_policy`；`get_session(auto_create=True)` 不再用于新建；强制单 `memory_worker`；`memory_sync_state` 增加 session 生命周期字段；ToolPart / PII / API 契约按 OpenViking Server 0.4.19 修正。
 >
 > 参考：
@@ -31,7 +45,7 @@
 | 常驻层 | 读取数据库中的 `profile.md`、项目内 `identity.md` / `soul.md` 并注入 | 只承载自动抽取的记忆类型；不保存这三个人设文件 |
 | 写入层 | before_agent 门控、逐消息 Redis Stream 投递 | session、archive、异步记忆抽取、memory_diff |
 | 检索层 | 工具门面、token 预算、结果映射 | `find` / L0/L1/L2（无 context search / 自动召回） |
-| 治理层 | 只提供“我的画像”结构化表单（profile 修改/删除）；identity/soul 随项目文件发布 | 文件系统、版本化归档；其他记忆在 OpenViking Studio/CLI |
+| 治理层 | 提供“我的画像”结构化表单（profile 修改/删除）与“记忆管理”页（六类记忆的查看/编辑/删除，直接走 OpenViking 协议）；identity/soul 随项目文件发布 | 文件系统、版本化归档；记忆正文与索引 |
 
 核心决策：
 
@@ -41,13 +55,15 @@
 4. **写入按 thread 分片，逐消息投递，单 worker 消费。** stream shard 由 `HMAC(salt, user_id + ":" + thread_id) % shard_count` 决定，同一 thread 永远落到同一 shard，每个 shard 只有一个 consumer 串行处理；CAPTURE 后 human / AI / ToolMessage 依次 `XADD`，不组装 turn envelope、不写 DB outbox。worker 用 `memory_capture_dedup` 做 at-least-once 去重与对账；正常 turn 收到 `turn_end` 后批量 append，显式信号可立即 commit；普通 `NONE` turn 由 OpenViking 24h idle auto-commit 兜底。压缩窗口不进入捕获流，不产生 `compaction` 消息。对话主链路不等待 OpenViking 的 append/commit。
 5. **删除任务分类器作为 session/任务机制。** 保留 `CommitSignalDetector`，只输出 commit 信号，不生成 `task_id`，不写 `task_context`，不切 session。
 6. **只有纯招呼/告别/致谢跳过抓取。** `SKIP` 不进入 message 抓取流，不抓取本轮 human/tool/AI 消息；告别可投递一个无消息的 `SESSION_END` control job。“可以”“继续”“好的”“收到”“完成”“记住”等全部按 `CAPTURE` 处理，由信号决定是否 commit。
-7. **profile 存数据库，identity/soul 是项目文件，但 OpenViking 自带同名类型。** `profile.md` 是用户身份，存 `memory_profile_documents`；`identity.md` / `soul.md` 仍是项目内本地文件。Server 0.4.19 的 `profile` / `identity` / `soul` 是默认启用的内置 memory types，MyFlow 必须通过 `memory_policy.memory_types` 白名单显式排除，不能声称它们“不是 memory_type”。MyFlow 只提供 `profile` 的结构化表单（修改/删除）。
+7. **profile 存数据库，identity/soul 是项目文件，但 OpenViking 自带同名类型。** `profile.md` 是用户身份，存 `memory_profile_documents`；`identity.md` / `soul.md` 仍是项目内本地文件。Server 0.4.19 的 `profile` / `identity` / `soul` 是默认启用的内置 memory types，MyFlow 必须通过 `memory_policy.memory_types` 白名单显式排除，不能声称它们“不是 memory_type”。MyFlow 只提供 `profile` 的结构化表单（修改/删除）与内置工具 `update_user_profile`
+（仅当用户在本轮显式陈述画像信息时调用），两者都写同一张 `memory_profile_documents`。自动记忆的查看/编辑/删除走“记忆管理”页，直接调用 OpenViking 协议。
 8. **OpenViking 只承载自动抽取的记忆。** 自动抽取启用 `preferences`、`entities`、`events`、`cases`、`trajectories`、`experiences`、`tools`、`skills`；不定义 `myflow_fact` 等自定义类型。
 9. **删除 pending_review、字段级置信度、画像 CAS/墓碑、程序性记忆、Skill 候选。** 这些是 A 方案的产品取舍；如果它们是硬性合规要求，需要走 C 方案。
 10. **直接使用 `openviking-sdk`，不使用 `langchain-openviking`（运行时和适配器都不用）。** `AsyncHTTPClient` 绑定事件循环，client cache 必须按 loop 隔离；同步 Agent 路径不得复用异步 worker 的 client。
 11. **多租户使用 trusted 模式。** MyFlow 网关持有 root key，为每个用户构造绑定身份的 client；用户 ID 做 HMAC 后写入 OpenViking URI。所有 OpenViking 记忆的 URI 都使用绝对形式 `viking://user/<ov_user>/...`，不依赖 `~`。
 12. **原始 session 默认保留 30 天，自动提交靠 idle。** OpenViking 会保存 session 消息和 archive；每 24h 无新消息时由 idle auto-commit 归档并抽取，避免普通 `NONE` 轮次永远不 commit。如果要求“抽取后立即不留原始 transcript”，需要缩短 retention 并接受审计/摘要不可回看。
-13. **当前不存在旧记忆数据，因此不做迁移、不做旧版本回滚。** 新链路从空记忆开始；旧代码/表在 P5 直接删除，不保留作为回退边界；上线后若需回退，只能回到空记忆状态，不能恢复旧模块数据。
+13. **记忆管理页是 OpenViking 的只读视图 + 受控写入面，不是第二套记忆库。** 列表用 `find`（无 query + filter + `level=2`）拿摘要，详情用 `overview` 渲染目录，正文用 `read`，编辑用 `write(edit_source=manual)`，删除用 `rm`；MyFlow 不落库、不缓存正文。只暴露 6 类自动记忆，`.abstract.md` / `.overview.md` 只读不可编辑删除。
+14. **当前不存在旧记忆数据，因此不做迁移、不做旧版本回滚。** 新链路从空记忆开始；旧代码/表在 P5 直接删除，不保留作为回退边界；上线后若需回退，只能回到空记忆状态，不能恢复旧模块数据。
 
 ### 0.1 本轮审计决议（规范性，优先于后文重复描述）
 
@@ -78,7 +94,11 @@
 - 是否渲染 identity/soul 系统提示段；
 - 是否挂 admin status/flush。
 
-`/api/memory/profile`、onboarding 和 suggestions 是 DB-backed 画像 surface，开关为 `false` 时仍可用（suggestions 没有 OpenViking 索引，返回空）。开关是 startup-only；不要在同一进程运行中热切换。旧 canonical runtime、旧 canonical 表已退役：fresh bootstrap 不再创建，migration 0009 删除既有表；`false` 不再是 canonical fallback。开关为 `true` 时缺少 Redis URL、database 或至少 32 字符的 `user_id_salt` 必须启动失败；不能静默降级。
+`/api/memory/profile`、`/api/memory/profile/schema`、onboarding 和 suggestions 是 DB-backed 画像 surface，
+开关为 `false` 时仍可用（suggestions 没有 OpenViking 索引，返回空）。内置工具 `update_user_profile`
+绑定的是 `ProfileService` 而不是 OpenViking facade，因此**不随这个开关开关**：只要网关建好了 profile
+服务就注册（`true` 时与 `memory_search` / `memory_read` / `memory_overview` 同一批挂到 lead agent）。
+开关是 startup-only；不要在同一进程运行中热切换。旧 canonical runtime、旧 canonical 表已退役：fresh bootstrap 不再创建，migration 0009 删除既有表；`false` 不再是 canonical fallback。开关为 `true` 时缺少 Redis URL、database 或至少 32 字符的 `user_id_salt` 必须启动失败；不能静默降级。
 
 ## 1. 背景、目标与非目标
 
@@ -113,8 +133,8 @@ canonical 记忆模块在本设计落地后已被物理删除。下面只是被�
 - 只有纯社交/无任务内容的轮次（招呼/告别/致谢/纯 emoji/标点）不进入抓取；其余 human / tool / AI 消息统一进入异步抓取管道；
 - 启用全部需要的 OpenViking 内置记忆类型，包括 Agent Evolution 与工具/技能经验；
 - 在任务边界、完成、失败修复、纠错、显式记住时由异步 worker commit；普通 `NONE` 由 24h idle auto-commit 兜底；压缩窗口不进入捕获链路；
-- MyFlow 前端只保留“我的画像”结构化表单，用于修改/删除用户 profile；
-- identity/soul 是项目文件；其他记忆由 OpenViking Studio/CLI 承担；MyFlow 不展示除 profile 外的记忆；
+- MyFlow 前端提供“我的画像”结构化表单（修改/删除 profile）与“记忆管理”页（查看/编辑/删除六类自动记忆）；
+- identity/soul 是项目文件；记忆管理页只代理 OpenViking 协议，不复制记忆内容；`tools` / `skills` 记忆仍由 OpenViking Studio/CLI 管理；
 - 用户隔离、隐私脱敏、失败降级和可观测性达到生产要求；
 - 不做旧 PostgreSQL/Milvus 记忆数据迁移；新链路从空记忆开始。
 
@@ -125,9 +145,9 @@ canonical 记忆模块在本设计落地后已被物理删除。下面只是被�
 - 不替换知识库（MinerU + Milvus）链路。
 - 不引入 OpenViking Rules、MCP、WebDAV、Feishu 等扩展。
 - 不追求“逐字保存用户原话”的笔记系统；记忆仍以抽取结果为准。
-- 不实现 MyFlow 前端记忆界面；只定义内部注入、捕获、检索和管理边界。
-- 不在前端展示或修改 `identity`、`soul`（项目文件）以及 `preferences`、`entities`、`events`、`cases`、`trajectories`、`experiences`、`tools`、`skills`（OpenViking 记忆）；后者统一由 OpenViking Studio/CLI 管理。
-- 不实现 MyFlow 内的记忆库、记忆编辑器和记忆搜索页；只保留“我的画像”结构化表单。
+- 不在前端展示或修改 `identity`、`soul`（项目文件）以及 `tools` / `skills` 记忆；这些仍由 OpenViking Studio/CLI 管理。
+- 不实现记忆**搜索**页（没有 query 输入的检索界面）；记忆管理页只做按类型筛选、列表、详情、编辑、删除。
+- 不复制 OpenViking 记忆正文到 MyFlow 数据库；页面每次打开都实时调用 OpenViking。
 
 ### 1.5 硬约束
 
@@ -167,7 +187,9 @@ MyFlow Gateway
 
   |-- CaptureGate（纯规则；before_agent 唯一门控）
   |-- memory_search / memory_read / memory_overview tools（模型内部工具，不是前端入口）
+  |-- update_user_profile tool（唯一的模型写画像入口；写 ProfileService，不写 OpenViking）
   |-- ProfileSuggester（应用服务，按需生成画像建议，不写 profile）
+  |-- /api/memory/items（记忆管理：列表/详情/正文/编辑/删除，全部代理 OpenViking）
   |-- /api/memory/profile（我的画像结构化表单）
   |-- /api/memory/profile/suggestions（画像建议）
   |-- /api/memory/profile/onboarding（引导状态）
@@ -219,7 +241,9 @@ OpenViking Server
 | `MemoryFacade` | 对 Agent/HTTP 暴露统一异步接口；映射错误；组织服务 | 不实现存储、向量、抽取 |
 | `OpenVikingClientFactory` | 按 `(event_loop, account, ov_user)` 构造并缓存 client；health 检查；在 owner loop 关闭 | 不决定用户身份；不跨 loop 复用 |
 | `SessionManager` | 先 `get_session(auto_create=False)`，NotFound 才显式 create；维护 8 类 memory policy + idle-only auto policy、epoch + incarnation、生命周期字段；提供 `resolve_capture_context`（只写 DB，不访问 OpenViking）；删除 tombstone；删除前检查 shard/phase 2 | 不用 `auto_create=True` 新建；不决定是否抓取 |
-| `ProfileService` | 读写 `memory_profile_documents`；字段校验；etag；删除字段/清空 | 不写 OpenViking；不自动抽取 profile |
+| `ProfileService` | 读写 `memory_profile_documents`；字段校验；etag；删除字段/清空；`update_fields()` 供工具使用（读当前 etag 后 CAS，冲突重读重试一次） | 不写 OpenViking；不自动抽取 profile；不做冲突合并 |
+| `update_user_profile` tool | 把用户在对话里显式陈述的画像信息写进 `memory_profile_documents`；参数校验失败返回结构化 tool error | 不写 OpenViking；不写事实记忆；不猜、不补全、不写敏感值 |
+| `MemoryLibraryService` | 记忆管理页的协议适配：`find`（无 query + filter）列摘要、`overview` 解析目录、`read` 读正文、`write` 保存、`rm` 删除；URI 白名单与 sidecar 保护 | 不保存记忆副本；不写 profile；不允许改 `.abstract.md` / `.overview.md` / 目录；不做语义搜索 |
 | `ProfileSuggester` | 按需从 preferences/entities/events 生成画像建议，写入 `memory_profile_suggestions`；用户 accept 时才调用 ProfileService 写 DB | 不后台常驻、不自动写 profile、不作为模型工具 |
 | `ProfileSuggestionStore` | 保存 `memory_profile_suggestions`（建议正文/脱敏限长证据/etag/状态/过期）和 onboarding 状态 | 不保存整段 OpenViking 记忆正文；evidence_quote 是受限期例外 |
 | `PersonalizationService` | 读取 DB `profile`、本地 `identity.md`/`soul.md`；缓存渲染；token 截断 | 不写 OpenViking；不提供 identity/soul 编辑 API |
@@ -245,7 +269,7 @@ OpenViking Server
 - **子代理：** `MemoryMiddleware` 只挂 lead；子代理内部的 human/AI/tool 消息不直接抓取，只把 lead 可见的 `task` ToolMessage 及其摘要作为证据。需要完整子代理轨迹时另立设计，不把本设计伪装成全链路捕获。
 - **技能系统：** 继续使用现有技能包/Git/审核；OpenViking Skills 不接入首版。
 - **认证：** MyFlow user_id → OpenViking user 的 HMAC 映射；不把 MyFlow 原始 ID 暴露在 URI。
-- **前端：** 只访问 `/api/memory/profile` 及建议/onboarding API 做本地画像表单；不访问 identity/soul；其他记忆查看/编辑在 OpenViking Studio/CLI，前端不下发 root key。
+- **前端：** 访问 `/api/memory/profile` 做画像表单，访问 `/api/memory/items` 做记忆管理；不访问 identity/soul；`tools` / `skills` 记忆仍在 OpenViking Studio/CLI，前端不下发 root key。
 
 ## 3. 身份与多租户
 
@@ -414,14 +438,14 @@ OpenViking 只保存自动抽取的记忆：
 
 - 种子模板：`config/personalization/profile.md`；首次创建用户 profile 时写入 DB，之后不再读模板；
 - 运行时权威：`memory_profile_documents.content`；不写本地 `data/personalization/`；
-- 只由“我的画像”表单写入；`ProfileService` 负责解析、重建、etag 和缓存失效；
+- 由“我的画像”表单或内置工具 `update_user_profile` 写入；`ProfileService` 负责解析、重建、etag 和缓存失效；
 - `identity.md` / `soul.md` 是助手身份/原则，来源不同，见 §4.5。
 
 结构化字段集合沿用现有 `PROFILE_FIELD_PRIORITY`；**注入和截断顺序以代码中的 `PROFILE_FIELD_PRIORITY` 为唯一来源**，下表只表达分组，不重复定义优先级。
 
 | 分组 | 字段 | 类型 |
 |---|---|---|
-| 身份 | `identity.preferred_name` / `identity.pronouns` / `identity.locale` / `identity.timezone` | string |
+| 身份 | `identity.preferred_name` / `identity.locale` | string |
 | 沟通 | `communication.language` | string |
 | 沟通 | `communication.tone` | neutral / friendly / formal / direct |
 | 沟通 | `communication.verbosity` | concise / balanced / detailed |
@@ -437,8 +461,8 @@ OpenViking 只保存自动抽取的记忆：
 ```markdown
 ---
 preferred_name: 小王
-locale: 杭州
-language: 中文
+locale: zh-CN
+language: zh-CN
 format: [bullets, steps]
 boundaries: [不要主动发邮件]
 ---
@@ -454,9 +478,7 @@ boundaries: [不要主动发邮件]
 | 文件 key | 内部 field_path |
 |---|---|
 | `preferred_name` | `identity.preferred_name` |
-| `pronouns` | `identity.pronouns` |
 | `locale` | `identity.locale` |
-| `timezone` | `identity.timezone` |
 | `language` | `communication.language` |
 | `tone` | `communication.tone` |
 | `verbosity` | `communication.verbosity` |
@@ -475,14 +497,69 @@ boundaries: [不要主动发邮件]
 - `DELETE /api/memory/profile/{field_path}` 删除单个字段；
 - `DELETE /api/memory/profile` 清空整份画像：写入**固定的空模板常量**（所有字段为空、正文仅标题，不使用可能演进的 seed 文件），生成新 etag，不删除行；GET 始终返回空字段而不是 404；
 - `GET /api/memory/profile` 行不存在时用 `INSERT ... ON CONFLICT DO NOTHING` 创建，再读取；GET 必须幂等，不能因并发首次读取产生唯一键冲突；
-- `PATCH` 的列表字段（`format`/`domains`/`tools`/`accessibility.needs`/`boundaries`）采用**整列表替换**语义；要清空传 `[]`，不要用省略字段表示清空；
+- `PATCH` 的列表字段（`format`/`domains`/`tools`/`accessibility.needs`/`boundaries`）采用**整列表替换**语义；
+  清空统一传 `null`（前端把空输入序列化成 `null`）。`communication.format` 的空数组 `[]` 会 422
+  （格式必须非空），所以不要用 `[]` 表示清空，也不要用省略字段表示清空；
 - 写入使用 PostgreSQL 事务 + 行级 etag 比较；不涉及文件锁、`fsync` 或 `os.replace`；
 - `etag = sha256(canonical_content)`；`canonical_content` 的定义是：frontmatter key 按固定 `PROFILE_FIELD_PRIORITY` 顺序、列表保持原顺序、统一 `\n`、无尾随空格、无未知 key；前端提交时带 etag，服务端在同一事务中比较，不一致返回 409；
 - `profile` 不在 OpenViking，不产生 `memory_diff`，也不会被对话抽取回写；
-- 对话抽取、`USER_CORRECTION`、`EXPLICIT_REMEMBER` 都不会写 `memory_profile_documents`；画像只由表单修改；
+- 自动抽取、`USER_CORRECTION`、`EXPLICIT_REMEMBER` 都不会写 `memory_profile_documents`；画像只由表单与内置工具 `update_user_profile` 写入；
 - `PersonalizationService` 每轮 `before_agent` 读取当前 etag 并注入；写入成功后更新本进程缓存并删除旧 etag 缓存，其他 worker 下一轮通过 etag 发现变化。
 
 `profile` 不在 OpenViking 中，也不出现在 `memory_types`；因此没有“自动抽取写 profile”的路径。OpenViking 的 `memory_types` 只列 §4.1 的 8 类自动记忆。
+
+#### 画像字段清单与前端渲染（2026-11-02）
+
+字段定义只有一份来源：`agentkit/agents/memory/profile_schema.py` 的 `PROFILE_FIELD_SPECS`（顺序即
+`PROFILE_FIELD_PRIORITY`）。每条 spec 含 `path / label / group / kind / options / max_length /
+max_items / item_max_length / explicit_only / placeholder / description`，同时被三处消费：
+
+1. `validate_profile_value()`：类型、枚举、长度、列表项上限、语言标签格式、密钥与脱敏标记扫描；
+2. `GET /api/memory/profile/schema`：前端**必须**按它渲染，不允许在前端维护第二份字段清单；
+3. `update_user_profile` 工具的 description：模型看到的就是这份清单。
+
+前端规则：
+
+- 无论有没有值，12 个字段**始终全部渲染**；没有值的字段显示空白控件，不显示“未设置”占位文案，
+  也不再出现“还没有画像信息”的空状态页；
+- 控件由 `kind` 决定：`text` → 单行输入；`language` → 下拉（含“跟随当前对话语言”=`auto`）；
+  `locale` → 单行输入 + 合法示例 placeholder；`choice` → 下拉（含“暂不设置”空选项）；
+  `multi_choice` → 复选组；`string_list` → 逗号分隔的单行输入，按 `max_items` / `item_max_length` 校验；
+- 表单预填当前值；用户改完后点一次“保存”，提交**所有有变化的字段**；被清空的字段提交 `null`；
+- `explicit_only` 字段（称呼/无障碍/边界）在表单里照常可填，但只能由用户本人填写；
+  建议卡片接受这些字段时必须二次确认并展示 evidence（见下面的 ProfileSuggester 规则）。
+
+#### 内置工具 `update_user_profile`（2026-11-02）
+
+画像的第二个写入入口，只在“用户在对话里显式说出画像信息”时使用：
+
+```text
+update_user_profile(
+    fields: dict[str, str | list[str] | None],   # path -> value；null 表示删除该字段
+    note: str | None = None,                     # 可选：一句话说明依据，只进日志/审计
+) -> str                                        # JSON
+```
+
+- 成功：`{"ok": true, "updated": ["communication.language"], "cleared": [], "profile_etag": "..."}`；
+- 失败：`{"error": "invalid_field" | "invalid_value" | "missing_user" | "profile_update_failed",
+  "message": "...", "allowed_fields": [...]}`；`invalid_value` 的消息必须带该字段的允许值；
+  模型拿到 `invalid_field` / `invalid_value` 后应按清单改正再试一次，不要重复同一个坏值；
+- 写入路径：`ProfileService.update_fields(user_id, fields)` —— 读当前快照 etag → `patch()`；
+  冲突时重读重试**一次**，仍冲突返回 `profile_update_failed`，绝不覆盖并发的表单写入；
+- 工具与表单写同一行、同一 etag CAS；不存在第二套画像，也不复制 Markdown；
+- 只注册给 lead agent，子代理没有这个工具；
+- 工具调用不触发 onboarding 的 `complete`（那是表单的语义），也不写 suggestions、不写 OpenViking。
+
+模型调用门槛（全部写进 tool description，并有测试断言这些触发条件文本存在）：
+
+1. 用户明确说出跨会话稳定的画像信息时才调用：「以后叫我小林」「以后都用英文」「少寒暄，直接给结论」「回答尽量用要点或表格」「我在 UTC+8」「我常驻杭州」
+   「我是后端工程师」「我主要用 FastAPI 和 Postgres」「按专家水平解释」「记一下我看不清小字」
+   「不要主动给我打电话」；
+2. 一次性的任务指令不调用：「这次用英文」「这一段先写代码」「这轮详细一点」只影响当前任务；
+3. 推测不调用：用户没有明说的偏好、从代码或工具输出推断出的角色/地区、模型自己的补充；
+4. 不写敏感值：密钥、令牌、证件号、私人联系方式；值里出现这些内容必须返回 `invalid_value`；
+5. 改写已有值以用户**最新**显式陈述为准；删除用 `null`（「以后不用叫我小林了」）；
+6. 调用后用自然语言简短复述写入了什么，不把内部 `field_path` 原样抛给用户。
 
 #### ProfileSuggester（画像建议）
 
@@ -514,11 +591,11 @@ class ProfileSuggestion:
 
 规则：
 
-- `identity.preferred_name`、`identity.pronouns`、`accessibility.needs`、`boundaries` 可以由自动记忆生成建议，但**绝不自动写入**；必须由用户在表单中明确确认，UI 必须展示 evidence_quote / evidence_uri；
+- `identity.preferred_name`、`accessibility.needs`、`boundaries` 可以由自动记忆生成建议，但**绝不自动写入**；必须由用户在表单中明确确认，UI 必须展示 evidence_quote / evidence_uri；
 - 其余字段同样只是建议；`accept` 是唯一的写入路径，建议本身不等同于事实；
 - `preferences` 中的语气/详细程度/格式 → `communication.*`；
 - `entities` 中的项目/工具/角色 → `work.*`；
-- `events`/`entities` 中明确地区/时区 → `identity.locale` / `identity.timezone`；
+- `events`/`entities` 中明确地区 → `identity.locale`；
 - 建议行持久化在 `memory_profile_suggestions`，按 `user_id + profile_etag` 生成/刷新；`GET` 只返回 `status=pending + 未过期 + profile_etag=当前 profile etag` 的行；TTL 由 `retention.suggestion_days`（默认 7 天）控制；跨 worker 不依赖进程内缓存；
 - `GET /suggestions` 的增量生成必须加 PostgreSQL advisory lock 或对 `(user_id, field_path, value_hash, profile_etag)` 建部分唯一索引，防止并发 GET 生成重复建议；
 - `evidence_quote` 必须脱敏、截断（默认 <=500 字符），不能复制整段记忆正文；
@@ -598,7 +675,7 @@ memory_profile_suggestions
 - MyFlow 前端不展示、不提供编辑入口；需要改人设时由项目维护者改文件并发布；
 - `identity.md` 中的头像/二进制资产只作为元数据，不进入系统提示；系统提示只渲染名称、气质、自我介绍等文本 section，避免把路径或二进制内容送到模型。
 
-`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools` / `skills` 仍由 OpenViking 自动抽取维护，但 MyFlow 前端不展示、不提供编辑入口。
+`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` 由 OpenViking 自动抽取维护，MyFlow 在“记忆管理”页提供查看/编辑/删除（§4.9）；`tools` / `skills` 仍只在 OpenViking Studio/CLI 维护。
 
 ### 4.6 原生 memory_type
 
@@ -742,6 +819,76 @@ memory_capture_dedup
 - 不保留 LangMem store/manager/operators。
 - 不保留 Skill 候选表与 `skill_candidates.py`。
 
+### 4.9 记忆管理（查看 / 编辑 / 删除）
+
+> 2026-11-02 修订：撤销“记忆只在 OpenViking Studio 管理”的旧取舍。MyFlow 新增“记忆管理”页，
+> 但**不建第二套记忆库**：页面所有数据都来自 OpenViking 协议的实时调用，MyFlow 不落库、不缓存正文。
+
+#### 4.9.1 范围与中文名
+
+只管理六类自动记忆（`DEFAULT_MEMORY_TYPES` 去掉默认关闭的 `tools` / `skills`）：
+
+| memory_type | 中文名 | 典型文件结构 |
+|---|---|---|
+| preferences | 偏好 | `memories/preferences/<user>/<topic>.md` |
+| entities | 实体 | `memories/entities/<category>/<name>.md` |
+| events | 事件 | `memories/events/<YYYY>/<MM>/<DD>/<event>.md` |
+| cases | 案例 | `memories/cases/<case>.md` |
+| trajectories | 轨迹 | `memories/trajectories/<name>_<ts>.md` |
+| experiences | 经验 | `memories/experiences/<name>.md` |
+
+`profile` / `identity` / `soul` 与 `tools` / `skills` 不出现：`profile` 由“我的画像”页管理，
+`identity` / `soul` 是项目文件，`tools` / `skills` 仍是 OpenViking Studio/CLI 的运维面。
+
+#### 4.9.2 L0/L1/L2 与界面的对应
+
+OpenViking 的 L0/L1 是**目录级 sidecar**（`.abstract.md` / `.overview.md`），L2 是具体记忆文件。
+界面按这个层级组织，不发明“每条记忆的短摘要”新字段：
+
+| 界面元素 | OpenViking 调用 | 说明 |
+|---|---|---|
+| 类型筛选 | `GET /api/memory/items/types` | 六类 + 中文名，来自代码常量 |
+| 列表项摘要 | `find(query="", target_uri=[<type>], filter=…, level=[2])` | 用记录里的 `abstract`；网关截断到 500 字符并标记 `abstract_truncated`；空摘要显示“暂无摘要” |
+| 详情目录（TOC） | `overview(<folder>)` | `.overview.md` 正文；网关解析成 `toc`（标题 + 相对链接）返回，前端渲染成可点击目录 |
+| 点击目录项 | `read(<file_uri>)` | L2 正文；同时返回 `sha256`，编辑时做乐观并发 |
+| 编辑保存 | `write(<file_uri>, content, mode="replace", options={"edit_source": "manual"})` | 带 `expected_sha256`；OpenViking 异步重建父目录 sidecar |
+| 删除 | `rm(<file_uri>, recursive=False)` | 只删具体记忆文件；父目录 sidecar 由 OpenViking 刷新 |
+
+为什么列表用 `find` 而不是 `ls`：`ls` 的 abstract 只挂在目录节点上，具体记忆文件没有摘要；
+`find` 支持“无 query + filter”的过滤型查询（OpenViking `_find_by_filter`），能直接返回 level=2 记录的
+`uri` 与 `abstract`，正好是列表要的两列。`find` 没有 offset，因此服务端一次取 `limit + 1` 条、
+按 URI 排序后返回 `has_more`；`limit` 上限 200，前端不翻页，只提示“仅显示前 N 条”。
+
+#### 4.9.3 服务端保护（安全边界）
+
+1. URI 必须是绝对形式 `viking://user/<ov_user>/memories/<type>/.../<name>.md`；`~`、`..`、编码穿越一律拒绝；
+2. `<type>` ∈ 六类白名单；路径段不得包含 `peers` / `sessions` / `privacy` / `rules`；
+3. 只允许以 `.md` 结尾的**文件**；`rm` 固定 `recursive=False`；删除前先 `read` 确认目标是文件；
+4. **禁止写入/删除 `.abstract.md`、`.overview.md`**（含 `*.abstract.md` 之类的变体）；它们由 OpenViking
+   语义处理生成，界面没有编辑/删除入口；
+5. 内容上限 200,000 字符，空内容拒绝；前端用现有 Markdown 渲染器，不渲染原始 HTML；
+6. 编辑必须带 `expected_sha256`：网关先 `read` 当前正文算摘要，不一致返回 409 `memory_conflict`；
+7. `ov_user` 由 `SessionManager` 用 `user_id_salt` 推导，绝不接收请求参数；跨用户 URI 直接 404；
+8. scope：类型/列表/详情/正文用 `memory:read`，编辑/删除用 `memory:write`；写接口走现有 CSRF 中间件。
+
+#### 4.9.4 失败与降级
+
+- `memory.openviking.enabled=false`：接口返回 503 `memory_unavailable`，前端整页提示“长期记忆未启用”；
+- OpenViking 不可用：列表/详情返回 503，页面保留已有内容并提示重试；写/删直接失败，不做本地排队；
+- 某条记忆 `abstract` 为空（尚未索引）不算错误：显示“暂无摘要”，仍可打开详情；
+- `overview` 缺失（`trajectories` / `experiences` 模板没有 overview）：详情返回 `toc=[]`，并用 `ls`
+  列出同目录 `.md` 文件作为降级目录；这是降级，不是错误；
+- 删除/编辑时目标已不存在（404）：前端刷新列表并提示“记忆已不存在”，不重试。
+
+#### 4.9.5 界面约定
+
+- 文案统一写“记忆”，不写“条目/知识卡片”；类型名只出现在筛选栏；
+- 列表项展示：类型标签、由文件名派生的可读标题、摘要、最后更新时间（OpenViking 返回时）；
+- 详情页左侧是 `.overview.md` 渲染的目录，右侧是选中记忆的正文/编辑器；
+- 编辑只对**当前选中的记忆文件**开放；目录里的 sidecar 不出现在 TOC 里；
+- 删除必须二次确认，并在成功后刷新列表；
+- 页面不提供全文搜索框（本设计不做记忆搜索页），只按类型筛选。
+
 ## 5. 检索与上下文注入
 
 ### 5.1 启动上下文
@@ -782,6 +929,9 @@ profile 不再进入隐藏 `HumanMessage`；它在 **run assembly** 阶段读取
 - 工具检索只使用当前用户 client 读取 OpenViking，绝不跨用户读取。
 
 ### 5.2 工具检索
+
+> 2026-11-02：这三个只读工具现在只挂在内置子代理 `memory-researcher` 上；lead 通过 `task`
+> 委派使用，不再直接持有它们（`2026-11-02-retrieval-subagents-design.md`）。工具契约不变。
 
 `memory_search(query, memory_types, limit, since=None, until=None, time_field=None)`：
 
@@ -825,6 +975,16 @@ targets = [f"viking://user/{ov_user}/memories/{memory_type}" for memory_type in 
 
 - 只允许与 `memory_read` 相同的前缀，并拒绝同样的 profile/identity/soul 文件与受管子树；返回 L1 摘要，经 `MemoryContentEnvelope` 包裹；
 - 供模型在 `memory_search` 的 L0 命中后显式读取，不替代 `memory_read`。
+
+`update_user_profile(fields, note=None)`（**唯一的写工具**，不属于检索面）：
+
+- 只写 DB `memory_profile_documents`，不写 OpenViking；检索/读取工具仍然只读；
+- 与表单共用 `ProfileService.patch()` 的 etag CAS，冲突时重读重试一次；
+- 不即时改写本轮上下文：写完之后下一次 run assembly 才会重新渲染 `<user_profile>`；
+- 工具输出只含 `updated` / `cleared` / `profile_etag`，不回传整份画像，避免重复塞入身份资料；
+- 失败是结构化 tool error（`invalid_field` / `invalid_value` / `missing_user` / `profile_update_failed`），
+  不是 HTTP 错误；模型可据此修正后重试；
+- 只有 lead agent 注册；子代理不写画像。
 
 可选 `memory_remember(text)`：
 
@@ -1763,12 +1923,13 @@ class MemoryFacade:
 
 ### 8.2 HTTP API
 
-MyFlow 只提供“我的画像”、画像建议和 onboarding API；identity/soul 是项目内文件，其他 OpenViking 记忆和导出/删除在 OpenViking Studio/CLI。
+MyFlow 提供“我的画像”、画像建议、onboarding 与“记忆管理”API；identity/soul 是项目内文件；`tools` / `skills` 记忆与导出仍在 OpenViking Studio/CLI。
 
 | 方法 | 路径 | scope | 说明 |
 |---|---|---|---|
 | GET | `/api/memory/profile` | `memory:read` | 返回 `{fields, etag, updated_at}`；行不存在返回空字段，不返回 404 |
-| PATCH | `/api/memory/profile` | `memory:write` | 部分更新字段；body 含 `fields` + `etag`；列表字段整列表替换 |
+| GET | `/api/memory/profile/schema` | `memory:read` | 返回全部受支持字段的 `path/label/group/kind/options/limits/explicit_only/placeholder`；前端按它渲染 |
+| PATCH | `/api/memory/profile` | `memory:write` | 部分更新字段；body 含 `fields` + `etag`；`null` 表示删除该字段；列表字段整列表替换 |
 | DELETE | `/api/memory/profile/{field_path}` | `memory:write` | 删除单个画像字段；body 含 `etag` |
 | DELETE | `/api/memory/profile` | `memory:write` | 清空整份画像；body 含 `etag`；写空模板常量 |
 | GET | `/api/memory/profile/suggestions` | `memory:read` | 返回当前用户 `status=pending`、未过期且 `profile_etag` 与当前 profile 一致的 `ProfileSuggestion[]` |
@@ -1776,6 +1937,12 @@ MyFlow 只提供“我的画像”、画像建议和 onboarding API；identity/s
 | POST | `/api/memory/profile/suggestions/{id}/dismiss` | `memory:write` | 只改本人 suggestion 状态，不删除源记忆 |
 | GET | `/api/memory/profile/onboarding` | `memory:read` | 返回 onboarding 状态与是否展示；active run 由网关 run store 判断 |
 | POST | `/api/memory/profile/onboarding` | `memory:write` | `seen` / `snooze` / `dismiss` / `completed` |
+| GET | `/api/memory/items/types` | `memory:read` | 六类记忆的中文名与顺序（`preferences`→偏好 …） |
+| GET | `/api/memory/items?type=&limit=` | `memory:read` | 过滤型 `find` 的列表：`{items:[{uri,name,folder,memory_type,abstract,abstract_truncated,updated_at}], has_more, limit}` |
+| GET | `/api/memory/items/detail?uri=` | `memory:read` | `overview` 渲染目录：`{uri,folder,memory_type,name,overview,toc:[{kind,title,depth,uri}],overview_missing}` |
+| GET | `/api/memory/items/content?uri=` | `memory:read` | `read` 正文：`{uri,content,sha256,size_bytes}` |
+| PUT | `/api/memory/items/content` | `memory:write` | body `{uri,content,expected_sha256}`；`write(edit_source=manual)`；冲突 409 `memory_conflict` |
+| DELETE | `/api/memory/items?uri=` | `memory:write` | `rm(recursive=False)`；只删具体记忆文件，sidecar 不可删 |
 | GET | `/api/admin/memory/status` | `admin` | 仅运维：health、degraded、stream backlog、missing turn_end 数 |
 | POST | `/api/admin/memory/flush` | `admin` | body 必带 `user_id + thread_id`，执行 flush |
 
@@ -1783,7 +1950,7 @@ MyFlow 只提供“我的画像”、画像建议和 onboarding API；identity/s
 
 旧接口：
 
-- 除 profile 相关路径外的 `/api/memory/*` → 410 Gone；包括 personalization、identity、soul、items、types、changes、pending、skill-candidates。
+- 除 profile 与 `/items*` 记忆管理路径外的 `/api/memory/*` → 410 Gone；包括 personalization、identity、soul、changes、pending、skill-candidates。
 - v1 BaseStore 路由与 v2 canonical 路由一并移除；不再保留记忆工作台。
 
 ### 8.3 SDK 调用映射
@@ -1800,8 +1967,14 @@ MyFlow 只提供“我的画像”、画像建议和 onboarding API；identity/s
 | 读正文 | `read` |
 | 列目录 | 仅运维/诊断使用；`before_agent` 不再调用 `ls` 取记忆索引 |
 | profile 表单 | PostgreSQL `memory_profile_documents`，不经 SDK |
+| 记忆管理列表 | `find(query="", target_uri=[memories/<type>], filter={context_type:memory}, level=[2])`（过滤型查询，无相似度打分） |
+| 记忆详情目录 | `overview(folder_uri)`；缺失时 `ls(folder_uri)` 降级 |
+| 记忆正文 | `read(file_uri)` |
+| 记忆编辑 | `write(file_uri, content, mode="replace", options={"edit_source":"manual"})` |
+| 记忆删除 | `rm(file_uri, recursive=False)` |
 | identity / soul | 项目文件：`config/personalization/identity.md` / `soul.md`，不经 SDK |
-| 其他 OpenViking 记忆编辑/导出 | 不在 MyFlow 内提供；由 OpenViking Studio/CLI 完成 |
+| 记忆管理（六类自动记忆） | `/api/memory/items`：`find` 列表、`overview` 目录、`read` 正文、`write` 编辑、`rm` 删除 |
+| `tools` / `skills` 记忆与导出 | 不在 MyFlow 内提供；由 OpenViking Studio/CLI 完成 |
 | 健康 | `health` |
 
 ### 8.4 错误映射
@@ -1819,46 +1992,55 @@ MyFlow 只提供“我的画像”、画像建议和 onboarding API；identity/s
 | `FailedPreconditionError` | 409 | 上一个 archive 失败；走 runbook |
 | `InvalidArgumentError` | 422 | 请求/配置校验失败 |
 | 工具内 invalid memory_type / URI | tool error | 内部工具返回结构化错误，不使用 HTTP 422 |
+| 工具内 `update_user_profile` 字段/值非法 | tool error | `invalid_field` / `invalid_value`；消息带允许值列表，不写任何字段 |
+| 工具内 `update_user_profile` etag 冲突（重试后） | tool error | `profile_update_failed`；不覆盖并发表单写入 |
+| 记忆管理：URI 越权 / sidecar / 目录 / 非 `.md` | 422 `invalid_memory_uri` | 不触达 OpenViking；消息说明允许范围 |
+| 记忆管理：`expected_sha256` 不一致 | 409 `memory_conflict` | 返回当前 `sha256`，前端提示刷新后再改 |
+| 记忆管理：目标记忆不存在 | 404 `memory_not_found` | 前端刷新列表，不重试 |
+| 记忆管理：开关关闭或运行时缺失 | 503 `memory_unavailable` | 页面提示“长期记忆未启用” |
+| 记忆管理：OpenViking 读取失败 | 503 `memory_unavailable` | 保留上次内容 + 重试按钮；不做本地缓存 |
 
 ## 9. 前端改造
 
 ### 9.1 我的画像入口
 
-- 左侧导航保留“我的画像”，路由 `/workspace/profile`；
+- 左侧导航保留“我的画像”（`/workspace/profile`），新增“记忆管理”（`/workspace/memory`）；
 - `/workspace` 空状态（新用户、没有 thread）显示可关闭的“完善画像”卡片，点击进入 `/workspace/profile`；
-- 不再有“记忆管理”“个性化”“待确认记忆”入口；
-- 页面只编辑 `profile`，不展示 identity/soul 以及其他记忆类型；
+- 不再有“个性化”“待确认记忆”入口；
+- 我的画像页只编辑 `profile`，不展示 identity/soul；六类自动记忆在“记忆管理”页（§9.5）；
 - 页面不使用 raw Markdown 编辑器，只使用结构化表单。
 
 ### 9.2 我的画像表单
 
-字段分组沿用 §4.4：
+字段清单与控件全部来自 `GET /api/memory/profile/schema`（§4.4）：
 
-| 分组 | 控件 |
+| 分组 | 控件（按 spec 的 `kind`） |
 |---|---|
-| 身份 | 称呼、代词、地区、时区 |
-| 沟通 | 语言、语气、详细程度、输出格式 |
-| 工作 | 角色、领域、工具、专长 |
-| 无障碍 | 需求 |
-| 边界 | 多条文本 |
+| 身份 | 称呼 `text`、地区 `locale` |
+| 沟通 | 语言 `language` 下拉、语气 `choice`、详细程度 `choice`、输出格式 `multi_choice` |
+| 工作 | 角色 `text`、领域 `string_list`、工具 `string_list`、专长 `choice` |
+| 无障碍 | 需求 `string_list` |
+| 边界 | 边界 `string_list` |
 
-交互：
+交互（2026-11-02 修订）：
 
-- 空状态：显示“还没有填写画像”，不报错；
-- 读取 `GET /api/memory/profile`，填充表单；
-- 修改后 `PATCH /api/memory/profile`，提交 `fields + etag`；列表字段用多值 tag 控件，不能把逗号当分隔符；
-- 单个字段的“删除”调用 `DELETE /api/memory/profile/{field_path}`，body 带 `etag`；
-- “清空画像”调用 `DELETE /api/memory/profile`，body 带 `etag`；
-- 409 提示“画像已被其他操作更新，请刷新后重试”；
-- 保存成功后重新拉取，展示更新时间；
+- **始终展示全部 12 个字段**，分 5 组排列；没有值的字段渲染空白控件，不显示“还没有填写画像”空状态；
+- 页面加载并行请求 `GET /api/memory/profile` 与 `GET /api/memory/profile/schema`，用 schema 预填表单；
+- 用户改完点一次“保存”：只提交**与预填值不同的字段**；清空的字段提交 `null`；列表字段整列表提交；
+- 保存走 `PATCH /api/memory/profile`，body 为 `{fields, expected_revision}`（或 `etag`）；成功后用响应重填表单，
+  并清空“有未保存修改”的提示；
+- 顶部提供“撤销修改”（把表单还原成当前画像）与“清空画像”（`DELETE /api/memory/profile`，body 带 `etag`）；
+  不再提供单字段“删除”按钮——把字段清空后保存即可；
+- 409 提示“画像已被其他操作更新，请刷新后重试”，不自动覆盖；
+- 有未保存修改时离开页面要提示；保存中禁用重复提交；
 - profile 本身不展示 source/confidence/evidence_tier；这些是建议的元数据，不是用户输入项；
-- 页面文案不得再写“后续对话可以更新画像”；profile 只由用户在本页确认写入。
+- 页面文案改成“画像只由你在这里修改，或在你明确告诉我之后由助手帮你更新”，不再写“后续对话可以自动更新画像”。
 
 Onboarding 卡片：
 
 - profile 非空字段数 `< 2`、未 completed/dismissed、不在 snooze 期且没有 active run 时显示；
 - 只在 `/workspace/profile` 顶部和 `/workspace` 空状态出现；
-- 可保存、`稍后`（7 天）、`不再提醒`；
+- 卡片只保留 `稍后`（7 天）与 `不再提醒` 两个动作；填写就在页面下方的完整表单里完成，卡片不再内嵌快捷表单；
 - 不弹出 modal、不写入聊天消息、不阻塞发送。
 
 画像建议：
@@ -1866,26 +2048,56 @@ Onboarding 卡片：
 - onboarding 未完成时先不显示建议；
 - onboarding 完成或已有基础 profile 后，在表单下方显示“发现可能的画像信息”；
 - 每条建议展示 field、value、evidence quote、来源 URI，并明确标注“建议，尚未写入”；
-- 操作：`接受` / `修改后接受` / `忽略`；敏感字段（称呼/代词/无障碍/边界）必须在二次确认弹窗中展示 evidence 后才能接受；
+- 操作：`接受` / `修改后接受` / `忽略`；敏感字段（称呼/无障碍/边界）必须在二次确认弹窗中展示 evidence 后才能接受；
 - 接受走 `POST /api/memory/profile/suggestions/{id}/accept`，body 必带当前 `etag`；忽略走 `dismiss`；
 - 建议只在打开页面时按需拉取，不进入聊天上下文。
 
 ### 9.3 identity / soul 与其他记忆
 
 - `identity.md` / `soul.md` 是项目文件，不在 MyFlow 前端展示或编辑；修改走项目 PR/发布；
-- 除 profile 外的 OpenViking 记忆（preferences/entities/events/cases/trajectories/experiences/tools/skills）不在 MyFlow 前端展示或编辑；
-- OpenViking 记忆统一由 OpenViking Studio 或 `ov` CLI 管理；
-- MyFlow 只保留可选的**管理员/运维入口链接** `openviking.studio_url`，不嵌入记忆表格、不代理内容；
-- 普通终端用户默认没有 MyFlow 内的 identity/soul 或其他记忆管理入口；
+- 六类自动记忆在“记忆管理”页查看/编辑/删除（§9.5）；`tools` / `skills` 仍不在 MyFlow 前端展示；
+- MyFlow 只保留可选的**管理员/运维入口链接** `openviking.studio_url`，不嵌入 Studio 页面；
+- 普通终端用户没有 identity/soul 入口；记忆管理只代理当前认证用户自己的记忆，不暴露 `ov_user`；
 - 由于 MyFlow 使用 HMAC 后的 `ov_user`，普通用户直接登录 OpenViking Studio 需要额外的用户体系/SSO 映射；首版把 Studio 定为管理员/运维工具。
 
 ### 9.4 状态与移除清单
 
 - 仅管理员可通过 `GET /api/admin/memory/status` 查看 health、degraded、stream backlog、missing turn_end 数；该接口要求 `admin` scope；
 - 用户界面不展示记忆状态、最近 commit 或抽取进度；
-- 移除：`personalization-page`、`memory-library-page`、`memory-changes`、`pending-memory-page`、`skill-suggestions`；
-- `my-profile-page` 保留但重写为结构化表单；
-- 前端 API 客户端只保留 profile 相关方法，移除通用 memory 列表/编辑方法。
+- 移除：`personalization-page`、`memory-changes`、`pending-memory-page`、`skill-suggestions`；
+- `my-profile-page` 保留但重写为结构化表单；新增 `memory-library-page`（§9.5）；
+- 前端 API 客户端保留 profile 方法，并新增 `memory-items` 客户端（列表/详情/正文/编辑/删除），不引入第二套记忆缓存。
+
+### 9.5 记忆管理页（2026-11-02）
+
+路由 `/workspace/memory`，左侧导航“记忆管理”。布局：
+
+```text
+┌ 类型筛选（偏好 / 实体 / 事件 / 案例 / 轨迹 / 经验）───────────────┐
+├ 记忆列表（摘要）──────────────┬ 详情（overview 目录 + 正文）──────┤
+│ 类型标签 · 标题 · 摘要        │ 目录（.overview.md 渲染）         │
+│ 更新时间 · 仅显示前 N 条      │ 选中记忆正文 / 编辑器 + 保存/删除 │
+└───────────────────────────────┴──────────────────────────────────┘
+```
+
+交互：
+
+- 打开页面先请求 `GET /api/memory/items/types`，再按默认类型（`preferences`）请求列表；
+- 切换类型 = 重新请求列表并清空右侧详情；列表项只展示摘要（`abstract`），从不展示全文；
+- 点击列表项 → `GET /api/memory/items/detail?uri=<file>`：用返回的 `toc` 渲染目录；`toc` 里的 `link`
+  条目可点击，`heading` 条目只做分组标题；
+- 点击目录项 → `GET /api/memory/items/content?uri=<toc.uri>`，右侧用 Markdown 渲染正文；
+  同时缓存该次返回的 `sha256`；
+- “编辑”和“删除”永远作用于右侧**当前查看**的那条记忆（TOC 可能已把右侧切到同目录的兄弟记忆），
+  不是左侧列表最初选中的那条；
+- “编辑”把正文切到 textarea；保存 `PUT /api/memory/items/content`（`uri + content + expected_sha256`），
+  成功后用响应里的 `sha256` 更新本地状态并提示“已保存，摘要稍后由 OpenViking 刷新”；
+- “删除”二次确认后 `DELETE /api/memory/items?uri=...`，成功后刷新列表并清空右侧；
+- 目录里的 `.abstract.md` / `.overview.md` 不会出现在 `toc` 中，也没有任何删除/编辑按钮；
+- 空列表显示“这个类型还没有记忆”，不是错误；`has_more` 时显示“仅显示前 N 条”；
+- 503 `memory_unavailable`：整页显示“长期记忆未启用或暂不可用”，保留重试按钮；
+- 409 `memory_conflict`：提示“这条记忆已被更新，请重新打开后再改”，不自动覆盖；
+- 页面不做全文搜索、不做跨类型混合列表、不提供新建记忆。
 
 ## 10. 旧数据边界
 
@@ -2204,6 +2416,21 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - `MemoryFacade` 错误映射；
 - `memory_types` 配置包含全部启用类型；`tools`/`skills` 模板启用校验；
 - `ProfileService` DB profile 解析/重建、字段校验、etag 冲突、删除字段/清空；
+- `update_fields()` 读 etag 后 CAS、冲突重读重试一次、二次冲突报错不覆盖；
+- `profile_schema` 是唯一字段来源：`validate_profile_value` 与 spec 一致（枚举/长度/列表项/语言标签/密钥扫描）、
+  schema 路由覆盖全部字段且顺序稳定；
+- `update_user_profile` 工具：成功/未知字段/非法值（含允许值提示）/敏感值拒绝/`null` 清空/缺用户/持久层异常，
+  以及 description 里必须存在的中文触发词与“不要推断/不要写敏感值”约束；
+- 工具注册：profile 服务存在时 lead agent 拿到 `update_user_profile`（`memory.openviking.enabled=false` 也一样），
+  子代理拿不到；没有 profile 服务时不注册；
+- 前端全字段表单：12 个字段全渲染、空值渲染空控件、只提交变化字段、清空提交 `null`、409 提示与撤销；
+- 记忆管理服务：过滤型 `find` 的 target/filter/level 参数、摘要截断、按 URI 排序、`has_more`；
+- 记忆管理 URI 白名单：`~`/`..`/编码穿越、跨用户、非六类、非 `.md`、目录、`.abstract.md`/`.overview.md` 全部拒绝；
+- 记忆管理详情：`overview` 解析成 `toc`（标题层级 + 链接解析）；缺 overview 时用 `ls` 降级；
+- 记忆管理写：`expected_sha256` 一致才 `write(edit_source=manual)`；不一致 409；内容超长/空 422；
+- 记忆管理删：`rm(recursive=False)`；先读再删；删除后 404 处理；
+- 记忆管理路由：scope（`memory:read`/`memory:write`）、CSRF、开关关闭 503、IDOR 404；
+- 记忆管理前端：类型筛选、摘要列表、TOC 点击加载正文、编辑保存、删除确认、sidecar 无入口、409/503 文案；
 - `PersonalizationService` 读 DB profile + 本地 identity/soul、缓存命中/失效、`include_empty_fields=false` 时不注入空字段、token 截断；
 - `_build_soul_section()` 渲染 identity/soul 到系统提示，缺文件时不崩溃且不产生空 section；
 - identity/soul 文件变更通过 `personalization_digest` 使装配缓存失效；profile 每轮按 DB etag 重读/刷新缓存；
@@ -2226,7 +2453,7 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - onboarding 只在 profile 页/workspace 空状态出现，不阻塞聊天；
 - 画像建议接受后写入 profile，忽略后 TTL 内不再出现；
 - profile 表单可修改/删除字段，清空后 GET 返回空 profile（不是 404）；
-- identity/soul 只能通过代码仓库 PR 修改，Profile 之外的其他记忆由管理员通过 OpenViking Studio/CLI 查看修改；
+- identity/soul 只能通过代码仓库 PR 修改；六类自动记忆在记忆管理页查看/编辑/删除，`tools` / `skills` 仍由管理员通过 OpenViking Studio/CLI 处理；
 - 一次包含 lead 工具调用/ToolMessage 的 turn 经 sharded MemoryCaptureStream 能产生 cases/trajectories/experiences/tools/skills 记忆；子代理内部步骤不在本设计抓取范围内；
 - 纯招呼/告别/致谢不投递消息流、不 append；告别只投递无消息的 SESSION_END control event；
 - “可以/继续/好了/完成”进入 CAPTURE；“好了/完成”由 worker commit；
@@ -2249,11 +2476,12 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - 纯招呼/告别/致谢轮次后 OpenViking `message_count` 不增加，且不产生消息流记录；告别仅产生无消息的 SESSION_END control event；
 - 自动抽取落 preferences / entities / events / cases / trajectories / experiences / tools / skills 八类内置类型；`profile` 由结构化表单写入 `memory_profile_documents`，`identity`/`soul` 是 `config/personalization/` 下的项目文件；三者不由 MyFlow 启用/写入 OpenViking；
 - `agent_evolution.enabled=true`，`tools`/`skills` 内置模板已启用；
-- MyFlow 前端只提供“我的画像”结构化表单/建议/onboarding，不展示 identity/soul 与其他记忆；
-- profile 表单可修改字段、删除字段、清空画像；
+- MyFlow 前端提供“我的画像”结构化表单/建议/onboarding 与“记忆管理”页（六类），不展示 identity/soul；
+- profile 表单始终展示全部受支持字段，空白字段可直接填写并一次保存；
+- 内置工具 `update_user_profile` 只在用户显式陈述画像信息时写入，冲突不覆盖表单；
 - onboarding 不阻塞聊天，建议接受后才写 profile；敏感字段必须二次确认；
 - 新建用户的 profile 由种子模板写入 DB，identity/soul 随代码仓库存在；
-- 除 profile 外的其他 OpenViking 记忆与导出/删除统一由 OpenViking Studio/CLI 承担；
+- 六类自动记忆的查看/编辑/删除由记忆管理页承担；`tools` / `skills` 与导出仍由 OpenViking Studio/CLI 承担；
 - 语义 commit 的原因可在 `memory_sync_state`/run event 中查到；
 - 用户 A 检索不到用户 B；
 - 删除后检索不到；
@@ -2266,6 +2494,26 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - **当前无旧数据，不做迁移/回滚**；P5 删除旧表前必须完成旧表计数为 0 + 备份；
 - P95：profile 读取+注入 < 120ms（无 OpenViking 调用），`before_agent` 总预算 < 1s，after_agent 入队 < 50ms，工具搜索 < 2s；
 - OpenViking/Redis 不可用时聊天不 500。
+
+### 13.5 实现记录（2026-11-02 画像表单、写入工具与记忆管理）
+
+- 字段唯一来源：新增 `agentkit/agents/memory/profile_schema.py`（12 个 `ProfileFieldSpec` + 校验）；
+  `agentkit/agents/memory/types.py` 保留旧导出名，避免调用点大改；列表项也做密钥/脱敏标记扫描。
+- HTTP：新增 `GET /api/memory/profile/schema`；`PATCH /api/memory/profile` 支持 `null` 删除字段。
+- 工具：新增 `update_user_profile`（`openviking/profile_tools.py`），description 由 schema 生成，
+  含调用/不调用门槛与全部字段清单；写入走 `ProfileService.update_fields()`（读 etag + 冲突重读一次）。
+  provider 钩子由网关 lifespan 在两种模式下都安装（`memory.openviking.enabled` 开关不影响它）。
+- 前端：`my-profile-page.tsx` 重写为 schema 驱动的 14 字段表单（分组、空白、一次保存、撤销、清空）；
+  草稿按画像 etag 打戳，保存成功后自动回落到服务端新值，不在 effect 里 setState。
+- 字段收敛：`identity.pronouns` / `identity.timezone` 从 schema、表单、工具描述与种子模板移除；
+  `identity` 组只剩称呼与地区。旧行里的同名 frontmatter 键解析时被忽略、下次写入时丢弃。
+- 记忆管理（2026-11-02）：`openviking/library.py` 提供列表（过滤型 `find`）、详情（`overview` 解析 TOC、
+  缺 sidecar 时 `ls` 降级）、正文（`read` + sha256）、编辑（`write(edit_source=manual)` + 乐观并发）与
+  删除（`rm(recursive=False)`）；URI 白名单与 sidecar 保护在服务层强制。`/api/memory/items*` 六个
+  接口挂在 `/api`；前端新增 `/workspace/memory` 与侧栏入口，侧栏高亮按前缀判断。
+- 测试：`test_profile_schema.py`、`test_openviking_profile_tools.py`、`test_profile_assembly.py`、
+  `test_openviking_library.py`、`test_memory_items_routes.py`、`memory-library-page.dom.test.tsx` 新增；
+  后端全量 **2193 passed, 6 skipped**；前端 **325 passed**，typecheck/lint/build 通过。
 
 ## 14. 分阶段交付
 
@@ -2285,8 +2533,8 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 | AGPL | 法律合规 | 法务评估；备选 HTTP-only/商业授权 |
 | 原始 transcript 留存 | 隐私/合规 | 30 天 retention；必要时抽取后删 session |
 | 无 pending_review | 错误记忆直接生效 | 通过 OpenViking Studio/CLI 事后处理；MyFlow 不做审批门 |
-| profile 不自动抽取 | 新用户画像为空，需要用户主动填写 | onboarding + 持久化 ProfileSuggester；不注入 preferences/entities 索引，用户需要时用 memory_search |
-| MyFlow 只能修正 profile | identity/soul 以及其他自动抽取类型抽错后无法在前端修正 | 通过 OpenViking Studio/CLI 处理；需要用户自助时再做身份/SSO 映射与受控编辑 |
+| profile 不自动抽取 | 新用户画像为空，需要用户主动填写 | onboarding + 全字段表单 + 显式陈述时由 `update_user_profile` 写入 + 持久化 ProfileSuggester；不注入 preferences/entities 索引 |
+| 记忆抽错 | 六类自动记忆抽错时需要可修正 | 记忆管理页直接编辑/删除具体记忆；identity/soul 仍是项目文件，`tools`/`skills` 走 Studio/CLI |
 | tools/skills 默认 disabled | 配置漏了模板启用，`memory_types` 校验失败或抽取为空 | 部署检查：自定义模板加载日志 + `memory_types` 校验（P1-5） |
 | Agent Evolution 成本 | cases/trajectories/experiences 增加抽取调用和存储 | 只在需要的 workspace 启用；监控 task 时长/成本；保留关闭开关 |
 | ToolPart 隐私 | 工具输入/输出可能含密钥/PII | 只写有界摘要/hash；统一脱敏；禁止原始输出（P1-8） |
@@ -2372,13 +2620,35 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - `frontend/src/core/api/profile.ts`
 - `frontend/src/components/profile/profile-onboarding-card.tsx`
 - `frontend/src/components/profile/profile-suggestions.tsx`
+- `agentkit/agents/memory/profile_schema.py`（`ProfileFieldSpec` + `validate_profile_value`，字段的唯一来源）
+- `.../openviking/library.py`（`MemoryLibraryService`：列表/详情/正文/编辑/删除 + URI 白名单）
+- `backend/app/gateway/routers/memory_items.py`（记忆管理 HTTP 面）
+- `frontend/src/core/api/memory-items.ts`（列表/详情/正文/保存/删除客户端）
+- `frontend/src/app/workspace/memory/page.tsx` + `frontend/src/components/memory/memory-library-page.tsx`
+- `backend/tests/test_openviking_library.py`、`backend/tests/test_memory_items_routes.py`
+- `frontend/src/components/memory/memory-library-page.dom.test.tsx`
+- `.../openviking/profile_tools.py`（`update_user_profile` 工具 + profile updater provider 钩子）
+- `frontend/src/components/profile/profile-fields-form.tsx`（schema 驱动的全字段表单）
+- `backend/tests/test_openviking_profile_tools.py`
+- `backend/tests/test_profile_schema.py`
 - `backend/tests/test_memory_openviking_*.py`
 
 ### 改造
 
 - `agentkit/config/memory_config.py`（移除 task_classifier/vector_store/langmem 字段；新增 shard/dedup/missing-turn-end/suggester 配置）
 - `agentkit/agents/middlewares/memory_middleware.py`（before gate + per-message publisher + epoch）
+- `agentkit/agents/memory/types.py`（保留对外导出；校验逻辑收敛到 `profile_schema.py`）
+- `agentkit/agents/memory/openviking/profile.py`（新增 `update_fields()`：读 etag + CAS 重试一次）
 - `agentkit/agents/memory/tools.py`（search/read/overview/remember）
+- `agentkit/agents/leader_agent/agent.py`（注册 `update_user_profile`：有 profile 服务就装，与 memory 开关解耦）
+- `backend/app/gateway/app.py`（启动时配置 profile updater provider；关闭/失败时清空）
+- `backend/app/gateway/routers/openviking_profile.py`（新增 `GET /api/memory/profile/schema`）
+- `backend/app/gateway/app.py`（挂载 `memory_items` 路由；复用 OpenViking runtime 依赖）
+- `backend/app/gateway/deps.py`（记忆管理服务依赖；开关关闭时给 503）
+- `frontend/src/components/workspace/sidebar.tsx` + `sidebar-container.tsx`（新增“记忆管理”入口与高亮）
+- `backend/tests/test_m3_routes.py`（路由清单增加六个记忆管理接口）
+- `frontend/src/core/api/memory.ts`（`getProfileSchema` + `ProfileFieldSpec` 类型）
+- `frontend/src/components/profile/my-profile-page.tsx`（14 字段全量表单；移除空状态与单字段增删）
 - `agentkit/agents/middlewares/assembly.py`（移除 task classifier / summarization hook；MemoryMiddleware 顺序）
 - `agentkit/agents/leader_agent/agent.py`（`AgentCacheKey` 增加 `personalization_digest`）
 - `agentkit/client.py`（在 `agent_cache_key` 前计算 `personalization_digest`，否则缓存键不会变化）

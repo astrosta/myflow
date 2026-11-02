@@ -387,6 +387,23 @@ class KnowledgeDocumentListResponse(BaseModel):
     count: int
 
 
+class KnowledgeChunkResponse(BaseModel):
+    chunk_id: str
+    chunk_index: int
+    section: str = ""
+    page: int = 0
+    content: str
+    #: Set for children of the parent-child strategy; empty for flat chunks.
+    parent_id: str = ""
+
+
+class KnowledgeChunksResponse(BaseModel):
+    document_id: str
+    chunks: list[KnowledgeChunkResponse]
+    count: int
+    next_offset: int | None = None
+
+
 class KnowledgeUploadResponse(BaseModel):
     documents: list[KnowledgeDocumentResponse]
     count: int
@@ -399,6 +416,7 @@ class KnowledgeSearchHitResponse(BaseModel):
     section: str
     page: int
     chunk_index: int
+    parent_id: str = ""
     score: float
     knowledge_base_id: str
     knowledge_base_name: str

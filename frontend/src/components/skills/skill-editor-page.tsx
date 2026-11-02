@@ -34,6 +34,9 @@ const draftKey = (skillId: string) => ["skills", "draft", skillId] as const;
 
 type Busy = "save" | "submit" | "withdraw" | "delete" | "upload" | null;
 
+const DELETE_PENDING_MESSAGE = "审核中，请先撤回审核，再删除草稿。";
+const SUBMIT_UNSAVED_MESSAGE = "技能尚未保存，请先保存，再提交审核。";
+
 /** 接口错误给一句人读的话；409 是审核流程里最常见的一种，单独说清楚。 */
 function readableError(error: unknown): string {
   if (error instanceof SkillApiError) {
@@ -44,6 +47,18 @@ function readableError(error: unknown): string {
   }
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+/** 提交审核的 409 不一定是“已有待审”：新草稿没保存过也会冲突。 */
+function readableSubmitError(error: unknown): string {
+  if (
+    error instanceof SkillApiError &&
+    error.status === 409 &&
+    error.detail.toLowerCase().includes("no saved version")
+  ) {
+    return SUBMIT_UNSAVED_MESSAGE;
+  }
+  return readableError(error);
 }
 
 function MetaItem({ label, value }: { label: string; value: string }) {
@@ -158,13 +173,19 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
 
   const submit = async () => {
     if (busy || pending) return;
+    // 新草稿还没有任何版本时，服务端必然拒绝；先把原因说清楚，不白跑一次请求。
+    if (!lastVersion?.version_id && !draft?.skill.version_id) {
+      setNotice(null);
+      setActionError(SUBMIT_UNSAVED_MESSAGE);
+      return;
+    }
     begin("submit");
     try {
       await submitSkill(skillId);
       await invalidateDraft();
-      setNotice("已提交审核");
+      router.push("/workspace/skills");
     } catch (cause) {
-      setActionError(readableError(cause));
+      setActionError(readableSubmitError(cause));
     } finally {
       setBusy(null);
     }
@@ -186,13 +207,22 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
 
   const remove = async () => {
     if (busy) return;
+    if (pending) {
+      setNotice(null);
+      setActionError(DELETE_PENDING_MESSAGE);
+      return;
+    }
     begin("delete");
     try {
       await deleteSkill(skillId);
       await queryClient.invalidateQueries({ queryKey: ["skills", "mine"] });
       router.push("/workspace/skills");
     } catch (cause) {
-      setActionError(readableError(cause));
+      setActionError(
+        cause instanceof SkillApiError && cause.status === 409
+          ? DELETE_PENDING_MESSAGE
+          : readableError(cause),
+      );
       setBusy(null);
     }
   };

@@ -18,7 +18,7 @@ export interface SkillEditorActionsProps {
  * 其余按钮的忙碌态由页面统一管理，避免两个请求同时在飞。
  *
  * 审核中时保存和提交都禁用：后端要求先撤回，前端提前把路堵上，别让用户
- * 点完才看到 409。撤回只在这个状态下出现。
+ * 点完才看到 409。删除也跳过确认框，由页面提示先撤回；撤回只在这个状态下出现。
  */
 export function SkillEditorActions({
   pending,
@@ -73,8 +73,15 @@ export function SkillEditorActions({
         <Button
           className="ml-auto"
           disabled={!idle}
-          onClick={() => setConfirmingDelete(true)}
+          onClick={() => {
+            if (pending) {
+              onDelete();
+              return;
+            }
+            setConfirmingDelete(true);
+          }}
           size="sm"
+          title={pending ? "审核中，请先撤回审核再删除草稿" : undefined}
           type="button"
           variant="danger"
         >

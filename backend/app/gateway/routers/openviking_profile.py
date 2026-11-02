@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agentkit.agents.memory.openviking.onboarding import OnboardingService
 from agentkit.agents.memory.openviking.profile import ProfileConflict, ProfileService
+from agentkit.agents.memory.profile_schema import PROFILE_FIELD_SPECS, ProfileFieldSpec
 from agentkit.agents.memory.openviking.suggestions import (
     ProfileSuggester,
     ProfileSuggestion,
@@ -73,6 +74,33 @@ class ProfileResponse(BaseModel):
     etag: str
     updated_at: str
     fields: dict[str, ProfileFieldResponse] = Field(default_factory=dict)
+
+
+class ProfileFieldOptionResponse(BaseModel):
+    value: str
+    label: str
+
+
+class ProfileFieldSpecResponse(BaseModel):
+    path: str
+    label: str
+    group: str
+    group_label: str
+    kind: str
+    description: str
+    placeholder: str = ""
+    options: list[ProfileFieldOptionResponse] = Field(default_factory=list)
+    max_length: int
+    max_items: int
+    item_max_length: int
+    explicit_only: bool
+
+
+class ProfileSchemaResponse(BaseModel):
+    """Every supported profile field; the form is rendered from this payload."""
+
+    schema_version: int = 1
+    fields: list[ProfileFieldSpecResponse]
 
 
 class PendingPage(BaseModel):
@@ -152,6 +180,26 @@ def _suggestion_response(item: ProfileSuggestion) -> SuggestionResponse:
         status=item.status,
         profile_etag=item.profile_etag,
         expires_at=item.expires_at,
+    )
+
+
+def _field_spec_response(spec: ProfileFieldSpec) -> ProfileFieldSpecResponse:
+    return ProfileFieldSpecResponse(
+        path=spec.path,
+        label=spec.label,
+        group=spec.group,
+        group_label=spec.group_label,
+        kind=spec.kind,
+        description=spec.description,
+        placeholder=spec.placeholder,
+        options=[
+            ProfileFieldOptionResponse(value=option.value, label=option.label)
+            for option in spec.options
+        ],
+        max_length=spec.max_length,
+        max_items=spec.max_items,
+        item_max_length=spec.item_max_length,
+        explicit_only=spec.explicit_only,
     )
 
 
@@ -306,6 +354,23 @@ async def get_profile(
     service: Annotated[ProfileService, Depends(get_openviking_profile_service)],
 ) -> ProfileResponse:
     return _response(await service.get_snapshot(_user_id(caller)))
+
+
+@router.get("/profile/schema", response_model=ProfileSchemaResponse)
+async def get_profile_schema(
+    request: Request,
+    caller: Annotated[RunCaller, Depends(require_scope("memory:read"))],
+) -> ProfileSchemaResponse:
+    """The bounded profile schema; the page renders all fields from it.
+
+    This endpoint is static, so it works even before the caller has a profile row
+    and regardless of the OpenViking switch.
+    """
+
+    del request, caller
+    return ProfileSchemaResponse(
+        fields=[_field_spec_response(spec) for spec in PROFILE_FIELD_SPECS]
+    )
 
 
 @router.patch("/profile", response_model=ProfileResponse)

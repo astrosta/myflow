@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { BookOpenIcon, SettingsIcon, ToolIcon, UserIcon } from "@/components/ui/icons";
+import { BookOpenIcon, MemoryIcon, SettingsIcon, ToolIcon, UserIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { ThreadSummary } from "@/core/types";
 import { cn, formatTimestamp } from "@/lib/utils";
@@ -57,6 +57,8 @@ export interface SidebarProps {
   reviewActive?: boolean;
   /** 当前是否在「我的画像」 */
   profileActive?: boolean;
+  /** 当前是否在「记忆管理」 */
+  memoryActive?: boolean;
   /**
    * 当前会话是不是管理员；只决定要不要画「审核」入口。
    *
@@ -79,6 +81,7 @@ export function Sidebar({
   skillsActive = false,
   reviewActive = false,
   profileActive = false,
+  memoryActive = false,
   isAdmin = false,
   className,
 }: SidebarProps) {
@@ -138,6 +141,14 @@ export function Sidebar({
         >
           <UserIcon className="shrink-0" size={15} />
           我的画像
+        </Link>
+        <Link
+          aria-current={memoryActive ? "page" : undefined}
+          className={navItemClass(memoryActive)}
+          href="/workspace/memory"
+        >
+          <MemoryIcon className="shrink-0" size={15} />
+          记忆管理
         </Link>
         {/**
          * 「审核」只对管理员画出来：普通用户看不到这个链接。

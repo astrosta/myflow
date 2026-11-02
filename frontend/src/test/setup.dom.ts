@@ -6,6 +6,15 @@
  */
 
 if (typeof window !== "undefined") {
+  // happy-dom 没有实现 compatMode，而 KaTeX 在非 standards 模式下会直接
+  // 拒绝渲染。浏览器里的文档一直是 CSS1Compat；测试环境补上同一个事实。
+  if (document.compatMode !== "CSS1Compat") {
+    Object.defineProperty(document, "compatMode", {
+      configurable: true,
+      value: "CSS1Compat",
+    });
+  }
+
   if (!window.matchMedia) {
     window.matchMedia = ((query: string) => ({
       matches: false,

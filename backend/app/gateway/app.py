@@ -16,6 +16,7 @@ from agentkit.agents.memory.openviking.profile import render_profile_prompt
 from agentkit.agents.memory.openviking.profile_prompt import (
     configure_profile_prompt_provider,
 )
+from agentkit.agents.memory.openviking.profile_tools import configure_profile_updater
 from agentkit.agents.memory.openviking.runtime import (
     OpenVikingMemoryRuntime,
     build_profile_services,
@@ -43,6 +44,7 @@ from backend.app.gateway.middleware.trace import TraceMiddleware
 from backend.app.gateway.routers import (
     artifacts,
     knowledge,
+    memory_items,
     mcp,
     models,
     openviking_admin,
@@ -109,6 +111,7 @@ def start_profile_services(
 
     if session_factory is None:
         configure_profile_prompt_provider(None)
+        configure_profile_updater(None)
         app.state.profile_service = None
         app.state.onboarding_service = None
         app.state.suggestion_service = None
@@ -125,6 +128,9 @@ def start_profile_services(
         )
 
     configure_profile_prompt_provider(prompt)
+    # 画像工具写的是同一行；这里显式装 provider，让 memory 开关关闭时也能记录
+    # 用户明确说出的称呼/语言。
+    configure_profile_updater(services.profile)
 
 
 async def stop_skill_runtime(app: FastAPI) -> None:
@@ -218,6 +224,7 @@ async def start_openviking_memory(
         )
 
     configure_profile_prompt_provider(prompt)
+    configure_profile_updater(runtime.profile)
     configure_openviking_memory(runtime)
     logger.info("OpenViking long-term memory runtime started")
     return runtime, redis
@@ -235,6 +242,7 @@ async def stop_openviking_memory(
         if redis is not None:
             await redis.aclose()
         configure_profile_prompt_provider(None)
+        configure_profile_updater(None)
         configure_openviking_memory(None)
         app.state.openviking_memory = None
         app.state.profile_service = None
@@ -308,6 +316,7 @@ async def lifespan(app: FastAPI):
                             )
                         if openviking_runtime is None:
                             configure_profile_prompt_provider(None)
+                            configure_profile_updater(None)
                             app.state.profile_service = None
                             app.state.onboarding_service = None
                             app.state.suggestion_service = None
@@ -402,6 +411,7 @@ def create_app(*, use_openviking_memory: bool | None = None) -> FastAPI:
     if use_openviking_memory is None:
         use_openviking_memory = openviking_memory_enabled()
     application.include_router(openviking_profile.router, prefix="/api")
+    application.include_router(memory_items.router, prefix="/api")
     if use_openviking_memory:
         application.include_router(openviking_admin.router, prefix="/api")
     # M9 §2.12：认证路由 prefix=/v1/auth，/api 同样加在这里。

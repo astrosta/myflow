@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -47,11 +48,20 @@ class OpenAICompatibleReranker:
         self._config = config
         self._client = client
         self._owns_client = client is None
+        # 知识库与技能的精排都会在子代理的隔离循环上跑：客户端必须按 loop 缓存。
+        self._loop_clients: weakref.WeakKeyDictionary[Any, httpx.AsyncClient] = (
+            weakref.WeakKeyDictionary()
+        )
 
     def _http(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._config.timeout_seconds)
-        return self._client
+        if self._client is not None:
+            return self._client
+        loop = asyncio.get_running_loop()
+        client = self._loop_clients.get(loop)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(timeout=self._config.timeout_seconds)
+            self._loop_clients[loop] = client
+        return client
 
     async def rerank(self, *, query: str, documents: Sequence[str]) -> list[RerankScore]:
         if not documents or not query.strip():
@@ -121,9 +131,17 @@ class OpenAICompatibleReranker:
         return scores
 
     async def aclose(self) -> None:
-        if self._owns_client and self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        if not self._owns_client:
+            return
+        clients = list(self._loop_clients.values())
+        self._loop_clients.clear()
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - closing a foreign loop's client may fail
+                logging.getLogger(__name__).debug(
+                    "rerank client close failed", exc_info=True
+                )
 
 
 def build_reranker(

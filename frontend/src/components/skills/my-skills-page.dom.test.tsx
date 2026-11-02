@@ -122,7 +122,7 @@ describe("我的技能页", () => {
     expect(screen.getByRole("button", { name: "新建技能" })).toBeTruthy();
   });
 
-  it("私有草稿行标出「私有」和状态「草稿」，并链到编辑器", async () => {
+  it("私有草稿行标出「私有」和状态「草稿」，编辑按钮与公共技能一致", async () => {
     mockedListMine.mockResolvedValue([
       makeSkill({ skill_id: "draft-1", name: "日报生成", scope: "private", status: "draft" }),
     ]);
@@ -134,8 +134,12 @@ describe("我的技能页", () => {
     expect(row).toBeTruthy();
     expect(row?.textContent).toContain("私有");
     expect(row?.textContent).toContain("草稿");
-    // 私有行本身就是进编辑器的入口
-    expect(row?.querySelector("a")?.getAttribute("href")).toBe("/workspace/skills/draft-1");
+    // 卡片本身不再是链接；编辑动作和公共技能一样放在右侧按钮里。
+    expect(row?.querySelector("a")).toBeNull();
+    expect(row?.querySelector("button")?.textContent).toBe("编辑");
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    await waitFor(() => expect(push).toHaveBeenCalledWith("/workspace/skills/draft-1"));
   });
 
   it("目录行标出「公共」，自己的公共技能给一个「编辑」动作：先 openDraft 再跳编辑器", async () => {
@@ -161,6 +165,112 @@ describe("我的技能页", () => {
 
     await waitFor(() => expect(mockedOpenDraft).toHaveBeenCalledWith("pub-1"));
     await waitFor(() => expect(push).toHaveBeenCalledWith("/workspace/skills/pub-1"));
+  });
+
+  it("旧网关不支持 scope=public 时回退到有效目录并过滤", async () => {
+    mockedListMine.mockResolvedValue([
+      makeSkill({
+        skill_id: "pub-1",
+        name: "已发布技能",
+        scope: "private",
+        status: "approved",
+        version_id: "ver-pub",
+        owner_user_id: "u-alice",
+      }),
+    ]);
+    mockedListCatalog
+      .mockRejectedValueOnce(
+        new SkillApiError(
+          422,
+          "invalid_request",
+          "query.scope: Input should be 'effective' or 'global'",
+          null,
+        ),
+      )
+      .mockResolvedValueOnce([
+        makeSkill({
+          skill_id: "pub-1",
+          name: "已发布技能",
+          scope: "private",
+          status: "approved",
+          version_id: "ver-pub",
+          owner_user_id: "u-alice",
+        }),
+        makeSkill({
+          skill_id: "pending-1",
+          name: "审核中的技能",
+          scope: "private",
+          status: "pending",
+          owner_user_id: "u-alice",
+        }),
+        makeSkill({
+          skill_id: "builtin-demo",
+          name: "内置样例",
+          scope: "builtin",
+          status: "builtin",
+          owner_user_id: null,
+          version_id: null,
+        }),
+      ]);
+
+    renderPage();
+
+    const row = (await screen.findByText("已发布技能")).closest("li");
+    expect(row?.textContent).toContain("公共");
+    expect(screen.getByText("内置样例")).toBeTruthy();
+    expect(screen.queryByText("审核中的技能")).toBeNull();
+    expect(screen.queryByText("我的草稿")).toBeNull();
+    expect(mockedListCatalog).toHaveBeenNthCalledWith(1, "public");
+    expect(mockedListCatalog).toHaveBeenNthCalledWith(2);
+  });
+
+  it("审核中的私有技能不会出现在公共技能中", async () => {
+    mockedListMine.mockResolvedValue([]);
+    mockedListCatalog.mockResolvedValue([
+      makeSkill({
+        skill_id: "pending-1",
+        name: "审核中的技能",
+        scope: "private",
+        status: "pending",
+        owner_user_id: "u-alice",
+      }),
+    ]);
+
+    renderPage();
+
+    await waitFor(() => expect(mockedListCatalog).toHaveBeenCalledWith("public"));
+    expect(screen.queryByText("审核中的技能")).toBeNull();
+    expect(screen.queryByText("公共技能")).toBeNull();
+  });
+
+  it("已通过审核的技能只出现在公共技能中", async () => {
+    mockedListMine.mockResolvedValue([
+      makeSkill({
+        skill_id: "pub-1",
+        name: "已发布技能",
+        scope: "private",
+        status: "approved",
+        version_id: "ver-published",
+        owner_user_id: "u-alice",
+      }),
+    ]);
+    mockedListCatalog.mockResolvedValue([
+      makeSkill({
+        skill_id: "pub-1",
+        name: "已发布技能",
+        scope: "public",
+        status: "approved",
+        version_id: "ver-published",
+        owner_user_id: "u-alice",
+      }),
+    ]);
+
+    renderPage();
+
+    const row = (await screen.findByText("已发布技能")).closest("li");
+    expect(row?.textContent).toContain("公共");
+    expect(row?.querySelector("button")?.textContent).toBe("编辑");
+    expect(screen.queryByText("我的草稿")).toBeNull();
   });
 
   it("不是自己的公共技能不给「编辑」", async () => {
@@ -219,11 +329,18 @@ describe("我的技能页", () => {
     const dialog = screen.getByRole("dialog", { name: "新建技能" });
     expect(dialog).toBeTruthy();
 
+    expect(screen.getByText("说明（必填）")).toBeTruthy();
+    const create = screen.getByRole("button", { name: "创建" }) as HTMLButtonElement;
+    expect(create.disabled).toBe(true);
+
     fireEvent.change(screen.getByLabelText("技能名称"), { target: { value: "周报助手" } });
+    expect(create.disabled).toBe(true);
+
     fireEvent.change(screen.getByLabelText("技能说明"), {
       target: { value: "把一周的记录整理成周报" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+    expect(create.disabled).toBe(false);
+    fireEvent.click(create);
 
     await waitFor(() =>
       expect(mockedCreate).toHaveBeenCalledWith({

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage
 
-from agentkit.agents.middlewares.subagent_limit_middleware import LIMIT_NOTICE, SubagentLimitMiddleware
+from agentkit.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
 from agentkit.config import (
     SUBAGENT_CONCURRENCY_CEILING,
     SubagentRuntimeConfig,
@@ -305,14 +305,29 @@ def test_the_real_lead_graph_compiles_with_the_limit_middleware(monkeypatch) -> 
     assert "tools" in nodes
 
 
-def test_the_assembly_leaves_subagents_out_when_disabled(monkeypatch) -> None:
+def test_the_assembly_leaves_subagents_out_when_the_client_disables_them(monkeypatch) -> None:
+    from agentkit.agents.leader_agent import assemble_agent
+
+    captured = _capture_assembly(monkeypatch)
+    assemble_agent(
+        {"configurable": {"subagent_enabled": False}},
+        app_config=make_app_config(),
+    )
+
+    assert captured["tools"] == []
+    assert not [m for m in captured["middleware"] if isinstance(m, SubagentLimitMiddleware)]
+
+
+def test_the_assembly_installs_task_by_default(monkeypatch) -> None:
+    """委派默认开启：检索工具已经移到子代理里，没有 task 就彻底失去检索能力。"""
+
     from agentkit.agents.leader_agent import assemble_agent
 
     captured = _capture_assembly(monkeypatch)
     assemble_agent({"configurable": {}}, app_config=make_app_config())
 
-    assert captured["tools"] == []
-    assert not [m for m in captured["middleware"] if isinstance(m, SubagentLimitMiddleware)]
+    assert [tool.name for tool in captured["tools"]] == ["task"]
+    assert [m for m in captured["middleware"] if isinstance(m, SubagentLimitMiddleware)]
 
 
 # ---------------------------------------------------------------- §10.3 剥调用
@@ -364,7 +379,10 @@ def test_extra_task_calls_are_dropped_not_reported() -> None:
     message = update["messages"][0]
     assert message.id == "ai-1", "同一个 id → add_messages 原地替换"
     assert [call["id"] for call in message.tool_calls] == ["call-1", "call-2"]
-    assert LIMIT_NOTICE in message.content
+    assert "额度已用尽" not in message.content
+    assert "本轮最多并行 2 个" in message.content
+    assert "还剩 4 次" in message.content
+    assert "do it" in message.content
     assert message.response_metadata.get("finish_reason") is None, "还有活要干，不能强制收尾"
 
 
@@ -389,7 +407,8 @@ def test_dropping_everything_forces_a_stop_and_leaves_a_visible_notice() -> None
     assert message.tool_calls == []
     assert message.additional_kwargs["tool_calls"] == []
     assert message.response_metadata["finish_reason"] == "stop"
-    assert LIMIT_NOTICE in message.content
+    assert "额度已用尽" in message.content
+    assert "以下任务未执行" in message.content
 
 
 def test_history_runs_do_not_consume_this_runs_budget() -> None:
@@ -519,6 +538,7 @@ def test_an_admission_failure_is_a_normal_failed_delegation(monkeypatch) -> None
     message = command.update["messages"][0]
 
     assert message.additional_kwargs["subagent_status"] == "failed"
-    assert "admission denied" in message.additional_kwargs["subagent_error"]
+    assert "rejected" in message.additional_kwargs["subagent_error"]
+    assert "不要立即重试" in message.additional_kwargs["subagent_error"]
     assert message.status == "error"
     assert command.update["delegations"][0]["status"] == "failed"

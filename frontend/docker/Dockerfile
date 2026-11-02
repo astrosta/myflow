@@ -26,7 +26,12 @@ WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@11.22.0 --activate
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+# registry.npmjs.org 在当前网络下会超时。锁文件里的 tarball 地址改到镜像源，
+# integrity 不变，frozen-lockfile 仍然有效。
+RUN sed -i 's#https://registry.npmjs.org/#https://registry.npmmirror.com/#g' pnpm-lock.yaml \
+    && pnpm config set fetch-retries 5 \
+    && pnpm config set fetch-timeout 300000 \
+    && pnpm install --frozen-lockfile
 
 # -----------------------------------------------------------------------------
 # builder：产出 .next/standalone（next.config.ts 里的 output: "standalone"）
@@ -48,7 +53,7 @@ COPY src ./src
 
 # Next 的 standalone 输出里不会带 public/，而 runner 阶段要 COPY 它。
 # 仓库暂时没有 public/，先建空的，避免 COPY 直接失败。
-RUN mkdir -p public && pnpm exec next build
+RUN mkdir -p public && ./node_modules/.bin/next build
 
 # -----------------------------------------------------------------------------
 # runner：只带 standalone 产物 + nginx
@@ -59,7 +64,8 @@ WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000 \
-    HOSTNAME=0.0.0.0
+    HOSTNAME=0.0.0.0 \
+    GATEWAY_UPSTREAM=myflow-gateway:8001
 
 # nginx 只在这里当反向代理用，不做任何缓存/压缩之外的活。
 RUN apk add --no-cache nginx \
@@ -76,7 +82,7 @@ COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
 # 完整替换 alpine 自带的 /etc/nginx/nginx.conf（§7.1 的 gzip 白名单、
 # §7.2 的 SSE 开关都在里面）
-COPY --chown=root:root docker/nginx.conf /etc/nginx/nginx.conf
+COPY --chown=root:root docker/nginx.conf /etc/nginx/nginx.conf.template
 
 USER nextjs
 
@@ -91,4 +97,4 @@ EXPOSE 2026
 # 拿不到 SIGTERM（docker 会在超时后 SIGKILL）。M9 要做优雅排空时再换 supervisor。
 # HOSTNAME / PORT 在这里再显式写一遍：docker 会给容器注入自己的 HOSTNAME（容器 ID），
 # 直接跑 `node server.js` 有绑到一个解析不了的名字上的风险。nginx 反代的是 127.0.0.1:3000。
-CMD ["sh", "-c", "HOSTNAME=0.0.0.0 PORT=3000 node server.js & for i in $(seq 1 50); do wget -q -O /dev/null http://127.0.0.1:3000/ && break; sleep 0.2; done; exec nginx -g 'daemon off;'"]
+CMD ["sh", "-c", "HOSTNAME=0.0.0.0 PORT=3000 node server.js & for i in $(seq 1 50); do wget -q -O /dev/null http://127.0.0.1:3000/ && break; sleep 0.2; done; case \"$GATEWAY_UPSTREAM\" in *[!A-Za-z0-9.:_-]*) echo \"invalid GATEWAY_UPSTREAM\" >&2; exit 1;; esac; sed \"s#__GATEWAY_UPSTREAM__#$GATEWAY_UPSTREAM#g\" /etc/nginx/nginx.conf.template > /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf -g 'daemon off;'"]

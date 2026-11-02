@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections.abc import Sequence
 from typing import Any
 
@@ -30,11 +31,21 @@ class OpenAICompatibleEmbedder:
         self._client = client
         self._owns_client = client is None
         self._counter = token_counter or ApproximateTokenCounter()
+        # 检索会在子代理的隔离循环上执行，gateway 主循环也在用同一个 embedder：
+        # httpx 客户端绑定创建它的 loop，所以按 running loop 各缓存一份。
+        self._loop_clients: weakref.WeakKeyDictionary[Any, httpx.AsyncClient] = (
+            weakref.WeakKeyDictionary()
+        )
 
     def _http(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._config.timeout_seconds)
-        return self._client
+        if self._client is not None:
+            return self._client
+        loop = asyncio.get_running_loop()
+        client = self._loop_clients.get(loop)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(timeout=self._config.timeout_seconds)
+            self._loop_clients[loop] = client
+        return client
 
     @property
     def dimensions(self) -> int:
@@ -135,6 +146,12 @@ class OpenAICompatibleEmbedder:
         return vectors
 
     async def aclose(self) -> None:
-        if self._owns_client and self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        if not self._owns_client:
+            return
+        clients = list(self._loop_clients.values())
+        self._loop_clients.clear()
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - closing a foreign loop's client may fail
+                logger.debug("embedding client close failed", exc_info=True)

@@ -159,7 +159,17 @@ export function useChat({
   // ---- 实时流 ----
   const stream = useStream<ThreadState>({
     assistantId,
-    threadId,
+    /**
+     * 这里必须传 `effectiveThreadId`，不能传 `threadId` 这个 prop。
+     *
+     * `useStream` 的 `threadId` 是**受控**的：只要 options 里带了这个键，
+     * SDK 就永远用它的值，不会用自己 `onThreadId` 之后记住的本地值。而新会话在
+     * 首轮结束前 prop 一直是 null（地址是 replaceState 换的，路由树不重挂载），
+     * 于是第二轮 submit 会**再建一个 thread**：用户以为还在同一个会话里，实际
+     * 消息跑到了新 thread 上。后端按 thread 派生 sandbox_id，新 thread 的
+     * sandbox 与前端折叠到的旧 sandbox 不同 → `Reducer conflict on "sandbox"`。
+     */
+    threadId: effectiveThreadId,
     client,
     /**
      * §3.3：用 SDK 自带的节流——"同一个宏任务内到达的更新先合并再通知 React"。

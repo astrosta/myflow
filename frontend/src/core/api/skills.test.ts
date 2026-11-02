@@ -7,6 +7,7 @@ import {
   createSkill,
   deleteDraftFile,
   listMySkills,
+  listSkills,
   openDraft,
   readDraftFile,
   uploadDraftFiles,
@@ -108,6 +109,33 @@ describe("skills author API contract", () => {
 
     expect((fetchMock.mock.calls[0] as [string])[0]).toBe("/api/skills/mine");
     expect(skills[0]?.skill_id).toBe("sk_1");
+  });
+
+  it("listSkills('public') asks only for the published catalog", async () => {
+    const fetchMock = stubFetch(jsonResponse({ skills: [SKILL] }));
+
+    await listSkills("public");
+
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe("/api/skills?scope=public");
+  });
+
+  it("listSkills maps a legacy filesystem category onto the catalog scope", async () => {
+    stubFetch(
+      jsonResponse({
+        skills: [
+          {
+            name: "pdf-tools",
+            description: "PDF 工具",
+            category: "public",
+            enabled: true,
+          },
+        ],
+      }),
+    );
+
+    const [skill] = await listSkills();
+
+    expect(skill?.scope).toBe("public");
   });
 
   it("readDraftFile encodes the path query parameter", async () => {

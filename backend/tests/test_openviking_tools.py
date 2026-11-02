@@ -6,6 +6,7 @@ import json
 
 import pytest
 from langchain.tools import ToolRuntime
+from pydantic import ValidationError
 
 from agentkit.agents.memory.openviking.contracts import MemoryHit
 from agentkit.agents.memory.openviking.tools import (
@@ -52,6 +53,24 @@ def runtime(context):
     )
 
 
+def test_memory_tools_document_their_arguments() -> None:
+    search = make_memory_search_tool(FakeFacade())
+    schema = search.args_schema.model_json_schema()
+    properties = schema["properties"]
+    assert "要回忆" in properties["query"]["description"]
+    assert "experiences" in properties["memory_types"]["description"]
+    assert "ISO-8601" in properties["since"]["description"]
+    assert "画像由系统单独注入" not in (search.description or "")
+
+    read = make_memory_read_tool(FakeFacade())
+    read_schema = read.args_schema.model_json_schema()
+    assert "uri" in read_schema["properties"]
+    assert read_schema["properties"]["uri"]["description"]
+
+    overview = make_memory_overview_tool(FakeFacade())
+    assert overview.args_schema.model_json_schema()["properties"]["uri"]["description"]
+
+
 @pytest.mark.asyncio
 async def test_search_tool_maps_hits_and_user() -> None:
     facade = FakeFacade()
@@ -75,7 +94,7 @@ async def test_search_tool_rejects_invalid_type_and_mixed_time_filter() -> None:
     facade = FakeFacade()
     tool = make_memory_search_tool(facade)
 
-    invalid = json.loads(
+    with pytest.raises(ValidationError, match="memory_types"):
         await tool.ainvoke(
             {
                 "query": "style",
@@ -83,8 +102,6 @@ async def test_search_tool_rejects_invalid_type_and_mixed_time_filter() -> None:
                 "runtime": runtime({"user_id": "u1"}),
             }
         )
-    )
-    assert invalid["error"] == "invalid_memory_type"
 
     mixed = json.loads(
         await tool.ainvoke(

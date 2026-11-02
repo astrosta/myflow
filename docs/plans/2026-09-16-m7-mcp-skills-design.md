@@ -839,6 +839,10 @@ def _is_usable_entry(entry: Path, skill_file: Path, root: Path) -> bool:
 
 #### 3.5.1 `search_and_load_skills`：技能多到读不完时的那一跳
 
+> 2026-11-02 修订：lead 不再直接调用本工具，改为委派内置子代理 `skill-finder`（它内部仍调
+> `search_and_load_skills`，并把候选 name/path/description 交回 lead，正文由 lead 用
+> `read_file` 读取）。详见 `2026-11-02-retrieval-subagents-design.md`。
+
 索引只给"名字 + 一行描述"。技能几十个时，模型要么挑错、要么逐个 `read_file` 试——
 每一次试错都是一段正文进上下文。`search_and_load_skills` 把这一步变成一次检索：
 

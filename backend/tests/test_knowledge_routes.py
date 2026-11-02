@@ -8,6 +8,7 @@ from agentkit.knowledge.config import KnowledgeBaseConfig
 from agentkit.knowledge.errors import KnowledgeDocumentNotFound
 from agentkit.knowledge.models import (
     KnowledgeBase,
+    KnowledgeChunk,
     KnowledgeDocument,
     SearchHit,
     SearchOutcome,
@@ -84,6 +85,18 @@ class FakeService:
         self.deleted.append(kwargs["document_id"])
         return kwargs["document_id"]
 
+    async def list_chunks(self, user_id: str, document_id: str, *, offset: int, limit: int):
+        assert user_id == "default"
+        assert document_id == "d1"
+        chunks = [
+            KnowledgeChunk(index=0, content="# 安装\n\n步骤一", section="安装", page=1),
+            KnowledgeChunk(
+                index=1, content="回滚命令", section="回滚", page=2, parent_id="d1:p1"
+            ),
+            KnowledgeChunk(index=2, content="附录", section="附录", page=3),
+        ]
+        return chunks[offset : offset + limit], len(chunks)
+
     async def search(self, **kwargs):
         self.search_calls.append(kwargs)
         return SearchOutcome(
@@ -155,6 +168,35 @@ def test_document_routes_check_base_ownership_shape() -> None:
     deleted = client.delete("/api/knowledge/bases/b1/documents/d1")
     assert deleted.status_code == 200
     assert service.deleted == ["d1"]
+
+
+def test_document_chunks_are_paged_under_the_owning_base() -> None:
+    service = FakeService()
+    client = _client(service)
+
+    response = client.get("/api/knowledge/bases/b1/documents/d1/chunks?offset=0&limit=2")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["document_id"] == "d1"
+    assert body["count"] == 3
+    assert body["next_offset"] == 2
+    assert [item["chunk_index"] for item in body["chunks"]] == [0, 1]
+    assert body["chunks"][0]["chunk_id"] == "d1:0"
+    assert body["chunks"][0]["section"] == "安装"
+    assert body["chunks"][0]["page"] == 1
+    assert body["chunks"][0]["content"].startswith("# 安装")
+    assert body["chunks"][0]["parent_id"] == ""
+
+    second = client.get("/api/knowledge/bases/b1/documents/d1/chunks?offset=1&limit=1")
+    assert second.json()["chunks"][0]["parent_id"] == "d1:p1"
+
+    tail = client.get("/api/knowledge/bases/b1/documents/d1/chunks?offset=2&limit=2")
+    assert tail.status_code == 200
+    assert tail.json()["next_offset"] is None
+
+    mismatch = client.get("/api/knowledge/bases/b2/documents/d1/chunks")
+    assert mismatch.status_code == 404
 
 
 def test_search_forwards_type_and_base_id() -> None:

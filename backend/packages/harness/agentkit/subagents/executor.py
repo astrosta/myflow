@@ -74,6 +74,25 @@ DEFAULT_SUBAGENT_SYSTEM_PROMPT = (
     "自己完成任务，报告结论而不是过程。"
 )
 
+def _subagent_tools(dispatch: "SubagentDispatch") -> list[Any]:
+    """按类型声明求交；`delegated_tools` 只给点名要它的类型。
+
+    `tools=None` 是"继承 lead 当时的工具"（general-purpose）。lead 已经不再持有检索
+    工具（2026-11-02 检索子代理设计），所以这类子代理**不能**顺手拿到 delegated 工具，
+    否则"检索只走专用子代理"就形同虚设。类型显式列出工具名时，才从 delegated 里补。
+    """
+
+    config = dispatch.config
+    tools = filter_tools(dispatch.tools, config.tools, config.disallowed_tools)
+    if config.tools is None:
+        return tools
+    delegated = filter_tools(
+        dispatch.delegated_tools, config.tools, config.disallowed_tools
+    )
+    existing = {tool.name for tool in tools}
+    return [*tools, *(tool for tool in delegated if tool.name not in existing)]
+
+
 _LOOP_START_TIMEOUT_SECONDS = 5.0
 _LOOP_STOP_TIMEOUT_SECONDS = 1.0
 _ISOLATED_THREAD_NAME = "subagent-isolated-loop"
@@ -232,7 +251,28 @@ def copy_isolated_subagent_context() -> Context:
 # ---------------------------------------------------------------- §7.3 子配置
 
 
-def build_child_config(parent_config: Mapping[str, Any] | None, *, max_turns: int) -> dict[str, Any]:
+def recursion_limit_for(agent: Any, max_turns: int) -> int:
+    """``max_turns`` 次模型调用所需的 LangGraph ``recursion_limit``。
+
+    ``recursion_limit`` 数的是图的超步，中间件的每个钩子都是一个节点：``before_agent`` /
+    ``after_agent`` 每次 run 各跑一次，``before_model`` / ``after_model``、``model``、``tools``
+    每轮各跑一次。把 ``max_turns`` 原样当 ``recursion_limit``，真实中间件链下子代理连一次
+    工具调用都做不完；按节点换算，子代理链加减中间件时预算也不会悄悄缩水。
+    """
+    once = 0
+    # model + tools。最后一轮不跑 tools，空出来的那一步正好是 LangGraph 要求的余量。
+    per_turn = 2
+    for name in getattr(agent, "nodes", None) or ():
+        if name.endswith((".before_agent", ".after_agent")):
+            once += 1
+        elif name.endswith((".before_model", ".after_model")):
+            per_turn += 1
+    return once + per_turn * max(1, int(max_turns))
+
+
+def build_child_config(
+    parent_config: Mapping[str, Any] | None, *, recursion_limit: int
+) -> dict[str, Any]:
     """子代理的 ``RunnableConfig``：省略 checkpoint 坐标键，其余原样继承。
 
     ✗ ``{"configurable": {"thread_id": parent_thread_id}}`` —— 哪怕值和父 run 完全一样，
@@ -249,7 +289,7 @@ def build_child_config(parent_config: Mapping[str, Any] | None, *, max_turns: in
             configurable = {
                 key: value for key, value in raw.items() if key not in CHECKPOINT_COORDINATE_KEYS
             }
-    return {"configurable": configurable, "recursion_limit": max_turns}
+    return {"configurable": configurable, "recursion_limit": recursion_limit}
 
 
 # ---------------------------------------------------------------- §7.5 回程：用量
@@ -343,7 +383,9 @@ class SubagentExecutor:
             logger.info("subagent admission denied (%s): %s", denied.reason, denied)
             dispatch.holder.try_set_terminal(
                 SubagentStatus.FAILED,
-                error=f"admission denied ({denied.reason}): {denied}",
+                error=(
+                    f"子代理槽位已满（{denied.reason}）：不要立即重试同一任务，先自己完成，或稍后再委派"
+                ),
                 admission_failure=True,
             )
             await self._finish(dispatch, report_loop=report_loop)
@@ -385,7 +427,10 @@ class SubagentExecutor:
         state = self._build_initial_state(dispatch)
         run.last_state = state
         parent_config = var_child_runnable_config.get()
-        config = build_child_config(parent_config, max_turns=dispatch.config.max_turns)
+        config = build_child_config(
+            parent_config,
+            recursion_limit=recursion_limit_for(agent, dispatch.config.max_turns),
+        )
         # §15：子代理自己的用量采集器挂在这条子 run 的 callbacks 上（**追加**，不覆盖继承来的
         # 处理器——§3.1 的帧发布依赖它们）。它把累计快照写进 holder，父循环的 task 工具再交付。
         config = attach_token_collector(
@@ -444,9 +489,9 @@ class SubagentExecutor:
         )
 
     def _build_middlewares(self, dispatch: SubagentDispatch) -> list[Any]:
-        """§12.1 的子代理链：没有上传、没有标题、没有 ``task``、没有澄清。
+        """§12.1 的子代理链：没有上传、没有标题、没有 ``task``、没有澄清；日期照常注入。
 
-        ``skip_memory_flush=True`、日期注入、护栏 trio 与 SystemMessage 合并是 D9 的事；
+        ``skip_memory_flush=True``、护栏 trio 与 SystemMessage 合并是 D9 的事；
         每份 task 都 new 一套实例，所以并行子代理的护栏状态不会串号（§12.5）。
         """
         return list(
@@ -468,7 +513,7 @@ class SubagentExecutor:
             app_config=self._resolve_app_config(),
             attach_tracing=False,
         )
-        tools = filter_tools(dispatch.tools, dispatch.config.tools, dispatch.config.disallowed_tools)
+        tools = _subagent_tools(dispatch)
         return create_agent(
             model=model,
             tools=tools,
@@ -528,11 +573,11 @@ class SubagentExecutor:
         if _has_error_fallback(run.last_state):
             # §13.2：图干净地结束 ≠ 子代理成功。provider 异常被中间件兜成了一条消息。
             status = SubagentStatus.FAILED
-            error = "the provider call failed and the middleware degraded it into a message"
+            error = "模型调用失败，中间件已将其降级为一条消息"
         if status is SubagentStatus.COMPLETED and not result:
             status = SubagentStatus.FAILED
         if status is SubagentStatus.FAILED and error is None:
-            error = "the subagent finished without producing an answer"
+            error = "子代理在轮次预算内没有产出结论"
         holder.try_set_terminal(status, result=result, error=error, stop_reason=reason)
 
     @staticmethod

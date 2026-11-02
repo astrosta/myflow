@@ -17,7 +17,7 @@ agents:
 # startup-only: 改了要重启（按 type 创建的单例不会随热重载重建）
 # M1 只认 memory。
 checkpointer:
-  type: memory
+  type: postgres
 
 # ------------------------------------------------------------
 # 模型。列表顺序有意义：不指定模型时用第一个。
@@ -140,7 +140,7 @@ run_events:
 # 直播帧的桥：进程级单例，lifespan 里建一次（backend 是 startup-only）。
 # 多 worker（GATEWAY_WORKERS>1）必须 backend=redis，否则启动直接拒绝（M9 §3.5）。
 stream_bridge:
-  backend: memory                  # memory | redis                        startup-only
+  backend: redis                  # memory | redis                        startup-only
   queue_maxsize: 256               # 每 run 保留的数据事件数，决定"能重放多久"
   heartbeat_interval_seconds: 15   # 0 = 关掉心跳（只给嵌入式 / IM 直读用）
 
@@ -224,9 +224,9 @@ skills:
   # embedding / rerank 要填地址才开（代码里没有默认端点）。
   search:
     enabled: true                 # 关掉后这个工具不注册，技能只能靠索引 + read_file
-    candidate_k: 20               # 召回交给精排的候选数
-    top_k: 3                      # 最终加载几个技能的正文
-    rrf_k: 60                     # 两路召回融合的 RRF k
+    candidate_k: 5               # 召回交给精排的候选数
+    top_k: 1                      # 最终加载几个技能的正文
+    rrf_k: 10                     # 两路召回融合的 RRF k
     min_score: null               # 融合分数下限（归一化到 1.0），null = 不过滤
     max_body_chars: 6000          # 单个技能正文预算
     max_context_chars: 12000      # 一次加载的正文总预算
@@ -278,7 +278,7 @@ skills:
 # 安装：uv sync --all-packages --all-extras（会同时装 postgres/mcp 等 extra）
 # ------------------------------------------------------------
 knowledge_base:
-  enabled: false
+  enabled: true
   storage_dir: .myflow/knowledge
   allowed_extensions: [pdf, doc, docx, ppt, pptx, xls, xlsx, md, markdown, txt, html, htm, csv, epub]
   text_extensions: [md, markdown, txt, html, htm, csv]
@@ -291,7 +291,7 @@ knowledge_base:
 
   parse:
     provider: mineru
-    mode: local                 # local | cloud
+    mode: cloud                 # local | cloud
     local:
       endpoint: ""              # 必填：本地 MinerU 地址，例如 http://127.0.0.1:8000
       file_parse_path: /v1/file_parse
@@ -333,7 +333,7 @@ knowledge_base:
       operations:
         strategy: procedure
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
       faq:
         strategy: qa_pair
         chunk_size_tokens: 384
@@ -341,7 +341,7 @@ knowledge_base:
       security:
         strategy: clause
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
       api:
         strategy: api_reference
         chunk_size_tokens: 768
@@ -349,7 +349,7 @@ knowledge_base:
       legal:                        # 法律法规：按“第X条”切分，条号进 section
         strategy: legal_clause
         chunk_size_tokens: 512
-        chunk_overlap_tokens: 64
+        chunk_overlap_tokens: 0
 
   # 服务地址、模型和维度来自顶层 embedding；这里只保留知识库自己的策略。
   embedding:

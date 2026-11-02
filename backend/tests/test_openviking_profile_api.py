@@ -43,6 +43,46 @@ def client(tmp_path: Path):
     asyncio.run(engine.dispose())
 
 
+def test_profile_schema_lists_every_supported_field(client) -> None:
+    response = client.get("/api/memory/profile/schema")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema_version"] == 1
+    paths = [field["path"] for field in body["fields"]]
+    assert paths == [
+        "identity.preferred_name",
+        "identity.locale",
+        "communication.language",
+        "accessibility.needs",
+        "boundaries",
+        "communication.tone",
+        "communication.verbosity",
+        "communication.format",
+        "work.role",
+        "work.domains",
+        "work.tools",
+        "work.expertise",
+    ]
+    by_path = {field["path"]: field for field in body["fields"]}
+    assert by_path["communication.tone"]["kind"] == "choice"
+    assert [option["value"] for option in by_path["communication.tone"]["options"]] == [
+        "neutral",
+        "friendly",
+        "formal",
+        "direct",
+    ]
+    assert by_path["communication.format"]["kind"] == "multi_choice"
+    assert by_path["work.tools"]["kind"] == "string_list"
+    assert by_path["work.tools"]["max_items"] == 20
+    assert by_path["identity.preferred_name"]["explicit_only"] is True
+    assert by_path["communication.tone"]["explicit_only"] is False
+    assert by_path["identity.locale"]["placeholder"] == "例如：zh-CN"
+    assert "identity.pronouns" not in by_path
+    assert "identity.timezone" not in by_path
+    assert all(field["label"] and field["group_label"] for field in body["fields"])
+
+
 def test_get_patch_conflict_and_clear(client) -> None:
     initial = client.get("/api/memory/profile")
     assert initial.status_code == 200
@@ -84,6 +124,16 @@ def test_get_patch_conflict_and_clear(client) -> None:
     )
     assert legacy.status_code == 200
     assert legacy.json()["fields"]["communication.verbosity"]["value"] == "concise"
+
+    follow = client.patch(
+        "/api/memory/profile",
+        json={
+            "fields": {"communication.language": "auto"},
+            "expected_revision": legacy.json()["revision"],
+        },
+    )
+    assert follow.status_code == 200
+    assert follow.json()["fields"]["communication.language"]["value"] == "auto"
 
     stale_revision = client.patch(
         "/api/memory/profile",

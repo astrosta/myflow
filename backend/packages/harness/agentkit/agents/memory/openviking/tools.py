@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Literal
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool, tool
+from pydantic import BaseModel, Field
 
 from agentkit.agents.memory.openviking.config import DEFAULT_MEMORY_TYPES as ALLOWED_MEMORY_TYPES
 from agentkit.agents.memory.openviking.contracts import MemoryHit
@@ -18,9 +19,57 @@ DEFAULT_SEARCH_TYPES = ["preferences", "entities", "events"]
 MAX_LIMIT = 20
 MAX_READ_CHARS = 16_000
 
+MemoryTypeArg = Literal[
+    "preferences",
+    "entities",
+    "events",
+    "cases",
+    "trajectories",
+    "experiences",
+    "tools",
+    "skills",
+]
+
+
+class MemorySearchInput(BaseModel):
+    query: str = Field(description="要回忆的事实，写成自包含的一句话。")
+    memory_types: list[MemoryTypeArg] | None = Field(
+        default=None,
+        description=(
+            "检索范围。合法值：preferences、entities、events、cases、trajectories、"
+            "experiences、tools、skills。默认 preferences/entities/events（不含经验与案例）；"
+            "查经验用 experiences，查案例用 cases。"
+        ),
+    )
+    limit: int = Field(default=8, description="最多返回几条，1–20。")
+    since: str | None = Field(
+        default=None,
+        description=(
+            "ISO-8601 时间下界（如 2026-10-01 或 2026-10-01T00:00:00Z）。"
+            "仅当 memory_types 为 ['events'] 时有效。"
+        ),
+    )
+    until: str | None = Field(
+        default=None,
+        description="ISO-8601 时间上界。仅当 memory_types 为 ['events'] 时有效。",
+    )
+    time_field: str | None = Field(
+        default=None,
+        description="事件时间字段名，原样传给 OpenViking；不确定时省略，由服务端默认。",
+    )
+
+
+class MemoryReadInput(BaseModel):
+    uri: str = Field(description="记忆条目的 URI，来自 memory_search 或 memory_overview 的结果。")
+    max_chars: int = Field(default=8_000, description="最多返回多少字符，1–16000。")
+
+
+class MemoryOverviewInput(BaseModel):
+    uri: str = Field(description="记忆条目的 URI，用来取 L1 摘要。")
+
 
 def make_memory_search_tool(facade: Any) -> BaseTool:
-    @tool("memory_search")
+    @tool("memory_search", args_schema=MemorySearchInput)
     async def memory_search(
         query: str,
         runtime: ToolRuntime[Any, Any] = None,
@@ -30,7 +79,7 @@ def make_memory_search_tool(facade: Any) -> BaseTool:
         until: str | None = None,
         time_field: str | None = None,
     ) -> str:
-        """检索用户长期记忆；画像由系统单独注入。"""
+        """检索当前用户的长期记忆。"""
 
         user_id = resolve_runtime_user_id(_context(runtime))
         if not user_id:
@@ -69,7 +118,7 @@ def make_memory_search_tool(facade: Any) -> BaseTool:
 
 
 def make_memory_read_tool(facade: Any) -> BaseTool:
-    @tool("memory_read")
+    @tool("memory_read", args_schema=MemoryReadInput)
     async def memory_read(
         uri: str,
         runtime: ToolRuntime[Any, Any] = None,
@@ -91,7 +140,7 @@ def make_memory_read_tool(facade: Any) -> BaseTool:
 
 
 def make_memory_overview_tool(facade: Any) -> BaseTool:
-    @tool("memory_overview")
+    @tool("memory_overview", args_schema=MemoryOverviewInput)
     async def memory_overview(
         uri: str,
         runtime: ToolRuntime[Any, Any] = None,

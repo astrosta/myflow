@@ -68,6 +68,15 @@ describe("侧栏的最近对话栏", () => {
     expect(view.getByText(/还没有会话/)).toBeTruthy();
   });
 
+  it("导航里有「记忆管理」，按当前路由高亮", () => {
+    const view = render(<Sidebar memoryActive threads={[]} />);
+
+    const memory = view.getByRole("link", { name: /记忆管理/ });
+    expect(memory.getAttribute("href")).toBe("/workspace/memory");
+    expect(memory.getAttribute("aria-current")).toBe("page");
+    expect(view.getByRole("link", { name: /我的画像/ }).getAttribute("aria-current")).toBeNull();
+  });
+
   it("当前会话高亮：aria-current 只挂在它自己身上", () => {
     const view = render(
       <Sidebar activeThreadId="t2" threads={[makeThread("t1", "第一个会话"), makeThread("t2", "第二个会话")]} />,

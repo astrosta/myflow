@@ -29,7 +29,9 @@ from agentkit.knowledge.errors import (
 )
 from agentkit.knowledge.models import (
     KnowledgeBase,
+    KnowledgeChunk,
     KnowledgeDocument,
+    KnowledgeParentChunk,
     ParsedDocument,
     RetrievalMode,
     SearchHit,
@@ -179,6 +181,31 @@ class KnowledgeService:
             raise KnowledgeDocumentNotFound("Document not found")
         return document
 
+    async def list_chunks(
+        self,
+        user_id: str,
+        document_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[KnowledgeChunk], int]:
+        """Return one page of a ready document's chunks plus the total count.
+
+        Chunk bodies live in the vector store, not PostgreSQL.  The store query
+        is already scoped by user and document; sorting happens here because
+        Milvus does not guarantee an order for a plain scalar query.
+        """
+        document = await self.get_document(user_id, document_id)
+        if document.status != "ready":
+            return [], 0
+        chunks = await self._vector_store.list_chunks(
+            user_id=user_id, document_id=document_id
+        )
+        ordered = sorted(chunks, key=lambda chunk: chunk.index)
+        start = max(0, int(offset))
+        size = max(1, int(limit))
+        return ordered[start : start + size], len(ordered)
+
     async def add_documents(
         self, *, user_id: str, base_id: str, uploads: Sequence[UploadStream]
     ) -> list[KnowledgeDocument]:
@@ -318,21 +345,39 @@ class KnowledgeService:
         else:
             parsed = await self._parser.parse(path, filename=document.filename)
 
-        from agentkit.knowledge.text import clean_text
+        from agentkit.knowledge.text import clean_document_text
 
-        cleaned = clean_text(parsed.markdown)
+        cleaned = clean_document_text(parsed.markdown)
         if len(cleaned) < 20:
             raise InvalidKnowledgeRequest("No usable text was extracted from this document")
 
         await self._store.update_document_status(user_id, document_id, status="chunking")
         chunks = chunk_document(
-            cleaned, base.type, self._config, token_counter=self._token_counter
+            cleaned,
+            base.type,
+            self._config,
+            token_counter=self._token_counter,
+            document_id=document.id,
         )
         if not chunks:
             raise InvalidKnowledgeRequest("Chunking produced no content")
 
+        parents: dict[str, KnowledgeParentChunk] = {}
+        for chunk in chunks:
+            if chunk.parent_id and chunk.parent_content:
+                parents.setdefault(
+                    chunk.parent_id,
+                    KnowledgeParentChunk(
+                        parent_id=chunk.parent_id,
+                        content=chunk.parent_content,
+                        section=chunk.section,
+                        page=chunk.page,
+                    ),
+                )
+
         await self._store.update_document_status(user_id, document_id, status="embedding")
-        vectors = await self._embedder.embed_documents([chunk.content for chunk in chunks])
+        embedding_inputs = [chunk.embedding_text or chunk.content for chunk in chunks]
+        vectors = await self._embedder.embed_documents(embedding_inputs)
         await self._vector_store.upsert_document(
             user_id=user_id,
             knowledge_base_id=base.id,
@@ -341,6 +386,7 @@ class KnowledgeService:
             document=document,
             chunks=chunks,
             vectors=vectors,
+            parents=list(parents.values()),
         )
         current = await self._store.get_document(user_id, document_id)
         if current is None:
@@ -407,6 +453,24 @@ class KnowledgeService:
             base_ids=base_ids,
             candidates=candidates,
         )
+        parent_ids = [hit.parent_id for hit in hits if hit.parent_id]
+        if parent_ids:
+            try:
+                parent_texts = await self._vector_store.get_parents(
+                    user_id=user_id, parent_ids=parent_ids
+                )
+            except Exception as exc:  # noqa: BLE001 - parent lookup is an enrichment
+                logger.warning(
+                    "Knowledge parent lookup failed (%s: %s); returning child chunks",
+                    type(exc).__name__,
+                    exc,
+                )
+                parent_texts = {}
+            for hit in hits:
+                if hit.parent_id and hit.parent_id in parent_texts:
+                    hit.content = parent_texts[hit.parent_id]
+                elif hit.parent_id:
+                    logger.warning("Knowledge parent %s is missing", hit.parent_id)
         hits, reranked = await self._rerank(text, hits)
         limited = hits[:limit]
         remaining = self._config.retrieval.max_context_chars
@@ -427,7 +491,7 @@ class KnowledgeService:
                     knowledge_base_id=hit.knowledge_base_id,
                     knowledge_base_name=hit.knowledge_base_name,
                     knowledge_base_type=hit.knowledge_base_type,
-                    chunk_index=hit.chunk_index, page=hit.page,
+                    chunk_index=hit.chunk_index, page=hit.page, parent_id=hit.parent_id,
                     rrf_score=hit.rrf_score, rerank_score=hit.rerank_score,
                 )
             )

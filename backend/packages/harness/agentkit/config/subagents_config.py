@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -44,6 +45,9 @@ SUBAGENT_CONCURRENCY_CEILING = 64
 DEFAULT_TOKEN_BUDGET_WITH_SUMMARIZATION = 1_000_000
 DEFAULT_TOKEN_BUDGET_WITHOUT_SUMMARIZATION = 2_000_000
 DEFAULT_TOKEN_BUDGET_WARN_THRESHOLD = 0.7
+CUSTOM_DESCRIPTION_WARN_CHARS = 600
+
+logger = logging.getLogger(__name__)
 
 
 def drop_null_config_entries(data: Any) -> Any:
@@ -94,7 +98,10 @@ class CustomSubagentConfig(SubagentConfigModel):
     description: str = Field(
         ...,
         min_length=1,
-        description="给 lead 看的一句话：这个帮手擅长什么、什么时候该派它。会进提示词的发现列表。",
+        description=(
+            "给 lead 看的一句话：这个帮手擅长什么、什么时候该派它。会进提示词的发现列表。"
+            f"建议不超过 {CUSTOM_DESCRIPTION_WARN_CHARS} 字。"
+        ),
     )
     system_prompt: str | None = Field(
         default=None,
@@ -113,18 +120,35 @@ class CustomSubagentConfig(SubagentConfigModel):
     )
     skills: list[str] | None = Field(
         default=None,
-        description="null = 全部启用技能；[] = 禁用技能（不是「继承 lead 的技能集」）。",
+        description=(
+            "暂未生效：子代理链没有技能中间件。null / 列表目前都不改变子代理看到的技能。"
+        ),
     )
     model: str = Field(
         default=INHERIT_MODEL,
         description=f"模型名，或 {INHERIT_MODEL!r}（跟 lead 同名，凭据仍来自服务端配置）。",
     )
-    max_turns: int = Field(default=DEFAULT_SUBAGENT_MAX_TURNS, ge=1, description="轮次轴：recursion_limit。")
+    max_turns: int = Field(
+        default=DEFAULT_SUBAGENT_MAX_TURNS,
+        ge=1,
+        description="轮次轴：模型调用次数上限。执行器按子代理图的节点换算成 recursion_limit。",
+    )
     timeout_seconds: int = Field(
         default=DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
         ge=1,
         description="墙钟上限（秒）。到点由隔离循环 wait_for 收尾，对外 status=timed_out。",
     )
+
+    @field_validator("description")
+    @classmethod
+    def _warn_long_description(cls, value: str) -> str:
+        if len(value) > CUSTOM_DESCRIPTION_WARN_CHARS:
+            logger.warning(
+                "custom subagent description is %d chars; keep it under %d so the lead discovery list stays bounded",
+                len(value),
+                CUSTOM_DESCRIPTION_WARN_CHARS,
+            )
+        return value
 
 
 class SubagentOverrideConfig(SubagentConfigModel):
@@ -157,7 +181,10 @@ class SubagentsConfig(SubagentConfigModel):
     max_turns: int | None = Field(
         default=None,
         ge=1,
-        description="全局轮次覆盖；null = 用每个类型自己的值（general-purpose=150，bash=60）。",
+        description=(
+            "全局轮次（模型调用次数）覆盖；null = 用每个类型自己的值（general-purpose=150，"
+            "bash=60，knowledge-researcher=12，memory-researcher=10，skill-finder=8）。"
+        ),
     )
     max_total_per_run: int = Field(
         default=DEFAULT_SUBAGENTS_MAX_TOTAL_PER_RUN,

@@ -12,6 +12,33 @@ def _models() -> list[dict]:
     return [{"name": "deepseek-reasoner", "use": "langchain_deepseek:ChatDeepSeek"}]
 
 
+def test_resolve_config_path_finds_config_yaml_in_cwd(tmp_path, monkeypatch):
+    """没有 MYFLOW_CONFIG_PATH 时回落到 cwd 的 config.yaml（曾因少了逗号只看首字母路径）。"""
+    monkeypatch.delenv("MYFLOW_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("MYFLOW_PROJECT_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text("models: []\n", encoding="utf-8")
+
+    assert AppConfig.resolve_config_path() == tmp_path.resolve() / "config.yaml"
+
+
+def test_resolve_config_path_prefers_env_path(tmp_path, monkeypatch):
+    config = tmp_path / "custom.yaml"
+    config.write_text("models: []\n", encoding="utf-8")
+    monkeypatch.setenv("MYFLOW_CONFIG_PATH", str(config))
+
+    assert AppConfig.resolve_config_path() == config
+
+
+def test_resolve_config_path_without_any_config_is_actionable(tmp_path, monkeypatch):
+    monkeypatch.delenv("MYFLOW_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("MYFLOW_PROJECT_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="No config file found"):
+        AppConfig.resolve_config_path()
+
+
 def test_omitted_sections_use_m1_defaults():
     cfg = AppConfig.model_validate({"models": _models()})
     assert cfg.checkpointer.type == "memory"

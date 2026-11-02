@@ -238,6 +238,7 @@ def test_a_disabled_search_tool_explains_instead_of_loading(tmp_path):
 
     assert payload["skills"] == []
     assert "已关闭" in payload["message"][0]
+    assert "技能索引" not in payload["message"][0]
 
 
 def test_skills_switched_off_by_the_user_are_not_loaded(tmp_path, monkeypatch):
@@ -347,6 +348,14 @@ def test_the_tool_is_registered_only_when_the_config_allows_it(tmp_path):
     assert TOOL_NAME not in disabled
 
 
+def test_the_tool_description_is_caller_agnostic() -> None:
+    """委派时读者是 skill-finder，回退时读者是 lead：文案只能写与调用方无关的事实。"""
+    description = search_and_load_skills.description or ""
+    assert "加载即激活" not in description
+    assert "<active_skills>" not in description
+    assert "技能索引" not in description
+
+
 def test_the_system_prompt_documents_the_blocks_but_not_the_routing(tmp_path):
     """提示词只说"你在看什么"（索引 vs 已加载），怎么说"什么时候去读"是工具 description 的事。
 
@@ -366,6 +375,15 @@ def test_the_system_prompt_documents_the_blocks_but_not_the_routing(tmp_path):
     # 路由策略不写进系统提示词
     assert "search_and_load_skills" not in prompt
     assert "skill_routing_protocol" not in prompt
+
+    # 委派开启时索引照样在：内置技能只能经索引发现，skill-finder 只管长尾检索
+    delegated = apply_prompt_template(
+        app_config=AppConfig(skills=_tree(tmp_path)),
+        subagent_enabled=True,
+    )
+    assert "<available_skills>" in delegated
+    assert f"- {SKILL} [public]: PostgreSQL 多租户与连接池" in delegated
+    assert "skill-finder" in delegated
 
 
 def test_dirty_keywords_are_cleaned_and_capped():
@@ -502,6 +520,9 @@ def test_an_empty_catalog_result_tells_the_model_not_to_retry(tmp_path):
     assert payload["skills"] == []
     assert payload["retrieval"]["candidates"] == 0
     assert payload["message"] == list(EMPTY_RESULT_MESSAGE)
+    joined = "".join(EMPTY_RESULT_MESSAGE)
+    assert "技能索引" not in joined
+    assert "read_file" not in joined
 
 
 def test_the_user_preferences_are_forwarded_to_the_service(tmp_path, monkeypatch):

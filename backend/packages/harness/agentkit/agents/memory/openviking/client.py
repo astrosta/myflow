@@ -8,6 +8,7 @@ still import the package.
 from __future__ import annotations
 
 import asyncio
+import weakref
 from typing import Any
 
 from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
@@ -71,6 +72,25 @@ class OpenVikingSessionClient:
     async def overview(self, uri: str) -> str:
         return await self._sdk.overview(uri)
 
+    async def abstract(self, uri: str) -> str:
+        return await self._sdk.abstract(uri)
+
+    async def ls(self, uri: str, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._sdk.ls(uri, **kwargs)
+
+    async def write(
+        self,
+        uri: str,
+        content: str,
+        *,
+        mode: str = "replace",
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await self._sdk.write(uri, content, mode=mode, options=options)
+
+    async def rm(self, uri: str, *, recursive: bool = False) -> None:
+        await self._sdk.rm(uri, recursive=recursive)
+
 
 def _raise_mapped(exc: Exception) -> None:
     code = str(getattr(exc, "code", "") or type(exc).__name__).upper()
@@ -91,32 +111,46 @@ class OpenVikingClientFactory:
     def __init__(self, config: OpenVikingMemoryConfig, *, builder: Any = None) -> None:
         self._config = config
         self._builder = builder or build_async_client
-        self._clients: dict[str, OpenVikingSessionClient] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        # The SDK client binds to the loop that created it. Retrieval now also runs
+        # on the subagent isolated loop, so the cache is keyed by (loop, ov_user).
+        self._clients: weakref.WeakKeyDictionary[
+            Any, dict[str, OpenVikingSessionClient]
+        ] = weakref.WeakKeyDictionary()
+        self._locks: weakref.WeakKeyDictionary[Any, dict[str, asyncio.Lock]] = (
+            weakref.WeakKeyDictionary()
+        )
 
     async def client_for(self, ov_user: str) -> OpenVikingSessionClient:
-        cached = self._clients.get(ov_user)
+        loop = asyncio.get_running_loop()
+        clients = self._clients.setdefault(loop, {})
+        cached = clients.get(ov_user)
         if cached is not None:
             return cached
         # A user can have threads on several shards, so two worker loops may
-        # request the same client concurrently. Keep one builder per user.
-        lock = self._locks.setdefault(ov_user, asyncio.Lock())
+        # request the same client concurrently. Keep one builder per (loop, user).
+        locks = self._locks.setdefault(loop, {})
+        lock = locks.setdefault(ov_user, asyncio.Lock())
         async with lock:
-            cached = self._clients.get(ov_user)
+            cached = clients.get(ov_user)
             if cached is not None:
                 return cached
             sdk = await self._builder(self._config, ov_user=ov_user)
             client = OpenVikingSessionClient(sdk)
-            self._clients[ov_user] = client
+            clients[ov_user] = client
             return client
 
     async def close(self) -> None:
-        for client in list(self._clients.values()):
-            close = getattr(client._sdk, "close", None)
-            if close is not None:
-                result = close()
-                if hasattr(result, "__await__"):
-                    await result
+        for clients in list(self._clients.values()):
+            for client in list(clients.values()):
+                close = getattr(client._sdk, "close", None)
+                if close is None:
+                    continue
+                try:
+                    result = close()
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception:  # noqa: BLE001 - a foreign loop may already be gone
+                    pass
         self._clients.clear()
         self._locks.clear()
 

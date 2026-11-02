@@ -17,6 +17,13 @@ from agentkit.agents.memory.openviking.contracts import (
     TurnDecision,
 )
 from agentkit.agents.memory.openviking.policy import classify_turn
+from agentkit.agents.memory.openviking.library import (
+    MemoryContent,
+    MemoryDetail,
+    MemoryLibraryService,
+    MemoryListPage,
+    MemoryUnavailable,
+)
 from agentkit.agents.memory.openviking.profile import PersonalizationService, ProfileService
 from agentkit.agents.memory.openviking.recall import RecallService
 from agentkit.agents.memory.openviking.session import SessionManager
@@ -41,6 +48,7 @@ class MemoryFacade:
         profile: ProfileService,
         personalization: PersonalizationService,
         recall: RecallService | None = None,
+        library: MemoryLibraryService | None = None,
     ) -> None:
         self.config = config
         self._sync_store = sync_store
@@ -52,6 +60,7 @@ class MemoryFacade:
         self._profile = profile
         self._personalization = personalization
         self._recall = recall
+        self._library = library
 
     def decide_capture(self, text: str, *, has_attachments: bool = False) -> TurnDecision:
         return classify_turn(
@@ -144,6 +153,46 @@ class MemoryFacade:
         if self._recall is None:
             raise RuntimeError("OpenViking recall is not configured")
         return await self._recall.overview(self._sessions.ov_user(user_id), uri)
+
+    async def list_memory_items(
+        self, user_id: str, memory_type: str, *, limit: int = 50
+    ) -> MemoryListPage:
+        return await self._library_service().list_items(
+            self._sessions.ov_user(user_id), memory_type, limit=limit
+        )
+
+    async def memory_detail(self, user_id: str, uri: str) -> MemoryDetail:
+        return await self._library_service().detail(self._sessions.ov_user(user_id), uri)
+
+    async def read_memory_content(self, user_id: str, uri: str) -> MemoryContent:
+        return await self._library_service().read_content(
+            self._sessions.ov_user(user_id), uri
+        )
+
+    async def update_memory_content(
+        self,
+        user_id: str,
+        uri: str,
+        content: str,
+        *,
+        expected_sha256: str | None,
+    ) -> MemoryContent:
+        return await self._library_service().update_content(
+            self._sessions.ov_user(user_id),
+            uri,
+            content,
+            expected_sha256=expected_sha256,
+        )
+
+    async def delete_memory_item(self, user_id: str, uri: str) -> None:
+        await self._library_service().delete_item(
+            self._sessions.ov_user(user_id), uri
+        )
+
+    def _library_service(self) -> MemoryLibraryService:
+        if self._library is None:
+            raise MemoryUnavailable("OpenViking memory library is not configured")
+        return self._library
 
     async def count_uncertain(self, *, limit: int = 100) -> int:
         """Return only rows that startup may need to reconcile.

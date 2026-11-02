@@ -71,6 +71,17 @@ export function ToolIcon(props: IconProps) {
   );
 }
 
+/** 记忆。堆叠的层——侧栏「记忆管理」入口 */
+export function MemoryIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="m12 3 9 5-9 5-9-5 9-5Z" />
+      <path d="m3 13 9 5 9-5" />
+      <path d="m3 18 9 5 9-5" />
+    </Icon>
+  );
+}
+
 /** 账号。人像——设置面板左栏「账号」那一项前面 */
 export function UserIcon(props: IconProps) {
   return (

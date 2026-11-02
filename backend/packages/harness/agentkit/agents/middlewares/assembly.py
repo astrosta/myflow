@@ -210,8 +210,12 @@ def build_subagent_runtime_middlewares(
     model_name: str | None = None,
     lazy_init: bool = True,
 ) -> list[AgentMiddleware]:
-    """子代理（M8）复用基础层：没有上传、没有标题、没有技能绑定。"""
+    """子代理（M8）复用基础层：没有上传、没有标题、没有技能绑定。
+
+    日期照样注入：记忆检索要把"上周""最近一个月"换算成 since/until。
+    """
     del model_name
     chain = build_runtime_middlewares(app_config, include_uploads=False, lazy_init=lazy_init)
+    chain.append(DynamicContextMiddleware(app_config=app_config))
     chain.append(PIIOutputMiddleware(app_config=app_config))
     return chain

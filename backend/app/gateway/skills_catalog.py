@@ -646,14 +646,25 @@ def _private_mounts_supported() -> bool:
         return False
 
 
-def visible_catalog_rows(snapshot: SkillSnapshot, user_id: str | None) -> list[Skill]:
+def visible_catalog_rows(
+    snapshot: SkillSnapshot,
+    user_id: str | None,
+    *,
+    include_private: bool = True,
+) -> list[Skill]:
     """Public plus the caller's private skills, private winning on a shared skill id.
 
     Unlike SkillSnapshot.visible_for this does **not** filter disabled or
     personally-switched-off skills: the settings page has to render both
-    switches, so it needs the row with its effective state.
+    switches, so it needs the row with its effective state.  include_private
+    is for the public catalog page: it must not inherit the slash menu's
+    private-precedence rule.
     """
-    private = tuple(snapshot.private_by_owner.get(user_id, ())) if user_id else ()
+    private = (
+        tuple(snapshot.private_by_owner.get(user_id, ()))
+        if include_private and user_id
+        else ()
+    )
     private_ids = {skill.skill_id for skill in private if skill.skill_id is not None}
     public = [
         skill
@@ -798,9 +809,12 @@ async def _catalog_responses(
     user_id: str | None,
     include_global: bool,
     is_admin: bool,
+    include_private: bool,
 ) -> list[SkillResponse]:
     responses: list[SkillResponse] = []
-    for skill in visible_catalog_rows(snapshot, user_id):
+    for skill in visible_catalog_rows(
+        snapshot, user_id, include_private=include_private
+    ):
         responses.append(
             _catalog_response(
                 skill,
@@ -819,6 +833,7 @@ async def list_skills_for_api(
     user_id: str | None,
     include_global: bool = False,
     is_admin: bool = False,
+    include_private: bool = True,
 ) -> list[SkillResponse]:
     """GET /api/skills: filesystem scans disk; git reads the published snapshot.
 
@@ -831,6 +846,8 @@ async def list_skills_for_api(
         catalog = await asyncio.to_thread(
             scan_skills_for_api, user_id=user_id, include_global=include_global
         )
+        if not include_private:
+            catalog = [row for row in catalog if row.category == "public"]
         return merge_builtin_responses(builtin, catalog)
     if runtime is None:
         # 没有运行时 = 没有权威目录。已发布的快照只是上一次刷新留下的残影，
@@ -844,6 +861,7 @@ async def list_skills_for_api(
         user_id=user_id,
         include_global=include_global,
         is_admin=is_admin,
+        include_private=include_private,
     )
     return merge_builtin_responses(builtin, catalog)
 

@@ -2,6 +2,7 @@
 
 - GET /api/skills：任何登录用户（skills:read）。斜杠菜单与设置页共用。
   来源决定数据从哪里来：filesystem 扫盘；git 读进程级快照（公共 + 本人私有）。
+  ?scope=public 只返回已发布的公共行，给技能页的公共目录用。
 - PUT /api/skills/{skill_id}/preference：**普通用户唯一的写操作**——开关"我用不用"。
   只写 skills_prefs.json；git 来源的键是内部 skill_id。
 - PATCH /api/skills/{skill_id}：admin 的**全局**开关，动所有人。
@@ -42,9 +43,13 @@ router = APIRouter(prefix="/skills", tags=["skills"])
 async def list_skills(
     request: Request,
     caller: Annotated[RunCaller, Depends(require_scope("skills:read"))],
-    scope: Annotated[Literal["effective", "global"], Query()] = "effective",
+    scope: Annotated[Literal["effective", "global", "public"], Query()] = "effective",
 ) -> SkillsListResponse:
-    """默认给**有效状态**；admin 传 ?scope=global 才额外看到全局值。"""
+    """默认给**有效状态**；admin 传 ?scope=global 才额外看到全局值。
+
+    ?scope=public 只返回已发布的公共技能，供技能页的公共目录使用；未审核的
+    私有草稿不会混进来。
+    """
     if scope == "global" and not caller.allows("admin"):
         raise RunPermissionDenied("missing scope: admin")
     skills = await list_skills_for_api(
@@ -52,6 +57,7 @@ async def list_skills(
         user_id=caller.user_id,
         include_global=scope == "global",
         is_admin=caller.allows("admin"),
+        include_private=scope != "public",
     )
     return SkillsListResponse(skills=skills)
 

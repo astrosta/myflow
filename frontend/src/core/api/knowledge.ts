@@ -101,6 +101,23 @@ export interface KnowledgeDocument {
   updated_at: string;
 }
 
+export interface KnowledgeChunk {
+  chunk_id: string;
+  chunk_index: number;
+  section: string;
+  page: number;
+  content: string;
+  /** Set for children of the parent-child strategy; empty for flat chunks. */
+  parent_id?: string;
+}
+
+export interface KnowledgeChunksPage {
+  document_id: string;
+  chunks: KnowledgeChunk[];
+  count: number;
+  next_offset: number | null;
+}
+
 export interface KnowledgeSearchHit {
   chunk_id: string;
   document_id: string;
@@ -108,6 +125,7 @@ export interface KnowledgeSearchHit {
   section: string;
   page: number;
   chunk_index: number;
+  parent_id?: string;
   score: number;
   knowledge_base_id: string;
   knowledge_base_name: string;
@@ -213,6 +231,38 @@ export async function uploadKnowledgeFiles(
   return request<{ documents: KnowledgeDocument[]; count: number }>(
     "/knowledge/bases/" + encodeURIComponent(baseId) + "/documents",
     { method: "POST", body: form },
+  );
+}
+
+export function getKnowledgeDocument(
+  baseId: string,
+  documentId: string,
+): Promise<KnowledgeDocument> {
+  return request<KnowledgeDocument>(
+    "/knowledge/bases/" +
+      encodeURIComponent(baseId) +
+      "/documents/" +
+      encodeURIComponent(documentId),
+  );
+}
+
+export function listKnowledgeDocumentChunks(
+  baseId: string,
+  documentId: string,
+  offset = 0,
+  limit = 20,
+): Promise<KnowledgeChunksPage> {
+  const params = new URLSearchParams({
+    offset: String(offset),
+    limit: String(limit),
+  });
+  return request<KnowledgeChunksPage>(
+    "/knowledge/bases/" +
+      encodeURIComponent(baseId) +
+      "/documents/" +
+      encodeURIComponent(documentId) +
+      "/chunks?" +
+      params.toString(),
   );
 }
 

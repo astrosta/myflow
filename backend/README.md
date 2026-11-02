@@ -102,21 +102,31 @@ models:
   最终由 `create_chat_model(..., reasoning_effort=…)` 传给模型；模型不支持就整体丢弃；
 - `provider` / `reasoning_efforts` 是**元数据**：不会被当成模型构造参数转发出去。
 
-### 持久记忆（M10 §2）
+### 持久记忆（M10 / OpenViking）
 
-`memory.enabled: true` 后，lifespan 按 `database.backend` 打开 LangGraph `BaseStore`
-（memory / sqlite / postgres 同一套选择），并按用户 namespace 存画像与 facts：
+`memory.openviking.enabled: true` 是长期记忆的唯一开关：自动抽取的偏好/实体/事件等八类记忆
+存 OpenViking，MyFlow 只保留运行所需元数据表。用户画像（profile）是数据库里的身份资料
+（`memory_profile_documents`），**不随这个开关关闭**：
 
-| 数据 | namespace | key |
-|---|---|---|
-| 画像 | `users/<user_id>/profile` | `current` |
-| 所有记录 | `users/<user_id>/records` | `kind:id` |
-| 维护统计 | `users/<user_id>/stats` | `current` |
+| 面 | 说明 |
+|---|---|
+| `GET /api/memory/profile` | 当前画像字段；行不存在返回空字段（不 404） |
+| `GET /api/memory/profile/schema` | 全部受支持字段的元数据，前端按它渲染全字段表单 |
+| `PATCH /api/memory/profile` | 部分更新；`null` 删除字段；列表整列表替换；etag CAS |
+| `GET/POST /api/memory/profile/suggestions` `/onboarding` | 画像建议与引导 |
+| `GET /api/memory/items/types` | 记忆管理支持的六类记忆与中文名 |
+| `GET /api/memory/items` | 按类型列记忆摘要（OpenViking 过滤型 `find`，不落库） |
+| `GET /api/memory/items/detail` / `content` | 详情目录（`.overview.md`）与记忆正文（`read`） |
+| `PUT /api/memory/items/content` / `DELETE /api/memory/items` | 编辑/删除具体记忆（`write` / `rm`，sidecar 只读） |
 
-画像在 `before_agent` 以隐藏 HumanMessage（id `__user_profile__`）注入；长尾事实只通过
-只读工具 `memory_search` 检索。写入走后台 debounce 抽取 + 确定性 proposal 门，模型不能
-声明"用户确认了"。HTTP 面是 `/api/memory`（profile / search / items / facts / conflicts /
-export / maintenance）。`memory.backend_class` 是启动项，换后端要重启并重置 manager。
+记忆管理页（前端入口 `/workspace/memory`，侧栏“记忆管理”）的查看/编辑/删除直接调用 OpenViking 协议
+（`find` / `overview` / `read` / `write` / `rm`），MyFlow 不保存记忆副本，`.abstract.md` / `.overview.md` 只读。
+
+画像在 run assembly 时渲染进系统提示的 `<user_profile>` 段；记忆正文由内置子代理
+`memory-researcher` 通过只读工具 `memory_search` / `memory_read` / `memory_overview` 检索，
+lead 只拿结论与来源（`2026-11-02-retrieval-subagents-design.md`）。写入只有两个入口：用户在“我的画像”
+表单里保存，或用户在对话里**显式**说出画像信息后由内置工具 `update_user_profile` 写入
+（模型推断不写画像；工具与表单共用同一行和 etag）。
 
 ### PII / 敏感信息边界
 
@@ -167,8 +177,9 @@ stdio 服务器是**有状态子进程**：会话按 `(server, user_id:thread_id
 模型看到的是系统提示词尾部的 `<available_skills>` 索引（每技能一行 `name [category]: 截断描述`，
 描述截断到 `index_description_max_chars`；根目录 `skills.container_path` 与"目录名即技能名、
 SOP 固定 `SKILL.md`"的约定在块前说一次，路径可推），
-正文一律按需：`read_file` 读 SKILL.md、`search_and_load_skills` 按任务意图检索加载，
-或 `/skill-name` 注入 —— 没有"全量注入"模式开关。
+正文一律按需：`read_file` 读 SKILL.md、委派内置子代理 `skill-finder`（内部调
+`search_and_load_skills`，只回候选 name/path/description）后由 lead 读正文，或 `/skill-name` 注入
+—— 没有"全量注入"模式开关。
 已激活的技能由 `<active_skills>`（在 `<durable_context_data>` 里）投影：名字、描述、目录，
 外加**核心 SOP 正文**。正文不进 state，每次投影按 `skill_context` 台账里的 path 现读，
 预算见 `skills.active_context`；正文还在消息里时默认不重复写（压缩之后它才是唯一副本）。
@@ -334,6 +345,21 @@ uv run python -m backend.scripts.migrate_user_buckets --apply
 
 旧扁平布局 `{base}/threads/{tid}/...` 全部归**第一个 admin**；目标已存在就跳过、
 **绝不覆盖**；跨盘时先校验条目数与总字节数再删源。旧共享 `{base}/agents/` 只报告不搬。
+### 知识库 collection 重置（父子块）
+
+```bash
+# 先看一眼会删哪两个 collection（默认就是 dry-run）
+uv run python -m backend.scripts.reset_knowledge_milvus
+# 真删（要求：Gateway 已停；SQL 元数据与上传文件先走删除知识库接口）
+uv run python -m backend.scripts.reset_knowledge_milvus --apply
+```
+
+父子块这轮的 schema **不兼容**：老 `myflow_knowledge` 没有 `parent_id`，入库会直接抛
+`KnowledgeUnavailable`。脚本删 `{collection}_parents` 和 `{collection}` 两套 collection，
+只读 `config.yaml` 的 `vector_store` / `knowledge_base.vector_store` 两个块（不展开模型 key，
+删 collection 不需要模型凭据）；父 collection 先删，中途失败不会留下孤儿父块。
+父 collection 用 2 维占位向量满足“collection 必须含向量字段”——Milvus 拒绝 dim<2
+（code 1100 `invalid dimension: 1`），父块全文只按主键读，不参与任何检索。
 
 ### PAT 的现状
 
@@ -372,7 +398,7 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `GET` | `/api/threads/{id}/artifacts/...` | 产物 |
 | `GET`/`PATCH` | `/api/mcp/config` | 读 MCP 配置（打码成 `****`）/ 启停一台已有服务器（`admin`） |
 | `POST` | `/api/mcp/cache/reset` | 清本进程的 MCP 工具缓存（`admin`） |
-| `GET` | `/api/skills` | 技能目录，`enabled` 是**有效状态**（`skills:read`；`?scope=global` 仅 `admin`） |
+| `GET` | `/api/skills` | 技能目录，`enabled` 是**有效状态**（`skills:read`；`?scope=global` 仅 `admin`；`?scope=public` 只返回已发布公共技能） |
 | `GET` | `/api/skills/mine` | 当前用户的私有草稿列表（`skills:read`） |
 | `POST` | `/api/skills` | 新建私有草稿（`skills:write`） |
 | `POST` | `/api/skills/{skill_id}/draft/save` | 保存草稿版本并刷新目录快照（`skills:write`） |
@@ -431,15 +457,21 @@ Qwen3-Embedding-8B（4096 维）→ Milvus。元数据与文档状态共用主�
 `document_count` 和当前活跃分片数 `chunk_count` 在知识库行上原子维护。
 
 创建知识库时必须选择类型（类型不可改）：技术文档、运维手册、FAQ、安全合规、API 参考、
-法律法规（`legal`）。默认 token 档位：技术/运维/安全/法律 512/64，FAQ 384/0，API 768/0；
-硬上界 1024 token。分片和查询都走 Qwen3 tokenizer，不可用时会明确回退近似计数。
+法律法规（`legal`）。默认 token 档位：技术 512/64，运维/安全/法律 512/0，
+FAQ 384/0，API 768/0；硬上界 1024 token。FAQ 只对问题做 embedding，正文仍保存 Q+A。
+运维/安全/API/法律超长逻辑单元使用父子块：父块存父 collection，子块带 parent_id；
+检索命中子块后返回父块全文。分片和查询都走 Qwen3 tokenizer，不可用时会明确回退近似计数。
+
+清洗在通用文本规范化后，确定性删除目录页、前言、版权声明、免责声明、修订记录和
+重复块；原始上传文件保留。该版本的 Milvus schema 新增 `parent_id` 和
+`{collection}_parents`；旧 collection 不兼容，必须删除现有知识库数据后重新入库。
 
 `security` 与 `legal` 是两种东西：前者是**内部**安全/合规要求与控制项，后者是**外部**
 法规原文；`legal_clause` 策略按 `第X条（之N）/ Article N / § N / 条款 N` 切分，
 一条一个分片，条号写进 `section`，引用能直接落到“《XX 办法》第十二条”。
 
-Agent 自动获得只读 `knowledge_search` 工具。工具把 `knowledge_base_type` 作为参数，
-由模型按问题语义路由；服务端始终按 `user_id` 过滤，模型不能传身份。首版入库任务
+Agent 通过内置子代理 `knowledge-researcher` 使用只读 `knowledge_search`（lead 不再直接持有它；
+子代理不可用时退回 lead 直连）。工具把 `knowledge_base_type` 作为参数，由模型按问题语义路由；服务端始终按 `user_id` 过滤，模型不能传身份。首版入库任务
 在 Gateway 进程内运行，重启会中断；按单 worker 部署，多实例前需换成持久任务队列。
 
 检索是混合检索（§7.4）：问题拆成 `query`（向量）与 `keyword_query`（BM25 关键词，
@@ -456,10 +488,12 @@ collection 没有这些字段，关键词通道会报 `keyword_search_unavailabl
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| `GET` | `/api/knowledge/status` | 启用状态、限制、五类分片参数 |
+| `GET` | `/api/knowledge/status` | 启用状态、限制、六类分片参数 |
 | `GET`/`POST` | `/api/knowledge/bases` | 列 / 建知识库 |
 | `GET`/`PATCH`/`DELETE` | `/api/knowledge/bases/{id}` | 详情 / 改名 / 级联删除 |
 | `GET`/`POST` | `/api/knowledge/bases/{id}/documents` | 文档列表 / 批量上传（202） |
+| `GET` | `/api/knowledge/bases/{id}/documents/{doc}` | 文档元数据 |
+| `GET` | `/api/knowledge/bases/{id}/documents/{doc}/chunks` | 文档切片，按 `chunk_index` 排序并分页 |
 | `POST` | `/api/knowledge/bases/{id}/documents/{doc}/reindex` | 重新解析 / 索引 |
 | `DELETE` | `/api/knowledge/bases/{id}/documents/{doc}` | 删除文档与向量 |
 | `GET` | `/api/knowledge/search` | 检索测试（`q` 向量 + `keyword` BM25、`type` / `base_id` 过滤） |

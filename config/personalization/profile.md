@@ -1,8 +1,6 @@
 ---
 preferred_name: ""
-pronouns: ""
 locale: ""
-timezone: ""
 language: ""
 tone: ""
 verbosity: ""
@@ -20,9 +18,7 @@ boundaries: []
 > 用户身份（profile）。助手身份在 `identity.md`，助手原则在 `soul.md`。
 
 - 称呼：
-- 代词：
 - 地区：
-- 时区：
 - 语言：
 - 语气：
 - 详细程度：

@@ -19,7 +19,11 @@ from agentkit.agents.memory.openviking.contracts import (
     ProfileView,
 )
 from agentkit.agents.memory.openviking.models import MemoryProfileDocumentRow
-from agentkit.agents.memory.types import PROFILE_FIELD_PRIORITY, validate_profile_value
+from agentkit.agents.memory.types import (
+    FOLLOW_CONVERSATION_LANGUAGE,
+    PROFILE_FIELD_PRIORITY,
+    validate_profile_value,
+)
 
 
 class ProfileConflict(Exception):
@@ -28,9 +32,7 @@ class ProfileConflict(Exception):
 
 _FIELD_TO_KEY = {
     "identity.preferred_name": "preferred_name",
-    "identity.pronouns": "pronouns",
     "identity.locale": "locale",
-    "identity.timezone": "timezone",
     "communication.language": "language",
     "communication.tone": "tone",
     "communication.verbosity": "verbosity",
@@ -46,10 +48,8 @@ _KEY_TO_FIELD = {key: field for field, key in _FIELD_TO_KEY.items()}
 _EMPTY_BODY = "# 用户画像\n\n> 用户身份（profile）。助手身份在 identity.md，助手原则在 soul.md。\n"
 _PROFILE_LABELS = {
     "identity.preferred_name": "希望被称呼为",
-    "identity.pronouns": "代词",
     "identity.locale": "地区",
-    "identity.timezone": "时区",
-    "communication.language": "主要语言",
+    "communication.language": "语言偏好",
     "communication.tone": "偏好语气",
     "communication.verbosity": "详细程度",
     "communication.format": "偏好格式",
@@ -103,7 +103,9 @@ def render_profile_fields(
         value = fields.get(path)
         if value in (None, "", []):
             continue
-        if isinstance(value, (list, tuple)):
+        if path == "communication.language" and value == FOLLOW_CONVERSATION_LANGUAGE:
+            rendered = "跟随当前对话语言"
+        elif isinstance(value, (list, tuple)):
             rendered = "、".join(str(item) for item in value if str(item).strip())
         else:
             rendered = str(value).strip()
@@ -162,6 +164,27 @@ class ProfileService:
             await session.commit()
             await session.refresh(row)
             return _view(row)
+
+    async def update_fields(
+        self, user_id: str, fields: dict[str, Any], *, attempts: int = 2
+    ) -> ProfileView:
+        """Apply fields without the caller holding an etag.
+
+        The model tool does not know the current etag, so it reads one and retries
+        once against a fresh one. A second conflict is real contention and must
+        surface instead of blindly overwriting the user's form submission.
+        """
+
+        if not fields:
+            return await self.get_snapshot(user_id)
+        last: ProfileConflict | None = None
+        for _ in range(max(1, int(attempts))):
+            snapshot = await self.get_snapshot(user_id)
+            try:
+                return await self.patch(user_id, fields, etag=snapshot.etag)
+            except ProfileConflict as exc:
+                last = exc
+        raise last or ProfileConflict("profile etag conflict")
 
     async def delete_field(self, user_id: str, field_path: str, *, etag: str) -> ProfileView:
         if field_path not in _FIELD_TO_KEY:

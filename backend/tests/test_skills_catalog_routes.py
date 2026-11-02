@@ -301,6 +301,47 @@ def test_alice_sees_public_and_her_private_but_not_bobs(
     assert {item["name"] for item in bob.json()["skills"]} == {"shared", "bob-tools"}
 
 
+def test_scope_public_excludes_private_drafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"})
+    runtime = _runtime(_snapshot())
+    set_skill_snapshot(runtime.catalog.snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+
+    rows = client.get("/api/skills?scope=public").json()["skills"]
+
+    assert {item["name"] for item in rows} == {"shared"}
+    assert rows[0]["scope"] == "public"
+
+
+def test_scope_public_keeps_the_public_row_when_the_owner_has_a_private_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(tmp_path, monkeypatch, source="git", git={"repository": "https://example.test/s.git"})
+    owner_copy = _skill(
+        "s-pub",
+        "shared",
+        SkillScope.PRIVATE,
+        "alice",
+        commit=PRIVATE_COMMIT,
+        path="users/alice/s-pub/SKILL.md",
+    )
+    snapshot = SkillSnapshot("epoch-1", (PUBLIC,), {"alice": (owner_copy,)})
+    runtime = _runtime(snapshot)
+    set_skill_snapshot(snapshot)
+    client = _client(monkeypatch, runtime=runtime)
+
+    effective = client.get("/api/skills").json()["skills"]
+    public = client.get("/api/skills?scope=public").json()["skills"]
+
+    assert len(effective) == 1
+    assert effective[0]["scope"] == "private"
+    assert len(public) == 1
+    assert public[0]["scope"] == "public"
+    assert public[0]["version_id"] == "ver-s-pub"
+
+
 def test_list_rows_carry_catalog_fields_and_hide_foreign_ownership(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

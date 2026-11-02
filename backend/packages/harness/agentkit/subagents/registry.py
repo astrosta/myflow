@@ -38,12 +38,20 @@ from agentkit.sandbox.security import is_host_bash_allowed
 from agentkit.skills.storage import SkillRegistry
 from agentkit.subagents.builtins import BUILTIN_SUBAGENTS
 from agentkit.subagents.builtins import bash_agent as _bash_agent
+from agentkit.subagents.builtins import (
+    knowledge_researcher as _knowledge_researcher,
+)
+from agentkit.subagents.builtins import memory_researcher as _memory_researcher
+from agentkit.subagents.builtins import skill_finder as _skill_finder
 from agentkit.subagents.config import SubagentConfig
 
 logger = logging.getLogger(__name__)
 
-#: 唯一一个"默认可能不可用"的内置类型（§5.2）：宿主 bash 没开时它整条消失。
+#: 默认可能不可用的内置类型：能力开关关掉时整条从发现列表消失。
 BASH_SUBAGENT_NAME = _bash_agent.NAME
+KNOWLEDGE_SUBAGENT_NAME = _knowledge_researcher.NAME
+MEMORY_SUBAGENT_NAME = _memory_researcher.NAME
+SKILL_SUBAGENT_NAME = _skill_finder.NAME
 
 
 def get_subagent_config(name: str, *, app_config: AppConfig) -> SubagentConfig | None:
@@ -131,14 +139,24 @@ def subagent_skill_registry(
 
 
 def _builtin_available(name: str, app_config: AppConfig) -> bool:
-    """§5.2：宿主 bash 未允许且当前沙箱不是隔离 provider 时，``bash`` 整条不进发现列表。
+    """§5.2：能力没开的内置类型整条不进发现列表。
 
-    ``is_host_bash_allowed`` 对隔离 provider（Docker 等）恒为 True——那种沙箱里跑 shell
-    本来就是设计；本地 provider 才看 ``sandbox.allow_host_bash``。
+    - ``bash``：宿主 bash 未允许且当前沙箱不是隔离 provider 时不可用；
+    - ``knowledge-researcher``：知识库关闭时不可用；
+    - ``memory-researcher``：长期记忆开关关闭时不可用；
+    - ``skill-finder``：技能检索关闭时不可用。
+
+    发现与执行共用这一个判断：只过滤一边会出现"看得见调不动"或"看不见却能调"。
     """
-    if name != BASH_SUBAGENT_NAME:
-        return True
-    return is_host_bash_allowed(app_config)
+    if name == BASH_SUBAGENT_NAME:
+        return is_host_bash_allowed(app_config)
+    if name == KNOWLEDGE_SUBAGENT_NAME:
+        return bool(app_config.knowledge_base.enabled)
+    if name == MEMORY_SUBAGENT_NAME:
+        return bool(app_config.memory.openviking.enabled)
+    if name == SKILL_SUBAGENT_NAME:
+        return bool(getattr(app_config.skills.search, "enabled", True))
+    return True
 
 
 def _discoverable_builtin_names(app_config: AppConfig) -> list[str]:
@@ -206,6 +224,9 @@ def _apply_overrides(
 
 __all__ = [
     "BASH_SUBAGENT_NAME",
+    "KNOWLEDGE_SUBAGENT_NAME",
+    "MEMORY_SUBAGENT_NAME",
+    "SKILL_SUBAGENT_NAME",
     "filter_tools",
     "get_subagent_config",
     "list_subagent_names",

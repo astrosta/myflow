@@ -42,13 +42,16 @@ class SubagentConfig:
 
     字段语义（§4.3）：
       * ``tools=None``              继承 lead **当时**持有的全部工具，再扣 ``disallowed_tools``
-      * ``skills=None``             全部启用技能；``[]`` = 禁用技能
+      * ``skills=None``             暂未生效（子代理链没有技能中间件）；``[]`` 同样不改变可见技能
       * ``disallowed_tools=None``   不过滤（默认值是 ``["task"]``）
       * ``model="inherit"``         只继承名字，凭据仍来自服务端配置（M7 §6）
+      * ``max_turns``               模型调用次数上限；执行器按图的节点换算 ``recursion_limit``
     """
 
     name: str
     description: str
+    #: ``max_concurrent == 1`` 时委派段改用这一版（去掉并行字样）；None = 两种模式同一份。
+    sequential_description: str | None = None
     system_prompt: str | None = None
     tools: list[str] | None = None
     disallowed_tools: list[str] | None = field(

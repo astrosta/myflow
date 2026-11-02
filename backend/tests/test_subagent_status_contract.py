@@ -138,6 +138,15 @@ def test_the_result_message_marks_a_capped_completion_as_partial() -> None:
     assert "结果：half" in message
 
 
+def test_the_result_message_marks_a_capped_failure() -> None:
+    """failed + stop_reason 也要带上限标签，否则 lead 会以为是普通失败而原样重试。"""
+    message = format_subagent_result_message(
+        status="failed", error="子代理在轮次预算内没有产出结论", stop_reason="turn_capped"
+    )
+    assert message.startswith("任务失败（触发护栏上限：轮次预算）。")
+    assert "子代理在轮次预算内没有产出结论" in message
+
+
 def test_the_result_message_covers_every_status() -> None:
     for status in SUBAGENT_STATUS_VALUES:
         assert "任务" in format_subagent_result_message(status=status, error="why")
