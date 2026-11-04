@@ -25,7 +25,11 @@ from agentkit.sandbox.exceptions import (
 )
 from agentkit.sandbox.lease import lease_owner_from_context, shield_sandbox_work
 from agentkit.sandbox.sandbox import Sandbox
-from agentkit.sandbox.sandbox_provider import SandboxProvider, get_sandbox_provider
+from agentkit.sandbox.sandbox_provider import (
+    SandboxProvider,
+    get_sandbox_provider,
+    reset_sandbox_provider,
+)
 from agentkit.sandbox.security import safe_app_config
 
 #: 沙箱动作名。M10 的策略按它分支，M9 的 AllowAll 不看。
@@ -170,6 +174,17 @@ def start_sandbox_provider(*, app_config: Any = None) -> SandboxProvider:
         provider = get_sandbox_provider(app_config=app_config)
     provider.startup_check()
     return provider
+
+
+async def shutdown_sandbox_provider() -> None:
+    """Drop the process provider off-loop: ``shutdown()`` kills every live sandbox.
+
+    ``reset_sandbox_provider`` calls ``provider.shutdown()``, which for a remote provider
+    pauses/kills containers over the network—the same blocking IO that justifies
+    ``release_async``. A synchronous reset here would stall the loop that is still
+    draining the run manager, so the shutdown path awaits this instead.
+    """
+    await asyncio.to_thread(reset_sandbox_provider)
 
 
 async def run_sync_tool_after_async_init(func, runtime: ToolRuntime, *args: Any) -> Any:

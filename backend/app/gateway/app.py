@@ -29,8 +29,7 @@ from agentkit.persistence.recovery import gateway_worker_count, recover_inflight
 from agentkit.persistence.thread_meta import make_thread_meta_store
 from agentkit.runtime import cancel_detached
 from agentkit.runtime.checkpointer import make_checkpointer
-from agentkit.sandbox.runtime import start_sandbox_provider
-from agentkit.sandbox.sandbox_provider import reset_sandbox_provider
+from agentkit.sandbox.runtime import shutdown_sandbox_provider, start_sandbox_provider
 from agentkit.subagents.runtime import get_subagent_runtime
 from agentkit.persistence.events import make_run_event_store
 from agentkit.runtime.run_services import build_run_services
@@ -334,8 +333,9 @@ async def lifespan(app: FastAPI):
                         # 仍要读快照和检索服务，先拆掉会让它们半路失明。
                         await services.run_manager.shutdown(timeout=timeout if timeout is not None else 10.0)
                         # run manager 排空之后才拆 provider：还在收尾的 run 仍可能要
-                        # release 自己的沙箱。reset 顺带 shutdown（本地杀进程，远程 kill 容器）。
-                        reset_sandbox_provider()
+                        # release 自己的沙箱。reset 顺带 shutdown（本地杀进程，远程 kill 容器），
+                        # 那是网络 IO——必须在线程池里跑，不能占着正在收尾的事件循环。
+                        await shutdown_sandbox_provider()
                         await stop_skill_runtime(app)
                         cancel_detached()
                         await services.bridge.aclose()  # 最后放掉桥的连接池（Redis 后端才有事可做）

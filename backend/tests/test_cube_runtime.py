@@ -109,6 +109,29 @@ def test_start_sandbox_provider_propagates_a_failed_check(monkeypatch) -> None:
         runtime.start_sandbox_provider()
 
 
+# ---------------------------------------------------------------- shutdown hook
+
+
+def test_shutdown_sandbox_provider_is_awaitable() -> None:
+    """The gateway shutdown needs an awaitable: the reset is not a bare callable call."""
+    assert asyncio.iscoroutinefunction(runtime.shutdown_sandbox_provider)
+
+
+def test_shutdown_sandbox_provider_offloads_the_reset(monkeypatch) -> None:
+    """Reset runs ``provider.shutdown()`` (remote kill/pause): not on the event loop."""
+    threads: list[int] = []
+
+    def _reset() -> None:
+        threads.append(threading.get_ident())
+
+    monkeypatch.setattr(runtime, "reset_sandbox_provider", _reset)
+
+    asyncio.run(runtime.shutdown_sandbox_provider())
+
+    assert len(threads) == 1, "the reset must run exactly once"
+    assert threads != [threading.get_ident()], "the reset must run in a worker thread"
+
+
 # ------------------------------------------------------- base release_async
 
 
