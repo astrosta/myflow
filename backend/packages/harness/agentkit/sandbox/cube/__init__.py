@@ -14,10 +14,12 @@ from agentkit.sandbox.cube.mounts import (
     to_host_path,
     validate_mount_sources,
 )
+from agentkit.sandbox.cube.provider import CubeSandboxProvider
 from agentkit.sandbox.cube.sandbox import CubeSandbox
 
 __all__ = [
     "CubeSandbox",
+    "CubeSandboxProvider",
     "HostRoots",
     "MountEntry",
     "build_host_mounts",
