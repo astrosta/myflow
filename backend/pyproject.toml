@@ -29,6 +29,10 @@ skills = [
 redis = [
     "agentkit[redis]",
 ]
+# CubeSandbox provider 需要控制面 SDK 与 Redis lease。
+cube = [
+    "agentkit[cube,redis]",
+]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",

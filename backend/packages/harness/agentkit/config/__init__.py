@@ -25,7 +25,13 @@ from agentkit.config.memory_config import MemoryConfig
 from agentkit.config.model_config import ModelConfig, ReasoningEffortOption
 from agentkit.config.pii_config import PIIConfig
 from agentkit.config.runs_config import RunsConfig
-from agentkit.config.sandbox_config import SandboxConfig
+from agentkit.config.sandbox_config import (
+    CubeSandboxConfig,
+    CubeSandboxHostMountConfig,
+    CubeSandboxLeaseConfig,
+    CubeSandboxNetworkConfig,
+    SandboxConfig,
+)
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.config.skills_prefs import (
     DEFAULT_USER_BUCKET,
@@ -64,6 +70,10 @@ __all__ = [
     "AuthConfig",
     "LocalLoginConfig",
     "CheckpointerConfig",
+    "CubeSandboxConfig",
+    "CubeSandboxHostMountConfig",
+    "CubeSandboxLeaseConfig",
+    "CubeSandboxNetworkConfig",
     "CustomSubagentConfig",
     "DatabaseConfig",
     "ExtensionsConfig",
