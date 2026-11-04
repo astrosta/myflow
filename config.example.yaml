@@ -180,10 +180,55 @@ stream_bridge:
 # 本地沙箱是路径映射，不是隔离。宿主 bash 默认关闭。
 # sandbox.use 是 startup-only：改了要重启。
 sandbox:
+  # 生产切 Cube：use: agentkit.sandbox.cube:CubeSandboxProvider，并启用下面的 cube 段。
   use: agentkit.sandbox.local:LocalSandboxProvider
   allow_host_bash: false   # 仅在完全可信的本地环境设为 true
   bash_command_timeout: 600
   mounts: []
+
+  # CubeSandbox（宿主挂载，Linux 同机部署）。默认保持注释：本地 provider 不需要这一节。
+  # 取消注释前先装依赖：cd backend && uv sync --extra cube（= agentkit[cube,redis]），
+  # 否则 sandbox.use 指向 Cube 会因缺 cubesandbox/redis 拒绝启动。
+  # sandbox.cube 整段是 startup-only：改完要重启 Gateway。
+  # cube:
+  #   api_url: $CUBE_API_URL            # 显式配置；不依赖 SDK 默认的 127.0.0.1:3000
+  #   api_key: ""                       # 有鉴权时写 $CUBE_API_KEY；无鉴权保持空
+  #   template_id: $CUBE_TEMPLATE_ID    # 必填；模板要预建 /mnt/user-data 与 /mnt/skills
+  #   sandbox_domain: cube.app
+  #   proxy_node_ip: null               # 留空走 DNS；需要时写 $CUBE_PROXY_NODE_IP
+  #   proxy_port: 80
+  #
+  #   # 生命周期：pause 保持 MicroVM 热，宿主文件不受影响；kill 每次重建。
+  #   timeout_seconds: 1800             # 空闲 TTL，显式给值，不依赖集群默认
+  #   on_timeout: pause                 # kill | pause
+  #   auto_resume: true
+  #   release_action: pause             # kill | pause；shutdown() 始终 kill
+  #   acquire_timeout_seconds: 120      # 等 Redis per-thread 锁的上限
+  #   request_timeout_seconds: 30       # 控制面 HTTP 超时，不是命令超时
+  #   startup_healthcheck: true         # 启动时 Cube health + Redis PING，失败即拒绝启动
+  #
+  #   # 网络
+  #   allow_internet_access: true
+  #   allow_public_traffic: false
+  #   sandbox_user: root                # V1 默认 root；非 root 要先验证 UID/GID/umask
+  #   network:
+  #     deny_out:
+  #       - 169.254.169.254/32
+  #
+  #   # 宿主挂载：Gateway 与 Cubelet 在同一台 Linux 主机，看到同一个项目根。
+  #   # 两项都省略时都取 project_root()（MYFLOW_PROJECT_ROOT 或工作目录）；
+  #   # host_root 必须落在 CubeMaster 的 allowed_host_mount_prefixes 里（默认只允许 /data/shared/）。
+  #   host_mount:
+  #     local_root: /opt/myflow          # Gateway 进程看到的根，要覆盖 .myflow 与 skills/
+  #     host_root: /opt/myflow           # Cubelet 看到的同一个根；同机可省略
+  #     allowed_prefix: /opt/myflow      # 只作记录；真正的白名单在 CubeMaster
+  #
+  #   # V1 必填：多 worker 的 per-thread 锁。Redis 不可达时启动失败。
+  #   lease:
+  #     redis_url: $REDIS_URL
+  #     ttl_seconds: 30
+  #
+  #   max_cached_threads: 64             # 进程内缓存上限；驱逐只丢 handle，不 pause/kill 远端
 
 # ------------------------------------------------------------
 # M8 子代理委派。整段热重载。

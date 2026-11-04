@@ -62,6 +62,55 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
 
 沙箱段见 `config.yaml` 的 `sandbox`。本机 Local provider 默认不开宿主 bash；可信环境可设 `allow_host_bash: true`。
 
+### CubeSandbox 宿主挂载（Linux 同机部署）
+
+默认仍是本地 provider。要在 CubeSandbox MicroVM 里跑工具，把 `sandbox.use` 切成
+`agentkit.sandbox.cube:CubeSandboxProvider`，并启用 `sandbox.cube`（`config.example.yaml`
+里有整段注释模板）。这是**宿主挂载**，不是第二套工作区：CubeSandbox 通过 bind mount 看到同一份
+`.myflow/users/{user_id}/threads/{thread_id}/user-data`；上传和产物的 `thread_files.py`
+链路完全不变，`/mnt/user-data/uploads`、`/mnt/user-data/outputs` 就是宿主上那两个目录。
+
+前置条件（缺一条都会在启动或第一次 acquire 失败）：
+
+1. **Gateway 与 Cubelet 在同一台 Linux 主机**，看到同一个项目根。`host_mount.local_root` 和
+   `host_mount.host_root` 默认都取 `project_root()`（`MYFLOW_PROJECT_ROOT` 或 Gateway 的工作目录），
+   同机部署时两项都可以省略。这个根必须同时覆盖 `.myflow`（thread 数据 + Git 技能缓存）和
+   `skills/`（内置技能），所以默认是整个项目根，不是一个单独的数据盘目录。
+2. CubeMaster 的 `allowed_host_mount_prefixes` 必须包含这个项目根。CubeMaster 默认只允许
+   `/data/shared/`；创建时报 `hostPath ... is not within an allowed mount prefix` 就是这里没配。
+3. 模板已预创建 `/mnt/user-data` 和 `/mnt/skills` 下的技能路径
+   （`skills.container_path` 默认 `/mnt/skills`），并提供 `bash`、`python3`、`tar`、`grep`、
+   `find`、`sed`、`dd`、`base64`。建议模板 umask `0022`。`workspace`、`uploads`、
+   `outputs` 三个子目录由宿主线程目录提供，每次 acquire 前创建。
+4. Gateway 进程对项目根有读写权限，沙箱内（默认 `sandbox_user: root`）写出的文件必须能被
+   Gateway 读和删。每次 acquire 的 canary 就在验证这一点：宿主机写 token → 沙箱读，
+   沙箱写 token → 宿主机读，探针放在 `workspace/.myflow-canary/`，成功后删除。
+   失败会 kill 新沙箱并报 `host mount canary failed`，先查 `host_mount`、模板 umask 和目录权限。
+5. 装依赖：`cd backend && uv sync --extra cube`（backend 的 `cube` extra = `agentkit[cube,redis]`，
+   提供 `cubesandbox>=0.7.3,<0.8` 和 `redis>=5`）。如果直接装 harness 的 extras，
+   `agentkit[cube]` 不够：per-thread 锁在 `redis` extra 里，必须 `agentkit[cube,redis]`。
+6. Redis 从 Gateway 可达，`sandbox.cube.lease.redis_url`（生产用 `$REDIS_URL`）指向它；
+   多 worker 必须共用同一个实例/DB。启动时 Redis `PING` 失败直接拒绝启动；运行中续租失败会把
+   handle 标成 dead，不会带着失效的锁继续写。
+
+配置要点：
+
+- `sandbox.use`、整个 `sandbox.cube`、`sandbox.mounts`、`skills.container_path`、
+  `skills.builtin.*`、`skills.git.cache_dir`、`skills.source` 都是 **startup-only**，改完重启。
+- `release_action` 默认 `pause`：`after_agent` 每轮跑完都会释放，kill 会变成"每条用户消息
+  冷启动一个 MicroVM"。pause 保留内存和进程状态，下一轮 `connect()` 自动恢复，宿主文件仍在。
+  `shutdown()` 始终 kill。
+- `on_timeout` 默认 `pause`，`auto_resume: true`：空闲到 `timeout_seconds` 暂停，下次请求自动恢复。
+  集群配额紧张时可以把 `on_timeout` / `release_action` 改成 `kill`，宿主数据不受影响。
+- `allow_public_traffic: false` 让 CubeProxy 拒绝未带 traffic token 的公网请求；SDK 会自动带。
+- 宿主挂载清单（`/mnt/user-data` 读写，技能树只读）和 mount hash 写进沙箱 metadata。
+  配置或技能路径变了，下一次 acquire 会发现 hash 不一致并重建旧沙箱，不会带着过期挂载继续跑。
+
+**回滚**：把 `sandbox.use` 改回 `agentkit.sandbox.local:LocalSandboxProvider`，重启 Gateway 即可。
+不需要数据库迁移，也不需要移动宿主文件：local 与 cube 共用同一份 `user-data` 和技能树。
+旧 checkpoint 里的 `cube:` sandbox_id 在回滚后 `get()` 返回 `None`，runtime 会重新 acquire
+本地沙箱；反过来从 local 切到 cube 也一样。
+
 ### 模型与推理等级（输入框里的两个选择）
 
 **列表来自厂商**：`GET /api/models` 会带着 `models[].api_key` 去调每个 provider 的
@@ -504,6 +553,22 @@ collection 没有这些字段，关键词通道会报 `keyword_search_unavailabl
 # 必须在仓库根跑：测试 import backend.* 和 agentkit.*
 uv run python -m pytest backend/tests
 ```
+
+CubeSandbox 的真集群用例默认跳过，只在 Linux 宿主上显式开启（会创建真实 MicroVM 和宿主挂载，
+不要指向共享生产 Cube）：
+
+```bash
+cd backend
+CUBE_INTEGRATION=1 \
+CUBE_API_URL=http://<cube-api> \
+CUBE_TEMPLATE_ID=<template-id> \
+CUBE_PROXY_NODE_IP=<node-ip> \
+REDIS_URL=redis://127.0.0.1:6379/0 \
+uv run pytest tests/test_cube_integration.py -v
+```
+
+有鉴权时再加 `CUBE_API_KEY`。用例跑真实 provider 的 acquire → `echo`/python3 →
+`/mnt/user-data/workspace` 双向读写 → canary → pause/release → 重新 acquire。
 
 ## 排障
 
