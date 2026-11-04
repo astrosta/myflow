@@ -18,7 +18,10 @@ from agentkit.sandbox.cube.client import SdkSandbox, error_status
 from agentkit.sandbox.cube.files import (
     command_exit_code,
     command_stdout,
+    glob_paths,
+    grep_paths,
     is_timeout_error,
+    list_tree,
     read_bytes,
     read_text,
     write_bytes,
@@ -174,8 +177,15 @@ class CubeSandbox(Sandbox):
     # -- tree listing and search -----------------------------------------
 
     def list_dir(self, path: str, max_depth: int = 2) -> list[str]:
-        del path, max_depth
-        raise NotImplementedError("CubeSandbox.list_dir is not implemented yet")
+        normalized = self._assert_path(path)
+        try:
+            return list_tree(
+                self._sdk, normalized, user=self.sandbox_user, max_depth=max_depth
+            )
+        except (SandboxError, OSError):
+            raise
+        except Exception as exc:
+            raise OSError(f"Failed to list {normalized}: {exc}") from exc
 
     def glob(
         self,
@@ -185,8 +195,20 @@ class CubeSandbox(Sandbox):
         include_dirs: bool = False,
         max_results: int = 200,
     ) -> tuple[list[str], bool]:
-        del path, pattern, include_dirs, max_results
-        raise NotImplementedError("CubeSandbox.glob is not implemented yet")
+        normalized = self._assert_path(path)
+        try:
+            return glob_paths(
+                self._sdk,
+                normalized,
+                pattern,
+                user=self.sandbox_user,
+                include_dirs=include_dirs,
+                max_results=max_results,
+            )
+        except (SandboxError, OSError):
+            raise
+        except Exception as exc:
+            raise OSError(f"Failed to search {normalized}: {exc}") from exc
 
     def grep(
         self,
@@ -198,8 +220,22 @@ class CubeSandbox(Sandbox):
         case_sensitive: bool = False,
         max_results: int = 100,
     ) -> tuple[list[GrepMatch], bool]:
-        del path, pattern, glob, literal, case_sensitive, max_results
-        raise NotImplementedError("CubeSandbox.grep is not implemented yet")
+        normalized = self._assert_path(path)
+        try:
+            return grep_paths(
+                self._sdk,
+                normalized,
+                pattern,
+                user=self.sandbox_user,
+                glob=glob,
+                literal=literal,
+                case_sensitive=case_sensitive,
+                max_results=max_results,
+            )
+        except (SandboxError, OSError):
+            raise
+        except Exception as exc:
+            raise OSError(f"Failed to search {normalized}: {exc}") from exc
 
     # -- helpers ----------------------------------------------------------
 
