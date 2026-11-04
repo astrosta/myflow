@@ -1,32 +1,26 @@
-"""SDK boundary for the CubeSandbox control plane and per-sandbox APIs.
+"""E2B protocol boundary for CubeSandbox.
 
-The CubeSandbox package is an optional dependency. It is imported only inside
-the methods that need it, so a local-only deployment can import the sandbox
-package without installing agentkit[cube].
+The official E2B Python SDK is optional. It is imported only inside the methods
+that need it, so a local-only deployment can import the sandbox package without
+installing agentkit[cube].
 
 The Protocols here are the narrow surface CubeSandboxProvider and CubeSandbox
-depend on. The fake in tests/fakes/cube_sdk.py implements the same surface.
+depend on. The adapters below translate E2B objects and exceptions into that
+surface; the fake in tests/fakes/cube_sdk.py implements the same surface.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import urlencode
-
-import httpx
-
-_DEFAULT_STATE_FILTER = "running,paused"
-# Only a forbidden metadata query degrades to client-side filtering. Missing or
-# rejected credentials (401) and server faults (5xx) must still surface.
-_FORBIDDEN_STATUS = 403
 
 logger = logging.getLogger(__name__)
 
 
 class SdkSandbox(Protocol):
-    """The subset of cubesandbox.Sandbox used by this project."""
+    """The subset of an E2B Sandbox used by this project."""
 
     sandbox_id: str
     commands: Any
@@ -40,7 +34,7 @@ class SdkSandbox(Protocol):
 
 
 class SdkFactory(Protocol):
-    """The CubeSandbox SDK operations the provider needs."""
+    """The E2B operations the provider needs."""
 
     def create(
         self,
@@ -60,23 +54,24 @@ class SdkFactory(Protocol):
     def health(self) -> None: ...
 
 
-def build_metadata_query(metadata: Mapping[str, str]) -> str:
-    """Render metadata as un-nested query pairs (x-www-form-urlencoded)."""
+_GONE_STATUS_CODES = frozenset({404, 410})
 
-    return urlencode(list(metadata.items()))
-
-
-def _row_matches_metadata(row: object, metadata: Mapping[str, str]) -> bool:
-    """Exact, string-compared metadata match for the fallback list."""
-
-    if not isinstance(row, dict):
-        return False
-    found = row.get("metadata")
-    if not isinstance(found, Mapping):
-        return False
-    return all(
-        str(found.get(key)) == str(value) for key, value in metadata.items()
-    )
+# E2B reports the sandbox's own lifecycle in the exception type rather than in
+# an HTTP status: the control plane answers `SandboxNotFoundException` and the
+# proxy in front of envd answers `SandboxNotRunningException` when the MicroVM
+# was killed, paused away, or timed out. Neither carries a status code, so the
+# provider's re-acquire decision has to read the type.
+_GONE_TYPE_NAMES = frozenset({"SandboxNotFoundException", "SandboxNotRunningException"})
+# A missing *path* inside a live sandbox is also a not-found, but it must never
+# be mistaken for a dead sandbox: the handle is still usable.
+_MISSING_PATH_TYPE_NAMES = frozenset(
+    {"FileNotFoundException", "VolumePathNotFoundException"}
+)
+# A sandbox that could not be reached is not a timeout of the request itself,
+# even though E2B makes these subclasses of its `TimeoutException`.
+_UNREACHABLE_TYPE_NAMES = frozenset(
+    {"SandboxUnreachableException", "SandboxNotRunningException"}
+)
 
 
 def error_status(exc: BaseException) -> int | None:
@@ -91,13 +86,184 @@ def error_status(exc: BaseException) -> int | None:
         return None
 
 
-class CubesandboxFactory:
-    """Thin adapter around cubesandbox.Config/Sandbox plus the v2 list API.
+def _type_names(exc: BaseException) -> set[str]:
+    return {cls.__name__ for cls in type(exc).__mro__}
 
-    One factory instance is cheap and reusable. The optional http_client is
-    injected by tests and is never closed by this class; a client created by
-    list_by_metadata is scoped to that call.
+
+def is_gone_error(exc: BaseException) -> bool:
+    """Whether ``exc`` may mean the remote sandbox itself no longer exists.
+
+    The owner must stop handing the handle out (the runtime then re-acquires),
+    so anything that names a missing path answers ``False`` here even though
+    both cases are a not-found on the wire. A bare 404/410 is ambiguous and
+    stays ``True``: dropping the handle costs one re-acquire, while serving a
+    dead sandbox costs the whole run.
     """
+
+    names = _type_names(exc)
+    if names & _MISSING_PATH_TYPE_NAMES:
+        return False
+    if names & _GONE_TYPE_NAMES:
+        return True
+    return error_status(exc) in _GONE_STATUS_CODES
+
+
+def is_missing_path_error(exc: BaseException) -> bool:
+    """Whether ``exc`` means a path inside the sandbox does not exist.
+
+    Callers that asked about a path must check this before ``is_gone_error``:
+    a bare 404 answers both, and for a path request the missing path is the
+    reading that keeps the tool error useful.
+    """
+
+    names = _type_names(exc)
+    if names & _MISSING_PATH_TYPE_NAMES:
+        return True
+    if names & _GONE_TYPE_NAMES:
+        return False
+    return error_status(exc) in _GONE_STATUS_CODES
+
+
+def is_unreachable_error(exc: BaseException) -> bool:
+    """Whether ``exc`` says the sandbox could not be reached at all."""
+
+    return bool(_type_names(exc) & _UNREACHABLE_TYPE_NAMES)
+
+
+class SandboxGoneError(OSError):
+    """The remote sandbox no longer exists: killed, paused away, or timed out.
+
+    Subclasses OSError so the Sandbox file contract is unchanged, while the
+    provider still learns that this handle must not be served again.
+    """
+
+
+@dataclass(frozen=True)
+class _CommandResult:
+    stdout: str
+    stderr: str
+    exit_code: int
+
+
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+class _CommandsAdapter:
+    """Convert E2B's CommandExitException into the project's result shape.
+
+    E2B raises where the rest of this project expects a result with a non-zero
+    exit code, and the tool layer renders "exit code N" itself. A command that
+    exits 1 is therefore normal tool output, not an SDK failure.
+    """
+
+    def __init__(self, sdk: Any, commands: Any) -> None:
+        exit_exception = getattr(sdk, "CommandExitException", None)
+        self._exit_exception: type[BaseException] | None = (
+            exit_exception if isinstance(exit_exception, type) else None
+        )
+        self._commands = commands
+
+    def run(
+        self,
+        cmd: str,
+        *,
+        timeout: float | None = None,
+        cwd: str | None = None,
+        envs: dict[str, str] | None = None,
+        user: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        try:
+            return self._commands.run(
+                cmd,
+                timeout=timeout,
+                cwd=cwd,
+                envs=envs,
+                user=user,
+                **kwargs,
+            )
+        except Exception as exc:
+            if self._exit_exception is None or not isinstance(
+                exc, self._exit_exception
+            ):
+                raise
+            return _CommandResult(
+                stdout=_as_text(getattr(exc, "stdout", "")),
+                stderr=_as_text(getattr(exc, "stderr", "")),
+                exit_code=int(getattr(exc, "exit_code", -1)),
+            )
+
+
+class _FilesAdapter:
+    """Normalize E2B EntryInfo objects and bytes results for existing helpers."""
+
+    def __init__(self, sdk: Any, files: Any) -> None:
+        self._sdk = sdk
+        self._files = files
+
+    def read(self, path: str, *, format: str = "text", user: str | None = None) -> Any:
+        data = self._files.read(path, format=format, user=user)
+        if format == "bytes":
+            return bytes(data)
+        return data
+
+    def write(self, path: str, data: str | bytes, *, user: str | None = None) -> Any:
+        return self._files.write(path, data, user=user)
+
+    def list(self, path: str, *, user: str | None = None) -> list[dict[str, Any]]:
+        entries = self._files.list(path, depth=1, user=user)
+        return [self._entry(entry) for entry in entries]
+
+    def stat(self, path: str, *, user: str | None = None) -> dict[str, Any]:
+        entry = self._files.get_info(path, user=user)
+        return self._entry(entry)
+
+    def exists(self, path: str, *, user: str | None = None) -> bool:
+        return bool(self._files.exists(path, user=user))
+
+    def make_dir(self, path: str, *, user: str | None = None) -> Any:
+        return self._files.make_dir(path, user=user)
+
+    @staticmethod
+    def _entry(entry: Any) -> dict[str, Any]:
+        type_value = getattr(entry, "type", None)
+        normalized = str(getattr(type_value, "value", type_value) or "").lower()
+        return {
+            "name": str(getattr(entry, "name", "") or ""),
+            "type": "FILE_TYPE_DIRECTORY" if normalized == "dir" else "FILE_TYPE_FILE",
+            "size": str(getattr(entry, "size", 0) or 0),
+            "path": str(getattr(entry, "path", "") or ""),
+        }
+
+
+class _SandboxAdapter:
+    """The SdkSandbox Protocol over an E2B Sandbox instance."""
+
+    def __init__(self, sdk: Any, sandbox: Any) -> None:
+        self._sandbox = sandbox
+        self.sandbox_id = sandbox.sandbox_id
+        self.commands = _CommandsAdapter(sdk, sandbox.commands)
+        self.files = _FilesAdapter(sdk, sandbox.files)
+
+    def kill(self) -> None:
+        self._sandbox.kill()
+
+    def pause(self) -> None:
+        self._sandbox.pause()
+
+    def close(self) -> None:
+        # E2B's sync Sandbox has no close(); its transport is released with the
+        # handle. Keep the method so the provider's lifecycle contract is stable.
+        return None
+
+
+class E2BFactory:
+    """Thin adapter around the official E2B Python SDK."""
 
     def __init__(
         self,
@@ -105,20 +271,13 @@ class CubesandboxFactory:
         api_key: str,
         template_id: str,
         sandbox_domain: str,
-        proxy_node_ip: str | None,
-        proxy_port: int,
         request_timeout: float,
-        *,
-        http_client: httpx.Client | None = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.template_id = template_id
         self.sandbox_domain = sandbox_domain
-        self.proxy_node_ip = proxy_node_ip
-        self.proxy_port = proxy_port
         self.request_timeout = request_timeout
-        self._http_client = http_client
 
     def create(
         self,
@@ -131,133 +290,77 @@ class CubesandboxFactory:
         allow_internet_access: bool,
     ) -> SdkSandbox:
         sdk = self._import_sdk()
-        return sdk.Sandbox.create(
+        sandbox = sdk.Sandbox.create(
             template=template,
             timeout=timeout,
             metadata=metadata,
             lifecycle=lifecycle,
             network=network,
             allow_internet_access=allow_internet_access,
-            config=self._sdk_config(sdk),
+            **self._connection_kwargs(),
         )
+        return _SandboxAdapter(sdk, sandbox)
 
     def connect(self, sandbox_id: str) -> SdkSandbox:
         sdk = self._import_sdk()
-        return sdk.Sandbox.connect(sandbox_id, config=self._sdk_config(sdk))
+        sandbox = sdk.Sandbox.connect(
+            sandbox_id,
+            **self._connection_kwargs(),
+        )
+        return _SandboxAdapter(sdk, sandbox)
 
     def list_by_metadata(self, metadata: Mapping[str, str]) -> list[dict]:
-        """List sandboxes matching every metadata pair, following pagination.
-
-        CubeAPI expects one metadata query parameter whose value is the
-        key=value pairs joined by ampersands:
-        ?metadata=myflow%3D1%26myflow.thread%3Dt1&state=running,paused.
-        The SDK's Sandbox.list_v2 does not expose that filter, so this method
-        talks to the v2 endpoint directly. x-next-token carries the next page
-        cursor back as the nextToken query parameter.
-
-        When the deployment forbids the metadata query (HTTP 403), discovery
-        degrades instead of blocking the run: one warning, one unfiltered
-        Sandbox.list_v2 call, and the same exact-pair match applied here.
-        """
-
-        headers: dict[str, str] = {}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-
-        params = {
-            "metadata": build_metadata_query(metadata),
-            "state": _DEFAULT_STATE_FILTER,
-        }
-
-        results: list[dict] = []
-        next_token: str | None = None
-        seen_tokens: set[str] = set()
-
-        while True:
-            request_params = dict(params)
-            if next_token is not None:
-                request_params["nextToken"] = next_token
-
-            response = self._get("/v2/sandboxes", headers, request_params)
-            if response.status_code == _FORBIDDEN_STATUS:
-                return self._list_v2_by_metadata(metadata)
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, list):
-                raise ValueError("CubeAPI /v2/sandboxes did not return a JSON list")
-            results.extend(payload)
-
-            next_token = response.headers.get("x-next-token")
-            next_token = next_token.strip() if next_token else None
-            if not next_token:
-                return results
-            if next_token in seen_tokens:
-                raise RuntimeError(
-                    f"CubeAPI repeated pagination token {next_token!r}"
-                )
-            seen_tokens.add(next_token)
-
-    def _list_v2_by_metadata(self, metadata: Mapping[str, str]) -> list[dict]:
-        """Degraded discovery: one unfiltered list_v2 call, filtered here."""
-
-        logger.warning(
-            "CubeAPI returned HTTP %s for /v2/sandboxes metadata discovery; "
-            "falling back to Sandbox.list_v2() with client-side filtering. "
-            "Grant the API key permission to list sandboxes by metadata to "
-            "restore server-side filtering.",
-            _FORBIDDEN_STATUS,
-        )
         sdk = self._import_sdk()
-        rows = sdk.Sandbox.list_v2(config=self._sdk_config(sdk))
-        if not isinstance(rows, list):
-            raise ValueError("CubeSandbox Sandbox.list_v2 did not return a JSON list")
-        return [row for row in rows if _row_matches_metadata(row, metadata)]
+        query = sdk.SandboxQuery(
+            metadata=dict(metadata),
+            state=[sdk.SandboxState.RUNNING, sdk.SandboxState.PAUSED],
+        )
+        paginator = sdk.Sandbox.list(query, **self._connection_kwargs())
+        rows: list[dict] = []
+        while paginator.has_next:
+            for info in paginator.next_items():
+                rows.append(
+                    {
+                        "sandboxID": info.sandbox_id,
+                        "metadata": dict(info.metadata or {}),
+                        "state": str(getattr(info.state, "value", info.state)),
+                        "startedAt": (
+                            info.started_at.isoformat()
+                            if getattr(info, "started_at", None) is not None
+                            else None
+                        ),
+                    }
+                )
+        return rows
 
     def health(self) -> None:
         sdk = self._import_sdk()
-        sdk.Sandbox.health(config=self._sdk_config(sdk))
+        paginator = sdk.Sandbox.list(limit=1, **self._connection_kwargs())
+        if paginator.has_next:
+            paginator.next_items()
 
-    def _get(
-        self,
-        path: str,
-        headers: dict[str, str],
-        params: dict[str, str],
-    ) -> httpx.Response:
-        if self._http_client is not None:
-            return self._http_client.get(
-                f"{self.api_url}{path}",
-                headers=headers,
-                params=params,
-            )
-        with httpx.Client(
-            base_url=self.api_url,
-            timeout=self.request_timeout,
-            headers=headers,
-        ) as client:
-            return client.get(path, params=params)
+    def _connection_kwargs(self) -> dict[str, Any]:
+        return {
+            "api_url": self.api_url,
+            "api_key": self.api_key or None,
+            "domain": self.sandbox_domain,
+            "request_timeout": self.request_timeout,
+        }
 
     @staticmethod
     def _import_sdk() -> Any:
-        import cubesandbox
+        import e2b
 
-        return cubesandbox
-
-    def _sdk_config(self, sdk: Any) -> Any:
-        return sdk.Config(
-            api_url=self.api_url,
-            api_key=self.api_key or None,
-            template_id=self.template_id,
-            sandbox_domain=self.sandbox_domain,
-            proxy_node_ip=self.proxy_node_ip,
-            proxy_port=self.proxy_port,
-            request_timeout=self.request_timeout,
-        )
+        return e2b
 
 
 __all__ = [
-    "CubesandboxFactory",
+    "E2BFactory",
+    "SandboxGoneError",
     "SdkFactory",
     "SdkSandbox",
-    "build_metadata_query",
     "error_status",
+    "is_gone_error",
+    "is_missing_path_error",
+    "is_unreachable_error",
 ]

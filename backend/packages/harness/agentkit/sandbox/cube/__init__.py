@@ -1,8 +1,8 @@
 """CubeSandbox host-mount descriptors and the SDK-backed sandbox.
 
 The package stays import-light: nothing here imports the optional
-cubesandbox/redis extras at module scope, so mount planning and startup
-validation work in a local-only deployment.
+e2b/redis extras at module scope, so mount planning and startup validation
+work in a local-only deployment.
 """
 
 from agentkit.sandbox.cube.mounts import (

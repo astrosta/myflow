@@ -7,14 +7,16 @@ run it manually:
 
     cd backend
     CUBE_INTEGRATION=1 \
-    CUBE_API_URL=http://<cube-api> \
-    CUBE_TEMPLATE_ID=<template-id> \
-    CUBE_PROXY_NODE_IP=<node-ip> \
+    E2B_API_URL=http://<cube-api> \
+    E2B_TEMPLATE_ID=<template-id> \
     REDIS_URL=redis://127.0.0.1:6379/0 \
     uv run pytest tests/test_cube_integration.py -v
 
-`CUBE_API_KEY` is optional. Never point this test at a shared production Cube:
-it starts and pauses sandboxes.
+`E2B_API_KEY` is optional. `E2B_DOMAIN` overrides the sandbox data-plane domain
+(`<port>-<sandbox-id>.<domain>`, default `cube.app`); the host must resolve those
+wildcard names, because the official SDK addresses each MicroVM through them.
+Never point this test at a shared production Cube: it starts and pauses
+sandboxes.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import pytest
 
 from agentkit.config import AppConfig
 from agentkit.config.paths import Paths
-from agentkit.sandbox.cube.client import CubesandboxFactory
+from agentkit.sandbox.cube.client import E2BFactory
 from agentkit.sandbox.cube.provider import CubeSandboxProvider
 
 # The real project root, exactly what the Gateway uses: MYFLOW_PROJECT_ROOT when
@@ -41,9 +43,8 @@ _PROJECT_ROOT = Path(
 ).resolve()
 _USER_ID = "cube-itest"
 _REQUIRED_ENV = (
-    "CUBE_API_URL",
-    "CUBE_TEMPLATE_ID",
-    "CUBE_PROXY_NODE_IP",
+    "E2B_API_URL",
+    "E2B_TEMPLATE_ID",
     "REDIS_URL",
 )
 
@@ -51,8 +52,8 @@ _REQUIRED_ENV = (
 def _skip_reason() -> str | None:
     if os.getenv("CUBE_INTEGRATION") != "1":
         return (
-            "set CUBE_INTEGRATION=1 and provide CUBE_API_URL, CUBE_TEMPLATE_ID, "
-            "CUBE_PROXY_NODE_IP, and REDIS_URL on the Linux Cube host"
+            "set CUBE_INTEGRATION=1 and provide E2B_API_URL, E2B_TEMPLATE_ID, "
+            "and REDIS_URL on the Linux Cube host"
         )
     if sys.platform != "linux":
         return "the live CubeSandbox round trip requires the Linux Cube host"
@@ -80,10 +81,10 @@ def _live_config() -> AppConfig:
             "sandbox": {
                 "use": "agentkit.sandbox.cube:CubeSandboxProvider",
                 "cube": {
-                    "api_url": os.environ["CUBE_API_URL"],
-                    "api_key": os.getenv("CUBE_API_KEY", ""),
-                    "template_id": os.environ["CUBE_TEMPLATE_ID"],
-                    "proxy_node_ip": os.environ["CUBE_PROXY_NODE_IP"],
+                    "api_url": os.environ["E2B_API_URL"],
+                    "api_key": os.getenv("E2B_API_KEY", ""),
+                    "template_id": os.environ["E2B_TEMPLATE_ID"],
+                    "sandbox_domain": os.getenv("E2B_DOMAIN", "cube.app"),
                     "release_action": "pause",
                     "host_mount": {
                         "local_root": str(_PROJECT_ROOT),
@@ -104,14 +105,12 @@ def _live_config() -> AppConfig:
     )
 
 
-def _sdk_factory() -> CubesandboxFactory:
-    return CubesandboxFactory(
-        api_url=os.environ["CUBE_API_URL"],
-        api_key=os.getenv("CUBE_API_KEY", ""),
-        template_id=os.environ["CUBE_TEMPLATE_ID"],
-        sandbox_domain="cube.app",
-        proxy_node_ip=os.environ["CUBE_PROXY_NODE_IP"],
-        proxy_port=80,
+def _sdk_factory() -> E2BFactory:
+    return E2BFactory(
+        api_url=os.environ["E2B_API_URL"],
+        api_key=os.getenv("E2B_API_KEY", ""),
+        template_id=os.environ["E2B_TEMPLATE_ID"],
+        sandbox_domain=os.getenv("E2B_DOMAIN", "cube.app"),
         request_timeout=30,
     )
 
@@ -124,7 +123,7 @@ def _row_remote_id(row: dict) -> str | None:
     return None
 
 
-def _kill_leftovers(factory: CubesandboxFactory, thread_id: str) -> None:
+def _kill_leftovers(factory: E2BFactory, thread_id: str) -> None:
     """Kill any sandbox this test leaves behind, including a paused one."""
 
     try:

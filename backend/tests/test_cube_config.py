@@ -77,7 +77,6 @@ def test_cube_config_documented_defaults() -> None:
     assert parsed is not None
     assert parsed.api_url == "http://127.0.0.1:3000"
     assert parsed.sandbox_domain == "cube.app"
-    assert parsed.proxy_port == 80
     assert parsed.timeout_seconds == 1800
     assert parsed.on_timeout == "pause"
     assert parsed.auto_resume is True

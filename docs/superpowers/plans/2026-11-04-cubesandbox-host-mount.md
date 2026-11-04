@@ -1,5 +1,10 @@
 # CubeSandbox Host-Mount Sandbox Implementation Plan
 
+> **已执行完毕的历史计划。** 计划里的 `cubesandbox` SDK 段落已被
+> [CubeSandbox E2B 协议迁移设计](../specs/2026-11-04-cubesandbox-e2b-protocol-design.md) 取代：
+> 线上实现用官方 `e2b>=2.62,<3`，`proxy_node_ip`/`proxy_port` 已删除，
+> 二进制读写走 E2B 原生 bytes。其余（host mount、Redis 锁、provider 生命周期、canary）仍然有效。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
 **Goal:** Add a CubeSandboxProvider that runs agent shell/file tools in a CubeSandbox MicroVM while the Gateway's existing per-thread user-data directory is bind-mounted into the sandbox, with no second workspace store and no changes to thread_files.py.

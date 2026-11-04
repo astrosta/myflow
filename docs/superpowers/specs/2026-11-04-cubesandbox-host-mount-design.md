@@ -1,6 +1,7 @@
 # CubeSandbox 宿主目录挂载沙箱设计
 
 > 状态：已确认并实现（2026-11-04；部署前提已确认）
+> 2026-11-04 协议修订：调用协议改为 E2B，SDK 相关段落以 [CubeSandbox E2B 协议迁移设计](2026-11-04-cubesandbox-e2b-protocol-design.md) 为准。
 > 适用范围：MyFlow 的 `agentkit.sandbox` 沙箱层、Gateway 启动配置、技能挂载、上传与产物读取
 > 已选方案：A（同机 Linux 宿主目录 + CubeSandbox `host-mount`）
 > 目标 provider：`agentkit.sandbox.cube:CubeSandboxProvider`

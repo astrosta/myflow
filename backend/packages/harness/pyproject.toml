@@ -41,9 +41,9 @@ skills = [
 redis = [
     "redis>=5.0",
 ]
-# CubeSandbox provider 的控制面 SDK；需与 redis extra 一起安装。
+# CubeSandbox provider 的 E2B 协议客户端；需与 redis extra 一起安装。
 cube = [
-    "cubesandbox>=0.7.3,<0.8",
+    "e2b>=2.62,<3",
 ]
 # OpenViking thin adapter. Server 0.4.19 is external; this is only the HTTP SDK.
 openviking = [

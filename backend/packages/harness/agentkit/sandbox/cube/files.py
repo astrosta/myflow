@@ -1,10 +1,8 @@
 """File helpers for CubeSandbox.
 
-Text goes through the SDK's envd file API. Real ``cubesandbox`` 0.7.3 exposes
-only ``Filesystem.read(path, *, user=None) -> str`` -- there is no ``format``
-argument and no bytes mode. Binary transfers therefore never ask the file API
-for bytes: they use a bounded ``dd`` + ``base64 -w0`` pipeline over
-``commands.run``, one 256 KiB slice at a time.
+Text and bytes both go through the E2B file API. E2B's
+``Filesystem.read`` supports ``format="text" | "bytes" | "stream"``, so
+binary reads use the native bytes mode instead of a base64 shell transfer.
 
 Search (``glob``/``grep``) runs one small Python helper dropped into the
 sandbox at ``SEARCH_HELPER_PATH``. The SDK has no glob and no content search, and
@@ -19,21 +17,25 @@ path-guard rejection stays a ``PermissionError``.
 from __future__ import annotations
 
 import base64
-import binascii
 import json
 import posixpath
 import shlex
 import weakref
 from typing import Any
 
-from agentkit.sandbox.cube.client import SdkSandbox, error_status
+from agentkit.sandbox.cube.client import (
+    SandboxGoneError,
+    SdkSandbox,
+    error_status,
+    is_gone_error,
+    is_missing_path_error,
+    is_unreachable_error,
+)
 from agentkit.sandbox.exceptions import SandboxError, SandboxRuntimeError
 from agentkit.sandbox.sandbox import GrepMatch
 
-# One dd slice per round trip. Large enough that a few MiB costs a few calls,
-# small enough that a single response cannot balloon the Gateway's memory.
-_TRANSFER_CHUNK_SIZE = 256 * 1024
-_TRANSFER_TIMEOUT_SECONDS = 120.0
+# A whole file crosses the wire in one E2B request now, so this is only a cap:
+# an artifact larger than this is refused instead of buffered in the Gateway.
 _MAX_TRANSFER_BYTES = 256 * 1024 * 1024
 _MKDIR_TIMEOUT_SECONDS = 30.0
 _READ_RANGE_TIMEOUT_SECONDS = 60.0
@@ -48,7 +50,6 @@ _SEARCH_TIMEOUT_SECONDS = 120.0
 # CubeSandbox: two sandboxes over one handle must not upload it twice.
 _PREPARED_SEARCH_HELPERS: weakref.WeakSet[Any] = weakref.WeakSet()
 _AUTH_STATUS_CODES = frozenset({401, 403})
-_MISSING_STATUS_CODES = frozenset({404, 410})
 _TIMEOUT_TYPE_NAMES = frozenset(
     {
         "TimeoutException",
@@ -115,54 +116,33 @@ def read_bytes(
     path: str,
     *,
     user: str,
-    chunk_size: int = _TRANSFER_CHUNK_SIZE,
-    timeout: float = _TRANSFER_TIMEOUT_SECONDS,
     max_bytes: int = _MAX_TRANSFER_BYTES,
 ) -> bytes:
-    """Read bytes through bounded base64 slices.
+    """Read bytes through the E2B native bytes mode.
 
-    The size comes from the file API, so a missing file fails before any
-    command runs. A file whose size cannot be reported falls back to reading
-    until a slice comes back empty, capped by ``max_bytes``.
+    One request carries the whole file, so the size is checked before the
+    download: an oversized artifact must fail rather than be buffered in the
+    Gateway. A directory is rejected here too, by the same probe.
     """
 
     size = _stat_size(sdk, path, user=user)
-    chunks: list[bytes] = []
-    offset = 0
-    index = 0
-    while size is None or offset < size:
-        if offset >= max_bytes:
-            raise OSError(
-                f"Failed to read {path}: it exceeds the {max_bytes}-byte transfer limit"
-            )
-        expected = chunk_size if size is None else min(chunk_size, size - offset)
-        chunk = _read_chunk(
-            sdk,
-            path,
-            user=user,
-            index=index,
-            chunk_size=chunk_size,
-            timeout=timeout,
+    if size is not None and size > max_bytes:
+        raise OSError(
+            f"Failed to read {path}: it exceeds the {max_bytes}-byte transfer limit"
         )
-        if not chunk:
-            if size is None:
-                break
-            raise OSError(
-                f"Failed to read {path}: the transfer stopped after "
-                f"{offset} of {size} bytes"
-            )
-        if size is not None and len(chunk) != expected:
-            if offset + len(chunk) == size:
-                chunks.append(chunk)
-                break
-            raise OSError(
-                f"Failed to read {path}: expected {expected} bytes but the "
-                f"sandbox returned {len(chunk)}"
-            )
-        chunks.append(chunk)
-        offset += len(chunk)
-        index += 1
-    return b"".join(chunks)
+    try:
+        data = sdk.files.read(path, format="bytes", user=user)
+    except Exception as exc:
+        raise _map_file_error(exc, path, action="read") from exc
+    if isinstance(data, bytearray):
+        data = bytes(data)
+    if not isinstance(data, bytes):
+        raise OSError(f"Failed to read {path}: the file API returned non-bytes data")
+    if len(data) > max_bytes:
+        raise OSError(
+            f"Failed to read {path}: it exceeds the {max_bytes}-byte transfer limit"
+        )
+    return data
 
 
 def write_bytes(sdk: SdkSandbox, path: str, content: bytes, *, user: str) -> None:
@@ -317,8 +297,15 @@ def command_exit_code(result: Any) -> int:
 
 
 def is_timeout_error(exc: BaseException) -> bool:
-    """Whether an SDK/HTTP exception reports a timeout."""
+    """Whether an SDK/HTTP exception reports a timeout of the request itself.
 
+    E2B models "the sandbox is gone" and "the sandbox cannot be reached" as
+    subclasses of its TimeoutException. Those are lifecycle failures, so they
+    must not be reported as a command or transfer deadline.
+    """
+
+    if is_gone_error(exc) or is_unreachable_error(exc):
+        return False
     return any(cls.__name__ in _TIMEOUT_TYPE_NAMES for cls in type(exc).__mro__)
 
 
@@ -376,25 +363,6 @@ def _is_large_file(sdk: SdkSandbox, path: str, *, user: str) -> bool:
     except Exception:
         return False
     return size > _LARGE_FILE_THRESHOLD
-
-
-def _read_chunk(
-    sdk: SdkSandbox,
-    path: str,
-    *,
-    user: str,
-    index: int,
-    chunk_size: int,
-    timeout: float,
-) -> bytes:
-    command = (
-        f"dd if={shlex.quote(path)} bs={chunk_size} skip={index} count=1"
-        " status=none 2>/dev/null | base64 -w0"
-    )
-    result = _run_command(
-        sdk, command, user=user, timeout=timeout, path=path, action="read"
-    )
-    return _decode_base64(command_stdout(result), path)
 
 
 def _read_line_range_with_sed(
@@ -528,10 +496,12 @@ def _map_list_error(
         return SandboxRuntimeError(
             "CubeSandbox rejected the file request; check sandbox.cube.api_key"
         )
+    if is_missing_path_error(exc):
+        return FileNotFoundError(f"{path}: no such file or directory")
+    if is_gone_error(exc):
+        return SandboxGoneError(f"Failed to list {path}: the sandbox is no longer running")
     if is_timeout_error(exc):
         return OSError(f"Failed to list {path}: the sandbox file API timed out")
-    if status in _MISSING_STATUS_CODES:
-        return FileNotFoundError(f"{path}: no such file or directory")
     entry = _probe_stat(sdk, path, user=user)
     if entry is not None and not _is_directory_entry(entry):
         return NotADirectoryError(f"{path}: not a directory")
@@ -639,15 +609,6 @@ def _mark_search_helper_ready(sdk: SdkSandbox) -> None:
         return
 
 
-def _decode_base64(payload: str, path: str) -> bytes:
-    try:
-        return base64.b64decode(payload.strip())
-    except (binascii.Error, ValueError) as exc:
-        raise OSError(
-            f"Failed to read {path}: the sandbox returned invalid base64"
-        ) from exc
-
-
 def _is_directory_entry(entry: dict[str, Any]) -> bool:
     return "DIR" in str(entry.get("type") or "").upper()
 
@@ -662,10 +623,16 @@ def _map_file_error(exc: BaseException, path: str, *, action: str) -> Exception:
         return SandboxRuntimeError(
             "CubeSandbox rejected the file request; check sandbox.cube.api_key"
         )
+    # A path request reads a bare not-found as a missing path; E2B names the
+    # sandbox-gone cases explicitly, so those are still reported as gone.
+    if is_missing_path_error(exc):
+        return OSError(f"Failed to {action} {path}: no such file or directory")
+    if is_gone_error(exc):
+        return SandboxGoneError(f"Failed to {action} {path}: the sandbox is no longer running")
     if is_timeout_error(exc):
         return OSError(f"Failed to {action} {path}: the sandbox file API timed out")
-    if status in _MISSING_STATUS_CODES:
-        return OSError(f"Failed to {action} {path}: no such file or directory")
+    if is_unreachable_error(exc):
+        return OSError(f"Failed to {action} {path}: the sandbox could not be reached: {exc}")
     return OSError(f"Failed to {action} {path}: {exc}")
 
 

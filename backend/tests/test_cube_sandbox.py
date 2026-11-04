@@ -1,16 +1,11 @@
 """CubeSandbox commands and file I/O contract tests.
 
-The real ``cubesandbox`` 0.7.3 ``Filesystem.read(path, *, user=None) -> str``
-has no ``format`` argument, so binary downloads go through a bounded
-``dd`` + ``base64 -w0`` transfer over ``commands.run``. The fake SDK is more
-permissive than the real one; these tests drive commands through the fake
-command handler and never rely on ``files.read(format="bytes")``.
+The E2B file API exposes native text and bytes modes. Binary downloads use
+``files.read(format="bytes")``; the fake SDK implements the same mode so these
+tests exercise the production path.
 """
 
 from __future__ import annotations
-
-import base64
-import re
 
 import pytest
 
@@ -299,37 +294,50 @@ def test_write_file_append_reads_then_writes(tmp_path) -> None:
 def test_download_and_update_bytes(tmp_path) -> None:
     sandbox = _sandbox(tmp_path)
     sandbox.update_file("/mnt/user-data/workspace/a.bin", b"\x00\x01")
-    sandbox._sdk.commands.handler = lambda cmd, **kw: FakeCommandResult("AAE=")
     assert sandbox.download_file("/mnt/user-data/workspace/a.bin") == b"\x00\x01"
 
 
-def test_download_file_reads_bounded_base64_chunks(tmp_path) -> None:
+def test_download_file_uses_native_e2b_bytes_mode(tmp_path) -> None:
     sandbox = _sandbox(tmp_path)
-    data = bytes(range(256)) * 1200  # 307_200 bytes: two 256 KiB slices
+    data = bytes(range(256)) * 1200
     sandbox.update_file("/mnt/user-data/workspace/big.bin", data)
-
-    commands: list[str] = []
-    reads: list[str] = []
-
-    def handler(cmd, **kw):
-        match = re.search(r"skip=(\d+)", cmd)
-        assert match is not None, cmd
-        offset = int(match.group(1)) * 262_144
-        commands.append(cmd)
-        return FakeCommandResult(base64.b64encode(data[offset : offset + 262_144]).decode())
-
-    sandbox._sdk.commands.handler = handler
+    calls: list[dict] = []
     original_read = sandbox._sdk.files.read
 
     def spy(path, **kwargs):
-        reads.append(path)
+        calls.append(kwargs)
         return original_read(path, **kwargs)
 
     sandbox._sdk.files.read = spy
+
     assert sandbox.download_file("/mnt/user-data/workspace/big.bin") == data
-    assert len(commands) == 2
-    assert all("dd if=" in cmd and "base64 -w0" in cmd for cmd in commands)
-    assert reads == []
+    assert calls[-1]["format"] == "bytes"
+
+
+def test_read_bytes_refuses_an_oversized_artifact_before_transfer(tmp_path) -> None:
+    from agentkit.sandbox.cube.files import read_bytes
+
+    sandbox = _sandbox(tmp_path)
+    sandbox.update_file("/mnt/user-data/workspace/big.bin", b"0123456789")
+    calls: list[str] = []
+    original_read = sandbox._sdk.files.read
+
+    def spy(path, **kwargs):
+        calls.append(path)
+        return original_read(path, **kwargs)
+
+    sandbox._sdk.files.read = spy
+
+    with pytest.raises(OSError, match="transfer limit"):
+        read_bytes(
+            sandbox._sdk,
+            "/mnt/user-data/workspace/big.bin",
+            user="root",
+            max_bytes=4,
+        )
+
+    # The size probe rejected it, so the gateway never buffered the file.
+    assert calls == []
 
 
 def test_download_file_missing_is_oserror(tmp_path) -> None:
@@ -345,14 +353,6 @@ def test_download_file_rejects_a_directory(tmp_path) -> None:
         sandbox.download_file("/mnt/user-data/workspace")
 
 
-def test_download_file_without_size_reads_until_empty(tmp_path) -> None:
-    sandbox = _sandbox(tmp_path)
-    sandbox._sdk.files.stat = lambda path, **kwargs: {"type": "FILE_TYPE_FILE"}
-    chunks = iter(["AAE=", ""])
-    sandbox._sdk.commands.handler = lambda cmd, **kw: FakeCommandResult(next(chunks))
-    assert sandbox.download_file("/mnt/user-data/workspace/a.bin") == b"\x00\x01"
-
-
 def test_file_tools_reject_escape_and_read_only(tmp_path) -> None:
     sandbox = _namespaced_sandbox(tmp_path)
     with pytest.raises(PermissionError):
@@ -366,5 +366,74 @@ def test_file_tools_reject_escape_and_read_only(tmp_path) -> None:
 
     (tmp_path / "private" / "a.txt").write_text("shared", encoding="utf-8")
     assert sandbox.read_file(f"{_PRIVATE_SKILLS}/a.txt") == "shared"
-    sandbox._sdk.commands.handler = lambda cmd, **kw: FakeCommandResult("c2hhcmVk")
     assert sandbox.download_file(f"{_PRIVATE_SKILLS}/a.txt") == b"shared"
+
+
+# -- E2B lifecycle errors --------------------------------------------------
+#
+# E2B reports "the sandbox is gone" in the exception type, not in an HTTP
+# status, and "this path is missing" as a distinct type. A dead handle must be
+# dropped; a missing path must stay an ordinary file error.
+
+
+class SandboxNotRunningException(Exception):
+    """Stand-in for e2b.SandboxNotRunningException."""
+
+
+class FileNotFoundException(Exception):
+    """Stand-in for e2b.FileNotFoundException."""
+
+
+def _raise(exception: BaseException):
+    def handler(*args, **kwargs):
+        del args, kwargs
+        raise exception
+
+    return handler
+
+
+def test_command_maps_an_e2b_gone_type_to_not_found(tmp_path) -> None:
+    dead: list[str] = []
+    sandbox = _sandbox(tmp_path, on_dead=lambda: dead.append(sandbox.id))
+    sandbox._sdk.commands.handler = _raise(
+        SandboxNotRunningException("was not found: the sandbox was killed")
+    )
+
+    with pytest.raises(SandboxNotFoundError):
+        sandbox.execute_command("true")
+
+    assert dead == ["cube:s1"]
+
+
+def test_a_file_read_of_a_gone_sandbox_drops_the_handle(tmp_path) -> None:
+    dead: list[str] = []
+    sandbox = _sandbox(tmp_path, on_dead=lambda: dead.append(sandbox.id))
+    sandbox._sdk.files.read = _raise(SandboxNotRunningException("was not found"))
+
+    with pytest.raises(OSError) as exc_info:
+        sandbox.read_file("/mnt/user-data/workspace/a.txt")
+
+    # The Sandbox file contract stays OSError-shaped for the tool layer.
+    assert not isinstance(exc_info.value, FileNotFoundError)
+    assert dead == ["cube:s1"]
+
+
+def test_a_missing_file_type_keeps_the_handle_alive(tmp_path) -> None:
+    dead: list[str] = []
+    sandbox = _sandbox(tmp_path, on_dead=lambda: dead.append(sandbox.id))
+    sandbox._sdk.files.read = _raise(FileNotFoundException("no such file"))
+
+    with pytest.raises(OSError):
+        sandbox.read_file("/mnt/user-data/workspace/a.txt")
+
+    assert dead == []
+
+
+def test_listing_a_missing_path_is_not_a_dead_handle(tmp_path) -> None:
+    dead: list[str] = []
+    sandbox = _sandbox(tmp_path, on_dead=lambda: dead.append(sandbox.id))
+
+    with pytest.raises(FileNotFoundError):
+        sandbox.list_dir("/mnt/user-data/missing")
+
+    assert dead == []

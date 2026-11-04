@@ -400,3 +400,52 @@ def test_lru_eviction_releases_the_lease_without_killing_the_remote(tmp_path) ->
     assert any(key == "myflow:sandbox:u1:t1" for key, _ in lock.released)
 
     provider.reset()
+
+# E2B reports a dead sandbox in the exception type, without an HTTP status: the
+# control plane answers SandboxNotFoundException, the proxy in front of envd
+# answers SandboxNotRunningException. Both must still drop the handle.
+
+
+class SandboxNotFoundException(Exception):
+    """Stand-in for e2b.SandboxNotFoundException."""
+
+
+class SandboxNotRunningException(Exception):
+    """Stand-in for e2b.SandboxNotRunningException."""
+
+
+def test_e2b_gone_command_drops_the_handle_and_releases_the_lease(tmp_path) -> None:
+    provider, factory, lock, _ = _provider(tmp_path)
+    sandbox_id = provider.acquire("t1", user_id="u1")
+    sdk = factory.created[0]
+
+    def raise_gone(cmd, **kwargs):
+        del cmd, kwargs
+        raise SandboxNotRunningException("was not found: the sandbox was killed")
+
+    sdk.commands.handler = raise_gone
+
+    sandbox = provider.get(sandbox_id)
+    assert sandbox is not None
+    with pytest.raises(SandboxNotFoundError):
+        sandbox.execute_command("true")
+
+    assert provider.get(sandbox_id) is None
+    assert any(key == "myflow:sandbox:u1:t1" for key, _ in lock.released)
+    assert sdk.closed is True
+
+
+def test_release_survives_a_pause_that_reports_the_sandbox_is_gone(tmp_path) -> None:
+    provider, factory, lock, _ = _provider(tmp_path)
+    sandbox_id = provider.acquire("t1", user_id="u1")
+    sdk = factory.created[0]
+
+    def raise_gone() -> None:
+        raise SandboxNotFoundException("sandbox not found")
+
+    sdk.pause = raise_gone
+
+    provider.release(sandbox_id)
+
+    assert lock.released
+    assert sdk.closed is True

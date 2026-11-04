@@ -188,15 +188,13 @@ sandbox:
 
   # CubeSandbox（宿主挂载，Linux 同机部署）。默认保持注释：本地 provider 不需要这一节。
   # 取消注释前先装依赖：cd backend && uv sync --extra cube（= agentkit[cube,redis]），
-  # 否则 sandbox.use 指向 Cube 会因缺 cubesandbox/redis 拒绝启动。
+  # 否则 sandbox.use 指向 Cube 会因缺 e2b/redis 拒绝启动。
   # sandbox.cube 整段是 startup-only：改完要重启 Gateway。
   # cube:
-  #   api_url: $CUBE_API_URL            # 显式配置；不依赖 SDK 默认的 127.0.0.1:3000
-  #   api_key: ""                       # 有鉴权时写 $CUBE_API_KEY；无鉴权保持空
-  #   template_id: $CUBE_TEMPLATE_ID    # 必填；模板要预建 /mnt/user-data 与 /mnt/skills
-  #   sandbox_domain: cube.app
-  #   proxy_node_ip: null               # 留空走 DNS；需要时写 $CUBE_PROXY_NODE_IP
-  #   proxy_port: 80
+  #   api_url: $E2B_API_URL             # 控制面地址；不依赖 SDK 默认的 127.0.0.1:3000
+  #   api_key: ""                       # 留空时由 e2b SDK 读 E2B_API_KEY；无鉴权保持空
+  #   template_id: $E2B_TEMPLATE_ID     # 必填；模板要预建 /mnt/user-data 与 /mnt/skills
+  #   sandbox_domain: cube.app          # 数据面 <port>-<sandbox-id>.<domain> 必须可解析（wildcard DNS）
   #
   #   # 生命周期：pause 保持 MicroVM 热，宿主文件不受影响；kill 每次重建。
   #   timeout_seconds: 1800             # 空闲 TTL，显式给值，不依赖集群默认

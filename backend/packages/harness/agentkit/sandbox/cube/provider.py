@@ -29,10 +29,10 @@ from agentkit.config.paths import Paths, get_paths
 from agentkit.config.sandbox_config import CubeSandboxConfig
 from agentkit.runtime.user_context import DEFAULT_USER_ID
 from agentkit.sandbox.cube.client import (
-    CubesandboxFactory,
+    E2BFactory,
     SdkFactory,
     SdkSandbox,
-    error_status,
+    is_gone_error,
 )
 from agentkit.sandbox.cube.locks import LockLease, RedisThreadLock, ThreadLock
 from agentkit.sandbox.cube.mounts import (
@@ -56,7 +56,6 @@ _CANARY_DIR = ".myflow-canary"
 _CANARY_CONTAINER = f"{_USER_DATA_CONTAINER}/workspace/{_CANARY_DIR}"
 _CANARY_IN = "in"
 _CANARY_OUT = "out"
-_GONE_STATUS_CODES = frozenset({404, 410})
 
 
 @dataclass
@@ -106,13 +105,11 @@ class CubeSandboxProvider(SandboxProvider):
         self._cube: CubeSandboxConfig = cube
         self._paths = paths if paths is not None else get_paths()
         self._instance_id = instance_id or uuid.uuid4().hex
-        self._sdk_factory: SdkFactory = sdk_factory or CubesandboxFactory(
+        self._sdk_factory: SdkFactory = sdk_factory or E2BFactory(
             api_url=cube.api_url,
             api_key=cube.api_key,
             template_id=cube.template_id,
             sandbox_domain=cube.sandbox_domain,
-            proxy_node_ip=cube.proxy_node_ip,
-            proxy_port=cube.proxy_port,
             request_timeout=cube.request_timeout_seconds,
         )
         if lock is None:
@@ -752,7 +749,7 @@ class CubeSandboxProvider(SandboxProvider):
             else:
                 raise SandboxRuntimeError(f"unknown CubeSandbox release action: {action}")
         except Exception as exc:
-            if error_status(exc) in _GONE_STATUS_CODES:
+            if is_gone_error(exc):
                 return
             raise
 
@@ -766,7 +763,7 @@ class CubeSandboxProvider(SandboxProvider):
         try:
             sdk.kill()
         except Exception as exc:
-            if error_status(exc) not in _GONE_STATUS_CODES:
+            if not is_gone_error(exc):
                 raise SandboxRuntimeError(
                     f"CubeSandbox kill of stale instance {remote_id} failed: {exc}"
                 ) from exc
@@ -783,7 +780,7 @@ class CubeSandboxProvider(SandboxProvider):
         try:
             sdk.kill()
         except Exception as exc:
-            if error_status(exc) not in _GONE_STATUS_CODES:
+            if not is_gone_error(exc):
                 logger.warning("could not kill a failed CubeSandbox", exc_info=True)
 
     @staticmethod

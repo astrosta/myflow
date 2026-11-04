@@ -79,19 +79,24 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
 2. CubeMaster 的 `allowed_host_mount_prefixes` 必须包含这个项目根。CubeMaster 默认只允许
    `/data/shared/`；创建时报 `hostPath ... is not within an allowed mount prefix` 就是这里没配。
 3. 模板已预创建 `/mnt/user-data` 和 `/mnt/skills` 下的技能路径
-   （`skills.container_path` 默认 `/mnt/skills`），并提供 `bash`、`python3`、`tar`、`grep`、
-   `find`、`sed`、`dd`、`base64`。建议模板 umask `0022`。`workspace`、`uploads`、
+   （`skills.container_path` 默认 `/mnt/skills`），并提供 `bash`、`python3`、`grep`、
+   `find`、`sed`（文本工具调它们；二进制读写走 E2B 文件 API，不需要 `dd`/`base64`）。
+   建议模板 umask `0022`。`workspace`、`uploads`、
    `outputs` 三个子目录由宿主线程目录提供，每次 acquire 前创建。
 4. Gateway 进程对项目根有读写权限，沙箱内（默认 `sandbox_user: root`）写出的文件必须能被
    Gateway 读和删。每次 acquire 的 canary 就在验证这一点：宿主机写 token → 沙箱读，
    沙箱写 token → 宿主机读，探针放在 `workspace/.myflow-canary/`，成功后删除。
    失败会 kill 新沙箱并报 `host mount canary failed`，先查 `host_mount`、模板 umask 和目录权限。
 5. 装依赖：`cd backend && uv sync --extra cube`（backend 的 `cube` extra = `agentkit[cube,redis]`，
-   提供 `cubesandbox>=0.7.3,<0.8` 和 `redis>=5`）。如果直接装 harness 的 extras，
+   提供 E2B 官方 Python SDK `e2b>=2.62,<3` 和 `redis>=5`）。如果直接装 harness 的 extras，
    `agentkit[cube]` 不够：per-thread 锁在 `redis` extra 里，必须 `agentkit[cube,redis]`。
 6. Redis 从 Gateway 可达，`sandbox.cube.lease.redis_url`（生产用 `$REDIS_URL`）指向它；
    多 worker 必须共用同一个实例/DB。启动时 Redis `PING` 失败直接拒绝启动；运行中续租失败会把
    handle 标成 dead，不会带着失效的锁继续写。
+7. **数据面域名可解析**：E2B 官方 SDK 按 `<port>-<sandbox_id>.<sandbox_domain>` 访问 envd，
+   所以 Gateway 必须能解析 `*.cube.app`（或你在 `sandbox_domain` 配的域名，需要 wildcard DNS）。
+   这是从 `cubesandbox` SDK 迁到 E2B 协议后唯一的部署新增项：旧 SDK 的
+   `CUBE_PROXY_NODE_IP` 逐请求 IP 覆盖在 E2B 协议里没有对应字段。
 
 配置要点：
 
@@ -102,7 +107,9 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
   `shutdown()` 始终 kill。
 - `on_timeout` 默认 `pause`，`auto_resume: true`：空闲到 `timeout_seconds` 暂停，下次请求自动恢复。
   集群配额紧张时可以把 `on_timeout` / `release_action` 改成 `kill`，宿主数据不受影响。
-- `allow_public_traffic: false` 让 CubeProxy 拒绝未带 traffic token 的公网请求；SDK 会自动带。
+- `allow_public_traffic: false` 让 CubeProxy 拒绝未带 traffic token 的公网请求；e2b SDK 会自动带。
+- `api_key` 留空时由 e2b SDK 读 `E2B_API_KEY`，`api_url` / `template_id` 建议直接用
+  `$E2B_API_URL` / `$E2B_TEMPLATE_ID`，与 SDK 自己的环境变量保持一致。
 - 宿主挂载清单（`/mnt/user-data` 读写，技能树只读）和 mount hash 写进沙箱 metadata。
   配置或技能路径变了，下一次 acquire 会发现 hash 不一致并重建旧沙箱，不会带着过期挂载继续跑。
 
@@ -560,14 +567,13 @@ CubeSandbox 的真集群用例默认跳过，只在 Linux 宿主上显式开启�
 ```bash
 cd backend
 CUBE_INTEGRATION=1 \
-CUBE_API_URL=http://<cube-api> \
-CUBE_TEMPLATE_ID=<template-id> \
-CUBE_PROXY_NODE_IP=<node-ip> \
+E2B_API_URL=http://<cube-api> \
+E2B_TEMPLATE_ID=<template-id> \
 REDIS_URL=redis://127.0.0.1:6379/0 \
 uv run pytest tests/test_cube_integration.py -v
 ```
 
-有鉴权时再加 `CUBE_API_KEY`。用例跑真实 provider 的 acquire → `echo`/python3 →
+有鉴权时再加 `E2B_API_KEY`；数据面域名不是 `cube.app` 时加 `E2B_DOMAIN`。用例跑真实 provider 的 acquire → `echo`/python3 →
 `/mnt/user-data/workspace` 双向读写 → canary → pause/release → 重新 acquire。
 
 ## 排障

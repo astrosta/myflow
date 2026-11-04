@@ -12,11 +12,17 @@ MicroVM, not this path table, is the isolation boundary for commands.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
-from agentkit.sandbox.cube.client import SdkSandbox, error_status
+from agentkit.sandbox.cube.client import (
+    SandboxGoneError,
+    SdkSandbox,
+    error_status,
+    is_gone_error,
+)
 from agentkit.sandbox.cube.files import (
     command_exit_code,
     command_stdout,
@@ -46,7 +52,6 @@ _DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024
 # 128 + SIGPIPE: head closed the pipe after the output cap. That is truncation,
 # not a failed command.
 _SIGPIPE_EXIT_CODE = 141
-_GONE_STATUS_CODES = frozenset({404, 410})
 _AUTH_STATUS_CODES = frozenset({401, 403})
 
 logger = logging.getLogger(__name__)
@@ -113,7 +118,7 @@ class CubeSandbox(Sandbox):
         except Exception as exc:
             mapped = _map_command_error(exc, self.id, limit)
             if isinstance(mapped, SandboxNotFoundError):
-                # A reaped sandbox answers every later call with 404/410, so the
+                # A reaped sandbox answers every later call the same way, so the
                 # owner must stop handing this handle out now.
                 self._notify_dead()
             if mapped is exc:
@@ -139,7 +144,7 @@ class CubeSandbox(Sandbox):
         end_line: int | None = None,
     ) -> str:
         normalized = self._assert_path(path)
-        try:
+        with self._file_errors(normalized, "read"):
             return read_text(
                 self._sdk,
                 normalized,
@@ -147,60 +152,38 @@ class CubeSandbox(Sandbox):
                 start_line=start_line,
                 end_line=end_line,
             )
-        except (SandboxError, OSError):
-            raise
-        except Exception as exc:
-            raise OSError(f"Failed to read {normalized}: {exc}") from exc
 
     def write_file(self, path: str, content: str, append: bool = False) -> None:
         normalized = self._assert_path(path, write=True)
         lock = get_file_operation_lock(self, normalized)
-        with lock:
-            try:
-                write_text(
-                    self._sdk,
-                    normalized,
-                    content,
-                    user=self.sandbox_user,
-                    append=append,
-                )
-            except (SandboxError, OSError):
-                raise
-            except Exception as exc:
-                raise OSError(f"Failed to write {normalized}: {exc}") from exc
+        with lock, self._file_errors(normalized, "write"):
+            write_text(
+                self._sdk,
+                normalized,
+                content,
+                user=self.sandbox_user,
+                append=append,
+            )
 
     def download_file(self, path: str) -> bytes:
         normalized = self._assert_path(path)
-        try:
+        with self._file_errors(normalized, "read"):
             return read_bytes(self._sdk, normalized, user=self.sandbox_user)
-        except (SandboxError, OSError):
-            raise
-        except Exception as exc:
-            raise OSError(f"Failed to read {normalized}: {exc}") from exc
 
     def update_file(self, path: str, content: bytes) -> None:
         normalized = self._assert_path(path, write=True)
         lock = get_file_operation_lock(self, normalized)
-        with lock:
-            try:
-                write_bytes(self._sdk, normalized, content, user=self.sandbox_user)
-            except (SandboxError, OSError):
-                raise
-            except Exception as exc:
-                raise OSError(f"Failed to write {normalized}: {exc}") from exc
+        with lock, self._file_errors(normalized, "write"):
+            write_bytes(self._sdk, normalized, content, user=self.sandbox_user)
 
     # -- tree listing and search -----------------------------------------
 
     def list_dir(self, path: str, max_depth: int = 2) -> list[str]:
         normalized = self._assert_path(path)
-        try:
+        with self._file_errors(normalized, "list"):
             return list_tree(
                 self._sdk, normalized, user=self.sandbox_user, max_depth=max_depth
             )
-        except (SandboxError, OSError):
-            raise
-        except Exception as exc:
-            raise OSError(f"Failed to list {normalized}: {exc}") from exc
 
     def glob(
         self,
@@ -211,7 +194,7 @@ class CubeSandbox(Sandbox):
         max_results: int = 200,
     ) -> tuple[list[str], bool]:
         normalized = self._assert_path(path)
-        try:
+        with self._file_errors(normalized, "search"):
             return glob_paths(
                 self._sdk,
                 normalized,
@@ -220,10 +203,6 @@ class CubeSandbox(Sandbox):
                 include_dirs=include_dirs,
                 max_results=max_results,
             )
-        except (SandboxError, OSError):
-            raise
-        except Exception as exc:
-            raise OSError(f"Failed to search {normalized}: {exc}") from exc
 
     def grep(
         self,
@@ -236,7 +215,7 @@ class CubeSandbox(Sandbox):
         max_results: int = 100,
     ) -> tuple[list[GrepMatch], bool]:
         normalized = self._assert_path(path)
-        try:
+        with self._file_errors(normalized, "search"):
             return grep_paths(
                 self._sdk,
                 normalized,
@@ -247,10 +226,6 @@ class CubeSandbox(Sandbox):
                 case_sensitive=case_sensitive,
                 max_results=max_results,
             )
-        except (SandboxError, OSError):
-            raise
-        except Exception as exc:
-            raise OSError(f"Failed to search {normalized}: {exc}") from exc
 
     # -- helpers ----------------------------------------------------------
 
@@ -276,6 +251,25 @@ class CubeSandbox(Sandbox):
                 self.id,
                 exc_info=True,
             )
+
+    @contextlib.contextmanager
+    def _file_errors(self, path: str, action: str) -> Iterator[None]:
+        """Keep the file contract while still reporting a gone sandbox.
+
+        A file helper maps its own failures, but the handle owner must stop
+        serving a sandbox that no longer exists, so a gone sandbox is reported
+        before the generic OSError wrapper hides it.
+        """
+
+        try:
+            yield
+        except SandboxGoneError:
+            self._notify_dead()
+            raise
+        except (SandboxError, OSError):
+            raise
+        except Exception as exc:
+            raise OSError(f"Failed to {action} {path}: {exc}") from exc
 
     def _assert_path(self, path: str, *, write: bool = False) -> str:
         return assert_virtual_path(path, self._virtual_mounts, write=write)
@@ -308,14 +302,14 @@ def _map_command_error(
         exc, (SandboxNotFoundError, SandboxRuntimeError, SandboxTimeoutError)
     ):
         return exc
-    status = error_status(exc)
-    if is_timeout_error(exc):
-        return SandboxTimeoutError(f"Command timed out after {timeout:g}s")
-    if status in _GONE_STATUS_CODES:
+    if isinstance(exc, SandboxGoneError) or is_gone_error(exc):
         return SandboxNotFoundError(
             f"CubeSandbox {sandbox_id} no longer exists; acquire a new sandbox",
             sandbox_id=sandbox_id,
         )
+    status = error_status(exc)
+    if is_timeout_error(exc):
+        return SandboxTimeoutError(f"Command timed out after {timeout:g}s")
     if status in _AUTH_STATUS_CODES:
         return SandboxRuntimeError(
             "CubeSandbox rejected the command credentials; check sandbox.cube.api_key"
