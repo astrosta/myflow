@@ -232,6 +232,13 @@ export function useChat({
        * `["messages"]` 是所有消息 query 的公共前缀，绕开这个过期闭包。
        */
       queryClient.invalidateQueries({ queryKey: ["messages"] });
+      /**
+       * 标题也是这一轮收尾时才落库的：worker 在 finally 里把 checkpoint 的
+       * `title` 投影到 `threads_meta.display_name`（M4 §4.1），然后才发 end 帧。
+       * 侧栏读的是 ["threads"] 列表缓存，不失效的话它会继续显示"新对话"，
+       * 直到用户刷新页面。
+       */
+      queryClient.invalidateQueries({ queryKey: ["threads"] });
     },
   });
 
@@ -331,14 +338,19 @@ export function useChat({
       if (!text.trim()) return;
 
       // 先传文件再起 run：M6 的 UploadsMiddleware 在 `before_agent` 里
-      // 把上传清单注入对话，所以提交本身只带文本。
+      // 读取本轮 human message 的 additional_kwargs.files 并注入清单。
+      // 这里必须把上传结果随消息一起提交；只传文本会让模型看不到附件。
       //
       // threadId 为 null 时不允许带附件（UI 也把附件按钮禁掉了）：上传需要一个
       // 已存在的 thread，而这里若是先建 thread 再 submit，SDK 会**再建一个**，
       // 于是文件传到了 A、对话跑在 B。
+      let uploadedFiles: Awaited<ReturnType<typeof uploadFiles>> = [];
       if (files?.length) {
         if (effectiveThreadId === null) throw new Error("请先发送一条消息，再上传附件");
-        await uploadFiles(effectiveThreadId, files);
+        uploadedFiles = await uploadFiles(effectiveThreadId, files);
+        if (uploadedFiles.length !== files.length) {
+          throw new Error("上传接口没有返回完整的文件清单，请重试");
+        }
       }
 
       const optimisticMessage = createOptimisticHumanMessage({ text });
@@ -354,7 +366,25 @@ export function useChat({
         await stream.submit(
           // 身份由客户端定：M6 的动态上下文中间件会把它改名为 X__user，
           // UI 侧的身份归一化让两条认成同一个可见轮次（§4.4）
-          { messages: [{ type: "human", content: text, id: optimisticMessage.id }] } as never,
+          {
+            messages: [
+              {
+                type: "human",
+                content: text,
+                id: optimisticMessage.id,
+                ...(uploadedFiles.length
+                  ? {
+                      additional_kwargs: {
+                        files: uploadedFiles.map((file) => ({
+                          filename: file.filename,
+                          size: file.size ?? 0,
+                        })),
+                      },
+                    }
+                  : {}),
+              },
+            ],
+          } as never,
           {
             streamMode: streamModes as never,
             /** model_name / reasoning_effort：空对象时网关按默认模型处理 */

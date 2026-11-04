@@ -159,6 +159,26 @@ def test_normalize_input_drops_forged_keys_for_clients() -> None:
     assert kwargs["keep"] == 1
 
 
+def test_normalize_input_keeps_the_client_upload_manifest() -> None:
+    raw = {
+        "messages": [
+            {
+                "role": "human",
+                "content": "看这个",
+                "additional_kwargs": {
+                    "files": [{"filename": "note.md", "size": 12}],
+                },
+            }
+        ]
+    }
+
+    result = normalize_input(raw, command=None, trusted=False)
+
+    assert result["messages"][0].additional_kwargs["files"] == [
+        {"filename": "note.md", "size": 12}
+    ]
+
+
 def test_normalize_input_strips_message_objects() -> None:
     message = HumanMessage(
         content="hello",

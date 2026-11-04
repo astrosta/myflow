@@ -34,7 +34,10 @@ vi.mock("@/core/api/messages-feed", () => ({
 vi.mock("@/core/api/threads", () => ({ getThreadState: vi.fn() }));
 vi.mock("@/core/api/uploads", () => ({ uploadFiles: vi.fn() }));
 
+import { uploadFiles } from "@/core/api/uploads";
 import { useChat } from "./use-chat";
+
+const uploadFilesMock = vi.mocked(uploadFiles);
 
 afterEach(cleanup);
 
@@ -44,6 +47,55 @@ function wrapper({ children }: { children: ReactNode }) {
   });
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
+
+describe("useChat 的缓存失效", () => {
+  /**
+   * 回归：标题由 worker 在收尾时投影到 threads_meta.display_name。侧栏读的是
+   * ["threads"] 这一份列表缓存；如果 run 结束后只失效历史消息，列表会继续用
+   * 首轮开始前的旧数据，用户要刷新页面才看得到新标题。
+   */
+  it("run 结束后让侧栏重新拉取标题", () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+    });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    renderHook(() => useChat({ threadId: "t1" }), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+
+    act(() => {
+      (captured.at(-1) as { onFinish: () => void }).onFinish();
+    });
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["threads"] });
+  });
+});
+
+describe("useChat 的附件清单", () => {
+  it("上传后把文件名和大小放进本轮 human message 的 additional_kwargs.files", async () => {
+    streamMock.submit.mockClear();
+    uploadFilesMock.mockReset();
+    uploadFilesMock.mockResolvedValue([
+      { path: "/mnt/user-data/uploads/note.md", filename: "note.md", size: 2 } as never,
+    ]);
+    const { result } = renderHook(() => useChat({ threadId: "t1" }), { wrapper });
+    const file = new File(["hi"], "note.md", { type: "text/markdown" });
+
+    await act(async () => {
+      await result.current.submit("看这个", [file]);
+    });
+
+    expect(uploadFilesMock).toHaveBeenCalledWith("t1", [file]);
+    const input = streamMock.submit.mock.calls.at(-1)?.[0] as {
+      messages: Array<{ additional_kwargs?: { files?: unknown } }>;
+    };
+    expect(input.messages[0]!.additional_kwargs).toEqual({
+      files: [{ filename: "note.md", size: 2 }],
+    });
+  });
+});
 
 describe("useChat 的 thread 身份", () => {
   /**

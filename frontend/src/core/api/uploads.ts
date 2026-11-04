@@ -18,6 +18,8 @@ export const UPLOAD_PATH = (threadId: string) =>
 
 export interface UploadedFileRef {
   path: string;
+  /** Stored filename; may differ from the browser filename after de-duplication. */
+  filename: string;
   name?: string;
   size?: number;
 }
@@ -37,7 +39,14 @@ export function parseUploadResponse(payload: unknown): UploadedFileRef[] {
     const path =
       typeof item.path === "string" ? item.path : typeof item.virtual_path === "string" ? item.virtual_path : null;
     if (!path) return [];
-    const ref: UploadedFileRef = { path };
+    const filename =
+      typeof item.filename === "string" && item.filename
+        ? item.filename
+        : typeof item.name === "string" && item.name
+          ? item.name
+          : path.split("/").pop() ?? "";
+    if (!filename) return [];
+    const ref: UploadedFileRef = { path, filename };
     if (typeof item.name === "string") ref.name = item.name;
     if (typeof item.size === "number") ref.size = item.size;
     return [ref];
