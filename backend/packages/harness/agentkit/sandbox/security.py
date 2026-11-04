@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import posixpath
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,10 @@ _REJECT_HINT = (
     "/mnt/user-data/workspace, /mnt/user-data/uploads, or /mnt/user-data/outputs. "
     "To probe the environment, run a command instead of a host path."
 )
+_VIRTUAL_REJECT_HINT = (
+    "Path is outside the sandbox mounts. Use an absolute POSIX path under an allowed mount."
+)
+_VIRTUAL_READ_ONLY_HINT = "Path is on a read-only sandbox mount."
 _MAX_DECODE_ROUNDS = 3
 
 
@@ -23,6 +29,12 @@ _MAX_DECODE_ROUNDS = 3
 class PathMapping:
     container_path: str
     local_path: str
+    read_only: bool = False
+
+
+@dataclass(frozen=True)
+class VirtualMount:
+    container_path: str
     read_only: bool = False
 
 
@@ -81,6 +93,50 @@ def find_path_mapping(virtual_path: str, mappings: list[PathMapping]) -> PathMap
         prefix = mapping.container_path.rstrip("/")
         if virtual_path == prefix or virtual_path.startswith(prefix + "/"):
             return mapping
+    return None
+
+
+def assert_virtual_path(
+    path: str, mounts: Sequence[VirtualMount], *, write: bool = False
+) -> str:
+    """Validate a remote POSIX path against the allowed virtual mounts.
+
+    The path lives inside the sandbox, so it is normalized with
+    ``posixpath.normpath`` rather than resolved on the Gateway host. Dangerous
+    shapes are rejected before normalization, and the chosen mount is the
+    longest segment-bounded ``container_path`` match.
+    """
+    if "\x00" in path:
+        raise PermissionError(_VIRTUAL_REJECT_HINT)
+    if "://" in path:
+        raise PermissionError(_VIRTUAL_REJECT_HINT)
+    if re.match(r"^[A-Za-z]:[\\/]", path) or path.startswith("\\\\") or path.startswith("//"):
+        raise PermissionError(_VIRTUAL_REJECT_HINT)
+    if not path.startswith("/"):
+        raise PermissionError(_VIRTUAL_REJECT_HINT)
+    if any(part == ".." for part in path.split("/")):
+        raise PermissionError(_VIRTUAL_REJECT_HINT)
+
+    normalized = posixpath.normpath(path)
+    if not normalized.startswith("/"):
+        raise PermissionError(_VIRTUAL_REJECT_HINT)
+
+    mount = _find_virtual_mount(normalized, mounts)
+    if mount is None:
+        raise PermissionError(_VIRTUAL_REJECT_HINT)
+    if write and mount.read_only:
+        raise PermissionError(_VIRTUAL_READ_ONLY_HINT)
+    return normalized
+
+
+def _find_virtual_mount(
+    path: str, mounts: Sequence[VirtualMount]
+) -> VirtualMount | None:
+    """Longest ``container_path`` wins. Match is segment-bounded."""
+    for mount in sorted(mounts, key=lambda item: len(item.container_path), reverse=True):
+        prefix = mount.container_path.rstrip("/")
+        if path == prefix or path.startswith(prefix + "/"):
+            return mount
     return None
 
 
