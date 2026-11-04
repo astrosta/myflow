@@ -25,7 +25,7 @@ from agentkit.sandbox.exceptions import (
 )
 from agentkit.sandbox.lease import lease_owner_from_context, shield_sandbox_work
 from agentkit.sandbox.sandbox import Sandbox
-from agentkit.sandbox.sandbox_provider import get_sandbox_provider
+from agentkit.sandbox.sandbox_provider import SandboxProvider, get_sandbox_provider
 from agentkit.sandbox.security import safe_app_config
 
 #: 沙箱动作名。M10 的策略按它分支，M9 的 AllowAll 不看。
@@ -154,6 +154,22 @@ async def ensure_sandbox_initialized_async(runtime: ToolRuntime | None = None) -
 
     _remember(runtime, sandbox_id)
     return sandbox
+
+
+def start_sandbox_provider(*, app_config: Any = None) -> SandboxProvider:
+    """Build (or reuse) the process provider and run its startup checks.
+
+    The lifespan calls this once, after the config is loaded and before the first
+    request, so an unreachable remote cluster or a bad mount source fails startup
+    instead of the first user run. 只做健康/配置检查：启动不创建任何沙箱，第一个
+    沙箱由 ``acquire`` 在真正有线程要跑的时候才建。
+    """
+    if app_config is None:
+        provider = get_sandbox_provider()
+    else:
+        provider = get_sandbox_provider(app_config=app_config)
+    provider.startup_check()
+    return provider
 
 
 async def run_sync_tool_after_async_init(func, runtime: ToolRuntime, *args: Any) -> Any:

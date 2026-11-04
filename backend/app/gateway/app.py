@@ -29,6 +29,8 @@ from agentkit.persistence.recovery import gateway_worker_count, recover_inflight
 from agentkit.persistence.thread_meta import make_thread_meta_store
 from agentkit.runtime import cancel_detached
 from agentkit.runtime.checkpointer import make_checkpointer
+from agentkit.sandbox.runtime import start_sandbox_provider
+from agentkit.sandbox.sandbox_provider import reset_sandbox_provider
 from agentkit.subagents.runtime import get_subagent_runtime
 from agentkit.persistence.events import make_run_event_store
 from agentkit.runtime.run_services import build_run_services
@@ -280,6 +282,11 @@ async def lifespan(app: FastAPI):
                 # 运行时一旦装进 app.state，后面任何一步启动失败都必须把它拆掉：
                 # 否则 outbox worker 会活到事件循环关闭，对着已经释放的 engine 轮询。
                 try:
+                    # M12：进程级 sandbox provider 在这里冻结并做启动自检（远程集群健康、
+                    # lease Redis、挂载源）。启动**不建**沙箱——第一个沙箱由第一次 acquire
+                    # 建；自检失败就让启动失败（skill runtime 由下面这层 finally 拆掉），
+                    # 而不是等第一个 run 报错。
+                    start_sandbox_provider(app_config=app_config)
                     # M10 §2.5.3 / §2.9.1：memory store 和 checkpointer 同一个 database 选择；
                     # maintenance 是独立服务，不复用定时任务服务（那个会创建 thread/run）。
                     app.state.memory_manager = None
@@ -326,6 +333,9 @@ async def lifespan(app: FastAPI):
                         # 先排空 run manager，再停技能运行时：优雅停机期间还在跑的 run
                         # 仍要读快照和检索服务，先拆掉会让它们半路失明。
                         await services.run_manager.shutdown(timeout=timeout if timeout is not None else 10.0)
+                        # run manager 排空之后才拆 provider：还在收尾的 run 仍可能要
+                        # release 自己的沙箱。reset 顺带 shutdown（本地杀进程，远程 kill 容器）。
+                        reset_sandbox_provider()
                         await stop_skill_runtime(app)
                         cancel_detached()
                         await services.bridge.aclose()  # 最后放掉桥的连接池（Redis 后端才有事可做）

@@ -38,6 +38,24 @@ class SandboxProvider(ABC):
     @abstractmethod
     def release(self, sandbox_id: str) -> None: ...
 
+    def startup_check(self) -> None:
+        """Validate configuration and dependencies before the gateway serves traffic.
+
+        The lifespan calls this once, after construction and before the first request.
+        It must not create or touch a sandbox: a remote provider only pings its health
+        endpoint and mount sources here, the first sandbox still comes from
+        ``acquire``. Raising aborts startup on purpose—半启动的 provider 比不启动更难排查。
+        """
+        return None
+
+    async def release_async(self, sandbox_id: str) -> None:
+        """Async callers must use this. The default offloads ``release`` to a worker thread.
+
+        A remote release pauses or kills a container. Running that on the event loop
+        stalls every concurrent session, the same reason ``acquire_async`` exists.
+        """
+        await asyncio.to_thread(self.release, sandbox_id)
+
     def reset(self) -> None:
         """Clear cross-call cache state. Does not guarantee release of live sandboxes."""
         return None

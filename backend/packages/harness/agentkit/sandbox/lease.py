@@ -78,18 +78,37 @@ class SandboxLeaseClient:
 
     provider 单例被 reset / 热重载换掉之后，旧持有者绝不能去释放新单例里的沙箱——
     所以这里存的是那个 release 函数本身，不是"到时候再查一次单例"。
+
+    两个出口：同步的 :meth:`release_now` 给同步图（M2 的路径不变），异步的
+    :meth:`release_now_async` 给 ``aafter_agent`` 这类有事件循环的调用点。远程 release
+    会 pause/kill 容器，不能占着循环跑，所以异步出口优先用 provider 的
+    ``release_async``，只在 provider 没给的时候退回 ``asyncio.to_thread(release)``。
     """
 
     sandbox_id: str
     release: Callable[[str], None]
+    release_async: Callable[[str], Awaitable[None]] | None = None
 
     def release_now(self) -> None:
         self.release(self.sandbox_id)
 
+    async def release_now_async(self) -> None:
+        """有事件循环的调用点走这里：优先用 provider 的 ``release_async``。"""
+        if self.release_async is not None:
+            await self.release_async(self.sandbox_id)
+            return
+        await asyncio.to_thread(self.release, self.sandbox_id)
+
 
 def current_sandbox_lease(sandbox_id: str) -> SandboxLeaseClient:
     """按**现在**的 provider 单例造一个句柄（retain 时调一次）。"""
-    return SandboxLeaseClient(sandbox_id=sandbox_id, release=get_sandbox_provider().release)
+    provider = get_sandbox_provider()
+    release_async = getattr(provider, "release_async", None)
+    return SandboxLeaseClient(
+        sandbox_id=sandbox_id,
+        release=provider.release,
+        release_async=release_async if callable(release_async) else None,
+    )
 
 
 @dataclass(slots=True)
@@ -131,29 +150,46 @@ class SandboxLeaseManager:
         幂等：没持有过、或已经释放过，都返回 False 且什么都不做。真正的 release 只在
         **它是最后一个持有者**且 owner 已经发起过 park 时发生。
         """
-        holder: _Holder | None
-        should_release = False
+        client = self._detach(owner_id)
+        if client is None:
+            return False
+        _release_now(client)
+        return True
+
+    async def release_async(self, owner_id: str) -> bool:
+        """``release`` 的 async 形状：语义完全相同，await 点落在真正的 release 上。
+
+        最后一个持有者离开时，provider 的 ``release_async``（远程 = 线程池里的
+        pause/kill）才是这次调用要等的东西；台账本身的摘除仍然是同步的。
+        """
+        client = self._detach(owner_id)
+        if client is None:
+            return False
+        await _release_now_async(client)
+        return True
+
+    def _detach(self, owner_id: str) -> SandboxLeaseClient | None:
+        """摘掉持有关系；返回"该由这次调用释放"的句柄，否则 None。
+
+        台账的读写全在锁里，真正的 release 一定在锁外——sync 和 async 两个出口共用它。
+        """
         with self._lock:
             holder = self._by_owner.pop(owner_id, None)
             if holder is None:
-                return False
+                return None
             sandbox_id = holder.client.sandbox_id
             owners = self._by_sandbox.get(sandbox_id)
             if owners is not None:
                 owners.discard(owner_id)
             if holder.releasing:
                 self._park_requested.add(sandbox_id)
-            if not owners:
-                self._by_sandbox.pop(sandbox_id, None)
-                should_release = sandbox_id in self._park_requested
-                if should_release:
-                    self._park_requested.discard(sandbox_id)
-        if should_release:
-            _release_now(holder.client)
-        return should_release
-
-    async def release_async(self, owner_id: str) -> bool:
-        return self.release(owner_id)
+            if owners:
+                return None
+            self._by_sandbox.pop(sandbox_id, None)
+            if sandbox_id not in self._park_requested:
+                return None
+            self._park_requested.discard(sandbox_id)
+            return holder.client
 
     # ---- 只读视图（测试 / 诊断）------------------------------------------
 
@@ -180,6 +216,13 @@ class SandboxLeaseManager:
 def _release_now(client: SandboxLeaseClient) -> None:
     try:
         client.release_now()
+    except Exception:
+        logger.exception("sandbox release failed for %s", client.sandbox_id)
+
+
+async def _release_now_async(client: SandboxLeaseClient) -> None:
+    try:
+        await client.release_now_async()
     except Exception:
         logger.exception("sandbox release failed for %s", client.sandbox_id)
 

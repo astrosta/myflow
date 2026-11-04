@@ -53,7 +53,7 @@ class SandboxMiddleware(AgentMiddleware):
         return None
 
     async def aafter_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        _release(state, runtime)
+        await _release_async(state, runtime)
         return None
 
 
@@ -105,6 +105,15 @@ def _release_lease(runtime: Runtime, sandbox_id: str) -> None:
     get_sandbox_lease_manager().release(owner_id)
 
 
+async def _release_lease_async(runtime: Runtime, sandbox_id: str) -> None:
+    """``_release_lease`` 的 async 形状：远程 release 在线程池里跑，不占事件循环。"""
+    owner_id, _ = _lease_identity(runtime)
+    if owner_id is None:
+        await get_sandbox_provider().release_async(sandbox_id)  # 退回 M2 行为
+        return
+    await get_sandbox_lease_manager().release_async(owner_id)
+
+
 def _acquire(state: Any, runtime: Runtime, *, async_acquire: bool) -> dict[str, Any] | None:
     del async_acquire
     existing = _existing_id(state)
@@ -143,9 +152,19 @@ def _stamp(runtime: Runtime, sandbox_id: str) -> None:
 
 
 def _release(state: Any, runtime: Runtime) -> None:
-    context = getattr(runtime, "context", None) or {}
-    sandbox_id = context.get("sandbox_id") if isinstance(context, dict) else None
-    if not sandbox_id:
-        sandbox_id = _existing_id(state)
+    sandbox_id = _sandbox_id(state, runtime)
     if sandbox_id:
         _release_lease(runtime, sandbox_id)
+
+
+async def _release_async(state: Any, runtime: Runtime) -> None:
+    """``aafter_agent`` 只有一个 await 时机：等 provider 的异步 release 结束。"""
+    sandbox_id = _sandbox_id(state, runtime)
+    if sandbox_id:
+        await _release_lease_async(runtime, sandbox_id)
+
+
+def _sandbox_id(state: Any, runtime: Runtime) -> str | None:
+    context = getattr(runtime, "context", None) or {}
+    sandbox_id = context.get("sandbox_id") if isinstance(context, dict) else None
+    return sandbox_id or _existing_id(state)
