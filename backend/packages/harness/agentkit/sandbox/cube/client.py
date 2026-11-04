@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Protocol
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import urlencode
 
 import httpx
 
@@ -129,10 +129,11 @@ class CubesandboxFactory:
     def list_by_metadata(self, metadata: Mapping[str, str]) -> list[dict]:
         """List sandboxes matching every metadata pair, following pagination.
 
-        CubeAPI accepts the metadata pairs as top-level query parameters:
-        ?myflow=1&myflow.thread=t1&state=running,paused. The SDK's
-        Sandbox.list_v2 does not expose those filters, so this method talks
-        to the v2 endpoint directly. x-next-token carries the next page
+        CubeAPI expects one metadata query parameter whose value is the
+        key=value pairs joined by ampersands:
+        ?metadata=myflow%3D1%26myflow.thread%3Dt1&state=running,paused.
+        The SDK's Sandbox.list_v2 does not expose that filter, so this method
+        talks to the v2 endpoint directly. x-next-token carries the next page
         cursor back as the nextToken query parameter.
         """
 
@@ -140,20 +141,21 @@ class CubesandboxFactory:
         if self.api_key:
             headers["X-API-Key"] = self.api_key
 
-        base_query = build_metadata_query(metadata)
-        query_parts = [base_query] if base_query else []
-        query_parts.append(f"state={_DEFAULT_STATE_FILTER}")
+        params = {
+            "metadata": build_metadata_query(metadata),
+            "state": _DEFAULT_STATE_FILTER,
+        }
 
         results: list[dict] = []
         next_token: str | None = None
         seen_tokens: set[str] = set()
 
         while True:
-            query = "&".join(query_parts)
+            request_params = dict(params)
             if next_token is not None:
-                query = f"{query}&nextToken={quote_plus(next_token)}"
+                request_params["nextToken"] = next_token
 
-            response = self._get(f"/v2/sandboxes?{query}", headers)
+            response = self._get("/v2/sandboxes", headers, request_params)
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, list):
@@ -174,18 +176,24 @@ class CubesandboxFactory:
         sdk = self._import_sdk()
         sdk.Sandbox.health(config=self._sdk_config(sdk))
 
-    def _get(self, path_with_query: str, headers: dict[str, str]) -> httpx.Response:
+    def _get(
+        self,
+        path: str,
+        headers: dict[str, str],
+        params: dict[str, str],
+    ) -> httpx.Response:
         if self._http_client is not None:
             return self._http_client.get(
-                f"{self.api_url}{path_with_query}",
+                f"{self.api_url}{path}",
                 headers=headers,
+                params=params,
             )
         with httpx.Client(
             base_url=self.api_url,
             timeout=self.request_timeout,
             headers=headers,
         ) as client:
-            return client.get(path_with_query)
+            return client.get(path, params=params)
 
     @staticmethod
     def _import_sdk() -> Any:

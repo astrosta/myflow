@@ -83,12 +83,13 @@ def test_list_by_metadata_sends_filters_and_api_key() -> None:
         http_client=client,
     )
 
-    assert factory.list_by_metadata({"myflow": "1", "myflow.thread": "t 1"}) == []
+    assert factory.list_by_metadata({"myflow": "1", "myflow.thread": "t1"}) == []
     url = seen["url"]
     assert isinstance(url, httpx.URL)
     assert url.path == "/v2/sandboxes"
-    assert url.params["myflow"] == "1"
-    assert url.params["myflow.thread"] == "t 1"
+    assert url.params["metadata"] == "myflow=1&myflow.thread=t1"
+    assert "myflow" not in url.params
+    assert "myflow.thread" not in url.params
     assert url.params["state"] == "running,paused"
     assert seen["api_key"] == "secret"
 
