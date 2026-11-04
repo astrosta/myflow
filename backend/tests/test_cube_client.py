@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from pathlib import Path
@@ -92,6 +93,68 @@ def test_list_by_metadata_sends_filters_and_api_key() -> None:
     assert "myflow.thread" not in url.params
     assert url.params["state"] == "running,paused"
     assert seen["api_key"] == "secret"
+
+
+def _fallback_rows() -> list[dict]:
+    return [
+        {
+            "sandboxID": "match",
+            "metadata": {"myflow": "1", "myflow.user": "u1", "myflow.thread": "t1"},
+        },
+        {
+            "sandboxID": "other-user",
+            "metadata": {"myflow": "1", "myflow.user": "u2", "myflow.thread": "t1"},
+        },
+        {
+            "sandboxID": "other-thread",
+            "metadata": {"myflow": "1", "myflow.user": "u1", "myflow.thread": "t2"},
+        },
+        {"sandboxID": "no-metadata"},
+        "not-a-row",
+    ]
+
+
+def test_list_by_metadata_falls_back_to_list_v2_on_forbidden(monkeypatch, caplog) -> None:
+    _, calls = _install_fake_cubesandbox(monkeypatch, list_v2_rows=_fallback_rows())
+    requests: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url)
+        return httpx.Response(403, json={"message": "forbidden"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with caplog.at_level(logging.WARNING, logger="agentkit.sandbox.cube.client"):
+        rows = _factory(client).list_by_metadata(
+            {"myflow": "1", "myflow.user": "u1", "myflow.thread": "t1"}
+        )
+
+    assert [row["sandboxID"] for row in rows] == ["match"]
+    # The direct endpoint was tried once, then the SDK fallback exactly once.
+    assert len(requests) == 1
+    assert calls["list_v2_calls"] == 1
+    assert calls["list_v2"]["config"] is calls["config_objs"][0]
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and record.name == "agentkit.sandbox.cube.client"
+    ]
+    assert len(warnings) == 1
+    assert "list_v2" in warnings[0].getMessage()
+
+
+def test_list_by_metadata_does_not_fall_back_without_a_forbidden(monkeypatch) -> None:
+    _, calls = _install_fake_cubesandbox(monkeypatch, list_v2_rows=_fallback_rows())
+
+    for status in (401, 500):
+        def handler(request: httpx.Request, code: int = status) -> httpx.Response:
+            return httpx.Response(code)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with pytest.raises(httpx.HTTPStatusError):
+            _factory(client).list_by_metadata({"myflow": "1"})
+
+    assert "list_v2" not in calls
 
 
 def test_error_status_reads_status_code() -> None:
@@ -269,7 +332,11 @@ def test_fake_factory_fail_canary_corrupts_reads(tmp_path: Path) -> None:
     assert sandbox.files.read("/mnt/user-data/probe", format="text") != "expected"
 
 
-def _install_fake_cubesandbox(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, dict]:
+def _install_fake_cubesandbox(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    list_v2_rows: list | None = None,
+) -> tuple[types.ModuleType, dict]:
     module = types.ModuleType("cubesandbox")
     calls: dict = {}
 
@@ -293,6 +360,12 @@ def _install_fake_cubesandbox(monkeypatch: pytest.MonkeyPatch) -> tuple[types.Mo
         def health(cls, **kwargs: object) -> dict[str, str]:
             calls["health"] = kwargs
             return {"status": "ok"}
+
+        @classmethod
+        def list_v2(cls, **kwargs: object) -> list:
+            calls["list_v2"] = kwargs
+            calls["list_v2_calls"] = calls.get("list_v2_calls", 0) + 1
+            return list(list_v2_rows or [])
 
     module.Config = FakeConfig  # type: ignore[attr-defined]
     module.Sandbox = FakeSandbox  # type: ignore[attr-defined]

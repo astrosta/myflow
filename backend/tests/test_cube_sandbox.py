@@ -27,13 +27,39 @@ _USER_DATA = "/mnt/user-data"
 _PRIVATE_SKILLS = "/mnt/skills/private"
 
 
-def _sandbox(tmp_path) -> CubeSandbox:
+def _sandbox(tmp_path, *, on_dead=None) -> CubeSandbox:
     sdk = FakeSdkSandbox(
         files=FakeFiles({_USER_DATA: tmp_path / "user-data"}),
         commands=FakeCommands(),
     )
     mounts = [MountEntry(_USER_DATA, str(tmp_path / "user-data"), False)]
-    return CubeSandbox(sdk, sandbox_id="cube:s1", mounts=mounts, command_timeout=600)
+    return CubeSandbox(
+        sdk,
+        sandbox_id="cube:s1",
+        mounts=mounts,
+        command_timeout=600,
+        on_dead=on_dead,
+    )
+
+
+class _ApiError(Exception):
+    """Stand-in for cubesandbox.ApiError carrying an HTTP status."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+def _raise_status(status_code: int):
+    def handler(cmd, **kwargs):
+        del cmd, kwargs
+        raise _ApiError(status_code)
+
+    return handler
+
+
+def _boom() -> None:
+    raise RuntimeError("the on_dead callback exploded")
 
 
 def _namespaced_sandbox(tmp_path) -> CubeSandbox:
@@ -124,6 +150,52 @@ def test_command_maps_timeout_and_gone_and_auth(tmp_path) -> None:
 
     sandbox._sdk.commands.handler = raise_auth
     with pytest.raises(SandboxRuntimeError):
+        sandbox.execute_command("true")
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_command_gone_marks_the_handle_dead_once(tmp_path, status) -> None:
+    dead: list[str] = []
+    sandbox = _sandbox(tmp_path, on_dead=lambda: dead.append(sandbox.id))
+    sandbox._sdk.commands.handler = _raise_status(status)
+
+    for _ in range(3):
+        with pytest.raises(SandboxNotFoundError):
+            sandbox.execute_command("true")
+
+    assert dead == ["cube:s1"]
+
+
+def test_command_failures_that_are_not_gone_leave_the_handle_alive(tmp_path) -> None:
+    dead: list[object] = []
+    sandbox = _sandbox(tmp_path, on_dead=lambda: dead.append(None))
+
+    sandbox._sdk.commands.handler = _raise_status(500)
+    with pytest.raises(SandboxRuntimeError):
+        sandbox.execute_command("true")
+
+    sandbox._sdk.commands.handler = _raise_status(401)
+    with pytest.raises(SandboxRuntimeError):
+        sandbox.execute_command("true")
+
+    class TimeoutException(Exception):
+        pass
+
+    def raise_timeout(cmd, **kwargs):
+        del cmd, kwargs
+        raise TimeoutException("read timed out")
+
+    sandbox._sdk.commands.handler = raise_timeout
+    with pytest.raises(SandboxTimeoutError):
+        sandbox.execute_command("true")
+
+    assert dead == []
+
+
+def test_failing_on_dead_callback_does_not_hide_not_found(tmp_path) -> None:
+    sandbox = _sandbox(tmp_path, on_dead=_boom)
+    sandbox._sdk.commands.handler = _raise_status(404)
+    with pytest.raises(SandboxNotFoundError):
         sandbox.execute_command("true")
 
 

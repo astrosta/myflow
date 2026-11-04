@@ -12,7 +12,9 @@ MicroVM, not this path table, is the isolation boundary for commands.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import logging
+import threading
+from collections.abc import Callable, Sequence
 
 from agentkit.sandbox.cube.client import SdkSandbox, error_status
 from agentkit.sandbox.cube.files import (
@@ -47,6 +49,8 @@ _SIGPIPE_EXIT_CODE = 141
 _GONE_STATUS_CODES = frozenset({404, 410})
 _AUTH_STATUS_CODES = frozenset({401, 403})
 
+logger = logging.getLogger(__name__)
+
 
 class CubeSandbox(Sandbox):
     """One CubeSandbox MicroVM behind the ``Sandbox`` interface."""
@@ -63,9 +67,13 @@ class CubeSandbox(Sandbox):
         sandbox_user: str = "root",
         command_timeout: float = _DEFAULT_COMMAND_TIMEOUT,
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+        on_dead: Callable[[], None] | None = None,
     ) -> None:
         self._sdk = sdk
         self._id = sandbox_id
+        self._on_dead = on_dead
+        self._dead_notified = False
+        self._dead_lock = threading.Lock()
         self.sandbox_user = sandbox_user
         self.command_timeout = command_timeout
         self.max_output_bytes = max_output_bytes
@@ -103,7 +111,14 @@ class CubeSandbox(Sandbox):
                 user=self.sandbox_user,
             )
         except Exception as exc:
-            raise _map_command_error(exc, self.id, limit) from exc
+            mapped = _map_command_error(exc, self.id, limit)
+            if isinstance(mapped, SandboxNotFoundError):
+                # A reaped sandbox answers every later call with 404/410, so the
+                # owner must stop handing this handle out now.
+                self._notify_dead()
+            if mapped is exc:
+                raise
+            raise mapped from exc
 
         stdout = command_stdout(result)
         stderr = _as_text(getattr(result, "stderr", ""))
@@ -238,6 +253,29 @@ class CubeSandbox(Sandbox):
             raise OSError(f"Failed to search {normalized}: {exc}") from exc
 
     # -- helpers ----------------------------------------------------------
+
+    def _notify_dead(self) -> None:
+        """Report that the remote sandbox is gone, at most once per handle.
+
+        Commands may run concurrently, so the owner gets exactly one callback
+        even when several calls observe 404/410. A failing callback must never
+        hide the SandboxNotFoundError the caller needs in order to re-acquire.
+        """
+
+        with self._dead_lock:
+            if self._dead_notified:
+                return
+            self._dead_notified = True
+        if self._on_dead is None:
+            return
+        try:
+            self._on_dead()
+        except Exception:
+            logger.warning(
+                "CubeSandbox %s on_dead callback failed; the handle is still dead",
+                self.id,
+                exc_info=True,
+            )
 
     def _assert_path(self, path: str, *, write: bool = False) -> str:
         return assert_virtual_path(path, self._virtual_mounts, write=write)

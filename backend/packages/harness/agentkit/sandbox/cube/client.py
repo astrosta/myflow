@@ -10,6 +10,7 @@ depend on. The fake in tests/fakes/cube_sdk.py implements the same surface.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any, Protocol
 from urllib.parse import urlencode
@@ -17,6 +18,11 @@ from urllib.parse import urlencode
 import httpx
 
 _DEFAULT_STATE_FILTER = "running,paused"
+# Only a forbidden metadata query degrades to client-side filtering. Missing or
+# rejected credentials (401) and server faults (5xx) must still surface.
+_FORBIDDEN_STATUS = 403
+
+logger = logging.getLogger(__name__)
 
 
 class SdkSandbox(Protocol):
@@ -58,6 +64,19 @@ def build_metadata_query(metadata: Mapping[str, str]) -> str:
     """Render metadata as un-nested query pairs (x-www-form-urlencoded)."""
 
     return urlencode(list(metadata.items()))
+
+
+def _row_matches_metadata(row: object, metadata: Mapping[str, str]) -> bool:
+    """Exact, string-compared metadata match for the fallback list."""
+
+    if not isinstance(row, dict):
+        return False
+    found = row.get("metadata")
+    if not isinstance(found, Mapping):
+        return False
+    return all(
+        str(found.get(key)) == str(value) for key, value in metadata.items()
+    )
 
 
 def error_status(exc: BaseException) -> int | None:
@@ -135,6 +154,10 @@ class CubesandboxFactory:
         The SDK's Sandbox.list_v2 does not expose that filter, so this method
         talks to the v2 endpoint directly. x-next-token carries the next page
         cursor back as the nextToken query parameter.
+
+        When the deployment forbids the metadata query (HTTP 403), discovery
+        degrades instead of blocking the run: one warning, one unfiltered
+        Sandbox.list_v2 call, and the same exact-pair match applied here.
         """
 
         headers: dict[str, str] = {}
@@ -156,6 +179,8 @@ class CubesandboxFactory:
                 request_params["nextToken"] = next_token
 
             response = self._get("/v2/sandboxes", headers, request_params)
+            if response.status_code == _FORBIDDEN_STATUS:
+                return self._list_v2_by_metadata(metadata)
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, list):
@@ -171,6 +196,22 @@ class CubesandboxFactory:
                     f"CubeAPI repeated pagination token {next_token!r}"
                 )
             seen_tokens.add(next_token)
+
+    def _list_v2_by_metadata(self, metadata: Mapping[str, str]) -> list[dict]:
+        """Degraded discovery: one unfiltered list_v2 call, filtered here."""
+
+        logger.warning(
+            "CubeAPI returned HTTP %s for /v2/sandboxes metadata discovery; "
+            "falling back to Sandbox.list_v2() with client-side filtering. "
+            "Grant the API key permission to list sandboxes by metadata to "
+            "restore server-side filtering.",
+            _FORBIDDEN_STATUS,
+        )
+        sdk = self._import_sdk()
+        rows = sdk.Sandbox.list_v2(config=self._sdk_config(sdk))
+        if not isinstance(rows, list):
+            raise ValueError("CubeSandbox Sandbox.list_v2 did not return a JSON list")
+        return [row for row in rows if _row_matches_metadata(row, metadata)]
 
     def health(self) -> None:
         sdk = self._import_sdk()

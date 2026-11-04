@@ -20,6 +20,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -302,6 +303,9 @@ class CubeSandboxProvider(SandboxProvider):
                 mounts=mounts,
                 sandbox_user=self._cube.sandbox_user,
                 command_timeout=float(self._app_config.sandbox.bash_command_timeout),
+                # A 404/410 means the MicroVM is gone: drop the handle so the
+                # runtime re-acquires instead of re-serving a dead sandbox.
+                on_dead=partial(self._handle_reaped, sdk.sandbox_id),
             )
 
             try:
@@ -586,11 +590,22 @@ class CubeSandboxProvider(SandboxProvider):
         remote_id = self._remote_id_from_sandbox_id(sandbox_id)
         if remote_id is None:
             return None
+        return self._take_handle_by_remote_id(remote_id)
+
+    def _take_handle_by_remote_id(self, remote_id: str) -> _CubeHandle | None:
+        """Remove one handle from the cache and from the remote index.
+
+        The cache entry is dropped only while it still holds this handle: a
+        concurrent acquire may already have stored a newer one for the key.
+        """
+
         with self._cache_lock:
             handle = self._by_remote_id.pop(remote_id, None)
-            if handle is not None:
+            if handle is None:
+                return None
+            handle.alive = False
+            if self._cache.get(handle.key) is handle:
                 self._cache.pop(handle.key, None)
-                handle.alive = False
         return handle
 
     def _remove_handle(self, handle: _CubeHandle) -> None:
@@ -626,6 +641,25 @@ class CubeSandboxProvider(SandboxProvider):
             "CubeSandbox %s lost its Redis lease; dropping the local handle",
             handle.sandbox_id,
         )
+
+    def _handle_reaped(self, remote_id: str) -> None:
+        """Detach a handle whose remote sandbox answered 404/410.
+
+        The MicroVM is gone, so neither pause nor kill would help: both are
+        only a wasted control-plane call that fails the same way. Releasing
+        the lease is what lets the next acquire re-lock the thread and build
+        a fresh sandbox on the same host mounts.
+        """
+
+        handle = self._take_handle_by_remote_id(remote_id)
+        if handle is None:
+            return
+        logger.warning(
+            "CubeSandbox %s no longer exists; dropping the handle for re-acquire",
+            handle.sandbox_id,
+        )
+        self._release_lease(handle)
+        self._close_sdk(handle.sdk)
 
     @staticmethod
     def _release_lease(handle: _CubeHandle) -> None:

@@ -12,6 +12,7 @@ from agentkit.config.sandbox_config import (
     CubeSandboxLeaseConfig,
 )
 from agentkit.sandbox.cube.provider import CubeSandboxProvider
+from agentkit.sandbox.exceptions import SandboxNotFoundError, SandboxRuntimeError
 from fakes.cube_sdk import FakeSdkFactory
 
 
@@ -298,6 +299,73 @@ def test_foreign_ids_are_memory_misses_without_factory_calls(tmp_path) -> None:
     assert provider.get("cube:") is None
     provider.release("local:u1:t1")
     assert factory.calls == []
+
+
+class _StatusError(Exception):
+    """Stand-in for cubesandbox.ApiError carrying an HTTP status."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+def _fail_command(status_code: int):
+    def handler(cmd, **kwargs):
+        del cmd, kwargs
+        raise _StatusError(status_code)
+
+    return handler
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_reaped_sandbox_drops_the_handle_and_releases_the_lease(tmp_path, status) -> None:
+    provider, factory, lock, _ = _provider(tmp_path)
+    sandbox_id = provider.acquire("t1", user_id="u1")
+    sdk = factory.created[0]
+    sdk.commands.handler = _fail_command(status)
+
+    sandbox = provider.get(sandbox_id)
+    assert sandbox is not None
+    with pytest.raises(SandboxNotFoundError):
+        sandbox.execute_command("true")
+
+    # The runtime re-acquires because the dead handle is no longer served.
+    assert provider.get(sandbox_id) is None
+    assert any(key == "myflow:sandbox:u1:t1" for key, _ in lock.released)
+    # A MicroVM that 404s is already gone: neither pause nor kill, only close.
+    assert sdk.paused is False
+    assert sdk.killed is False
+    assert sdk.closed is True
+
+
+def test_reacquisition_after_a_reap_creates_a_fresh_sandbox(tmp_path) -> None:
+    provider, factory, _, _ = _provider(tmp_path)
+    sandbox_id = provider.acquire("t1", user_id="u1")
+    factory.created[0].commands.handler = _fail_command(404)
+    sandbox = provider.get(sandbox_id)
+    assert sandbox is not None
+    with pytest.raises(SandboxNotFoundError):
+        sandbox.execute_command("true")
+
+    assert provider.acquire("t1", user_id="u1") == "cube:s2"
+    assert provider.get("cube:s2") is not None
+    assert provider.get(sandbox_id) is None
+
+
+def test_ordinary_command_failures_keep_the_cached_handle(tmp_path) -> None:
+    provider, factory, lock, _ = _provider(tmp_path)
+    sandbox_id = provider.acquire("t1", user_id="u1")
+    sdk = factory.created[0]
+    sdk.commands.handler = _fail_command(500)
+
+    sandbox = provider.get(sandbox_id)
+    assert sandbox is not None
+    with pytest.raises(SandboxRuntimeError):
+        sandbox.execute_command("true")
+
+    assert provider.get(sandbox_id) is sandbox
+    assert lock.released == []
+    assert sdk.closed is False
 
 
 def test_lease_loss_drops_the_handle_without_touching_the_remote(tmp_path) -> None:
