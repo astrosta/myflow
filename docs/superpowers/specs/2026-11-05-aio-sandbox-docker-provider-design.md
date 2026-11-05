@@ -249,15 +249,15 @@ Gateway 自己也是容器时（挂 `/var/run/docker.sock` 做 Docker-outside-of
    | `publish_host` | `auto` / `127.0.0.1` / `0.0.0.0` / 具体 IP | 发布端绑定地址 |
    | `connect_host` | `auto` / `127.0.0.1` / `host.docker.internal` / 具体 IP | Gateway 用什么地址访问该端口 |
 
-   `auto` 的解析规则（`docker.py::resolve_topology()`）：
-   - 不在容器里（`/.dockerenv` 不存在且 `/proc/self/cgroup` 不含 docker/kubepods）→
-     两端都是 `127.0.0.1`；
-   - 在容器里 → `publish_host` = Docker 网桥网关 IP（`docker network inspect bridge` 的
-     `.IPAM.Config[0].Gateway`，默认 `172.17.0.1`），`connect_host` 同值；
-     若 `host.docker.internal` 可解析则优先用它（Docker Desktop / Linux 的
-     `--add-host=host.docker.internal:host-gateway`）。
-   - 解析不出来 → 启动即失败，报"显式配置 `sandbox.aio.connect_host` / `publish_host`"，
-     不猜、不静默降级成 `0.0.0.0`（那会把 root shell 端口暴露到整台宿主）。
+   `auto` 的解析规则（`docker.py::resolve_topology()`，已实现并测试）：
+   - 两端都写了 → 原样使用；
+   - **只写了一端 → 另一端跟随它**（一对参数描述的是同一条可达路径，拆开就没有意义）；
+   - 两端都 `auto` 且不在容器里 → 两端都是 `127.0.0.1`；
+   - 两端都 `auto` 且在容器里 → 两端都是 Docker 网桥网关 IP（
+     `docker network inspect bridge` 的 `.IPAM.Config[0].Gateway`，默认 `172.17.0.1`）：
+     它既是宿主在沙箱网络里的地址，也是发布端口能落到的地址，两端同源才不会错位。
+   - 推不出来（在容器里拿不到网关）→ 启动即失败，报"显式配置
+     `sandbox.aio.publish_host` / `connect_host`"，不猜、不静默降级成 `0.0.0.0`。
 3. **HTTP 代理**：控制面流量走 loopback/私网，不能继承 `HTTP_PROXY`
    （deerflow 有过 proxy 返回假 502 的教训）。AIO 客户端用
    `httpx.Client(trust_env=False)` 注入，并且默认 `NO_PROXY` 语义只对私网地址生效。
