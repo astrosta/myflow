@@ -149,6 +149,22 @@ describe("设置持久化", () => {
     const parsed = parseSettings(JSON.stringify({ modelName: "flash", thinkingEnabled: false }));
     expect(parsed.modelName).toBe("flash");
     expect(parsed.reasoningEffort).toBeNull();
+    expect(parsed.thinkingEnabled).toBe(false);
+  });
+
+  it("旧版本写下的默认 thinking=true 不被当成用户显式打开", () => {
+    const parsed = parseSettings(JSON.stringify({ modelName: "flash", thinkingEnabled: true }));
+    expect(parsed.thinkingEnabled).toBe(false);
+    expect(parsed.thinkingTouched).toBe(false);
+  });
+
+  it("用户显式切换思考后持久化为 touched", () => {
+    const storage = memoryStorage();
+    saveSettings({ thinkingEnabled: true }, storage);
+    expect(loadSettings(storage)).toMatchObject({
+      thinkingEnabled: true,
+      thinkingTouched: true,
+    });
   });
 
   it("选择会写回本地并保留其它字段", () => {
@@ -158,7 +174,8 @@ describe("设置持久化", () => {
     expect(loadSettings(storage)).toEqual({
       modelName: "flash",
       reasoningEffort: "high",
-      thinkingEnabled: true,
+      thinkingEnabled: false,
+      thinkingTouched: false,
     });
   });
 
@@ -166,7 +183,8 @@ describe("设置持久化", () => {
     expect(parseSettings("{not json")).toEqual({
       modelName: null,
       reasoningEffort: null,
-      thinkingEnabled: true,
+      thinkingEnabled: false,
+      thinkingTouched: false,
     });
   });
 });

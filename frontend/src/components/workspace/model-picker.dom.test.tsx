@@ -96,6 +96,32 @@ describe("根菜单", () => {
   });
 });
 
+describe("思考开关", () => {
+  it("模型支持思考时，根菜单显示开/关并回调", () => {
+    const onToggleThinking = vi.fn();
+    const { view } = setup({
+      thinkingEnabled: false,
+      thinkingSupported: true,
+      onToggleThinking,
+    });
+    fireEvent.click(trigger(view));
+
+    const row = view.getByRole("menuitem", { name: "思考" });
+    expect(row.textContent).toContain("关");
+    fireEvent.click(row);
+
+    expect(onToggleThinking).toHaveBeenCalledTimes(1);
+    expect(view.queryByRole("menu")).toBeNull();
+  });
+
+  it("模型不支持思考时不显示这一行", () => {
+    const { view } = setup({ thinkingSupported: false });
+    fireEvent.click(trigger(view));
+
+    expect(view.queryByRole("menuitem", { name: "思考" })).toBeNull();
+  });
+});
+
 describe("模型列表", () => {
   it("点“模型”进入列表：厂商名是小字，当前模型后面打勾", () => {
     const { view } = setup({ models: [model(), model({ name: "pro", display_name: "pro" })] });

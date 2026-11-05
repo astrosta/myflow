@@ -29,6 +29,10 @@ export interface ModelPickerProps {
   effortOptions: ReasoningEffort[];
   effortId: string | null;
   effortLabel: string;
+  /** 模型支持思考时，根菜单显示「思考」开关 */
+  thinkingSupported?: boolean;
+  thinkingEnabled?: boolean;
+  onToggleThinking?: () => void;
   loading?: boolean;
   error?: string | null;
   vendorErrors?: readonly string[];
@@ -48,6 +52,9 @@ export function ModelPicker({
   effortOptions,
   effortId,
   effortLabel: currentEffortLabel,
+  thinkingSupported = false,
+  thinkingEnabled = false,
+  onToggleThinking,
   loading = false,
   error = null,
   vendorErrors = [],
@@ -130,6 +137,16 @@ export function ModelPicker({
               modelLabelText={current ? modelLabel(current) : "选择模型"}
               onOpenEfforts={() => setView("efforts")}
               onOpenModels={() => setView("models")}
+              thinkingEnabled={thinkingEnabled}
+              thinkingSupported={thinkingSupported}
+              onToggleThinking={
+                onToggleThinking
+                  ? () => {
+                      onToggleThinking();
+                      setOpen(false);
+                    }
+                  : undefined
+              }
             />
           ) : view === "models" ? (
             <ModelList
@@ -173,18 +190,31 @@ function RootMenu({
   hasEffort,
   onOpenModels,
   onOpenEfforts,
+  thinkingSupported,
+  thinkingEnabled,
+  onToggleThinking,
 }: {
   modelLabelText: string;
   effortText: string;
   hasEffort: boolean;
   onOpenModels: () => void;
   onOpenEfforts: () => void;
+  thinkingSupported: boolean;
+  thinkingEnabled: boolean;
+  onToggleThinking?: () => void;
 }) {
   return (
     <div className="flex flex-col gap-1">
       <EntryRow label="模型" onClick={onOpenModels} value={modelLabelText} />
       {hasEffort ? (
         <EntryRow label="推理等级" onClick={onOpenEfforts} value={effortText} />
+      ) : null}
+      {thinkingSupported && onToggleThinking ? (
+        <EntryRow
+          label="思考"
+          onClick={onToggleThinking}
+          value={thinkingEnabled ? "开" : "关"}
+        />
       ) : null}
     </div>
   );

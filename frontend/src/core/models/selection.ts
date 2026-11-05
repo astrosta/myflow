@@ -13,7 +13,7 @@ import type { ModelCatalog, ModelInfo, ReasoningEffort } from "../api/models";
 export interface ModelSelection {
   modelName: string | null;
   effortId: string | null;
-  /** 是否让模型输出思考过程：模型支持就开（网关会再按 supports_thinking 协商一次） */
+  /** 是否让模型输出思考过程；必须由用户显式打开，模型支持只是前提 */
   thinkingEnabled?: boolean;
 }
 
