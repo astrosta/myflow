@@ -1,5 +1,13 @@
 # M7 能力扩展：MCP 与技能 详细设计
 
+> **历史文档说明（2026-11-02）：** Git 用户技能的管理员审核、公共发布、公共向量行、
+> 全局技能开关与 `PATCH /api/skills/{name}` 已移除。现行技能模型见
+> [用户隔离技能、安全扫描与生效设计](../superpowers/specs/2026-10-23-skill-package-git-release-design.md)。
+> 本文保留用于 filesystem 本地调试模式与 MCP 部分的背景。
+> **2026-11-03 再修订：** 本文中的 `search_and_load_skills` 已拆分为
+> `search_skills`（skill-finder 元数据检索）和 `load_skills`（系统内置正文加载）。
+> 工具拆分与 Redis 使用次数设计以用户隔离技能设计 §12 为准。
+
 > 配套文档：[分阶段开发方案](2026-09-16-greenfield-agent-service-roadmap.md) ·
 > [M0 地基](2026-09-16-m0-foundation-design.md) · [M1 最小 Agent](2026-09-16-m1-minimal-agent-design.md) ·
 > [M2 工具与沙箱](2026-09-16-m2-tools-sandbox-design.md) · [M3 Gateway 与流式](2026-09-16-m3-gateway-streaming-design.md) ·

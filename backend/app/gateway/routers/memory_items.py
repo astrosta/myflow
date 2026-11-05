@@ -128,7 +128,7 @@ async def memory_types(
     caller: Annotated[RunCaller, Depends(require_scope("memory:read"))],
     library: Annotated[Any, Depends(get_memory_library)],
 ) -> MemoryTypesResponse:
-    """The six manageable types; 503 when long-term memory is not enabled."""
+    """The seven manageable types; 503 when long-term memory is not enabled."""
 
     del request, caller, library
     return MemoryTypesResponse(

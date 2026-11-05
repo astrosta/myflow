@@ -282,9 +282,9 @@ class SkillResponse(BaseModel):
     追加目录字段：skill_id/scope/版本/commit/path/status。新增字段全部可空，
     旧客户端只读它认识的字段就不会看到形状变化。
 
-    - enabled 是**有效状态** = 全局启用 and 个人偏好；
-    - global_enabled 只在 admin 传 ?scope=global 时回填（§2.4 的两层开关）；
-    - owner_user_id 只对本人/admin 返回；
+    - enabled 是用户开关（Git 私有技能持久化在 skills.enabled）；
+    - global_enabled 仅为旧 filesystem 来源保留；Git 用户技能没有全局开关；
+    - owner_user_id 只返回给所有者；
     - container_file 是沙箱路径，私有技能只对所有者（且 provider 支持按用户挂载时）返回。
     """
 

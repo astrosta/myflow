@@ -41,7 +41,7 @@ _DURABLE_CONTEXT_DATA_KEY = "durable_context_data"
 _SUMMARY_MARKER = "\n...\n"
 DEFAULT_SKILLS_CONTAINER_PATH = "/mnt/skills"
 #: 会**按需加载技能正文**的工具：它返回的 JSON 里有 path，加载即激活（M7 §3.5）。
-DEFAULT_SKILL_LOADER_TOOL_NAMES = frozenset({"search_and_load_skills"})
+DEFAULT_SKILL_LOADER_TOOL_NAMES = frozenset({"load_skills"})
 _AUTHORITY_CONTRACT = "\n".join([
     "## 持久上下文权限约定",
     "后面隐藏的持久上下文数据消息可能包含运行时提供的历史观察。",
@@ -80,7 +80,7 @@ def extract_skills(
     而且会让 checkpoint 膨胀）：
 
     * `tool_names` 里的读文件工具：路径在**参数**里；
-    * `loader_tool_names` 里的加载工具（`search_and_load_skills`）：路径在**结果 JSON** 里。
+    * `loader_tool_names` 里的加载工具（`load_skills`）：路径在**结果 JSON** 里。
       加载即激活，所以它和 read_file 走同一本账——否则模型拿着刚加载的 SOP，
       它声明的 allowed-tools 却不生效。
 
@@ -142,7 +142,7 @@ def _container_skill_path(raw: object, *, root: str) -> str | None:
 
 
 def _loaded_skill_entries(content: object, *, root: str) -> list[dict]:
-    """`search_and_load_skills` 的结果 JSON → 台账条目。
+    """`load_skills` 的结果 JSON → 台账条目。
 
     结果里带的是**模型看得见的那份正文**，但台账只取 name/path/description：
     正文留在消息里，不进 state。路径照样要过校验——技能正文是运维写的文件，
@@ -155,7 +155,12 @@ def _loaded_skill_entries(content: object, *, root: str) -> list[dict]:
         payload = json.loads(text)
     except ValueError:
         return []
-    raw_items = payload.get("skills") if isinstance(payload, Mapping) else None
+    raw_skill = payload.get("skill") if isinstance(payload, Mapping) else None
+    raw_items = (
+        [raw_skill]
+        if isinstance(raw_skill, Mapping)
+        else (payload.get("skills") if isinstance(payload, Mapping) else None)
+    )
     if not isinstance(raw_items, list):
         return []
     entries: list[dict] = []

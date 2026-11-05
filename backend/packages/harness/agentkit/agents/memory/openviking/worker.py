@@ -3,16 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agentkit.agents.memory.openviking.adapter import MemoryMessageAdapter
-from agentkit.agents.memory.openviking.contracts import CapturedMessage, SessionRef
+from agentkit.agents.memory.openviking.config import SessionSkillsConfig
+from agentkit.agents.memory.openviking.contracts import (
+    CapturedMessage,
+    SessionRef,
+    SignalContext,
+    SignalKind,
+)
 from agentkit.agents.memory.openviking.session import SessionManager
+from agentkit.agents.memory.openviking.signals import (
+    CommitSignalDetector,
+    commit_reason,
+    needs_commit,
+)
 from agentkit.agents.memory.openviking.store import CaptureDedupStore, MemorySyncStore
 from agentkit.agents.memory.openviking.stream import CaptureStream
+from agentkit.skills.session_import import SessionSkillImporter
+
+logger = logging.getLogger(__name__)
 
 
 class TurnCaptureWorker:
@@ -26,6 +43,9 @@ class TurnCaptureWorker:
         *,
         lease_seconds: int = 60,
         missing_turn_end_timeout_seconds: int = 86_400,
+        detector: CommitSignalDetector | None = None,
+        session_skills: SessionSkillsConfig | None = None,
+        session_skill_importer: SessionSkillImporter | None = None,
     ) -> None:
         self._adapter = adapter
         self._stream = stream
@@ -34,6 +54,9 @@ class TurnCaptureWorker:
         self._sync_store = sync_store
         self._lease_seconds = lease_seconds
         self._missing_turn_end_timeout = max(0, int(missing_turn_end_timeout_seconds))
+        self._detector = detector or CommitSignalDetector()
+        self._session_skills = session_skills or SessionSkillsConfig()
+        self._session_skill_importer = session_skill_importer
         self._buffers: dict[tuple[str, str, int, str, str], list[CapturedMessage]] = {}
 
     async def handle(self, captured: CapturedMessage) -> str:
@@ -64,9 +87,24 @@ class TurnCaptureWorker:
             await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
             return "discarded"
 
+        pending = list(self._buffers.get(key, ()))
         result = await self._flush(key)
         if result == "retry":
             return "retry"
+
+        if not captured.signals and pending:
+            # The detector runs in the worker, after the turn has been
+            # appended. Existing signals (notably EXPLICIT_REMEMBER from the
+            # built-in tool) win; the detector never overrides them.
+            detected = await self._detect_signals(captured, pending)
+            if detected:
+                captured = replace(captured, signals=detected)
+
+        if needs_commit(captured.signals):
+            commit = await self._commit_if_needed(captured)
+            if commit == "retry":
+                return "retry"
+
         await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
         return "flushed"
 
@@ -110,6 +148,174 @@ class TurnCaptureWorker:
             captured.turn_id,
         )
 
+    async def _detect_signals(
+        self,
+        control: CapturedMessage,
+        pending: list[CapturedMessage],
+    ) -> tuple[SignalKind, ...]:
+        try:
+            return await self._detector.detect(
+                SignalContext(
+                    user_text=_latest_text(pending, "human"),
+                    assistant_text=_latest_text(pending, "ai"),
+                    signals=control.signals,
+                    has_tool_error=control.has_tool_error,
+                    has_recovery=control.has_recovery,
+                    run_status=control.run_status,
+                )
+            )
+        except Exception:
+            logger.warning("OpenViking commit-signal detection failed; continuing", exc_info=True)
+            return ()
+
+    async def _commit_if_needed(self, captured: CapturedMessage) -> str:
+        reason = commit_reason(captured.signals)
+        if reason is None:
+            return "skipped"
+
+        sync = await self._sync_store.get(captured.user_id, captured.thread_id)
+        if sync is None or sync.state == "deleted":
+            return "skipped"
+        if (
+            sync.session_epoch != captured.session_epoch
+            or sync.session_incarnation != captured.session_incarnation
+        ):
+            return "skipped"
+        # A SESSION_END turn is a SKIP turn: it has no messages of its own and
+        # must not create an empty OpenViking session just to commit it.
+        if sync.last_message_at is None:
+            return "skipped"
+
+        ref = SessionRef(
+            user_id=captured.user_id,
+            thread_id=captured.thread_id,
+            ov_user=sync.ov_user,
+            ov_session_id=sync.ov_session_id,
+            stream_shard=sync.stream_shard,
+            session_epoch=sync.session_epoch,
+            session_incarnation=sync.session_incarnation,
+        )
+        try:
+            await self._sessions.ensure_session(ref)
+            response = await self._sessions.commit(ref, reason=reason)
+        except Exception:
+            # The control event stays in the PEL, so the next claim retries
+            # the commit after the current turn has already been appended.
+            logger.warning(
+                "OpenViking commit failed for turn %s (%s); will retry",
+                captured.turn_id,
+                reason,
+                exc_info=True,
+            )
+            return "retry"
+        # The commit is already durable. Session-skill import is best-effort and
+        # must never turn a successful commit into a retry (which would append
+        # and commit the same turn twice).
+        await self._after_commit_task(captured, ref, response)
+        return "committed"
+
+    async def _after_commit_task(
+        self,
+        captured: CapturedMessage,
+        ref: SessionRef,
+        response: dict[str, Any],
+    ) -> None:
+        importer = self._session_skill_importer
+        if importer is None or not self._session_skills.enabled:
+            return
+        task_id = response.get("task_id") if isinstance(response, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            return
+        task = await self._wait_for_commit_task(ref, task_id)
+        if task is None:
+            return
+        status = str(task.get("status") or "").casefold()
+        if status not in {"completed", "succeeded", "success", "done"}:
+            logger.warning(
+                "OpenViking commit task %s for turn %s ended with status %s: %s",
+                task_id,
+                captured.turn_id,
+                status or "unknown",
+                str(task.get("error") or "")[:500],
+            )
+            return
+        result = task.get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (TypeError, ValueError):
+                result = {}
+        if not isinstance(result, dict):
+            result = {}
+        raw_uris = result.get("session_skill_uris") or task.get("session_skill_uris") or []
+        if not isinstance(raw_uris, list) or not raw_uris:
+            return
+        try:
+            imported = await importer.import_skills(
+                owner_user_id=captured.user_id,
+                ov_user=ref.ov_user,
+                task_id=task_id,
+                skill_uris=raw_uris,
+            )
+        except Exception:
+            logger.warning(
+                "OpenViking session-skill import failed for turn %s task %s",
+                captured.turn_id,
+                task_id,
+                exc_info=True,
+            )
+            return
+        logger.info(
+            "Imported %s OpenViking session skill(s) for %s/%s from task %s",
+            len(imported),
+            captured.user_id,
+            captured.thread_id,
+            task_id,
+        )
+
+    async def _wait_for_commit_task(
+        self, ref: SessionRef, task_id: str
+    ) -> dict[str, Any] | None:
+        get_task = getattr(self._sessions, "get_task", None)
+        if not callable(get_task):
+            logger.warning(
+                "SessionManager does not expose get_task; skipping session-skill import"
+            )
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._session_skills.task_timeout_seconds
+        final = {
+            "completed",
+            "succeeded",
+            "success",
+            "done",
+            "failed",
+            "cancelled",
+            "canceled",
+            "error",
+        }
+        last_error: Exception | None = None
+        while True:
+            try:
+                task = await get_task(ref, task_id)
+            except Exception as exc:
+                last_error = exc
+            else:
+                if isinstance(task, dict):
+                    status = str(task.get("status") or "").casefold()
+                    if status in final:
+                        return task
+            if loop.time() >= deadline:
+                logger.warning(
+                    "OpenViking commit task %s did not finish within %.1fs; "
+                    "skipping session-skill import for this commit (last error: %s)",
+                    task_id,
+                    self._session_skills.task_timeout_seconds,
+                    type(last_error).__name__ if last_error is not None else "none",
+                )
+                return None
+            await asyncio.sleep(self._session_skills.poll_interval_seconds)
+
     async def process(self, captured: CapturedMessage) -> str:
         sync = await self._sync_store.get(captured.user_id, captured.thread_id)
         if sync is None or sync.state == "deleted":
@@ -124,8 +330,11 @@ class TurnCaptureWorker:
             return "skipped"
 
         if captured.kind == "control":
+            commit = await self._commit_if_needed(captured)
+            if commit == "retry":
+                return "retry"
             await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
-            return "skipped"
+            return "committed" if commit == "committed" else "skipped"
 
         message = _message_from_snapshot(captured.message)
         if message is None or not self._adapter.is_recordable(message):
@@ -163,9 +372,21 @@ class TurnCaptureWorker:
         try:
             await self._sessions.ensure_session(ref)
             response = await self._sessions.append_messages(ref, payloads)
-        except Exception:
+        except Exception as exc:
             # Leave the row appending. A restart reconciles it by source ids;
-            # the message is not acked, so Redis can redeliver it.
+            # the message is not acked, so Redis can redeliver it. The log is
+            # deliberately bounded: session creation / policy failures used to
+            # vanish here and look like "memory silently does nothing".
+            logger.warning(
+                "OpenViking append failed for %s/%s turn %s session %s: %s: %s",
+                captured.user_id,
+                captured.thread_id,
+                captured.turn_id,
+                ref.ov_session_id,
+                type(exc).__name__,
+                str(exc)[:500],
+                exc_info=True,
+            )
             return "retry"
 
         await self._dedup.mark_appended(captured, ov_message_ids=_message_ids(response))
@@ -178,6 +399,31 @@ class TurnCaptureWorker:
         await self._sync_store.set_state(captured.user_id, captured.thread_id, "appended")
         await self._stream.ack(captured.stream_id, shard=captured.stream_shard)
         return "appended"
+
+
+def _latest_text(pending: list[CapturedMessage], kind: str) -> str:
+    for item in reversed(pending):
+        if item.kind != kind:
+            continue
+        text = _snapshot_text(item.message)
+        if text:
+            return text
+    return ""
+
+
+def _snapshot_text(snapshot: dict[str, Any]) -> str:
+    content = snapshot.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for block in content:
+            if isinstance(block, str):
+                chunks.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                chunks.append(block["text"])
+        return "\n".join(chunks)
+    return "" if content is None else str(content)
 
 
 def _message_from_snapshot(snapshot: dict[str, Any]) -> HumanMessage | AIMessage | ToolMessage | None:

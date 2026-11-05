@@ -159,9 +159,13 @@ def _retrieval_hint(names: list[str]) -> list[str]:
         parts.append("用户的私有知识库和长期记忆只能通过对应的检索子代理访问")
     if SKILL_SUBAGENT_NAME in listed:
         parts.append("技能见下方索引")
-    if not parts:
-        return []
-    return ["；".join(parts) + "。"]
+    lines = ["；".join(parts) + "。"] if parts else []
+    if SKILL_SUBAGENT_NAME in listed:
+        lines.append(
+            "索引对不上时委派 skill-finder，它只交回 skill_id；"
+            "要按该技能执行时，用返回的 skill_id 调用 load_skills。"
+        )
+    return lines
 
 
 def _parallel_hint(policy: SubagentPolicy, app_config: AppConfig) -> str:

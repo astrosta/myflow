@@ -1,8 +1,12 @@
-"""Twelve ORM tables for the Git-backed skill catalog.
+"""ORM tables for the user-isolated Git-backed skill catalog.
 
 PostgreSQL is authoritative in production; SQLite is the test backend.  Partial
-unique indexes therefore carry both `sqlite_where` and `postgresql_where` so the
+unique indexes therefore carry both sqlite_where and postgresql_where so the
 database enforces the same invariants in both places.
+
+The public-release/review tables were removed in v2.  Skills are private to
+their owner; a saved version becomes runtime-visible only through the explicit
+scan -> activate flow.
 """
 
 from __future__ import annotations
@@ -37,14 +41,25 @@ def _now() -> datetime:
 
 
 class SkillRow(Base):
-    """Skill identity. The name may change; `id` is the stable API id."""
+    """User-private skill identity. The name may change; id is the stable id."""
 
     __tablename__ = "skills"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
     owner_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     private_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    public_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="manual", server_default="manual"
+    )
+    source_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: 用户开关；只有 active 技能可以切换，关闭后不进入提示词/检索/投影。
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    #: `load_skills` 成功加载次数；Redis ZSET 的持久化来源，内置技能不入库。
+    load_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )
@@ -62,18 +77,11 @@ class SkillRow(Base):
             sqlite_where=text("deleted_at IS NULL"),
             postgresql_where=text("deleted_at IS NULL"),
         ),
-        Index(
-            "uq_skills_public_name",
-            "public_name",
-            unique=True,
-            sqlite_where=text("public_name IS NOT NULL"),
-            postgresql_where=text("public_name IS NOT NULL"),
-        ),
     )
 
 
 class SkillVersionRow(Base):
-    """Immutable package version; only `index_status` may change after insert."""
+    """Local immutable version; Git coordinates are attached on activation."""
 
     __tablename__ = "skill_versions"
 
@@ -90,7 +98,19 @@ class SkillVersionRow(Base):
     draft_commit: Mapped[str | None] = mapped_column(String(40), nullable=True)
     skill_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     index_status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="pending", server_default="pending"
+        String(16),
+        nullable=False,
+        default="unindexed",
+        server_default="unindexed",
+        index=True,
+    )
+    #: 对账快路径的退避状态：坏行不能每轮都吃满修复预算。
+    index_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    index_last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    index_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
@@ -104,116 +124,8 @@ class SkillVersionRow(Base):
     )
 
 
-class SkillSubmissionRow(Base):
-    """One review submission around an immutable version commit."""
-
-    __tablename__ = "skill_submissions"
-
-    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
-    skill_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("skills.id"), nullable=False, index=True
-    )
-    version_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("skill_versions.id"), nullable=False, index=True
-    )
-    submitted_commit: Mapped[str] = mapped_column(String(40), nullable=False)
-    owner_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="pending", server_default="pending"
-    )
-    submitted_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, nullable=False
-    )
-    reviewed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    reject_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    public_release_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, nullable=False
-    )
-
-    __table_args__ = (
-        Index(
-            "uq_skill_submissions_skill_pending",
-            "skill_id",
-            unique=True,
-            sqlite_where=text("status = 'pending'"),
-            postgresql_where=text("status = 'pending'"),
-        ),
-        Index("ix_skill_submissions_status_submitted", "status", "submitted_at"),
-    )
-
-
-class SkillReleaseBatchRow(Base):
-    """One public approval commit; batches allow future multi-skill approvals."""
-
-    __tablename__ = "skill_release_batches"
-
-    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
-    git_repository: Mapped[str] = mapped_column(String(512), nullable=False)
-    git_commit: Mapped[str] = mapped_column(String(40), nullable=False)
-    approved_by: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, nullable=False
-    )
-    stats_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-
-    __table_args__ = (Index("ix_skill_release_batches_git_commit", "git_commit"),)
-
-
-class SkillReleaseRow(Base):
-    """Immutable public release row; the active pointer selects the current one."""
-
-    __tablename__ = "skill_releases"
-
-    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
-    batch_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("skill_release_batches.id"), nullable=False
-    )
-    version_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("skill_versions.id"), nullable=False
-    )
-    skill_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("skills.id"), nullable=False, index=True
-    )
-    skill_version: Mapped[str] = mapped_column(String(32), nullable=False)
-    git_repository: Mapped[str] = mapped_column(String(512), nullable=False)
-    git_commit: Mapped[str] = mapped_column(String(40), nullable=False)
-    skill_path: Mapped[str] = mapped_column(String(1024), nullable=False)
-    public_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    source_commit: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    approved_by: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, nullable=False
-    )
-
-    __table_args__ = (
-        UniqueConstraint("batch_id", "skill_id", name="uq_skill_releases_batch_skill"),
-        Index("ix_skill_releases_skill_created", "skill_id", "created_at"),
-        Index("ix_skill_releases_git_commit", "git_commit"),
-        Index("ix_skill_releases_skill_version", "skill_version"),
-    )
-
-
-class SkillPublicActiveRow(Base):
-    """Current public release pointer. No row means the skill is not public."""
-
-    __tablename__ = "skill_public_active"
-
-    skill_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("skills.id"), primary_key=True
-    )
-    release_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("skill_releases.id"), nullable=False
-    )
-    activated_by: Mapped[str] = mapped_column(String(64), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
-    )
-
-
 class SkillPrivateActiveRow(Base):
-    """Current private version pointer for one owner."""
+    """The one active version for a skill. Written only by explicit activation."""
 
     __tablename__ = "skill_private_active"
 
@@ -229,20 +141,48 @@ class SkillPrivateActiveRow(Base):
     )
 
 
-class SkillSettingsRow(Base):
-    """Global public-skill switch. Private skills ignore it."""
+class SkillSecurityScanRow(Base):
+    """Immutable result of one cisco-ai-skill-scanner run against a version."""
 
-    __tablename__ = "skill_settings"
+    __tablename__ = "skill_security_scans"
 
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
     skill_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("skills.id"), primary_key=True
+        String(64), ForeignKey("skills.id"), nullable=False, index=True
     )
-    enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default=text("true")
+    version_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("skill_versions.id"), nullable=False, index=True
     )
-    updated_by: Mapped[str] = mapped_column(String(64), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    owner_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    package_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="completed", server_default="completed"
+    )
+    is_safe: Mapped[bool] = mapped_column(
+        default=False, nullable=False, server_default=text("false")
+    )
+    max_severity: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="SAFE", server_default="SAFE"
+    )
+    findings_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    findings_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    scanner: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="cisco-ai-skill-scanner"
+    )
+    scanner_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_skill_security_scans_skill_created", "skill_id", "created_at"),
+        Index("ix_skill_security_scans_version_created", "version_id", "created_at"),
     )
 
 
@@ -255,8 +195,6 @@ class SkillAuditEventRow(Base):
     actor: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     action: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     skill_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    submission_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    release_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     detail_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
@@ -340,11 +278,7 @@ __all__ = [
     "SkillDraftFileRow",
     "SkillIndexOutboxRow",
     "SkillPrivateActiveRow",
-    "SkillPublicActiveRow",
-    "SkillReleaseBatchRow",
-    "SkillReleaseRow",
     "SkillRow",
-    "SkillSettingsRow",
-    "SkillSubmissionRow",
+    "SkillSecurityScanRow",
     "SkillVersionRow",
 ]

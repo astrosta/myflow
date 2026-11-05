@@ -24,6 +24,7 @@ from agentkit.skills import search as skill_search
 from agentkit.skills.catalog import SkillSnapshot, get_skill_snapshot, set_skill_snapshot
 from agentkit.skills.domain import SkillScope
 from agentkit.skills.git import GitCommandError
+from agentkit.skills.outbox import RepairStats, VerifyStats
 from agentkit.skills.projection import MilvusSkillProjection, ProjectionRow
 from agentkit.skills.search import (
     LEXICAL_FALLBACK,
@@ -92,7 +93,7 @@ class FakeProjection:
 class FakeCatalog:
     order: list[str] = field(default_factory=list)
     snapshot: SkillSnapshot = field(
-        default_factory=lambda: SkillSnapshot(epoch="built", public=(), private_by_owner={})
+        default_factory=lambda: SkillSnapshot(epoch="built")
     )
 
     async def refresh(self) -> SkillSnapshot:
@@ -114,14 +115,8 @@ class FakeStore:
 @dataclass
 class FakeContent:
     order: list[str] = field(default_factory=list)
-    public: list[list[Any]] = field(default_factory=list)
     private: list[tuple[str, list[Any]]] = field(default_factory=list)
     existing_owners: list[str] = field(default_factory=list)
-
-    async def materialize_public(self, active: list[Any]) -> Path:
-        self.order.append("content.materialize_public")
-        self.public.append(list(active))
-        return Path("active/public")
 
     async def materialize_private(self, owner: str, active: list[Any]) -> Path:
         self.order.append(f"content.materialize_private:{owner}")
@@ -144,9 +139,10 @@ class FakeRuntime:
     started: bool = False
     stopped: bool = False
     author: Any = field(default_factory=lambda: SimpleNamespace(name="author"))
-    review: Any = field(default_factory=lambda: SimpleNamespace(name="review"))
     catalog: Any = field(default_factory=lambda: SimpleNamespace(name="catalog"))
     search: Any = field(default_factory=lambda: SimpleNamespace(name="search"))
+    usage: Any = None
+    usage_redis: Any = None
 
     async def start(self) -> None:
         self.started = True
@@ -177,7 +173,6 @@ async def test_refresh_publishes_the_snapshot_then_materializes_every_tree() -> 
     store = FakeStore(
         order=order,
         rows=[
-            _row(SkillScope.PUBLIC, "author-id"),
             _row(SkillScope.PRIVATE, "alice"),
             _row(SkillScope.PRIVATE, "bob"),
         ],
@@ -188,7 +183,6 @@ async def test_refresh_publishes_the_snapshot_then_materializes_every_tree() -> 
         git=FakeGit(),
         content=content,
         author=None,
-        review=None,
         catalog=catalog,
     )
 
@@ -196,7 +190,6 @@ async def test_refresh_publishes_the_snapshot_then_materializes_every_tree() -> 
 
     assert snapshot is catalog.snapshot
     assert get_skill_snapshot() is catalog.snapshot
-    assert content.public == [[store.rows[0]]]
     assert sorted(owner for owner, _rows in content.private) == ["alice", "bob"]
     assert {owner: [row.skill.owner_user_id for row in rows] for owner, rows in content.private} == {
         "alice": ["alice"],
@@ -205,28 +198,9 @@ async def test_refresh_publishes_the_snapshot_then_materializes_every_tree() -> 
     assert order == [
         "catalog.refresh",
         "store.all_active",
-        "content.materialize_public",
         "content.materialize_private:alice",
         "content.materialize_private:bob",
     ]
-
-
-@pytest.mark.asyncio
-async def test_refresh_still_rebuilds_the_public_tree_when_it_is_empty() -> None:
-    content = FakeContent()
-    runtime = SkillRuntime(
-        store=FakeStore(rows=[]),
-        git=FakeGit(),
-        content=content,
-        author=None,
-        review=None,
-        catalog=FakeCatalog(),
-    )
-
-    await runtime.refresh()
-
-    assert content.public == [[]]
-    assert content.private == []
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +218,6 @@ async def test_start_readies_git_refreshes_and_starts_the_outbox() -> None:
         git=git,
         content=FakeContent(order=order),
         author=None,
-        review=None,
         search=None,
         catalog=FakeCatalog(order=order),
         outbox=outbox,
@@ -258,7 +231,6 @@ async def test_start_readies_git_refreshes_and_starts_the_outbox() -> None:
         "git.ensure_ready",
         "catalog.refresh",
         "store.all_active",
-        "content.materialize_public",
         "outbox.start",
     ]
 
@@ -273,13 +245,12 @@ async def test_stop_stops_the_outbox_closes_the_projection_and_resets_process_st
         git=FakeGit(),
         content=FakeContent(),
         author=None,
-        review=None,
         catalog=FakeCatalog(),
         outbox=outbox,
         projection=projection,
     )
     configure_skill_runtime(runtime)
-    set_skill_snapshot(SkillSnapshot(epoch="live", public=(), private_by_owner={}))
+    set_skill_snapshot(SkillSnapshot(epoch="live"))
 
     await runtime.stop()
 
@@ -312,6 +283,10 @@ def test_lifespan_builds_starts_and_stops_the_runtime(
     monkeypatch.setattr(gateway_app, "get_app_config", _config)
     monkeypatch.setattr(gateway_app, "build_skill_runtime", build)
     monkeypatch.setattr(gateway_app, "recover_inflight_runs", recover)
+    # The sandbox provider is a process singleton built from the *global* app
+    # config, so a developer's live config.yaml (a remote provider, a Redis lease)
+    # would decide whether this test can start. This test is about skill wiring.
+    monkeypatch.setattr(gateway_app, "start_sandbox_provider", lambda **_kwargs: None)
 
     async def scenario() -> None:
         app = SimpleNamespace(state=SimpleNamespace())
@@ -320,13 +295,11 @@ def test_lifespan_builds_starts_and_stops_the_runtime(
             assert fake.started is True and fake.stopped is False
             assert app.state.skill_runtime is fake
             assert app.state.skill_author_service is fake.author
-            assert app.state.skill_review_service is fake.review
             assert get_skill_runtime() is fake
             assert skill_search.get_skill_runtime() is fake.search
         assert fake.stopped is True
         assert app.state.skill_runtime is None
         assert app.state.skill_author_service is None
-        assert app.state.skill_review_service is None
         assert get_skill_runtime() is None
         assert get_skill_snapshot().epoch == ""
 
@@ -385,18 +358,6 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
         ) -> None:
             seen.calls.append(("author", (creation, reserved_names)))
 
-    class Review:
-        def __init__(
-            self,
-            store: Any,
-            git: Any,
-            content: Any,
-            review: Any,
-            *,
-            reserved_names: Any = None,
-        ) -> None:
-            seen.calls.append(("review", (review, reserved_names)))
-
     class Catalog:
         def __init__(self, store: Any, content: Any, container_path: str) -> None:
             seen.calls.append(("catalog", None))
@@ -418,20 +379,27 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
             embedder: Any,
             config: Any,
             reranker: Any = None,
+            usage: Any = None,
         ) -> None:
             seen.calls.append(("search", (projection, embedder, config, reranker)))
 
     class Outbox:
         def __init__(
-            self, store: Any, content: Any, embedder: Any, projection: Any, *, poll_seconds: float
+            self,
+            store: Any,
+            content: Any,
+            embedder: Any,
+            projection: Any,
+            *,
+            poll_seconds: float,
+            repair_max_attempts: int = 8,
         ) -> None:
-            seen.calls.append(("outbox", poll_seconds))
+            seen.calls.append(("outbox", (poll_seconds, repair_max_attempts)))
 
     monkeypatch.setattr(skills_catalog, "SqlSkillStore", Store)
     monkeypatch.setattr(skills_catalog, "SkillGitRepository", Git)
     monkeypatch.setattr(skills_catalog, "SkillContentStore", Content)
     monkeypatch.setattr(skills_catalog, "SkillAuthorService", Author)
-    monkeypatch.setattr(skills_catalog, "SkillReviewService", Review)
     monkeypatch.setattr(skills_catalog, "SkillCatalogService", Catalog)
     monkeypatch.setattr(skills_catalog, "OpenAICompatibleEmbedder", Embedder)
     monkeypatch.setattr(skills_catalog, "MilvusSkillProjection", Projection)
@@ -441,7 +409,7 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
     return seen
 
 
-def test_factory_injects_builtin_names_for_author_and_review(
+def test_factory_injects_builtin_names_for_the_author_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen = _patch_factory(monkeypatch, embedding=False)
@@ -455,8 +423,6 @@ def test_factory_injects_builtin_names_for_author_and_review(
 
     payloads = {name: payload for name, payload in seen.calls}
     author_reserved = payloads["author"][1]
-    review_reserved = payloads["review"][1]
-    assert author_reserved is review_reserved
     assert author_reserved() == frozenset({"demo"})
 
 
@@ -477,7 +443,7 @@ def test_shipped_git_config_still_builds_the_lexical_search_service(
     runtime = build_skill_runtime(config, session_factory=object())
 
     assert runtime.store is not None
-    assert runtime.author is not None and runtime.review is not None
+    assert runtime.author is not None
     assert runtime.catalog is not None
     # Lexical-only: the service exists, the Milvus projection and its outbox do not.
     assert runtime.search is not None
@@ -490,7 +456,6 @@ def test_shipped_git_config_still_builds_the_lexical_search_service(
         "git",
         "content",
         "author",
-        "review",
         "catalog",
         "search",
     ]
@@ -512,7 +477,6 @@ async def test_keyword_search_answers_without_milvus_or_an_embedder() -> None:
         task_query="pdf report",
         domain_keywords=(),
         available_skills=None,
-        prefs=None,
     )
 
     assert [hit.skill.name for hit in outcome.hits] == ["pdf-report"]
@@ -546,7 +510,7 @@ def test_factory_builds_projection_outbox_and_search_when_configured(
     assert runtime.search is not None
     # The projection gets its own vector-store config, never the knowledge one.
     assert ("projection", (config.skills.search.vector_store, 8)) in seen.calls
-    assert ("outbox", 0.5) in seen.calls
+    assert ("outbox", (0.5, config.skills.index.repair_max_attempts)) in seen.calls
     assert any(name == "search" for name, _ in seen.calls)
 
 
@@ -607,15 +571,15 @@ def _captured_projection(seen: _Constructed) -> tuple[Any, int]:
 
 def _projection_row(dimensions: int) -> ProjectionRow:
     return ProjectionRow(
-        projection_key="public:s1",
-        scope="public",
-        owner_user_id=None,
+        projection_key="private:u1:s1",
+        scope="private",
+        owner_user_id="u1",
         skill_id="s1",
         version_id="v1",
         skill_version="1.0.0",
         enabled=True,
-        name="public skill",
-        description="public description",
+        name="private skill",
+        description="private description",
         package_sha256="p1",
         skill_md_sha256="m1",
         embedding=[0.1] * dimensions,
@@ -648,7 +612,7 @@ async def test_projection_targets_the_skills_active_collection_not_the_knowledge
     projection = MilvusSkillProjection(projection_config, dimensions=dimensions, client=client)
     await projection.upsert_active(_projection_row(dimensions))
     await projection.search(
-        user_id="alice", private_skill_ids=(), vector=[0.1] * dimensions, limit=3
+        user_id="alice", vector=[0.1] * dimensions, limit=3
     )
 
     assert [call["collection_name"] for call in client.upserts] == ["myflow_skills_active"]
@@ -716,7 +680,6 @@ async def test_start_survives_a_git_outage_and_serves_the_local_cache(
         git=FailingGit(order),
         content=FakeContent(order=order),
         author=None,
-        review=None,
         catalog=catalog,
         outbox=outbox,
     )
@@ -728,7 +691,6 @@ async def test_start_survives_a_git_outage_and_serves_the_local_cache(
         "git.ensure_ready",
         "catalog.refresh",
         "store.all_active",
-        "content.materialize_public",
         "outbox.start",
     ]
     assert outbox.started is True
@@ -745,13 +707,12 @@ async def test_start_survives_a_git_outage_and_serves_the_local_cache(
 @pytest.mark.asyncio
 async def test_start_accepts_an_empty_snapshot_when_the_cache_has_nothing() -> None:
     order: list[str] = []
-    empty = SkillSnapshot(epoch="empty", public=(), private_by_owner={})
+    empty = SkillSnapshot(epoch="empty")
     runtime = SkillRuntime(
         store=FakeStore(order=order),
         git=FailingGit(order),
         content=FakeContent(order=order),
         author=None,
-        review=None,
         catalog=FakeCatalog(order=order, snapshot=empty),
         outbox=FakeOutbox(order=order),
     )
@@ -759,7 +720,7 @@ async def test_start_accepts_an_empty_snapshot_when_the_cache_has_nothing() -> N
     await runtime.start()
 
     assert get_skill_snapshot() is empty
-    assert get_skill_snapshot().public == ()
+    assert get_skill_snapshot().private_by_owner == {}
 
 
 @pytest.mark.asyncio
@@ -773,7 +734,6 @@ async def test_start_still_fails_when_the_catalog_cannot_be_read() -> None:
         git=FakeGit(),
         content=FakeContent(),
         author=None,
-        review=None,
         catalog=BrokenCatalog(),
         outbox=FakeOutbox(),
     )
@@ -789,65 +749,222 @@ async def test_start_still_fails_when_the_catalog_cannot_be_read() -> None:
 
 @dataclass
 class RecordingOutbox(FakeOutbox):
-    """Records reconcile/prune so the sweeper can be asserted without Milvus."""
+    """Records the maintenance passes so the loops can be asserted without Milvus."""
 
-    reconciled: int = 0
-    pruned: int = 0
+    repaired: int = 0
+    missing: int = 0
+    deleted: int = 0
     keep: int | None = None
     min_age_seconds: float | None = None
+    budget: tuple[int, float] | None = None
+    verify_budget: tuple[int, float] | None = None
     fail_with: Exception | None = None
 
-    async def reconcile(self, *, force: bool = False) -> int:
-        self.order.append("outbox.reconcile")
+    async def repair_missing(self, *, budget_rows: int, budget_seconds: float):
+        self.order.append("outbox.repair")
+        self.budget = (budget_rows, budget_seconds)
         if self.fail_with is not None:
             raise self.fail_with
-        return self.reconciled
+        return RepairStats(scanned=self.repaired, repaired=self.repaired, seconds=0.0)
 
-    async def prune(
-        self, keep_versions_per_skill: int = 20, *, min_age_seconds: float = 0.0
+    async def verify_projection(self, *, budget_rows: int, budget_seconds: float):
+        self.order.append("outbox.verify")
+        self.verify_budget = (budget_rows, budget_seconds)
+        if self.fail_with is not None:
+            raise self.fail_with
+        return VerifyStats(missing=self.missing, deleted=self.deleted, seconds=0.0)
+
+    async def forget_commits(
+        self, skill_id: str, *, keep_versions: int, min_age_seconds: float = 0.0
     ) -> int:
-        self.order.append("outbox.prune")
-        self.keep = keep_versions_per_skill
+        self.order.append("outbox.forget")
+        self.keep = keep_versions
         self.min_age_seconds = min_age_seconds
-        return self.pruned
+        return self.deleted
+
+
+class _LockConnection:
+    """Minimal async connection: pg_try_advisory_lock returns whatever we set."""
+
+    def __init__(self, acquired: bool) -> None:
+        self.acquired = acquired
+        self.queries: list[tuple[str, object]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+    async def scalar(self, statement, params=None):
+        self.queries.append(("scalar", params))
+        return self.acquired
+
+    async def execute(self, statement, params=None):
+        self.queries.append(("execute", params))
+
+    async def commit(self) -> None:
+        self.queries.append(("commit", None))
+
+
+class _LockBind:
+    dialect = SimpleNamespace(name="postgresql")
+
+    def __init__(self, acquired: bool) -> None:
+        self.connection = _LockConnection(acquired)
+
+    def connect(self):
+        return self.connection
+
+
+def _locked_store(acquired: bool):
+    return SimpleNamespace(_sf=SimpleNamespace(kw={"bind": _LockBind(acquired)}))
 
 
 @pytest.mark.asyncio
-async def test_one_sweep_reconciles_then_prunes_with_the_configured_keep() -> None:
+async def test_a_worker_without_the_advisory_lock_skips_the_round() -> None:
     order: list[str] = []
-    outbox = RecordingOutbox(order=order, reconciled=2, pruned=3)
+    outbox = RecordingOutbox(order=order, repaired=2)
+    runtime = SkillRuntime(
+        store=_locked_store(acquired=False),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        catalog=FakeCatalog(order=order),
+        outbox=outbox,
+    )
+
+    stats = await runtime.repair_projection_once()
+
+    assert stats.skipped_due_to_lock is True
+    assert order == []  # 没抢到锁就完全不动 Milvus/embedding
+
+
+@pytest.mark.asyncio
+async def test_the_lock_holder_runs_the_round_and_unlocks() -> None:
+    order: list[str] = []
+    bind = _LockBind(acquired=True)
+    outbox = RecordingOutbox(order=order, repaired=1)
+    runtime = SkillRuntime(
+        store=SimpleNamespace(_sf=SimpleNamespace(kw={"bind": bind})),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        catalog=FakeCatalog(order=order),
+        outbox=outbox,
+    )
+
+    stats = await runtime.repair_projection_once()
+
+    assert stats.repaired == 1
+    assert order == ["outbox.repair"]
+    # 抢到之后一定解锁：会话级锁不解开就会一直挂在池化连接上。
+    statements = [entry[0] for entry in bind.connection.queries]
+    assert statements.count("execute") == 1
+
+@pytest.mark.asyncio
+async def test_one_repair_pass_uses_the_configured_budget() -> None:
+    order: list[str] = []
+    outbox = RecordingOutbox(order=order, repaired=2)
     runtime = SkillRuntime(
         store=FakeStore(order=order),
         git=FakeGit(),
         content=FakeContent(order=order),
         author=None,
-        review=None,
+        catalog=FakeCatalog(order=order),
+        outbox=outbox,
+        repair_budget_rows=7,
+        repair_budget_seconds=42.0,
+    )
+
+    stats = await runtime.repair_projection_once()
+
+    assert (stats.scanned, stats.repaired) == (2, 2)
+    assert order == ["outbox.repair"]
+    assert outbox.budget == (7, 42.0)
+
+
+@pytest.mark.asyncio
+async def test_one_verify_pass_reports_what_it_found() -> None:
+    order: list[str] = []
+    outbox = RecordingOutbox(order=order, missing=1, deleted=2)
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        catalog=FakeCatalog(order=order),
+        outbox=outbox,
+        verify_budget_rows=11,
+        verify_budget_seconds=22.0,
+    )
+
+    stats = await runtime.verify_projection_once()
+
+    assert (stats.missing, stats.deleted) == (1, 2)
+    assert order == ["outbox.verify"]
+    assert outbox.verify_budget == (11, 22.0)
+
+
+@pytest.mark.asyncio
+async def test_event_driven_cleanup_forwards_the_retention_config() -> None:
+    order: list[str] = []
+    outbox = RecordingOutbox(order=order, deleted=3)
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
         catalog=FakeCatalog(order=order),
         outbox=outbox,
         keep_versions_per_skill=7,
         prune_min_age_seconds=86400.0,
     )
 
-    assert await runtime.reconcile_projection_once() == (2, 3)
-    assert order == ["outbox.reconcile", "outbox.prune"]
-    assert outbox.keep == 7
+    assert await runtime.forget_commits("skill-1") == 3
+    assert order == ["outbox.forget"]
     # retention.cache_ttl_days 是分钟/秒换算后的安全期，必须真的传下去。
+    assert outbox.keep == 7
     assert outbox.min_age_seconds == 86400.0
 
 
 @pytest.mark.asyncio
-async def test_a_runtime_without_a_projection_has_nothing_to_reconcile() -> None:
+async def test_a_runtime_without_a_projection_has_nothing_to_maintain() -> None:
     runtime = SkillRuntime(
         store=FakeStore(),
         git=FakeGit(),
         content=FakeContent(),
         author=None,
-        review=None,
         outbox=None,
     )
 
-    assert await runtime.reconcile_projection_once() == (0, 0)
+    assert await runtime.repair_projection_once() == RepairStats()
+    assert await runtime.verify_projection_once() == VerifyStats()
+    assert await runtime.forget_commits("skill-1") == 0
 
+
+@pytest.mark.asyncio
+async def test_index_verify_is_scheduled_and_stopped_with_the_runtime() -> None:
+    order: list[str] = []
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        catalog=FakeCatalog(order=order),
+        outbox=FakeOutbox(order=order),
+        reconcile_interval_seconds=3600.0,
+        verify_interval_seconds=7200.0,
+    )
+
+    await runtime.start()
+    task = runtime._verify_task  # noqa: SLF001 - lifecycle assertion
+    assert task is not None
+    assert task.get_name() == "skill-index-verify"
+
+    await runtime.stop()
+    assert runtime._verify_task is None  # noqa: SLF001
+    assert task.cancelled() or task.done()
 
 @pytest.mark.asyncio
 async def test_index_maintenance_is_scheduled_and_stopped_with_the_runtime() -> None:
@@ -857,7 +974,6 @@ async def test_index_maintenance_is_scheduled_and_stopped_with_the_runtime() -> 
         git=FakeGit(),
         content=FakeContent(order=order),
         author=None,
-        review=None,
         catalog=FakeCatalog(order=order),
         outbox=FakeOutbox(order=order),
         reconcile_interval_seconds=3600.0,
@@ -881,7 +997,6 @@ async def test_index_maintenance_needs_a_projection_to_schedule() -> None:
         git=FakeGit(),
         content=FakeContent(order=order),
         author=None,
-        review=None,
         catalog=FakeCatalog(order=order),
         outbox=None,
         reconcile_interval_seconds=60.0,
@@ -903,7 +1018,6 @@ async def test_a_failing_sweep_logs_and_keeps_the_loop_alive(
         git=FakeGit(),
         content=FakeContent(order=order),
         author=None,
-        review=None,
         catalog=FakeCatalog(order=order),
         outbox=outbox,
         reconcile_interval_seconds=0.01,
@@ -918,8 +1032,31 @@ async def test_a_failing_sweep_logs_and_keeps_the_loop_alive(
         await runtime.stop()
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any("Skill index maintenance failed" in message for message in messages), messages
-    assert order.count("outbox.reconcile") >= 2
+    assert any("Skill index repair failed" in message for message in messages), messages
+    assert order.count("outbox.repair") >= 2
+
+@pytest.mark.asyncio
+async def test_the_first_maintenance_pass_does_not_wait_a_full_interval(monkeypatch) -> None:
+    """部署重启后要尽快修漂移：首轮延迟是 min(interval, 30s)，不是一整个周期。"""
+    monkeypatch.setattr(skills_catalog, "_FIRST_RECONCILE_DELAY_SECONDS", 0.01)
+    order: list[str] = []
+    outbox = RecordingOutbox(order=order)
+    runtime = SkillRuntime(
+        store=FakeStore(order=order),
+        git=FakeGit(),
+        content=FakeContent(order=order),
+        author=None,
+        catalog=FakeCatalog(order=order),
+        outbox=outbox,
+        reconcile_interval_seconds=3600.0,
+    )
+
+    await runtime.start()
+    await asyncio.sleep(0.05)
+    await runtime.stop()
+
+    assert order.count("outbox.repair") >= 1
+
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +1086,6 @@ def test_a_failed_runtime_start_stops_it_and_clears_app_state(
         assert fake.stopped is True
         assert app.state.skill_runtime is None
         assert app.state.skill_author_service is None
-        assert app.state.skill_review_service is None
         assert app.state.skill_catalog is None
         assert app.state.skill_search is None
         assert get_skill_runtime() is None
@@ -1027,15 +1163,11 @@ def _lexical_visible(name: str = "pdf-report") -> Any:
             draft_commit="a" * 40,
             skill_path="users/alice/s1/SKILL.md",
         ),
-        release=None,
     )
 
 
 class _LexicalStore:
-    """Only the three reads SkillSearchService performs on the catalog."""
-
-    async def private_skill_ids(self, user_id: str) -> tuple[str, ...]:
-        return ("s1",)
+    """Only the catalog read SkillSearchService performs for lexical recall."""
 
     async def visible_for_user(self, user_id: str) -> list[Any]:
         return [_lexical_visible()]
@@ -1117,7 +1249,6 @@ async def test_refresh_prunes_private_trees_of_owners_without_private_skills() -
         git=FakeGit(),
         content=content,
         author=None,
-        review=None,
         catalog=FakeCatalog(),
     )
 
@@ -1144,7 +1275,6 @@ async def test_a_broken_private_tree_does_not_stop_the_other_prunes() -> None:
         git=FakeGit(),
         content=content,
         author=None,
-        review=None,
         catalog=FakeCatalog(),
     )
 
@@ -1180,7 +1310,6 @@ def test_a_failed_later_startup_step_tears_the_runtime_down(
         assert fake.order == ["runtime.start", "runtime.stop"]
         assert app.state.skill_runtime is None
         assert app.state.skill_author_service is None
-        assert app.state.skill_review_service is None
         assert app.state.skill_catalog is None
         assert app.state.skill_search is None
         assert get_skill_runtime() is None

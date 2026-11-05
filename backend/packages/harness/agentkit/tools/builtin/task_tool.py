@@ -117,6 +117,9 @@ class SubagentDispatch:
     #: 父 run 的用量记录器（``RunJournal``，§15）。**在这里就解析好**：执行器的收尾闭包
     #: 只允许持有它 + 几个 id，不许持有整个 runtime（§7.5）。
     usage_recorder: Any | None = None
+    #: 父 run 根 span 的 16 hex id。只用于把隔离 loop 里的子代理 trace 接回同一条 trace；
+    #: 没有开启可观测性时为 None。
+    trace_parent_span_id: str | None = None
 
 
 @runtime_checkable
@@ -290,6 +293,7 @@ async def _run_delegation(
         delegated_tools=list(delegated_tools or ()),
         allowed_subagents=allowed,
         usage_recorder=_find_usage_recorder(runtime),
+        trace_parent_span_id=_context_text(context, "trace_parent_span_id"),
     )
     try:
         submitted = dispatcher.start(dispatch)

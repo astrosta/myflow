@@ -28,6 +28,13 @@ def _has_index(table: str, name: str) -> bool:
     return any(index["name"] == name for index in sa.inspect(op.get_bind()).get_indexes(table))
 
 
+def _has_columns(table: str, columns: list[str]) -> bool:
+    existing = {
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns(table)
+    }
+    return all(column in existing for column in columns)
+
+
 def _create_index(
     name: str,
     table: str,
@@ -38,6 +45,11 @@ def _create_index(
     postgresql_where: TextClause | None = None,
 ) -> None:
     if _has_index(table, name):
+        return
+    # The database may already be at a newer shape (for example after
+    # Base.metadata.create_all and a stamped baseline).  Historical migrations
+    # must not create an index for a column the current shape has removed.
+    if not _has_columns(table, columns):
         return
     kwargs: dict[str, object] = {"unique": unique}
     if sqlite_where is not None:

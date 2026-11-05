@@ -84,12 +84,15 @@ def test_resolve_memory_uri_accepts_only_user_memory_files() -> None:
     assert parsed.folder == f"viking://user/{USER}/memories/preferences/alice"
     assert parsed.name == "style.md"
 
+    tools = resolve_memory_uri(USER, f"viking://user/{USER}/memories/tools/x.md")
+    assert tools.memory_type == "tools"
+
     for bad in (
         f"viking://user/{USER}/memories/preferences/.abstract.md",
         f"viking://user/{USER}/memories/preferences/.overview.md",
         f"viking://user/{USER}/memories/preferences/alice/.hidden.md",
         f"viking://user/{USER}/memories/preferences/alice/style.txt",
-        f"viking://user/{USER}/memories/tools/x.md",
+        f"viking://user/{USER}/memories/skills/x.md",
         f"viking://user/{USER}/memories/profile.md",
         f"viking://user/{USER}/peers/p/memories/preferences/x.md",
         f"viking://user/other/memories/preferences/x.md",

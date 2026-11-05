@@ -18,7 +18,7 @@ class Client:
     async def get_session(self, session_id, *, auto_create=False):
         return {
             "session_id": session_id,
-            "memory_policy": {"memory_types": ["preferences", "entities", "events", "cases", "trajectories", "experiences", "tools", "skills"]},
+            "memory_policy": {"memory_types": ["preferences", "entities", "events", "cases", "trajectories", "experiences"]},
             "auto_commit_policy": {
                 "pending_token_threshold": 0,
                 "message_count_threshold": 0,

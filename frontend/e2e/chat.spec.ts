@@ -184,6 +184,8 @@ interface ThreadFixture {
   messages: unknown[];
   runningRunId: string | null;
   cancelled: boolean;
+  /** threads_meta.display_name 的投影；首轮结束后由 worker 写入 */
+  displayName: string | null;
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -260,6 +262,11 @@ class MockGateway {
     this.fixture(threadId).messages = messages;
   }
 
+  /** 模拟 worker 收尾时把 checkpoint title 投影成列表里的 display_name */
+  setThreadTitle(title: string | null, threadId = THREAD_ID): void {
+    this.fixture(threadId).displayName = title;
+  }
+
   /** 测试放行一个 gate（mock 停在那里等） */
   release(gate: string): void {
     this.gateOpen.add(gate);
@@ -278,7 +285,7 @@ class MockGateway {
   private fixture(threadId: string): ThreadFixture {
     let fixture = this.fixtures.get(threadId);
     if (!fixture) {
-      fixture = { messages: [], runningRunId: null, cancelled: false };
+      fixture = { messages: [], runningRunId: null, cancelled: false, displayName: null };
       this.fixtures.set(threadId, fixture);
     }
     return fixture;
@@ -496,6 +503,7 @@ class MockGateway {
   private threadBody(threadId: string): unknown {
     return {
       thread_id: threadId,
+      display_name: this.fixture(threadId).displayName,
       created_at: "2026-09-16T00:00:00Z",
       updated_at: "2026-09-16T00:00:00Z",
       status: "idle",
@@ -674,6 +682,33 @@ test("发送一条消息：SSE 流式返回，文字逐步出现", async ({ page
 
   // 只开了一个 run：发一次消息不会重复建流
   expect(backend.createCount).toBe(1);
+  expect(backend.unhandled).toEqual([]);
+});
+
+test("首轮完成：侧栏标题自动更新，不需要刷新页面", async ({ page, backend }) => {
+  backend.setPlan({
+    frames: [
+      { text: metadataFrame(backend.runId, backend.threadId) },
+      { text: messagesFrame(humanMessage("你好", 1), 1) },
+      { text: messagesFrame(aiChunk("你好！", "ai-1"), 2) },
+    ],
+    ending: "end",
+  });
+
+  await openChat(page, backend);
+  const recentThreads = page.getByRole("navigation", { name: "最近对话" });
+  await expect(recentThreads.getByText("新对话", { exact: true })).toBeVisible();
+
+  /**
+   * 模拟 worker 收尾：真实后端在发 end 帧之前把 checkpoint 的 title 投影成
+   * threads_meta.display_name。列表已在首屏缓存了 "新对话"，前端必须主动失效
+   * ["threads"] 才会重新拉到这个名字；否则用户得刷新页面。
+   */
+  backend.setThreadTitle("问候");
+  await sendMessage(page, "你好");
+
+  await expect(answerBubble(page)).toContainText("你好！");
+  await expect(recentThreads.getByText("问候", { exact: true })).toBeVisible();
   expect(backend.unhandled).toEqual([]);
 });
 

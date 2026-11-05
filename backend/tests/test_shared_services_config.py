@@ -75,6 +75,23 @@ def test_shared_services_fill_both_consumers_without_overwriting_policies() -> N
     assert cfg.skills.search.vector_store.consistency_level == "Session"
 
 
+def test_blank_vector_store_credentials_match_config_yaml() -> None:
+    """config.yaml 把 token / db_name 留空，YAML 读成 null，表示不鉴权、用默认库。"""
+    cfg = _config(
+        vector_store={"uri": "http://milvus:19530", "token": None, "db_name": None},
+        knowledge_base={"vector_store": {"collection": "myflow_knowledge"}},
+        skills={"search": {"vector_store": {"collection": "myflow_skills_active"}}},
+    )
+
+    for store in (
+        cfg.vector_store,
+        cfg.knowledge_base.vector_store,
+        cfg.skills.search.vector_store,
+    ):
+        assert store.token == ""
+        assert store.db_name == ""
+
+
 def test_consumer_sections_override_shared_values() -> None:
     cfg = _config(
         embedding={"base_url": "http://common", "model": "common-embedding"},

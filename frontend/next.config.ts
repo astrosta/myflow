@@ -47,6 +47,13 @@ const nextConfig: NextConfig = {
   experimental: {
     // 聊天页的 markdown/代码高亮只挂在 /workspace/chats/*，不要泄漏到落地页
     optimizePackageImports: ["shiki"],
+    /**
+     * 开发期 rewrite 默认 30 秒没有任何响应字节就掐断，并自己回 HTTP 500。
+     * 技能安全扫描在 LLM 返回前整段请求都是静默的，大文件经常要 1–2 分钟，
+     * 浏览器看到的 500 出在 Next，网关仍在跑，所以网关日志里什么都没有。
+     * 和生产 nginx 的 /api proxy_read_timeout 对齐，都是 600 秒。
+     */
+    proxyTimeout: 600_000,
   },
   async rewrites() {
     return [

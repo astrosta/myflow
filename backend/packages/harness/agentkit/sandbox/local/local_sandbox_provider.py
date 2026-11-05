@@ -39,7 +39,6 @@ class LocalSandboxProvider(SandboxProvider):
         )
         self._skills_root = _skills_container_root()
         self._skills_source = _skills_source()
-        self._public_skills = f"{self._skills_root}/public"
         self._private_skills = f"{self._skills_root}/private"
         self._builtin_skills_dir = _builtin_skills_dir()
         self._static_mappings = _static_mappings(
@@ -241,20 +240,15 @@ def _static_mappings(
 ) -> list[PathMapping]:
     """Process-wide mounts only. Never bind a user id here.
 
-    git 来源挂 active 公共树（私有树按用户挂，见 _build）。filesystem 来源没有
-    runtime，也就没有 active 树：它必须挂**技能树根本身**，否则提示词里写的
+    git 来源没有进程级技能挂载：每个用户的活动树按 owner 单独挂到
+    {root}/private（见 _private_skill_mappings）。filesystem 来源没有 runtime，
+    也就没有 active 树：它必须挂**技能树根本身**，否则提示词里写的
     {container}/<category>/<name>/SKILL.md 在沙箱里根本不存在。内置技能树在两种
     来源下都额外挂到 {root}/builtin；目录不存在也挂，配置变化要重启进程。
     """
     root = container_root.rstrip("/") or "/"
     mappings: list[PathMapping] = (
-        [
-            PathMapping(
-                f"{root}/public",
-                str(skills_cache_dir / "active" / "public"),
-                read_only=True,
-            )
-        ]
+        []
         if source == "git"
         else [PathMapping(root, str(_skills_tree_root()), read_only=True)]
     )
@@ -281,7 +275,7 @@ def _static_mappings(
             local_path = Path(str(local)).resolve()
             # Operator mounts must never reintroduce the process-wide skill
             # cache (or its active/users subtree) that this provider replaced
-            # with one public mount plus a per-sandbox private mount.
+            # with one per-sandbox private mount.
             if container_text == root or container_text.startswith(f"{root}/"):
                 continue
             if any(

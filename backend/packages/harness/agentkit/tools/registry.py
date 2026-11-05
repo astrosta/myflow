@@ -19,7 +19,8 @@ from agentkit.sandbox.tools import (
     str_replace,
     write_file,
 )
-from agentkit.tools.builtin.search_and_load_skills import search_and_load_skills
+from agentkit.tools.builtin.load_skills import load_skills
+from agentkit.tools.builtin.search_skills import search_skills
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,9 @@ _HOST_BASH_DISABLED = (
 
 # (group, tool). Config entries with the same .name win because they are added first.
 _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
-    # 技能的按需加载：框架工具，任何策略下都可用（M7 §3.8）
-    ("skills", search_and_load_skills),
+    # 技能发现只属于 skill-finder；正文加载是框架工具，任何策略下都可用。
+    ("skills", search_skills),
+    ("skills", load_skills),
     ("sandbox", read_file),
     ("sandbox", write_file),
     ("sandbox", str_replace),
@@ -153,7 +155,7 @@ def _apply_capability_filters(
             continue
         if tool.name == "run_code" and not run_code_enabled:
             continue
-        if tool.name == "search_and_load_skills" and not skill_search_enabled:
+        if tool.name == "search_skills" and not skill_search_enabled:
             continue
         if tool.name == "view_image" and not vision:
             continue

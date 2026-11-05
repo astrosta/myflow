@@ -11,6 +11,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+#: The application-level memory type catalog used by retrieval, model tools and
+#: the management API. Session skills are deliberately not a memory type here:
+#: OpenViking extracts them into the user's skill directory and MyFlow imports
+#: them into the Git-backed skill catalog instead.
 DEFAULT_MEMORY_TYPES: tuple[str, ...] = (
     "preferences",
     "entities",
@@ -19,7 +23,18 @@ DEFAULT_MEMORY_TYPES: tuple[str, ...] = (
     "trajectories",
     "experiences",
     "tools",
-    "skills",
+)
+
+#: Types accepted by the stock OpenViking 0.5.2 memory templates. Session
+#: creation always starts from this constant; tools/skills are not session
+#: memory types.
+DEFAULT_SESSION_MEMORY_TYPES: tuple[str, ...] = (
+    "preferences",
+    "entities",
+    "events",
+    "cases",
+    "trajectories",
+    "experiences",
 )
 
 
@@ -45,15 +60,17 @@ class SessionPolicyConfig(BaseModel):
     self_enabled: bool = True
     peer_enabled: bool = False
     working_memory: bool = False
-    memory_types: tuple[str, ...] = DEFAULT_MEMORY_TYPES
+    memory_types: tuple[str, ...] = DEFAULT_SESSION_MEMORY_TYPES
 
     @model_validator(mode="after")
     def _validate_memory_types(self) -> "SessionPolicyConfig":
-        unknown = set(self.memory_types) - set(DEFAULT_MEMORY_TYPES)
+        unknown = set(self.memory_types) - set(DEFAULT_SESSION_MEMORY_TYPES)
         if unknown:
             raise ValueError(f"unsupported memory types: {sorted(unknown)}")
-        if len(set(self.memory_types)) != len(self.memory_types):
-            raise ValueError("memory_types must not contain duplicates")
+        if tuple(self.memory_types) != DEFAULT_SESSION_MEMORY_TYPES:
+            raise ValueError(
+                "memory_types must equal DEFAULT_SESSION_MEMORY_TYPES"
+            )
         return self
 
     def memory_policy(self) -> dict[str, Any]:
@@ -134,6 +151,23 @@ class PersonalizationConfig(BaseModel):
     include_empty_fields: bool = False
 
 
+class SessionSkillsConfig(BaseModel):
+    """Import OpenViking session-extracted skills into the Git skill catalog.
+
+    OpenViking exposes the generated skill URIs only after the commit task
+    reaches a terminal state. The worker polls that task, reads each generated
+    SKILL.md and creates an extracted, unscanned draft for the user to review,
+    scan and activate in the normal skills UI.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    poll_interval_seconds: float = Field(default=2.0, gt=0.0, le=60.0)
+    task_timeout_seconds: float = Field(default=180.0, gt=0.0, le=3600.0)
+    max_skills_per_task: int = Field(default=20, ge=1, le=100)
+
+
 class OpenVikingMemoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -152,6 +186,8 @@ class OpenVikingMemoryConfig(BaseModel):
     studio_url: str = ""
 
     session: SessionPolicyConfig = Field(default_factory=SessionPolicyConfig)
+    session_skills: SessionSkillsConfig = Field(default_factory=SessionSkillsConfig)
+    session_skills: SessionSkillsConfig = Field(default_factory=SessionSkillsConfig)
     capture_stream: CaptureStreamConfig = Field(default_factory=CaptureStreamConfig)
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)

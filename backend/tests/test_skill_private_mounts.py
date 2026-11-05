@@ -96,7 +96,7 @@ def _request(messages, context, *, tools=()) -> ModelRequest:
     )
 
 
-def test_public_mount_is_static_and_private_mount_is_per_user(tmp_path: Path) -> None:
+def test_there_is_no_public_mount_and_private_mount_is_per_user(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     provider = _provider(cache=cache)
 
@@ -104,9 +104,7 @@ def test_public_mount_is_static_and_private_mount_is_per_user(tmp_path: Path) ->
     second = provider.get(provider.acquire("thread-b", user_id="user-b"))
     assert first is not None and second is not None
 
-    public = _mapping(first, "/mnt/skills/public")
-    assert public.local_path == str(cache / "active" / "public")
-    assert public.read_only is True
+    assert find_path_mapping("/mnt/skills/public", first.path_mappings) is None
 
     private_a = _mapping(first, "/mnt/skills/private")
     private_b = _mapping(second, "/mnt/skills/private")
@@ -171,7 +169,7 @@ def _private_snapshot(tmp_path: Path) -> tuple[SkillSnapshot, Path, SkillsConfig
         owner="user-a",
         skill_id="s-private",
     )
-    return SkillSnapshot("e14", (), {"user-a": (private,)}), private_file, config
+    return SkillSnapshot("e14", {"user-a": (private,)}), private_file, config
 
 
 def test_slash_activation_reads_the_private_snapshot_body(tmp_path: Path) -> None:
@@ -222,48 +220,6 @@ def test_slash_activation_reads_the_private_snapshot_body(tmp_path: Path) -> Non
         policy_handler,
     )
     assert policy_seen["tools"] == ["read_file"]
-
-
-def test_private_precedes_public_with_the_same_name_for_the_owner(tmp_path: Path) -> None:
-    cache = tmp_path / "cache"
-    public_file = _write_skill_file(
-        cache / "commits" / "public", "public/same", PUBLIC_MARKER, name="same"
-    )
-    private_file = _write_skill_file(
-        cache / "commits" / "private", "private/same", PRIVATE_MARKER, name="same"
-    )
-    config = skills_config(tmp_path)
-    public = _skill(
-        name="same", path=public_file, scope=SkillScope.PUBLIC, skill_id="s-public"
-    )
-    private = _skill(
-        name="same",
-        path=private_file,
-        scope=SkillScope.PRIVATE,
-        owner="user-a",
-        skill_id="s-private",
-    )
-    snapshot = SkillSnapshot("e14", (public,), {"user-a": (private,)})
-    activation = SkillActivationMiddleware(
-        skills_config=config, user_id="user-a", snapshot=snapshot
-    )
-    context: dict = {"user_id": "user-a"}
-    seen: dict = {}
-
-    def handler(request: ModelRequest):
-        seen["request"] = request
-        return "ok"
-
-    activation.wrap_model_call(
-        _request([HumanMessage(content="/same go", id="m1")], context), handler
-    )
-
-    body = "\n".join(str(message.content) for message in seen["request"].messages)
-    assert PRIVATE_MARKER in body
-    assert PUBLIC_MARKER not in body
-    assert read_secret_context(
-        context, SLASH_SKILL_SOURCE_CONTEXT_KEY, token=activation.owner_token
-    ) == "/mnt/skills/private/same/SKILL.md"
 
 
 def test_build_skill_middlewares_uses_the_process_snapshot(tmp_path: Path) -> None:
@@ -343,9 +299,7 @@ def test_provider_uses_the_configured_git_cache_dir(tmp_path: Path, monkeypatch)
     provider = LocalSandboxProvider()
     sandbox = provider.get(provider.acquire("thread-a", user_id="user-a"))
     assert sandbox is not None
-    assert _mapping(sandbox, "/mnt/skills/public").local_path == str(
-        cache / "active" / "public"
-    )
+    assert find_path_mapping("/mnt/skills/public", sandbox.path_mappings) is None
     assert _mapping(sandbox, "/mnt/skills/private").local_path == str(
         cache / "active" / "users" / "user-a"
     )
@@ -487,9 +441,7 @@ def test_operator_mounts_cannot_shadow_a_configured_skill_root(
     assert _mapping(sandbox, "/opt/skills/private").local_path != str(
         cache / "active" / "users"
     )
-    assert _mapping(sandbox, "/opt/skills/public").local_path == str(
-        cache / "active" / "public"
-    )
+    assert find_path_mapping("/opt/skills/public", sandbox.path_mappings) is None
     assert _mapping(sandbox, "/opt/skills/private").local_path == str(
         cache / "active" / "users" / "user-a"
     )

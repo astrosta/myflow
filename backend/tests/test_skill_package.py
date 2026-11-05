@@ -14,14 +14,11 @@ from agentkit.skills.domain import (
     InvalidSkillPackage,
     PackageManifest,
     PrivateActiveRecord,
-    PublicActiveRecord,
-    ReviewDetail,
-    ReviewItem,
+    SecurityScanRecord,
     SkillConflict,
     SkillRecord,
-    SkillReleaseRecord,
+    SkillScanUnavailable,
     SkillScope,
-    SkillSubmissionRecord,
     SkillVersionRecord,
     StagedFile,
     StagedFileInfo,
@@ -54,8 +51,8 @@ def make_skill(**overrides: object) -> Skill:
         "name": "pdf-tools",
         "description": "Does PDF things",
         "license": None,
-        "skill_dir": Path("/host/skills/public/pdf-tools"),
-        "skill_file": Path("/host/skills/public/pdf-tools/SKILL.md"),
+        "skill_dir": Path("/host/skills/private/pdf-tools"),
+        "skill_file": Path("/host/skills/private/pdf-tools/SKILL.md"),
         "relative_path": Path("pdf-tools"),
         "category": SkillCategory.CUSTOM,
     }
@@ -64,8 +61,8 @@ def make_skill(**overrides: object) -> Skill:
 
 
 def test_scope_values_and_staged_file_defaults():
-    assert SkillScope.PUBLIC == "public"
     assert SkillScope.PRIVATE == "private"
+    assert SkillScope.BUILTIN == "builtin"
     assert StagedFile("SKILL.md", b"x").mode == "text"
 
 
@@ -242,12 +239,6 @@ def test_private_skill_container_path_uses_private_root():
     assert skill.container_file == "/mnt/skills/private/pdf-tools/SKILL.md"
 
 
-def test_public_skill_container_path_uses_public_root():
-    skill = make_skill(scope=SkillScope.PUBLIC, name="pdf-tools")
-
-    assert skill.container_file == "/mnt/skills/public/pdf-tools/SKILL.md"
-
-
 def test_skill_without_scope_keeps_legacy_category_path():
     skill = make_skill()
 
@@ -263,7 +254,6 @@ def test_skill_catalog_fields_default_to_none_at_the_end():
     assert skill.owner_user_id is None
     assert skill.version_id is None
     assert skill.skill_version is None
-    assert skill.release_id is None
     assert skill.git_repository is None
     assert skill.git_commit is None
     assert skill.repo_path is None
@@ -284,28 +274,22 @@ def test_domain_records_are_constructible_and_immutable():
         index_status="pending",
         created_at=NOW,
     )
-    release = SkillReleaseRecord(
-        id="r1",
-        batch_id="b1",
+    scan = SecurityScanRecord(
+        id="scan1",
+        skill_id="s1",
         version_id="v1",
-        skill_id="s1",
-        skill_version="v1",
-        git_repository="https://example.invalid/skills.git",
-        git_commit="d" * 40,
-        skill_path="public/pdf-tools/SKILL.md",
-        public_name="pdf-tools",
-        source_commit="c" * 40,
-        approved_by="admin",
-        created_at=NOW,
-    )
-    item = ReviewItem(
-        submission_id="sub1",
-        skill_id="s1",
-        name="pdf-tools",
-        version="v1",
         owner_user_id="u1",
-        submitted_at=NOW,
-        submitted_commit="c" * 40,
+        package_sha256="a" * 64,
+        status="completed",
+        is_safe=True,
+        max_severity="SAFE",
+        findings_count=0,
+        findings=[],
+        scanner="cisco-ai-skill-scanner",
+        scanner_version="2.3.2",
+        duration_ms=3,
+        error=None,
+        created_at=NOW,
     )
 
     records = (
@@ -313,60 +297,26 @@ def test_domain_records_are_constructible_and_immutable():
             id="s1",
             owner_user_id="u1",
             private_name="pdf-tools",
-            public_name=None,
             created_at=NOW,
             updated_at=NOW,
             deleted_at=None,
         ),
         version,
-        SkillSubmissionRecord(
-            id="sub1",
-            skill_id="s1",
-            version_id="v1",
-            submitted_commit="c" * 40,
-            owner_user_id="u1",
-            status="pending",
-            submitted_at=NOW,
-            reviewed_by=None,
-            reviewed_at=None,
-            reject_reason=None,
-            public_release_id=None,
-        ),
-        release,
-        PublicActiveRecord(
-            skill_id="s1", release_id="r1", activated_by="admin", updated_at=NOW
-        ),
         PrivateActiveRecord(
             skill_id="s1", owner_user_id="u1", version_id="v1", updated_at=NOW
         ),
         VisibleSkill(
-            skill=make_skill(scope=SkillScope.PUBLIC),
-            scope=SkillScope.PUBLIC,
+            skill=make_skill(scope=SkillScope.PRIVATE),
+            scope=SkillScope.PRIVATE,
             version=version,
-            release=release,
         ),
-        item,
-        ReviewDetail(
-            item=item,
-            files=[
-                StagedFileInfo(
-                    path="SKILL.md",
-                    size_bytes=len(skill_md()),
-                    mode="text",
-                    sha256=hashlib.sha256(skill_md()).hexdigest(),
-                )
-            ],
-            skill_md=skill_md().decode(),
-            diff="+ body",
-            metadata={"name": "pdf-tools"},
-            package_bytes=len(skill_md()),
-        ),
+        scan,
     )
 
-    assert len(records) == 9
+    assert len(records) == 5
     assert version.metadata == {"name": "pdf-tools"}
-    assert records[6].version is version
-    assert records[6].release is release
+    assert records[3].version is version
+    assert records[4].is_safe is True
     with pytest.raises(AttributeError):
         version.index_status = "ready"  # type: ignore[misc]
 
@@ -374,8 +324,10 @@ def test_domain_records_are_constructible_and_immutable():
 def test_domain_error_codes_are_stable():
     assert InvalidSkillPackage.code == "invalid_skill_package"
     assert SkillConflict.code == "skill_conflict"
+    assert SkillScanUnavailable.code == "skill_scanner_unavailable"
     assert isinstance(InvalidSkillPackage(), ValueError)
     assert isinstance(SkillConflict(), RuntimeError)
+    assert isinstance(SkillScanUnavailable(), RuntimeError)
 
 
 def test_validate_skill_path_rejects_overlong_paths_and_segments() -> None:

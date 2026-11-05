@@ -250,7 +250,7 @@ def test_a_snapshot_activation_never_rescans_the_filesystem(tmp_path, monkeypatc
         owner_user_id="u1",
         skill_id="s-secret",
     )
-    snapshot = SkillSnapshot("e14", (), {"u1": (skill,)})
+    snapshot = SkillSnapshot("e14", {"u1": (skill,)})
     activation = SkillActivationMiddleware(
         skills_config=skills_config(tmp_path), user_id="u1", snapshot=snapshot
     )

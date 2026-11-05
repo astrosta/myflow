@@ -22,6 +22,8 @@ class FakeFacade:
         self.ai: list = []
         self.tool: list = []
         self.turn_ends: list = []
+        self.commits: list = []
+        self.decision = TurnDecision("capture")
         self.publish_error: Exception | None = None
         self.ref = SessionRef(
             user_id="u1",
@@ -34,7 +36,9 @@ class FakeFacade:
         )
 
     def decide_capture(self, text: str, *, has_attachments: bool = False) -> TurnDecision:
-        return TurnDecision("skip" if text == "你好" else "capture")
+        if text == "你好":
+            return TurnDecision("skip")
+        return self.decision
 
     async def resolve_capture_context(self, user_id: str, thread_id: str) -> SessionRef:
         return self.ref
@@ -56,6 +60,9 @@ class FakeFacade:
 
     async def publish_turn_end(self, session, turn_id, decision, **kwargs):
         self.turn_ends.append((turn_id, decision, kwargs))
+
+    async def commit_session(self, session):
+        self.commits.append(session)
 
 
 @pytest.fixture(autouse=True)
@@ -191,3 +198,97 @@ async def test_turn_end_is_published_once_after_capture() -> None:
 
     assert len(facade.turn_ends) == 1
     assert facade.turn_ends[0][0] == "r1"
+    assert facade.commits == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["TASK_COMPLETE", "EXPLICIT_REMEMBER", "USER_CORRECTION"])
+async def test_a_commit_signal_is_published_for_the_worker(signal: str) -> None:
+    facade = FakeFacade()
+    facade.decision = TurnDecision("capture", signals=(signal,))
+    middleware = OpenVikingMemoryMiddleware(facade)
+    context = {"user_id": "u1", "thread_id": "t1", "run_id": "r1"}
+    await middleware.abefore_agent(
+        {"messages": [HumanMessage(content="请记住我喜欢吃苹果", id="h1")]},
+        runtime(context),
+    )
+
+    await middleware.aafter_agent({"messages": []}, runtime(context))
+
+    assert len(facade.turn_ends) == 1
+    assert facade.turn_ends[0][1].signals == (signal,)
+    assert facade.commits == []
+
+
+@pytest.mark.asyncio
+async def test_session_end_is_published_without_capturing_the_farewell() -> None:
+    facade = FakeFacade()
+    facade.decision = TurnDecision("skip", signals=("SESSION_END",))
+    middleware = OpenVikingMemoryMiddleware(facade)
+    context = {"user_id": "u1", "thread_id": "t1", "run_id": "r1"}
+
+    await middleware.abefore_agent(
+        {"messages": [HumanMessage(content="再见", id="h1")]},
+        runtime(context),
+    )
+    await middleware.aafter_agent({"messages": []}, runtime(context))
+
+    assert facade.human == []
+    assert len(facade.turn_ends) == 1
+    assert facade.turn_ends[0][1].signals == ("SESSION_END",)
+    assert facade.commits == []
+
+
+@pytest.mark.asyncio
+async def test_detector_adds_a_correction_to_the_turn_end() -> None:
+    facade = FakeFacade()
+    middleware = OpenVikingMemoryMiddleware(facade)
+    context = {"user_id": "u1", "thread_id": "t1", "run_id": "r1"}
+    await middleware.abefore_agent(
+        {"messages": [HumanMessage(content="不对，应该是周三", id="h1")]},
+        runtime(context),
+    )
+
+    await middleware.aafter_agent({"messages": []}, runtime(context))
+
+    assert len(facade.turn_ends) == 1
+    assert facade.turn_ends[0][1].signals == ("USER_CORRECTION",)
+    assert facade.commits == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_memory_marker_is_merged_into_turn_end() -> None:
+    facade = FakeFacade()
+    middleware = OpenVikingMemoryMiddleware(facade)
+    context = {"user_id": "u1", "thread_id": "t1", "run_id": "r1"}
+    await middleware.abefore_agent(
+        {"messages": [HumanMessage(content="请记住我喜欢吃苹果", id="h1")]},
+        runtime(context),
+    )
+    context["memory_explicit_remember"] = True
+
+    await middleware.aafter_agent({"messages": []}, runtime(context))
+
+    assert len(facade.turn_ends) == 1
+    assert facade.turn_ends[0][1].signals == ("EXPLICIT_REMEMBER",)
+    assert facade.commits == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_memory_tool_signal_reaches_turn_end_without_duplication() -> None:
+    facade = FakeFacade()
+    middleware = OpenVikingMemoryMiddleware(facade)
+    context = {"user_id": "u1", "thread_id": "t1", "run_id": "r1"}
+    await middleware.abefore_agent(
+        {"messages": [HumanMessage(content="请记住我喜欢吃苹果", id="h1")]},
+        runtime(context),
+    )
+    context["capture_decision"] = TurnDecision(
+        "capture", signals=("EXPLICIT_REMEMBER",), reason="explicit_tool"
+    )
+
+    await middleware.aafter_agent({"messages": []}, runtime(context))
+
+    assert len(facade.turn_ends) == 1
+    assert facade.turn_ends[0][1].signals == ("EXPLICIT_REMEMBER",)
+    assert facade.commits == []

@@ -12,6 +12,30 @@ def _models() -> list[dict]:
     return [{"name": "deepseek-reasoner", "use": "langchain_deepseek:ChatDeepSeek"}]
 
 
+def test_braced_env_reference_expands_inside_a_value(monkeypatch):
+    monkeypatch.setenv("MYFLOW_HOST", "10.1.2.3")
+
+    assert (
+        AppConfig.resolve_env_variables(
+            "postgresql+asyncpg://postgres:postgres@${MYFLOW_HOST}:5432/myflow"
+        )
+        == "postgresql+asyncpg://postgres:postgres@10.1.2.3:5432/myflow"
+    )
+
+
+def test_missing_braced_env_reference_is_an_error(monkeypatch):
+    monkeypatch.delenv("MYFLOW_HOST", raising=False)
+
+    with pytest.raises(ValueError, match=r"\$\{MYFLOW_HOST\}"):
+        AppConfig.resolve_env_variables("http://${MYFLOW_HOST}:3050")
+
+
+def test_whole_value_env_reference_still_replaces_the_string(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://db/myflow")
+
+    assert AppConfig.resolve_env_variables("$DATABASE_URL") == "postgresql://db/myflow"
+
+
 def test_resolve_config_path_finds_config_yaml_in_cwd(tmp_path, monkeypatch):
     """没有 MYFLOW_CONFIG_PATH 时回落到 cwd 的 config.yaml（曾因少了逗号只看首字母路径）。"""
     monkeypatch.delenv("MYFLOW_CONFIG_PATH", raising=False)

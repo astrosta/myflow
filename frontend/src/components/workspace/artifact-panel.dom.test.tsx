@@ -53,8 +53,8 @@ describe("artifact 面板的 UI 状态（sessionStorage）", () => {
     const view = render(<ArtifactPanel artifacts={[]} loadPreview={loadPreview} threadLoading />);
     // 空清单不是"用户改了选择"，不许写回 storage
     expect(storedState()?.path).toBe("old.txt");
-    // 而且这时说"还没有产物"是在撒谎——历史还没到
-    expect(view.queryByText("这一轮还没有产物。")).toBeNull();
+    // 历史还没到，不能断言"没有产物"：此时整块面板都不渲染
+    expect(view.queryByRole("complementary", { name: "产物" })).toBeNull();
 
     // 真实清单到达，恢复出来的路径不在里面，面板落到第一个上
     view.rerender(<ArtifactPanel artifacts={["new.txt"]} loadPreview={loadPreview} />);

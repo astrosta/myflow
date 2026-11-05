@@ -1,10 +1,13 @@
-"""Process-wide immutable view of the active skill catalog.
+"""Process-wide immutable view of each user's active skill catalog.
 
 The synchronous prompt and middleware paths cannot query PostgreSQL.  This
-module materializes one immutable snapshot of every active public/private row,
-with only metadata and host cache paths; bodies stay on disk and are read on
-demand.  SkillSnapshot.visible_for is the per-user projection of that global
-snapshot, so private metadata never leaks to another user's prompt.
+module materializes one immutable snapshot of every active private row, with
+only metadata and host cache paths; bodies stay on disk and are read on demand.
+SkillSnapshot.visible_for is the per-user projection of that global snapshot,
+so one user's metadata never leaks into another user's prompt.
+
+There is no public catalog in v2.  A saved draft is not in this snapshot until
+its owner completes the scan -> activate flow.
 """
 
 from __future__ import annotations
@@ -19,8 +22,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from agentkit.config.skills_config import DEFAULT_SKILLS_CONTAINER_PATH
-from agentkit.skills import prefs as skill_prefs
-from agentkit.skills.domain import SkillScope, VisibleSkill
+from agentkit.skills.domain import VisibleSkill
 from agentkit.skills.package import validate_skill_path
 from agentkit.skills.types import Skill
 
@@ -34,27 +36,19 @@ _snapshot_lock = threading.Lock()
 _snapshot = None  # type: SkillSnapshot | None
 
 
-def _scope_value(scope: object) -> str | None:
-    if scope is None:
-        return None
-    return str(getattr(scope, "value", scope))
-
-
 @dataclass(frozen=True, slots=True)
 class SkillSnapshot:
     """One immutable catalog generation.
 
-    public is the complete active public set.  private_by_owner contains every
-    owner's private active set.  The mapping and tuples are copied and frozen in
-    __post_init__; callers cannot mutate a published snapshot.
+    private_by_owner contains every owner's active private set.  The mapping and
+    tuples are copied and frozen in __post_init__; callers cannot mutate a
+    published snapshot.
     """
 
     epoch: str
-    public: tuple[Skill, ...]
     private_by_owner: Mapping[str, tuple[Skill, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "public", tuple(self.public))
         object.__setattr__(
             self,
             "private_by_owner",
@@ -72,39 +66,16 @@ class SkillSnapshot:
         *,
         available_skills: frozenset[str] | None,
     ) -> list[Skill]:
-        """Public plus this owner's private skills, with private precedence."""
-        return self._visible_for(
-            user_id,
-            available_skills=available_skills,
-            prefs=skill_prefs.read_user_skill_prefs(user_id),
-        )
+        """Return only this owner's enabled active skills after the whitelist."""
+        return self._visible_for(user_id, available_skills=available_skills)
 
     def _visible_for(
         self,
         user_id: str | None,
         *,
         available_skills: frozenset[str] | None,
-        prefs: Mapping[str, bool] | None,
     ) -> list[Skill]:
-        """Internal variant used by SkillRegistry to honor a custom prefs path.
-
-        Suppression happens before preference filtering: an owner who turned
-        off their private skill must not silently fall back to the public row
-        with the same skill id.
-        """
-        private = tuple(self.private_by_owner.get(user_id, ())) if user_id else ()
-        private_ids = {
-            skill.skill_id
-            for skill in private
-            if skill.skill_id is not None
-        }
-        candidates: list[Skill] = [
-            skill
-            for skill in self.public
-            if skill.skill_id is None or skill.skill_id not in private_ids
-        ]
-        candidates.extend(private)
-
+        candidates = tuple(self.private_by_owner.get(user_id, ())) if user_id else ()
         seen: set[tuple[object, object, object]] = set()
         visible: list[Skill] = []
         for skill in candidates:
@@ -112,7 +83,7 @@ class SkillSnapshot:
             if identity in seen:
                 continue
             seen.add(identity)
-            if not skill_prefs.effective_enabled(skill, prefs):
+            if not skill.enabled:
                 continue
             if available_skills is not None and skill.name not in available_skills:
                 continue
@@ -121,16 +92,12 @@ class SkillSnapshot:
         # Stable prompt/prefix behavior: never depend on database row order.
         return sorted(
             visible,
-            key=lambda skill: (
-                skill.name,
-                0 if _scope_value(skill.scope) == SkillScope.PUBLIC.value else 1,
-                skill.skill_id or "",
-            ),
+            key=lambda skill: (skill.name, skill.skill_id or ""),
         )
 
 
 def _empty_snapshot() -> SkillSnapshot:
-    return SkillSnapshot(epoch="", public=(), private_by_owner={})
+    return SkillSnapshot(epoch="")
 
 
 def get_skill_snapshot() -> SkillSnapshot:
@@ -149,20 +116,6 @@ def set_skill_snapshot(snapshot: SkillSnapshot) -> None:
         _snapshot = snapshot
 
 
-def _commit_for(visible: VisibleSkill) -> str | None:
-    if visible.scope is SkillScope.PUBLIC:
-        release = visible.release
-        return release.git_commit if release is not None else None
-    return visible.version.draft_commit
-
-
-def _path_for(visible: VisibleSkill) -> str | None:
-    if visible.scope is SkillScope.PUBLIC:
-        release = visible.release
-        return release.skill_path if release is not None else None
-    return visible.version.skill_path
-
-
 def _snapshot_skill(
     visible: VisibleSkill,
     *,
@@ -170,13 +123,13 @@ def _snapshot_skill(
     container_path: str,
 ) -> Skill | None:
     """Bind one active row to its host cache path without reading the body."""
-    commit = _commit_for(visible)
-    raw_path = _path_for(visible)
+    version = visible.version
+    commit = version.draft_commit
+    raw_path = version.skill_path
     if not commit or not raw_path:
         logger.warning(
-            "Skipping skill %s (%s): active pointer has no content commit/path",
+            "Skipping skill %s: active pointer has no content commit/path",
             visible.skill.name,
-            _scope_value(visible.scope),
         )
         return None
     try:
@@ -216,16 +169,14 @@ class SkillCatalogService:
         global snapshot is retained until the new one has been fully built.
         """
         active = await self._store.all_active()
-        public: list[Skill] = []
         private: dict[str, list[Skill]] = {}
 
         for visible in active:
-            commit = _commit_for(visible)
+            commit = visible.version.draft_commit
             if not commit:
                 logger.warning(
-                    "Skipping skill %s (%s): active pointer has no content commit",
+                    "Skipping skill %s: active pointer has no content commit",
                     visible.skill.name,
-                    _scope_value(visible.scope),
                 )
                 continue
             try:
@@ -245,25 +196,23 @@ class SkillCatalogService:
             )
             if skill is None:
                 continue
-            if visible.scope is SkillScope.PUBLIC:
-                public.append(skill)
-            else:
-                owner = skill.owner_user_id
-                if not owner:
-                    logger.warning("Skipping private skill %s: owner is missing", skill.name)
-                    continue
-                private.setdefault(owner, []).append(skill)
+            owner = skill.owner_user_id
+            if not owner:
+                logger.warning("Skipping private skill %s: owner is missing", skill.name)
+                continue
+            private.setdefault(owner, []).append(skill)
 
         snapshot = SkillSnapshot(
             epoch=uuid.uuid4().hex,
-            public=tuple(public),
-            private_by_owner={owner: tuple(skills) for owner, skills in private.items()},
+            private_by_owner={
+                owner: tuple(sorted(skills, key=lambda item: item.name))
+                for owner, skills in private.items()
+            },
         )
         set_skill_snapshot(snapshot)
         return snapshot
 
     def current(self) -> SkillSnapshot:
-        """Return the process-wide current generation."""
         return get_skill_snapshot()
 
 

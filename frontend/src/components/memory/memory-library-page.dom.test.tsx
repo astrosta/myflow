@@ -5,12 +5,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deleteMemoryItem,
   getMemoryContent,
-  getMemoryDetail,
   listMemoryItems,
   listMemoryTypes,
   saveMemoryContent,
   type MemoryContentView,
-  type MemoryDetailView,
   type MemoryItemView,
 } from "@/core/api/memory-items";
 import { MemoryApiError } from "@/core/api/memory";
@@ -23,7 +21,6 @@ vi.mock("@/core/api/memory-items", async (importOriginal) => {
     ...actual,
     listMemoryTypes: vi.fn(),
     listMemoryItems: vi.fn(),
-    getMemoryDetail: vi.fn(),
     getMemoryContent: vi.fn(),
     saveMemoryContent: vi.fn(),
     deleteMemoryItem: vi.fn(),
@@ -32,7 +29,6 @@ vi.mock("@/core/api/memory-items", async (importOriginal) => {
 
 const mockedTypes = vi.mocked(listMemoryTypes);
 const mockedList = vi.mocked(listMemoryItems);
-const mockedDetail = vi.mocked(getMemoryDetail);
 const mockedContent = vi.mocked(getMemoryContent);
 const mockedSave = vi.mocked(saveMemoryContent);
 const mockedDelete = vi.mocked(deleteMemoryItem);
@@ -68,24 +64,9 @@ function makeTypes() {
       { type: "cases", label: "案例" },
       { type: "trajectories", label: "轨迹" },
       { type: "experiences", label: "经验" },
+      { type: "tools", label: "工具" },
     ],
   });
-}
-
-function makeDetail(): MemoryDetailView {
-  return {
-    uri: STYLE_URI,
-    folder: FOLDER,
-    memory_type: "preferences",
-    name: "style.md",
-    overview: "# Preferences Overview\n- [Style](./style.md)",
-    toc: [
-      { kind: "heading", title: "Preferences Overview", depth: 1, uri: null, navigable: false },
-      { kind: "link", title: "style", depth: 2, uri: STYLE_URI, navigable: true },
-      { kind: "link", title: "reply", depth: 2, uri: REPLY_URI, navigable: true },
-    ],
-    overview_missing: false,
-  };
 }
 
 function makeContent(uri: string, body: string, sha = "a".repeat(64)): MemoryContentView {
@@ -104,40 +85,52 @@ function renderPage() {
 }
 
 describe("记忆管理页", () => {
-  it("按类型展示摘要，详情用 overview 渲染目录，点击目录项读取正文", async () => {
+  it("左侧只显示当前类型的记忆列表，右侧只显示选中记忆的标题和正文", async () => {
     makeTypes();
     mockedList.mockResolvedValue({
       type: "preferences",
-      items: [makeItem(STYLE_URI, "style.md", "偏好简洁，先给结论。")],
+      items: [
+        makeItem(STYLE_URI, "style.md", "偏好简洁，先给结论。"),
+        makeItem(REPLY_URI, "reply.md", "回复尽量简短。"),
+      ],
       has_more: false,
       limit: 50,
     });
-    mockedDetail.mockResolvedValue(makeDetail());
     mockedContent.mockImplementation(async (uri) =>
       makeContent(uri, uri === STYLE_URI ? "偏好先给结论。" : "回复要短。"),
     );
 
     renderPage();
 
-    // 六类中文标签都在筛选栏里
+    // 后端会把可管理的七类中文标签都放进筛选栏；skills 不在其中
     expect(await screen.findByRole("button", { name: "偏好" })).toBeTruthy();
-    for (const label of ["实体", "事件", "案例", "轨迹", "经验"]) {
+    for (const label of ["实体", "事件", "案例", "轨迹", "经验", "工具"]) {
       expect(screen.getByRole("button", { name: label })).toBeTruthy();
     }
 
-    // 列表只显示摘要
-    const summary = await screen.findByText("偏好简洁，先给结论。");
-    expect(summary).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /style/ }));
+    const directory = await screen.findByRole("region", { name: "记忆目录" });
+    const content = screen.getByRole("region", { name: "记忆内容" });
+    expect(
+      directory.compareDocumentPosition(content) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
 
-    // 详情目录来自 .overview.md
-    const detail = await screen.findByRole("region", { name: "记忆详情" });
-    expect(await within(detail).findByText("Preferences Overview")).toBeTruthy();
-    expect(await within(detail).findByText("偏好先给结论。")).toBeTruthy();
+    // 左侧只列当前类型的记忆，没有 overview 目录卡片
+    expect(await within(directory).findByText("偏好简洁，先给结论。")).toBeTruthy();
+    expect(within(directory).getByText("回复尽量简短。")).toBeTruthy();
+    expect(within(directory).queryByText("Preferences Overview")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "目录" })).toBeNull();
 
-    // 点击目录里的另一条记忆 → 读取它的完整内容
-    fireEvent.click(within(detail).getByRole("button", { name: "reply" }));
-    expect(await within(detail).findByText("回复要短。")).toBeTruthy();
+    fireEvent.click(within(directory).getByRole("button", { name: /style/ }));
+    expect(within(content).getByRole("heading", { name: "style" })).toBeTruthy();
+    expect(await within(content).findByText("偏好先给结论。")).toBeTruthy();
+    // 右侧不展示类型/路径等元数据，也没有目录项
+    expect(within(content).queryByText(/viking:/)).toBeNull();
+    expect(within(content).queryByText("reply")).toBeNull();
+
+    // 点击左侧另一条记忆 → 右侧读取它的完整内容
+    fireEvent.click(within(directory).getByRole("button", { name: /reply/ }));
+    expect(await within(content).findByText("回复要短。")).toBeTruthy();
+    expect(within(content).getByRole("heading", { name: "reply" })).toBeTruthy();
     expect(mockedContent).toHaveBeenCalledWith(REPLY_URI);
 
     // 切换类型会重新拉列表
@@ -153,7 +146,6 @@ describe("记忆管理页", () => {
       has_more: false,
       limit: 50,
     });
-    mockedDetail.mockResolvedValue(makeDetail());
     mockedContent.mockResolvedValue(makeContent(STYLE_URI, "偏好先给结论。"));
     mockedSave.mockResolvedValue(makeContent(STYLE_URI, "偏好结论优先。", "b".repeat(64)));
     mockedDelete.mockResolvedValue();
@@ -185,11 +177,13 @@ describe("记忆管理页", () => {
     makeTypes();
     mockedList.mockResolvedValue({
       type: "preferences",
-      items: [makeItem(STYLE_URI, "style.md", "偏好简洁")],
+      items: [
+        makeItem(STYLE_URI, "style.md", "偏好简洁"),
+        makeItem(REPLY_URI, "reply.md", "回复简短"),
+      ],
       has_more: false,
       limit: 50,
     });
-    mockedDetail.mockResolvedValue(makeDetail());
     mockedContent.mockImplementation(async (uri) =>
       makeContent(uri, uri === STYLE_URI ? "偏好先给结论。" : "回复要短。"),
     );
@@ -199,7 +193,7 @@ describe("记忆管理页", () => {
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /style/ }));
     await screen.findByText("偏好先给结论。");
-    fireEvent.click(screen.getByRole("button", { name: "reply" }));
+    fireEvent.click(screen.getByRole("button", { name: /reply/ }));
     await screen.findByText("回复要短。");
 
     fireEvent.click(screen.getByRole("button", { name: "删除" }));

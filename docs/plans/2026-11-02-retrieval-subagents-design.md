@@ -1,6 +1,6 @@
 # 检索子代理设计（知识库 / 记忆 / 技能）
 
-> 状态：设计（2026-11-02）
+> 状态：设计（2026-11-02；2026-11-03 工具拆分修订）
 > 范围：把 lead 直接调用的三个检索工具改成**专用子代理**：知识库检索、长期记忆检索、技能检索。
 > 本文是这三条链路的行为规范；工具本身的实现（Milvus、OpenViking、技能目录）不变，只是
 > 调用方从 lead 变成子代理。
@@ -17,7 +17,7 @@
 |---|---|---|
 | 知识库 | lead 直接调 `knowledge_search` | 委派 `knowledge-researcher`（内部仍调 `knowledge_search`） |
 | 长期记忆 | lead 直接调 `memory_search/read/overview` | 委派 `memory-researcher`（内部仍调这三个只读工具） |
-| 技能 | lead 直接调 `search_and_load_skills` | 委派 `skill-finder`（内部仍调 `search_and_load_skills`） |
+| 技能 | lead 直接调 `search_and_load_skills` | 委派 `skill-finder`（内部调 `search_skills`，只回元数据）；lead 再用系统内置 `load_skills` 按 skill_id 取正文 |
 
 三个子代理都是**内置**类型，随功能开关出现在发现列表里；它们的 `system_prompt` 写清
 检索顺序、次数上限、结果怎么引用。“何时委派”写在 `description` 里给 lead 看。
@@ -41,7 +41,7 @@ lead 的系统提示词始终保留 L0 技能索引；委派段列出可用子�
 |---|---|---|---|
 | `knowledge-researcher` | `knowledge_search` | 答案依赖用户上传文档：安装/配置、运维排障、FAQ、安全合规、API 参数、法规条文 | 通用常识；用户已把原文贴在对话里；纯写作/翻译 |
 | `memory-researcher` | `memory_search` / `memory_read` / `memory_overview` | 需要用户跨会话的偏好、实体、事件、经验；画像里没有的长尾事实 | 画像已注入的信息；当前对话刚说过的内容；凭猜测“用户可能喜欢…” |
-| `skill-finder` | `search_and_load_skills` | 任务超出已有技能索引覆盖、涉及内部 SOP/企业规范、长任务进入新阶段 | 索引里已有匹配技能（直接 `read_file` 读 SKILL.md）；纯通用任务；同一意图重复检索 |
+| `skill-finder` | `search_skills` | 任务超出已有技能索引覆盖、涉及内部 SOP/企业规范、长任务进入新阶段 | 索引里已有匹配技能（lead 直接用 `load_skills`）；纯通用任务；同一意图重复检索 |
 
 三个组件共用 `disallowed_tools = ["task", "ask_clarification"]`：不能嵌套委派、不能向用户提问。
 `skills=[]`：不注入技能正文，检索子代理只做检索。
@@ -66,11 +66,10 @@ make_task_tool(dispatcher=..., app_config=..., delegated_tools=[...])
 
 ### 3.1 技能正文不随子代理返回
 
-`skill-finder` 只返回候选 `name / path / description / 匹配理由`，不返回整段正文：
-lead 需要正文时自己 `read_file` 读 `SKILL.md`。代价是 `<active_skills>` 的自动激活
-（M7 §3.10 通过 loader 工具结果捕获）不会因这次委派发生；allowed-tools 仍由 lead 的工具策略
-兜底。若后续要求“委派也能激活技能”，需要让 `task` 结果参与 durable context 的
-`skill_context` 解析，属于下一轮改造。
+`skill-finder` 只返回候选 `skill_id / name / description / 匹配理由`，不返回正文。
+lead 需要正文时调用系统内置 `load_skills(skill_id)`：这一步加载正文、触发 durable-context
+的 `skill_context` 记录，并让技能声明的 allowed-tools 生效。`task` 结果本身仍不参与
+`skill_context` 解析；只有 `load_skills` 的结果会。
 
 **回退**：检索工具只有在认领它的子代理出现在发现列表里时才下沉到 `delegated_tools`。
 `task` 不可用（`allowed_subagents: []`、白名单对不上任何类型、或 run 未启用子代理）时，
@@ -118,16 +117,18 @@ lead 需要正文时自己 `read_file` 读 `SKILL.md`。代价是 `<active_skill
   不要用常识补全；画像是注入的，不要重复检索画像字段。
 - **skill-finder**：`task_query` 必须自包含且具体（技术栈、报错、目标产出），禁止代词；
   `domain_keywords` 1–4 个；先看 `<available_skills>` 索引，索引能对上就直接返回
-  “用某个技能 + 路径”，不要检索；同一意图最多检索一次；返回候选 name/path/description/
-  匹配理由，**不要**把整段正文搬回 lead（正文由 lead 用 `read_file` 读取）。
+  “用某个技能 + skill_id”，不要检索；同一意图最多检索一次；返回候选
+  `skill_id/name/description/`匹配理由，**不要**把整段正文搬回 lead（正文由 lead 用
+  `load_skills` 读取）。
 
 ## 6. 提示词与工具表的联动
 
 检索工具按**认领关系**逐个决定归属，不靠“委派开没开”一刀切：
 
 - 认领它的子代理出现在 `list_subagent_names(allowed=...)` 里 → 工具进 `task.delegated_tools`，lead 工具表去掉它；
-- 否则工具留在 lead。对应关系：`knowledge_search` ↔ knowledge-researcher、`memory_*` ↔ memory-researcher、`search_and_load_skills` ↔ skill-finder。
-- 发现列表为空时不注册 `task`。
+- 否则工具留在 lead。对应关系：`knowledge_search` ↔ knowledge-researcher、`memory_*` ↔ memory-researcher、`search_skills` ↔ skill-finder。
+- `load_skills` 是系统内置工具，不参与检索工具下沉；lead 在委派与直连两种模式都保留它。
+- 发现列表为空时不注册 `task`，也不注册 `search_skills`；lead 仍可用技能索引和 `load_skills`。
 - 技能索引两种模式都渲染。委派段在检索子代理可用时写明：私有知识库和长期记忆只能走对应子代理；技能见下方索引。
 
 不在提示词里同时写两套调用方式：模型会挑更省事的那条，导致“有时委派、有时直连”。
@@ -162,7 +163,7 @@ gateway 主循环与子代理隔离循环两个使用者，跨 loop 复用会抛
 
 - `knowledge_base.enabled` 决定 `knowledge-researcher` 是否出现；
 - `memory.openviking.enabled` 决定 `memory-researcher`；
-- `skills.search.enabled` 决定 `skill-finder`；
+- `skills.search.enabled` 决定 `skill-finder` / `search_skills`；`load_skills` 不受它影响；
 - `agents.allowed_subagents`、`subagents.enabled`、`subagents.agents.<name>` 沿用现有语义；
 - 三个类型的 `max_turns` 默认 12 / 10 / 8（模型调用次数；执行器按图节点换算 `recursion_limit`），墙钟沿用 `subagents.timeout_seconds`。
 
@@ -170,7 +171,8 @@ gateway 主循环与子代理隔离循环两个使用者，跨 loop 复用会抛
 
 - 注册表：三类型仅在对应开关开启时出现在发现列表；`bash` 的可用性规则不变；
 - 装配：委派启用时 lead 工具表**不含**三个检索工具，`task` 的 `delegated_tools` 含它们；
-  委派关闭（`allowed_subagents: []` / 未启用）时退回直接工具；
+  委派关闭（`allowed_subagents: []` / 未启用）时知识库/记忆退回直接工具，技能只保留
+  `load_skills`，不把 `search_skills` 留给 lead；
 - 执行器：`filter_tools` 能按类型拿到 delegated tool；名字冲突时 lead 工具优先；
 - 提示词：启用委派时出现三个子代理名与“不要委派”的规则；技能索引始终渲染；
 - 子代理提示词：四段结构、引用与失败措辞（字符串断言）；“何时用”只出现在 description；
@@ -210,3 +212,20 @@ gateway 主循环与子代理隔离循环两个使用者，跨 loop 复用会抛
   `SubagentLimitMiddleware` 用同一个判定；`test_subagent_concurrency` 增加默认开启用例；
 - 测试：`test_retrieval_subagents.py`（11 例）+ 注册表 / 装配 / 并发用例更新；后端全量
   **2205 passed, 6 skipped**；前端 **326 passed**，typecheck/lint/build 通过。
+
+## 12. 2026-11-03 修订：search_skills / load_skills 与使用次数
+
+- 删除 `search_and_load_skills`。新工具职责固定：
+  - `search_skills`：skill-finder 专属，返回 `skill_id/name/description`，不返回正文；
+  - `load_skills`：系统内置工具，按 `skill_id` 返回正文；lead 始终可用。
+- `skill-finder` 只负责发现；它的结果不携带正文。lead 调用 `load_skills` 才加载正文，
+  同时触发 durable-context 的 `skill_context` 记录和 allowed-tools 激活。
+- `search_skills` 在委派关闭时不留给 lead；`load_skills` 不参与认领/下沉。
+- 每次成功 `load_skills` 增加该私有技能的使用次数：
+  - PostgreSQL `skills.load_count` 持久化；
+  - Redis ZSET `myflow:skills:usage:<user_id>` 维护排名，供 system prompt top-10；
+  - 两者独立写入，不要求原子事务；
+  - 启动时异步把 DB 计数回填 Redis（`ZADD GT`），并预热进程内 top-K 缓存。
+- 系统提示词超过 10 个私有技能时，按 Redis 排名取 top-10；Redis 冷/不可用时退 DB。
+- `builtin` 技能不参与 `search_skills` / `load_skills` 和使用次数；内置发现仍走索引、
+  read_file 或 slash。

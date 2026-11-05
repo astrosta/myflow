@@ -87,7 +87,7 @@ auth:
 database:
   backend: sqlite          # memory | sqlite | postgres   startup-only
   sqlite_dir: .myflow
-  url: postgresql+asyncpg://...   # 仅 postgres
+  url: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/myflow   # 仅 postgres
   checkpoint_channel_mode: full   # full | delta，启动时冻结
   postgres_schema: ""             # 非空时钉 search_path
 
@@ -116,7 +116,7 @@ rerank:
 
 vector_store:
   provider: milvus
-  uri: ""                     # 必填：例如 http://192.168.154.141:19530
+  uri: ""                     # 必填：例如 http://127.0.0.1:19530
   token: ""
   db_name: ""
 
@@ -181,7 +181,7 @@ stream_bridge:
   stream_ttl_seconds: 3600         # retained key 的 TTL，每次 publish/end 刷新（泄漏安全网，不是 run 超时）
   tombstone_ttl_seconds: 300       # cleanup 之后"已回收"保留多久；期间订阅立刻拿到 END
   key_prefix: myflow:stream        # 三个 key 共享 {run_id} hash tag，集群下同 slot
-  socket_timeout_seconds: 5
+  socket_timeout_seconds: 15      # 必须比 read_block 至少多 5 秒，否则空闲的 XREAD BLOCK 会被客户端先掐断
   socket_connect_timeout_seconds: 5
   health_check_interval_seconds: 30
   max_connections: 32

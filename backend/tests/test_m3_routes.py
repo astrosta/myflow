@@ -56,7 +56,6 @@ EXPECTED_ROUTES = {
     # M11 task 15: the path parameter is the internal skill_id, not the display
     # name, so every skills/{...} route in the table uses the same placeholder.
     ("PUT", "/api/skills/{skill_id}/preference"),
-    ("PATCH", "/api/skills/{skill_id}"),
     # M11 task 8: Git-backed private draft author surface. /skills/mine is
     # registered before the parameterized {skill_id} routes.
     ("GET", "/api/skills/mine"),
@@ -69,19 +68,11 @@ EXPECTED_ROUTES = {
     ("POST", "/api/skills/{skill_id}/draft/files"),
     ("DELETE", "/api/skills/{skill_id}/draft/file"),
     ("POST", "/api/skills/{skill_id}/draft/save"),
-    ("POST", "/api/skills/{skill_id}/submit"),
-    ("POST", "/api/skills/{skill_id}/withdraw"),
     ("GET", "/api/skills/{skill_id}/versions"),
+    ("POST", "/api/skills/{skill_id}/scan"),
+    ("GET", "/api/skills/{skill_id}/scans"),
+    ("POST", "/api/skills/{skill_id}/activate"),
     ("DELETE", "/api/skills/{skill_id}"),
-    # M11 task 9: admin review and public-release surface.
-    ("GET", "/api/admin/skills/reviews"),
-    ("GET", "/api/admin/skills/reviews/{submission_id}"),
-    ("POST", "/api/admin/skills/reviews/{submission_id}/approve"),
-    ("POST", "/api/admin/skills/reviews/{submission_id}/reject"),
-    ("POST", "/api/admin/skills/{skill_id}/unpublish"),
-    ("POST", "/api/admin/skills/{skill_id}/activate"),
-    # M11.1 task 23: 换嵌入文本/模型后的一次性强制重建（设计 §7.6）。
-    ("POST", "/api/admin/skills/reindex"),
     # M10 §2.12：canonical memory（prefix=/memory，/api 由 create_app 加）
     ("GET", "/api/memory/profile"),
     ("GET", "/api/memory/profile/schema"),
@@ -101,6 +92,8 @@ EXPECTED_ROUTES = {
     ("DELETE", "/api/memory/items"),
     ("GET", "/api/memory/pending"),
     ("GET", "/api/memory/skill-candidates"),
+    ("GET", "/api/admin/memory/status"),
+    ("POST", "/api/admin/memory/flush"),
     # Knowledge base: per-user CRUD + nested documents + retrieval test.
     ("GET", "/api/knowledge/status"),
     ("GET", "/api/knowledge/bases"),

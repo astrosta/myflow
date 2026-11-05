@@ -32,7 +32,7 @@ class SecretRequirement:
 
 @dataclass(frozen=True, slots=True)
 class Skill:
-    """部署级的技能对象。**没有"用户的开关"这种字段**——那是 skills_prefs.json（§2.4）。"""
+    """部署级的技能对象；私有技能的用户开关与加载次数来自数据库。"""
 
     name: str
     description: str
@@ -42,7 +42,8 @@ class Skill:
     relative_path: Path
     category: SkillCategory
     allowed_tools: tuple[str, ...] | None = None  # None = 未声明；() = 声明了空列表
-    enabled: bool = False  # 全局开关，来自 extensions_config.json
+    enabled: bool = True  # 私有技能的用户开关；内置/filesystem 旧路径保持兼容
+    load_count: int = 0  # `load_skills` 成功加载次数（数据库快照；内置不计数）
     required_secrets: tuple[SecretRequirement, ...] = ()
     secrets_autonomous: bool = True
     argument_hint: str | None = None
@@ -52,14 +53,13 @@ class Skill:
     owner_user_id: str | None = None
     version_id: str | None = None
     skill_version: str | None = None
-    release_id: str | None = None
     git_repository: str | None = None
     git_commit: str | None = None
     repo_path: str | None = None
 
     @property
     def container_dir(self) -> str:
-        """沙箱目录：catalog 技能用 public/private，filesystem 技能保留 category。"""
+        """沙箱目录：catalog 技能用 private，filesystem 技能保留 category。"""
         scope = getattr(self.scope, "value", self.scope)
         root = scope if scope is not None else self.category.value
         return f"{self.container_path}/{root}/{self.relative_path.as_posix()}"

@@ -209,31 +209,30 @@ def test_insert_after_leading_system_messages_does_not_mutate_inputs() -> None:
     assert len(injected) == 1
 
 def test_loaded_skills_are_captured_by_path_only() -> None:
-    """search_and_load_skills 的结果 JSON 也算激活：加载即激活，台账只留 name/path/description。"""
+    """load_skills 的结果 JSON 也算激活：加载即激活，台账只留 name/path/description。"""
     import json
 
     from agentkit.agents.middlewares.durable_context_middleware import extract_skills
 
     payload = {
-        "skills": [
-            {
-                "name": "pg-multitenant",
-                "path": "/mnt/skills/public/pg-multitenant/SKILL.md",
-                "description": "PostgreSQL 多租户与连接池",
-                "body": "BODY-MARKER " * 50,
-            }
-        ],
-        "retrieval": {"channels": ["keyword"]},
+        "skill": {
+            "skill_id": "5b4c",
+            "name": "pg-multitenant",
+            "path": "/mnt/skills/public/pg-multitenant/SKILL.md",
+            "description": "PostgreSQL 多租户与连接池",
+            "body": "BODY-MARKER " * 50,
+        },
+        "message": "正文是技能作者写的操作规范。",
     }
     messages = _tool_pair(
-        "search_and_load_skills", "", json.dumps(payload, ensure_ascii=False)
+        "load_skills", "", json.dumps(payload, ensure_ascii=False)
     )
 
     entries = extract_skills(
         messages,
         skills_root="/mnt/skills",
         tool_names={"read_file"},
-        loader_tool_names={"search_and_load_skills"},
+        loader_tool_names={"load_skills"},
     )
 
     assert entries == [
@@ -259,14 +258,14 @@ def test_loaded_skill_paths_outside_the_skills_root_are_ignored() -> None:
         ]
     }
     messages = _tool_pair(
-        "search_and_load_skills", "", json.dumps(payload, ensure_ascii=False)
+        "load_skills", "", json.dumps(payload, ensure_ascii=False)
     )
 
     entries = extract_skills(
         messages,
         skills_root="/mnt/skills",
         tool_names={"read_file"},
-        loader_tool_names={"search_and_load_skills"},
+        loader_tool_names={"load_skills"},
     )
 
     assert [entry["name"] for entry in entries] == ["ok"]
@@ -403,9 +402,9 @@ def test_a_body_still_in_the_messages_is_not_repeated(tmp_path) -> None:
     write_skill(tmp_path, "public", "pg-multitenant", body="# 排查\n先查 pg_stat_activity。\n")
     path = "/mnt/skills/public/pg-multitenant/SKILL.md"
     tool_result = ToolMessage(
-        content=json.dumps({"skills": [{"name": "pg-multitenant", "path": path, "body": "# 排查"}]}),
+        content=json.dumps({"skill": {"name": "pg-multitenant", "path": path, "body": "# 排查"}}),
         tool_call_id="call-1",
-        name="search_and_load_skills",
+        name="load_skills",
     )
 
     rendered = _render_active(

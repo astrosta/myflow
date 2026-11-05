@@ -35,7 +35,7 @@ import { ChatPage } from "./chat-page";
  * null、epoch 不动），所以首轮不会重挂载 —— 这正是这个模块存在的理由。
  */
 export function ChatRoute({ threadId }: { threadId: string | null }) {
-  const { epoch } = useChatSession();
+  const { epoch, scrollToBottomRequest } = useChatSession();
   /**
    * 模型 / 推理等级的选择放在**重挂载层之上**：换会话不该把用户刚选好的模型清掉。
    * 目录本身来自 `/api/models`（config.yaml），这里只负责把它变成 composer 的 props。
@@ -58,6 +58,7 @@ export function ChatRoute({ threadId }: { threadId: string | null }) {
       key={epoch + ":" + (threadId ?? "new")}
       modelControl={modelControl}
       runContext={modelSelection.runContext}
+      scrollToBottomRequest={scrollToBottomRequest}
       threadId={threadId}
     />
   );
@@ -67,10 +68,12 @@ function ChatSession({
   threadId,
   modelControl,
   runContext,
+  scrollToBottomRequest,
 }: {
   threadId: string | null;
   modelControl: ModelControlProps;
   runContext: RunContext;
+  scrollToBottomRequest: number;
 }) {
   const { reportThreadCreated, setActiveThreadId } = useChatSession();
 
@@ -90,5 +93,11 @@ function ChatSession({
     onThreadCreated: reportThreadCreated,
     runContext,
   });
-  return <ChatPage controller={controller} modelControl={modelControl} />;
+  return (
+    <ChatPage
+      controller={controller}
+      modelControl={modelControl}
+      scrollToBottomRequest={scrollToBottomRequest}
+    />
+  );
 }

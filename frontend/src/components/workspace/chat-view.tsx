@@ -1,5 +1,7 @@
 "use client";
 
+import { useCallback, useState } from "react";
+
 import type { ChatController } from "@/core/threads/chat-controller";
 import { cn } from "@/lib/utils";
 
@@ -24,6 +26,8 @@ export interface ChatViewProps {
   loadArtifactPreview: ArtifactPreviewLoader;
   /** 模型 / 推理等级选择条；由容器层从 `/api/models` 取数后注入 */
   modelControl?: ModelControlProps;
+  /** 侧栏点击会话标题的次数；变化时消息列表滚到最新一条 */
+  scrollToBottomRequest?: number;
   className?: string;
 }
 
@@ -50,6 +54,7 @@ export function ChatView({
   controller,
   loadArtifactPreview,
   modelControl,
+  scrollToBottomRequest,
   className,
 }: ChatViewProps) {
   /**
@@ -59,6 +64,23 @@ export function ChatView({
    * 只看 groups 会让每个已有会话在首屏闪一下 hero。
    */
   const isEmpty = controller.groups.length === 0 && !controller.threadLoading;
+
+  /**
+   * 用户自己发消息时，不管刚才把历史翻到了哪里，都回到最底下。
+   *
+   * 消息列表平时遵守"用户上翻就不抢滚动位置"；但**发送**是一个明确的
+   * "我要看这一轮"的动作，和收到后台流式更新不是一回事。这里只加一个
+   * 本地请求号，由 MessageList 统一处理滚动（和点侧栏标题走同一条路）。
+   */
+  const [sendScrollRequest, setSendScrollRequest] = useState(0);
+  const controllerSubmit = controller.submit;
+  const submit = useCallback(
+    async (text: string, files: readonly File[]) => {
+      setSendScrollRequest((n) => n + 1);
+      await controllerSubmit(text, files);
+    },
+    [controllerSubmit],
+  );
 
   return (
     <div className={cn("flex h-full min-h-0 flex-col bg-white", className)}>
@@ -95,6 +117,8 @@ export function ChatView({
                 void controller.loadOlder();
               }}
               recovering={controller.recovery !== null}
+              // 侧栏点击和"用户自己发送"都通过这个递增请求号触发同一个滚动
+              scrollToBottomRequest={(scrollToBottomRequest ?? 0) + sendScrollRequest}
               streaming={controller.streaming}
             />
           )}
@@ -125,7 +149,7 @@ export function ChatView({
             attachmentsDisabled={controller.threadId === null}
             disabled={controller.threadLoading || controller.interrupt !== null}
             modelControl={modelControl}
-            onSubmit={controller.submit}
+            onSubmit={submit}
             onStop={() => {
               void controller.stop();
             }}
@@ -137,8 +161,14 @@ export function ChatView({
           {isEmpty ? <div aria-hidden className="min-h-0 flex-1" /> : null}
         </div>
 
-        {/** 还没有对话就没有产物面板：在落地态显示"这一轮还没有产物"只是噪声 */}
-        {isEmpty ? null : (
+        {/**
+         * 没有产物时**整块不渲染**。
+         *
+         * 之前这里会留一行"这一轮还没有产物。"，占着右侧一整条空白；用户看不出
+         * 它有什么用，只会问"这是什么"。产物面板只在真的有东西可看时出现，
+         * 没有就不占屏幕（空会话更不该有）。
+         */}
+        {isEmpty || controller.artifacts.length === 0 ? null : (
           <ArtifactPanel
             artifacts={controller.artifacts}
             className="max-h-[45vh] lg:max-h-none lg:w-80 lg:shrink-0"

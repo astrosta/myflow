@@ -1,30 +1,55 @@
 import { apiFetch, apiUrl } from "./base";
 
 /**
- * Git 技能目录 / 私有草稿 / 审核 API。
+ * 用户隔离的 Git 技能 API：草稿 / 保存 / 安全扫描 / 生效。
  *
- * 路径、方法、参数、响应形状以网关 router 为准（skill_drafts / skill_reviews /
- * skills），不要在页面里自己拼 URL。错误体沿用网关的 { code, detail, trace_id }，
- * 页面按 code 决定提示，detail 只作为人读的补充。
+ * 路径、方法、参数、响应形状以网关 router 为准。错误体沿用网关的
+ * { code, detail, trace_id }，页面按 code 决定提示。
  *
- * 两个和后端模型对齐时要注意的地方：
- * - 作者路由（/skills/mine、POST /skills）返回的行主键叫 `id`，计划里的
- *   前端类型叫 `skill_id`；客户端在边界上统一成 `skill_id`，并保留 `id`。
- * - GET /skills 与 PUT /skills/{id}/preference 返回的是目录行（`skill_id`），
- *   在 filesystem 来源下 `skill_id` 可能为空，这里回退到 id/name。
- * - 内置行也走 GET /skills，scope/status 是 `builtin`、skill_id 可能为 null；
- *   客户端保留 scope，只把主键回退到 id/name。
+ * 没有审核、发布、公共目录或管理员接口：每个技能只属于当前用户；保存只产生
+ * 草稿版本，安全扫描通过并点击生效后才进入运行时与向量索引。
  */
 
-export type SkillScope = "public" | "private" | "builtin";
+export type SkillScope = "private" | "builtin";
+
+export type SkillSource = "manual" | "extracted";
 
 export type SkillStatus =
   | "draft"
-  | "pending"
-  | "approved"
-  | "rejected"
-  | "withdrawn"
+  | "unscanned"
+  | "scan_failed"
+  | "scanned"
+  | "active"
   | "builtin";
+
+export interface SecurityFinding {
+  rule_id: string;
+  title: string;
+  severity: string;
+  category: string;
+  file_path: string | null;
+  line_number: number | null;
+  remediation: string | null;
+}
+
+export interface SecurityScanSummary {
+  scan_id: string;
+  version_id: string;
+  status: "completed" | "failed";
+  is_safe: boolean;
+  max_severity: string;
+  findings_count: number;
+  scanner_version: string | null;
+  duration_ms: number;
+  created_at: string;
+}
+
+export interface SecurityScan extends SecurityScanSummary {
+  skill_id: string;
+  findings: SecurityFinding[];
+  scanner: string;
+  error: string | null;
+}
 
 export interface SkillListItem {
   skill_id: string;
@@ -39,11 +64,16 @@ export interface SkillListItem {
   git_commit: string | null;
   skill_path: string | null;
   status: SkillStatus;
+  source?: SkillSource;
+  source_uri?: string | null;
   enabled: boolean;
-  global_enabled?: boolean | null;
   container_file?: string | null;
-  /** 作者自己的最近一次审核结论；只有 /skills/mine 与草稿详情会带。 */
-  reject_reason?: string | null;
+  index_status?: string | null;
+  active_version_id?: string | null;
+  active?: boolean;
+  latest_scan?: SecurityScanSummary | null;
+  can_activate?: boolean;
+  activation_blocked_reason?: string | null;
 }
 
 export interface DraftFile {
@@ -66,61 +96,23 @@ export interface SkillVersion {
   draft_commit: string | null;
   index_status: string;
   created_at: string;
-  /** 网关还会回这两个字段；计划里的类型没列，前端按可选读。 */
   draft_ref?: string | null;
   skill_path?: string | null;
-}
-
-export interface SkillSubmission {
-  submission_id: string;
-  skill_id: string;
-  version_id: string;
-  status: string;
-  submitted_at: string;
-  owner_user_id: string;
-  reject_reason?: string | null;
-}
-
-export interface ReviewSummary {
-  submission_id: string;
-  skill_id: string;
-  name: string;
-  version: string;
-  owner_user_id: string;
-  submitted_at: string;
-  submitted_commit: string;
-}
-
-export interface ReviewDetail extends ReviewSummary {
-  files: DraftFile[];
-  skill_md: string;
-  diff: string;
-  metadata: Record<string, unknown>;
-  package_bytes: number;
-}
-
-export interface SkillRelease {
-  release_id: string;
-  skill_id: string;
-  skill_version: string;
-  git_repository: string;
-  git_commit: string;
-  skill_path: string;
-  public_name: string;
-  source_commit?: string | null;
-  approved_by: string;
-  created_at: string;
 }
 
 export interface DraftView {
   skill: SkillListItem;
   files: DraftFile[];
-  pending: boolean;
+  latest_version: SkillVersion | null;
+  latest_scan: SecurityScan | null;
 }
 
-export interface UnpublishResult {
-  skill_id: string;
-  unpublished: boolean;
+export interface ActivateResult {
+  version: SkillVersion;
+  active_version_id: string;
+  active: boolean;
+  index_status: string;
+  indexed: boolean | null;
 }
 
 export class SkillApiError extends Error {
@@ -170,7 +162,7 @@ async function readError(response: Response): Promise<SkillApiError> {
 
 /**
  * 唯一的请求入口：拼同源前缀、按 body 类型补 Content-Type、把错误体转成
- * SkillApiError。DELETE 与 activate 是 204，没有 JSON body。
+ * SkillApiError。DELETE 与 204 没有 JSON body。
  */
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
@@ -190,28 +182,22 @@ type WireSkill = Partial<SkillListItem> & {
   skill_id?: string | null;
   name?: string;
   description?: string | null;
-  category?: "public" | "custom" | "builtin";
+  category?: "custom" | "builtin";
   scope?: SkillScope;
   status?: string | null;
   enabled?: boolean;
 };
 
 /**
- * 作者路由的行主键是 `id`，目录路由的是 `skill_id`；这里统一成 `skill_id`。
+ * 作者路由的行主键是 id，目录路由的是 skill_id；这里统一成 skill_id。
  * 缺字段就补安全默认值，页面不必到处判空。
  */
 function toSkillListItem(raw: WireSkill): SkillListItem {
   const skillId = raw.skill_id ?? raw.id ?? raw.name ?? "";
   const status = raw.status ?? "draft";
-  // filesystem 来源只有旧 M7 的 category；没有 scope 时用它还原目录语义，
-  // 否则公共页会把一条 public 行当成私有行过滤掉。
-  const scope =
+  const scope: SkillScope =
     raw.scope ??
-    (raw.category === "public"
-      ? "public"
-      : raw.category === "builtin"
-        ? "builtin"
-        : "private");
+    (raw.category === "builtin" ? "builtin" : "private");
   return {
     ...raw,
     skill_id: skillId,
@@ -225,21 +211,23 @@ function toSkillListItem(raw: WireSkill): SkillListItem {
     git_commit: raw.git_commit ?? null,
     skill_path: raw.skill_path ?? null,
     status: status as SkillStatus,
-    enabled: raw.enabled ?? true,
-    global_enabled: raw.global_enabled ?? null,
+    source: raw.source ?? "manual",
+    source_uri: raw.source_uri ?? null,
+    enabled: raw.enabled ?? false,
     container_file: raw.container_file ?? null,
+    index_status: raw.index_status ?? null,
+    active_version_id: raw.active_version_id ?? null,
+    active: raw.active ?? false,
+    latest_scan: raw.latest_scan ?? null,
+    can_activate: raw.can_activate ?? false,
+    activation_blocked_reason: raw.activation_blocked_reason ?? null,
   };
 }
 
 const skillPath = (skillId: string) => "/skills/" + encodeURIComponent(skillId);
-const reviewPath = (submissionId: string) =>
-  "/admin/skills/reviews/" + encodeURIComponent(submissionId);
 
-export async function listSkills(
-  scope: "effective" | "global" | "public" = "effective",
-): Promise<SkillListItem[]> {
-  const query = scope === "effective" ? "" : "?scope=" + scope;
-  const body = await request<{ skills: WireSkill[] }>("/skills" + query);
+export async function listSkills(): Promise<SkillListItem[]> {
+  const body = await request<{ skills: WireSkill[] }>("/skills");
   return body.skills.map(toSkillListItem);
 }
 
@@ -268,13 +256,20 @@ export async function openDraft(skillId: string): Promise<DraftFile[]> {
 }
 
 export async function getDraft(skillId: string): Promise<DraftView> {
-  const body = await request<{ skill: WireSkill; files: DraftFile[]; pending: boolean }>(
-    skillPath(skillId) + "/draft",
-  );
-  return { skill: toSkillListItem(body.skill), files: body.files, pending: body.pending };
+  const body = await request<{
+    skill: WireSkill;
+    files: DraftFile[];
+    latest_version: SkillVersion | null;
+    latest_scan: SecurityScan | null;
+  }>(skillPath(skillId) + "/draft");
+  return {
+    skill: toSkillListItem(body.skill),
+    files: body.files,
+    latest_version: body.latest_version ?? null,
+    latest_scan: body.latest_scan ?? null,
+  };
 }
 
-/** 草稿文件树与 openDraft 同形，只是不触发"从公共版本复制"的副作用。 */
 export async function listDraftFiles(skillId: string): Promise<DraftFile[]> {
   const body = await request<{ files: DraftFile[] }>(skillPath(skillId) + "/draft/tree");
   return body.files;
@@ -300,12 +295,25 @@ export function writeDraftFile(
   });
 }
 
+/**
+ * 文件夹上传时 file.name 只剩文件名，webkitRelativePath 才带着目录层级。
+ * 去掉用户选中的最外层目录，让所选目录的内容落到技能包根目录（SKILL.md
+ * 必须在根目录）；普通多选上传没有相对路径，继续使用 file.name。
+ */
+function uploadPath(file: File): string {
+  const relative = file.webkitRelativePath;
+  if (!relative) return file.name;
+  const separator = relative.indexOf("/");
+  const path = separator >= 0 ? relative.slice(separator + 1) : relative;
+  return path || file.name;
+}
+
 export async function uploadDraftFiles(
   skillId: string,
   files: readonly File[],
 ): Promise<DraftFile[]> {
   const form = new FormData();
-  for (const file of files) form.append("files", file, file.name);
+  for (const file of files) form.append("files", file, uploadPath(file));
   // 不要手动设 Content-Type：multipart boundary 由浏览器生成。
   const body = await request<{ files: DraftFile[] }>(skillPath(skillId) + "/draft/files", {
     method: "POST",
@@ -327,49 +335,104 @@ export async function saveDraft(skillId: string): Promise<SkillVersion> {
   return body.version;
 }
 
-export function submitSkill(skillId: string): Promise<SkillSubmission> {
-  return request<SkillSubmission>(skillPath(skillId) + "/submit", { method: "POST" });
+function parseSseBlock(block: string): { event: string; data: unknown } | null {
+  let event = "message";
+  const dataLines: string[] = [];
+  for (const rawLine of block.split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  if (dataLines.length === 0) return null;
+  return { event, data: JSON.parse(dataLines.join("\n")) as unknown };
 }
 
-export function withdrawSkill(skillId: string): Promise<SkillSubmission> {
-  return request<SkillSubmission>(skillPath(skillId) + "/withdraw", { method: "POST" });
+/**
+ * 扫描走 SSE：阶段状态先到，最后一帧才是和原来 JSON 一样的扫描结果。
+ * 旧网关若仍回 JSON，按 JSON 读，避免前端和网关必须同一时刻发布。
+ */
+export async function scanSkill(
+  skillId: string,
+  onStatus?: (message: string) => void,
+): Promise<SecurityScan> {
+  const headers = new Headers({ Accept: "text/event-stream" });
+  const response = await apiFetch(apiUrl(skillPath(skillId) + "/scan"), {
+    method: "POST",
+    headers,
+  });
+  if (!response.ok) throw await readError(response);
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/event-stream")) {
+    const text = await response.text();
+    return JSON.parse(text) as SecurityScan;
+  }
+  if (!response.body) {
+    throw new SkillApiError(response.status, "invalid_response", "扫描没有返回内容", null);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: SecurityScan | null = null;
+
+  const take = (block: string) => {
+    const parsed = parseSseBlock(block);
+    if (!parsed) return;
+    if (parsed.event === "status") {
+      const message = (parsed.data as { message?: unknown }).message;
+      if (typeof message === "string" && message) onStatus?.(message);
+      return;
+    }
+    if (parsed.event === "result") {
+      result = parsed.data as SecurityScan;
+      return;
+    }
+    if (parsed.event === "error") {
+      const body = parsed.data as { status?: unknown; code?: unknown; detail?: unknown };
+      throw new SkillApiError(
+        typeof body.status === "number" ? body.status : 500,
+        typeof body.code === "string" ? body.code : "internal_error",
+        typeof body.detail === "string" ? body.detail : "扫描失败",
+        null,
+      );
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() ?? "";
+    for (const block of blocks) take(block);
+  }
+  if (buffer.trim()) take(buffer);
+  if (!result) {
+    throw new SkillApiError(response.status, "invalid_response", "扫描没有返回结果", null);
+  }
+  return result;
+}
+
+export async function listScans(skillId: string, limit = 20): Promise<SecurityScan[]> {
+  const body = await request<{ scans: SecurityScan[] }>(
+    skillPath(skillId) + "/scans?limit=" + encodeURIComponent(String(limit)),
+  );
+  return body.scans;
+}
+
+export function activateSkill(
+  skillId: string,
+  versionId?: string | null,
+): Promise<ActivateResult> {
+  return request<ActivateResult>(skillPath(skillId) + "/activate", {
+    method: "POST",
+    body: JSON.stringify(versionId ? { version_id: versionId } : {}),
+  });
 }
 
 export async function deleteSkill(skillId: string): Promise<void> {
   await request<void>(skillPath(skillId), { method: "DELETE" });
-}
-
-export async function listReviews(): Promise<ReviewSummary[]> {
-  const body = await request<{ items: ReviewSummary[] }>("/admin/skills/reviews");
-  return body.items;
-}
-
-export function getReview(submissionId: string): Promise<ReviewDetail> {
-  return request<ReviewDetail>(reviewPath(submissionId));
-}
-
-export function approveReview(submissionId: string): Promise<SkillRelease> {
-  return request<SkillRelease>(reviewPath(submissionId) + "/approve", { method: "POST" });
-}
-
-export function rejectReview(submissionId: string, reason: string): Promise<SkillSubmission> {
-  return request<SkillSubmission>(reviewPath(submissionId) + "/reject", {
-    method: "POST",
-    body: JSON.stringify({ reason }),
-  });
-}
-
-export function unpublishSkill(skillId: string): Promise<UnpublishResult> {
-  return request<UnpublishResult>("/admin/skills/" + encodeURIComponent(skillId) + "/unpublish", {
-    method: "POST",
-  });
-}
-
-export async function activateRelease(skillId: string, releaseId: string): Promise<void> {
-  await request<void>("/admin/skills/" + encodeURIComponent(skillId) + "/activate", {
-    method: "POST",
-    body: JSON.stringify({ release_id: releaseId }),
-  });
 }
 
 export async function setSkillPreference(

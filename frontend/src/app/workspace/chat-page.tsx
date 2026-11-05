@@ -12,6 +12,8 @@ export interface ChatPageProps {
   controller: ChatController;
   /** 模型 / 推理等级选择条（目录来自 `/api/models`，由路由层取数） */
   modelControl?: ModelControlProps;
+  /** 侧栏点击会话标题的次数；变化时消息列表滚到最新一条 */
+  scrollToBottomRequest?: number;
 }
 
 /**
@@ -21,7 +23,7 @@ export interface ChatPageProps {
  * artifact 预览的取数函数在这一层构造（core 的 fetchArtifactPreview 只被
  * 应用层引用），下面的 components/workspace 因此保持"只接 props"的形状。
  */
-export function ChatPage({ controller, modelControl }: ChatPageProps) {
+export function ChatPage({ controller, modelControl, scrollToBottomRequest }: ChatPageProps) {
   const threadId = controller.threadId;
 
   const loadArtifactPreview = useCallback<ArtifactPreviewLoader>(
@@ -41,6 +43,7 @@ export function ChatPage({ controller, modelControl }: ChatPageProps) {
       controller={controller}
       loadArtifactPreview={loadArtifactPreview}
       modelControl={modelControl}
+      scrollToBottomRequest={scrollToBottomRequest}
     />
   );
 }

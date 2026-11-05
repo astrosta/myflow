@@ -63,6 +63,9 @@ class OpenVikingSessionClient:
         except Exception as exc:
             _raise_mapped(exc)
 
+    async def get_task(self, task_id: str) -> dict[str, Any] | None:
+        return await self._sdk.get_task(task_id)
+
     async def find(self, **kwargs: Any) -> dict[str, Any]:
         return await self._sdk.find(**kwargs)
 

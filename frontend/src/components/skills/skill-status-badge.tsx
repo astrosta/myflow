@@ -2,27 +2,26 @@ import type { SkillStatus } from "@/core/api/skills";
 import { cn } from "@/lib/utils";
 
 /**
- * 技能状态徽标（纯展示：不取数、不带副作用）。
+ * 技能生命周期徽标（纯展示：不取数、不带副作用）。
  *
- * 状态词表是后端定的（draft/pending/approved/rejected/withdrawn），这里只负责
- * 翻译成人话并配一个颜色。页面、编辑器、审核队列都要画同一个状态，所以抽在
- * 一处——三处各写一份的话，"pending" 迟早有三个人话版本。
+ * 词表由后端派生：draft / unscanned / scan_failed / scanned / active / builtin。
+ * 页面与编辑器共用，避免同一状态出现多份翻译。
  */
 const LABELS: Record<SkillStatus, string> = {
   draft: "草稿",
-  pending: "审核中",
-  approved: "已通过",
-  rejected: "已驳回",
-  withdrawn: "已撤回",
+  unscanned: "草稿 · 待扫描",
+  scan_failed: "草稿 · 扫描未通过",
+  scanned: "草稿 · 扫描通过",
+  active: "已生效",
   builtin: "内置",
 };
 
 const TONES: Record<SkillStatus, string> = {
   draft: "border-neutral-200 bg-neutral-50 text-neutral-600",
-  pending: "border-amber-200 bg-amber-50 text-amber-800",
-  approved: "border-emerald-200 bg-emerald-50 text-emerald-700",
-  rejected: "border-red-200 bg-red-50 text-red-700",
-  withdrawn: "border-neutral-200 bg-neutral-100 text-neutral-500",
+  unscanned: "border-sky-200 bg-sky-50 text-sky-700",
+  scan_failed: "border-red-200 bg-red-50 text-red-700",
+  scanned: "border-amber-200 bg-amber-50 text-amber-800",
+  active: "border-emerald-200 bg-emerald-50 text-emerald-700",
   builtin: "border-neutral-300 bg-neutral-100 text-neutral-600",
 };
 

@@ -3,23 +3,18 @@
 The catalog path is deliberately small and linear:
 
     query -> one embedding -> one Milvus search -> one PostgreSQL confirmation
-          -> read bodies from the commit cache -> sort, prefer private, budget
+          -> read bodies from the commit cache -> sort, budget
 
 Milvus only narrows the candidate set.  Every hit that becomes visible has been
-confirmed against the authoritative public/private active pointer, so a stale
-projection row can never leak content.  PostgreSQL is the authority: when the
-catalog cannot be read the request fails closed instead of returning
-unconfirmed hits.
+confirmed against the caller's active private pointer, so a stale projection row
+can never leak content.  PostgreSQL is the authority: when the catalog cannot be
+read the request fails closed instead of returning unconfirmed hits.
 
-A private row always wins over a public row for the same skill id.  The two are
-not compared by score: "my copy" is a different object with different content,
-and ranking must not decide which one the owner sees.  If the private body is
-unreadable the skill is dropped with a warning; falling back to the public body
-would silently load content the owner never approved.
-
+There is no public catalog in v2.  A user's retrieval can only return skills
+whose owner_user_id equals the caller and whose version is currently active.
 A vector outage is not a retrieval outage: when the query embedding or the
-Milvus search fails, the same visibility rules are applied to the catalog and
-the existing BM25 scorer ranks those skills locally (lexical_fallback).
+Milvus search fails, the same visibility rules are applied to the active catalog
+and the existing BM25 scorer ranks those skills locally (lexical_fallback).
 """
 
 from __future__ import annotations
@@ -44,6 +39,7 @@ from agentkit.skills.router import (
 )
 from agentkit.skills.store.sql import SqlSkillStore
 from agentkit.skills.types import Skill
+from agentkit.skills.usage import SkillUsageService
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +63,6 @@ class SkillSearchHit:
     score: float
     scope: str
     version_id: str
-    release_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,23 +80,19 @@ CHANNEL_EMBEDDING = 'embedding'
 CHANNEL_KEYWORD = 'keyword'
 
 
-def _is_private(source: VisibleSkill) -> bool:
-    return _scope_value(source.scope) == SkillScope.PRIVATE.value
-
-
 def _fuse_ranked(
     dense: Sequence[tuple[VisibleSkill, float]],
     sparse: Sequence[tuple[VisibleSkill, float]],
     *,
     rrf_k: int,
 ) -> list[tuple[VisibleSkill, float, tuple[str, ...]]]:
-    """RRF 融合两路名次；同一 skill_id 只留一条，私有副本胜出。
+    """RRF 融合两路名次；同一 skill_id 只留一条。
 
     两路的名次各自给 1/(k + rank) 的分，然后**归一化到最高分为 1.0**，这样
     min_score 仍然是配置里那个 0..1 语义（老 router 也是这么做的）。
 
-    去重发生在这里而不是两路内部：公共副本可能只被向量召回、私有副本只被
-    BM25 召回，先在合并处收敛到私有，才不会出现同一技能两条命中。
+    去重发生在这里而不是两路内部：同一技能可能只被向量或只被 BM25 召回，
+    在合并处收敛后才不会出现两条命中。
     """
 
     picked: dict[str, VisibleSkill] = {}
@@ -113,14 +104,11 @@ def _fuse_ranked(
     for name, ranked in ((CHANNEL_EMBEDDING, dense), (CHANNEL_KEYWORD, sparse)):
         for rank, (source, _score) in enumerate(ranked):
             skill_id = source.version.skill_id
-            current = picked.get(skill_id)
-            if current is None:
+            if skill_id not in picked:
                 picked[skill_id] = source
                 order.append(skill_id)
                 channels[skill_id] = []
                 fused[skill_id] = 0.0
-            elif _is_private(source) and not _is_private(current):
-                picked[skill_id] = source
             fused[skill_id] += 1.0 / (k + rank + 1)
             if name not in channels[skill_id]:
                 channels[skill_id].append(name)
@@ -155,46 +143,15 @@ def _scope_value(scope: SkillScope | str) -> str:
     return scope.value if isinstance(scope, SkillScope) else str(scope)
 
 
-def _preference_allows(skill: Skill, prefs: Mapping[str, bool] | None) -> bool:
-    """Personal prefs are keyed by skill id (catalog) or name (legacy file)."""
-    if prefs is None:
-        return True
-    if skill.skill_id is not None and skill.skill_id in prefs:
-        return bool(prefs[skill.skill_id])
-    return bool(prefs.get(skill.name, True))
-
-
 def _allows(
     skill: Skill,
     available_skills: frozenset[str] | None,
-    prefs: Mapping[str, bool] | None,
 ) -> bool:
-    if not _preference_allows(skill, prefs):
-        return False
     return available_skills is None or skill.name in available_skills
 
 
-def _prefer_private(sources: Sequence[VisibleSkill]) -> list[VisibleSkill]:
-    """Collapse public/private rows per skill id; private wins unconditionally."""
-    chosen: dict[str, VisibleSkill] = {}
-    for source in sources:
-        skill_id = source.version.skill_id
-        current = chosen.get(skill_id)
-        if current is None or (
-            source.scope is SkillScope.PRIVATE
-            and current.scope is not SkillScope.PRIVATE
-        ):
-            chosen[skill_id] = source
-    return list(chosen.values())
-
-
 def _content_location(source: VisibleSkill) -> tuple[str | None, str]:
-    """Public bodies come from the release commit; private from the draft commit."""
-    if source.scope is SkillScope.PUBLIC:
-        release = source.release
-        if release is None:
-            return None, ""
-        return release.git_commit, release.skill_path
+    """Active private bodies come from the immutable draft commit."""
     version = source.version
     return version.draft_commit, version.skill_path
 
@@ -228,6 +185,7 @@ class SkillSearchService:
         embedder: Embedder | None,
         config: SkillSearchConfig,
         reranker: Reranker | None = None,
+        usage: SkillUsageService | None = None,
     ) -> None:
         """Projection, embedder and reranker are all optional.
 
@@ -244,6 +202,36 @@ class SkillSearchService:
         self._embedder = embedder
         self._config = config
         self._reranker = reranker
+        self._usage = usage
+
+    async def load_skill(
+        self, *, user_id: str, skill_id: str
+    ) -> SkillSearchHit | None:
+        """Load one active, enabled private skill by its internal id."""
+        try:
+            source = await self._store.get_active_visible(
+                scope=SkillScope.PRIVATE,
+                skill_id=skill_id,
+                owner_user_id=user_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - tool maps this to unavailable
+            raise SkillSearchUnavailable(
+                "skills catalog confirmation is unavailable"
+            ) from exc
+        if source is None or not source.skill.enabled:
+            return None
+        body = await self._read_body(source)
+        if body is None:
+            return None
+        if self._usage is not None:
+            await self._usage.record_load(user_id, skill_id)
+        return SkillSearchHit(
+            skill=source.skill,
+            body=body,
+            score=1.0,
+            scope=_scope_value(source.scope),
+            version_id=source.version.id,
+        )
 
     async def search(
         self,
@@ -252,20 +240,16 @@ class SkillSearchService:
         task_query: str,
         domain_keywords: Sequence[str],
         available_skills: frozenset[str] | None,
-        prefs: Mapping[str, bool] | None,
     ) -> SkillSearchOutcome:
         query = (task_query or "").strip()
         if not query:
             return SkillSearchOutcome(hits=(), candidates=0, warnings=())
 
-        private_skill_ids = await self._private_skill_ids(user_id)
         warnings: list[str] = []
         dense = await self._dense_ranked(
             user_id=user_id,
             query=query,
-            private_skill_ids=private_skill_ids,
             available_skills=available_skills,
-            prefs=prefs,
             warnings=warnings,
         )
         sparse = await self._sparse_ranked(
@@ -273,7 +257,6 @@ class SkillSearchService:
             query=query,
             domain_keywords=domain_keywords,
             available_skills=available_skills,
-            prefs=prefs,
             warnings=warnings,
         )
         if not dense and not sparse:
@@ -303,7 +286,7 @@ class SkillSearchService:
         ordered = [
             (source, score)
             for source, score, _names in head
-            if _allows(source.skill, available_skills, prefs)
+            if _allows(source.skill, available_skills)
         ]
         bodies: dict[str, str] = {}
         ordered, reranked = await self._rerank_candidates(
@@ -325,12 +308,6 @@ class SkillSearchService:
     # stages
     # ------------------------------------------------------------------
 
-    async def _private_skill_ids(self, user_id: str) -> tuple[str, ...]:
-        try:
-            return await self._store.private_skill_ids(user_id)
-        except Exception as exc:  # noqa: BLE001 - the catalog is the authority
-            raise SkillSearchUnavailable("skills catalog is unavailable") from exc
-
     async def _query_vector(self, query: str) -> list[float] | None:
         """Embed the task intent exactly once; a failure degrades to lexical."""
         embedding = self._config.embedding
@@ -351,9 +328,7 @@ class SkillSearchService:
         *,
         user_id: str,
         query: str,
-        private_skill_ids: tuple[str, ...],
         available_skills: frozenset[str] | None,
-        prefs: Mapping[str, bool] | None,
         warnings: list[str],
     ) -> list[tuple[VisibleSkill, float]]:
         """稠密通道：一次 query embedding + 一次 Milvus search + 一次 PG 确认。
@@ -368,7 +343,6 @@ class SkillSearchService:
         try:
             hits = await self._projection.search(
                 user_id=user_id,
-                private_skill_ids=private_skill_ids,
                 vector=vector,
                 limit=self._config.candidate_k,
             )
@@ -403,7 +377,7 @@ class SkillSearchService:
                     0.0,
                 ),
             )
-            for source in _prefer_private(confirmed)
+            for source in confirmed
         ]
         ranked.sort(
             key=lambda item: (-item[1], item[0].skill.name, item[0].version.skill_id)
@@ -417,7 +391,6 @@ class SkillSearchService:
         query: str,
         domain_keywords: Sequence[str],
         available_skills: frozenset[str] | None,
-        prefs: Mapping[str, bool] | None,
         warnings: list[str],
     ) -> list[tuple[VisibleSkill, float]]:
         """稀疏通道：对 PG 可见集合做本地 BM25（读正文，不依赖任何外部服务）。
@@ -432,7 +405,7 @@ class SkillSearchService:
         except Exception as exc:  # noqa: BLE001 - fail closed, not fail open
             raise SkillSearchUnavailable("skills catalog is unavailable") from exc
 
-        chosen = _prefer_private(visible)
+        chosen = list(visible)
         documents: list[SkillDocument] = []
         for source in chosen:
             body = await self._read_body(source)
@@ -570,9 +543,9 @@ class SkillSearchService:
                     score=round(float(score), 4),
                     scope=_scope_value(source.scope),
                     version_id=source.version.id,
-                    release_id=source.release.id if source.release is not None else None,
                 )
             )
+
         return SkillSearchOutcome(
             hits=tuple(hits),
             candidates=candidates,

@@ -17,7 +17,8 @@ import warnings
 import pytest
 from langchain.tools import ToolRuntime
 
-from agentkit.tools.builtin.search_and_load_skills import search_and_load_skills
+from agentkit.tools.builtin.load_skills import load_skills
+from agentkit.tools.builtin.search_skills import search_skills
 
 
 def _runtime() -> ToolRuntime:
@@ -54,9 +55,10 @@ def _invoke(tool, args: dict) -> None:
 def test_injected_runtime_does_not_trigger_pydantic_serializer_warnings() -> None:
     # args_schema 版（模型只给业务字段）同样不能喷：runtime 不在 schema 里，但会被注入
     _invoke(
-        search_and_load_skills,
+        search_skills,
         {"task_query": "PostgreSQL 多租户 search_path 串库", "domain_keywords": ["search_path"]},
     )
+    _invoke(load_skills, {"skill_id": "5b4c"})
 
 
 def test_bare_tool_runtime_still_warns_so_the_regression_is_real() -> None:

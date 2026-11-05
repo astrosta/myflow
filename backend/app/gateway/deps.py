@@ -39,7 +39,6 @@ __all__ = [
     "get_openviking_profile_service",
     "get_openviking_suggestion_service",
     "get_skill_author_service",
-    "get_skill_review_service",
     "get_request_id",
     "get_run_services",
     "get_run_store",
@@ -188,23 +187,6 @@ def get_skill_author_service(request: Request):
     if service is None:
         raise SkillRuntimeUnavailable(
             "skill authoring is unavailable: this deployment has no Git skill catalog "
-            "(skills.source=filesystem)"
-        )
-    return service
-
-
-def get_skill_review_service(request: Request):
-    """Process-owned SkillReviewService (or a narrow fake in route tests).
-
-    Task 15 builds the real service in the app lifespan together with the
-    catalog runtime; the admin review routes only need this injection point.
-    和作者面同理：没有 Git 目录就没有审核面，按 503 而不是 500 报。
-    """
-
-    service = getattr(request.app.state, "skill_review_service", None)
-    if service is None:
-        raise SkillRuntimeUnavailable(
-            "skill review is unavailable: this deployment has no Git skill catalog "
             "(skills.source=filesystem)"
         )
     return service

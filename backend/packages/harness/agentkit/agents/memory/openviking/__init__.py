@@ -8,7 +8,9 @@ with fakes.
 
 from agentkit.agents.memory.openviking.config import (
     DEFAULT_MEMORY_TYPES,
+    DEFAULT_SESSION_MEMORY_TYPES,
     OpenVikingMemoryConfig,
+    SessionSkillsConfig,
     idle_only_auto_commit_policy,
 )
 from agentkit.agents.memory.openviking.facade import MemoryFacade
@@ -24,15 +26,19 @@ from agentkit.agents.memory.openviking.contracts import (
     MemoryStatus,
     ProfileView,
     SessionRef,
+    SignalContext,
     SignalKind,
     ToolEvidence,
     TurnDecision,
 )
+from agentkit.agents.memory.openviking.signals import CommitSignalDetector
 
 __all__ = [
     "CapturedMessage",
     "CommitResult",
+    "CommitSignalDetector",
     "DEFAULT_MEMORY_TYPES",
+    "DEFAULT_SESSION_MEMORY_TYPES",
     "MemoryFacade",
     "MemoryHit",
     "MemoryStatus",
@@ -40,6 +46,8 @@ __all__ = [
     "OpenVikingMemoryRuntime",
     "ProfileView",
     "SessionRef",
+    "SessionSkillsConfig",
+    "SignalContext",
     "SignalKind",
     "ToolEvidence",
     "TurnDecision",

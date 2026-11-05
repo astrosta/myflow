@@ -4,7 +4,7 @@
 deferred_discovery 被刻意删掉了——两套渲染等于两套提示词契约与两套测试。
 
 `search` 是**按需加载的第二条路径**：技能多到一个都读不完时，模型用
-`search_and_load_skills` 按任务意图检索，只把最相关的那几个技能的正文拉进来。
+`search_skills` 按任务意图检索元数据，`load_skills` 再按 skill_id 加载正文。
 默认只有本地 BM25 通道（不依赖任何外部服务）；语义召回与精排要显式配置地址才开，
 和知识库一样——代码里没有默认端点。
 """
@@ -96,13 +96,13 @@ class SkillVectorStoreConfig(MilvusConfig):
 
 
 class SkillSearchConfig(BaseModel):
-    """`search_and_load_skills` 的两段式检索：召回 candidate_k → 精排 top_k。"""
+    """`search_skills` 的两段式检索：召回 candidate_k → 精排 top_k。"""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(
         default=True,
-        description="关掉后不注册 search_and_load_skills：技能只能靠索引 + read_file 逐个读。",
+        description="关掉后 skill-finder / search_skills 不可用；load_skills 仍按 skill_id 加载正文。",
     )
     candidate_k: int = Field(
         default=DEFAULT_SEARCH_CANDIDATE_K,
@@ -228,11 +228,8 @@ class SkillCreationConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = Field(default=True, description="关闭后只有 admin 能创建技能。")
-    max_drafts_per_user: int = Field(default=20, ge=1, description="每个用户最多保存多少个私有草稿。")
-    max_pending_submissions_per_user: int = Field(
-        default=5, ge=1, description="每个用户同时最多有多少个待审核提交。"
-    )
+    enabled: bool = Field(default=True, description="关闭后任何人都不能创建技能。")
+    max_drafts_per_user: int = Field(default=20, ge=1, description="每个用户最多保存多少个私有技能。")
     max_package_bytes: int = Field(
         default=5_242_880, ge=1, description="单个技能包（所有文件之和）的字节上限。"
     )
@@ -246,7 +243,6 @@ class SkillGitConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository: str = Field(default="", description="技能仓库 URL；代码里没有默认服务地址。")
-    public_branch: str = Field(default="main", min_length=1, description="公共技能所在分支。")
     draft_ref_prefix: str = Field(
         default="refs/heads/myflow/drafts",
         min_length=1,
@@ -281,13 +277,6 @@ class SkillGitConfig(BaseModel):
         return compact
 
 
-class SkillReviewConfig(BaseModel):
-    """公共发布的人工审核规则。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    require_admin: bool = Field(default=True, description="公共发布必须经过 admin 审核。")
-    allow_self_approval: bool = Field(default=True, description="是否允许 admin 批准自己的提交。")
 
 
 class SkillIndexConfig(BaseModel):
@@ -302,12 +291,76 @@ class SkillIndexConfig(BaseModel):
         description="跨 worker catalog epoch 轮询间隔；0 = 关闭轮询（单 worker 部署）。",
     )
     reconciliation_interval_minutes: int = Field(
-        default=10, ge=1, description="active projection 对账任务的运行间隔。"
+        default=10,
+        ge=1,
+        description="修复快路径的运行间隔：只处理 index_status != ready 的 active 版本。",
+    )
+    maintenance_lock: bool = Field(
+        default=True,
+        description="用 pg_try_advisory_lock 让多 worker 每轮只有一个在跑维护任务。",
+    )
+    repair_budget_rows: int = Field(
+        default=500,
+        ge=1,
+        description="快路径每轮最多修复多少个版本；没修完的留给下一轮。",
+    )
+    repair_budget_seconds: float = Field(
+        default=180.0,
+        gt=0,
+        description="快路径每轮的墙钟上限（秒），和行数预算先到为准。",
+    )
+    repair_max_attempts: int = Field(
+        default=8,
+        ge=1,
+        description="同一版本连续失败多少次后停止自动重试（重新生效会清零）。",
+    )
+    verify_interval_minutes: int = Field(
+        default=60,
+        ge=0,
+        description="完整性巡查间隔（分钟）：流式扫描 Milvus 主键找静默丢失；0 = 关闭。",
+    )
+    verify_budget_rows: int = Field(
+        default=5000,
+        ge=1,
+        description="巡查每轮最多读多少个主键；达到上限就按本轮不完整处理。",
+    )
+    verify_budget_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description="巡查每轮的墙钟上限（秒）。",
+    )
+
+
+class SkillUsageConfig(BaseModel):
+    """Per-user skill load counts and the Redis ranking used by the prompt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True, description="启用 Redis 使用次数排名。")
+    redis_url: str = Field(
+        default="",
+        description="Redis URL；留空则退回 PostgreSQL load_count（不影响加载技能正文）。",
+    )
+    key_prefix: str = Field(
+        default="myflow:skills:usage",
+        min_length=1,
+        description="每个用户一个 ZSET：<prefix>:<user_id>。",
+    )
+    prompt_top_k: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="私有技能超过这个数量时，system prompt 只加载最常用的前 N 个。",
+    )
+    refresh_seconds: float = Field(
+        default=30.0,
+        ge=0,
+        description="多 worker 的 top-K 缓存刷新间隔；0 = 只靠启动回填和本进程累加。",
     )
 
 
 class SkillRetentionConfig(BaseModel):
-    """可重建缓存的保留策略；元数据和公共历史永久保留。"""
+    """可重建缓存的保留策略；数据库元数据与扫描历史永久保留。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -366,8 +419,8 @@ class SkillsConfig(BaseModel):
     builtin: BuiltinSkillsConfig = Field(default_factory=BuiltinSkillsConfig)
     creation: SkillCreationConfig = Field(default_factory=SkillCreationConfig)
     git: SkillGitConfig = Field(default_factory=SkillGitConfig)
-    review: SkillReviewConfig = Field(default_factory=SkillReviewConfig)
     index: SkillIndexConfig = Field(default_factory=SkillIndexConfig)
+    usage: SkillUsageConfig = Field(default_factory=SkillUsageConfig)
     retention: SkillRetentionConfig = Field(default_factory=SkillRetentionConfig)
     path: str = Field(
         default=DEFAULT_SKILLS_PATH,

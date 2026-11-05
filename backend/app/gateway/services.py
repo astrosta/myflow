@@ -96,7 +96,10 @@ _SERVER_OWNED_MESSAGE_KEYS = PROVENANCE_KEYS | SUBAGENT_TOOL_MESSAGE_KEYS | {
 SERVER_OWNED_MESSAGE_KEYS: frozenset[str] = _SERVER_OWNED_MESSAGE_KEYS
 
 #保留的metadata key，不放到RunConfigable的metadata里面，TRACE_METADATA_KEY重新生成
-_RESERVED_METADATA_KEYS = CLIENT_IDENTITY_KEYS | {TRACE_METADATA_KEY}
+_RESERVED_METADATA_KEYS = CLIENT_IDENTITY_KEYS | {TRACE_METADATA_KEY, "trace_parent_span_id"}
+# Langfuse trace attributes are server-owned: a client must not spoof the
+# user, session, trace name or tags used for audit and cost attribution.
+_RESERVED_METADATA_PREFIXES = ("langfuse_",)
 
 # 默认循环次数
 DEFAULT_RECURSION_LIMIT = 100
@@ -496,7 +499,13 @@ def build_run_config(thread_id: str, request_config: dict | None, run_metadata: 
     config["recursion_limit"] = _clamp_recursion_limit(request_config.get("recursion_limit"), app_config.max_recursion_limit)
     client_metadata = request_config.get("metadata") or {}
     config["metadata"] = {
-        **{k: v for k, v in client_metadata.items() if k not in _RESERVED_METADATA_KEYS},
+        **{
+            k: v
+            for k, v in client_metadata.items()
+            if isinstance(k, str)
+            and k not in _RESERVED_METADATA_KEYS
+            and not k.startswith(_RESERVED_METADATA_PREFIXES)
+        },
         **run_metadata,
     }
 

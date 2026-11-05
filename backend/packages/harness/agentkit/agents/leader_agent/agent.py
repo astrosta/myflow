@@ -199,10 +199,13 @@ def assemble_agent(
 
         retrieval_tools.append(make_knowledge_search_tool())
     skill_search_tool = next(
-        (tool for tool in tools if tool.name == "search_and_load_skills"), None
+        (tool for tool in tools if tool.name == "search_skills"), None
     )
     if skill_search_tool is not None:
         retrieval_tools.append(skill_search_tool)
+        # search_skills is skill-finder-only.  It may be re-added through
+        # task.delegated_tools, but never directly to the lead tool table.
+        tools = [tool for tool in tools if tool.name != "search_skills"]
     claimed = _claimed_tool_names(available_subagents, resolved_config) & {
         tool.name for tool in retrieval_tools
     }
@@ -225,7 +228,9 @@ def assemble_agent(
         *(
             tool
             for tool in retrieval_tools
-            if tool.name not in claimed and tool.name not in existing_names
+            if tool.name != "search_skills"
+            and tool.name not in claimed
+            and tool.name not in existing_names
         ),
     ]
     # 画像工具写的是 DB 画像，不是 OpenViking：只要网关装了 profile 服务就注册，
@@ -234,6 +239,16 @@ def assemble_agent(
 
     existing_names = {tool.name for tool in tools}
     tools = [*tools, *(tool for tool in make_profile_tools() if tool.name not in existing_names)]
+    # 显式记忆工具只标记当前 turn 的 EXPLICIT_REMEMBER；读取类记忆工具仍然只在
+    # memory-researcher 子代理里，避免把“记住”这件事委派出去后丢失信号。
+    if resolved_config.memory.openviking.enabled:
+        from agentkit.agents.memory.openviking.tools import make_explicit_memory_tools
+
+        existing_names = {tool.name for tool in tools}
+        tools = [
+            *tools,
+            *(tool for tool in make_explicit_memory_tools() if tool.name not in existing_names),
+        ]
     # 过滤（将来 M9 的鉴权也在这里）必须看到**完整**的工具表，所以 task 在它之前就位
     tools = apply_tool_filter(tools, cfg=cfg)
 

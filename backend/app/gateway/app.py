@@ -4,8 +4,9 @@ FastAPI装配 + lifespan
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, nullcontext, suppress
 from typing import Any
 
 from fastapi import FastAPI
@@ -23,6 +24,7 @@ from agentkit.agents.memory.openviking.runtime import (
     configure_openviking_memory,
 )
 from agentkit.config import AppConfig, get_app_config
+from agentkit.observability import configure_observability, shutdown_observability
 from agentkit.knowledge.service import configure_knowledge_service, reset_knowledge_service
 from agentkit.persistence.engine import close_engine, get_session_factory, init_engine_from_config
 from agentkit.persistence.recovery import gateway_worker_count, recover_inflight_runs
@@ -51,7 +53,6 @@ from backend.app.gateway.routers import (
     openviking_admin,
     openviking_profile,
     skill_drafts,
-    skill_reviews,
     skills,
     thread_runs,
     threads,
@@ -82,7 +83,6 @@ async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRunti
     runtime = build_skill_runtime(app_config)
     app.state.skill_runtime = runtime
     app.state.skill_author_service = runtime.author
-    app.state.skill_review_service = runtime.review
     app.state.skill_catalog = runtime.catalog
     app.state.skill_search = runtime.search
     configure_skill_runtime(runtime)
@@ -134,6 +134,13 @@ def start_profile_services(
     configure_profile_updater(services.profile)
 
 
+async def stop_observability() -> None:
+    """Flush/close the Langfuse exporter without blocking process teardown."""
+
+    with suppress(Exception):
+        await asyncio.wait_for(asyncio.to_thread(shutdown_observability), timeout=5.0)
+
+
 async def stop_skill_runtime(app: FastAPI) -> None:
     """Stop the outbox worker, close the projection, and reset catalog state."""
     runtime = getattr(app.state, "skill_runtime", None)
@@ -145,7 +152,6 @@ async def stop_skill_runtime(app: FastAPI) -> None:
         # 半死的运行时留在 app.state / 进程注册表里。
         app.state.skill_runtime = None
         app.state.skill_author_service = None
-        app.state.skill_review_service = None
         app.state.skill_catalog = None
         app.state.skill_search = None
         reset_skill_runtime()
@@ -206,6 +212,7 @@ async def start_openviking_memory(
         session_factory,
         client_factory,
         redis=redis,
+        skill_author=getattr(app.state, "skill_author_service", None),
     )
     try:
         await runtime.start()
@@ -258,6 +265,7 @@ async def lifespan(app: FastAPI):
     preflight_auth(app_config)
     await init_engine_from_config(app_config.database)
     try:
+        app.state.observability = configure_observability(app_config)
         session_factory = get_session_factory()
         thread_meta = make_thread_meta_store(session_factory)
         run_store = make_run_store(session_factory)
@@ -339,9 +347,12 @@ async def lifespan(app: FastAPI):
                         await stop_skill_runtime(app)
                         cancel_detached()
                         await services.bridge.aclose()  # 最后放掉桥的连接池（Redis 后端才有事可做）
+                        # run manager 已排空；现在才 flush/关掉 Langfuse exporter 线程。
+                        await stop_observability()
                 finally:
                     await stop_skill_runtime(app)
     finally:
+        await stop_observability()
         await close_engine()
 
 
@@ -406,12 +417,9 @@ def create_app(*, use_openviking_memory: bool | None = None) -> FastAPI:
     application.include_router(artifacts.router, prefix="/api")
     # M7 §2.4：两个 router 各自 prefix，/api 加在这里。
     application.include_router(mcp.router, prefix="/api")
-    # Git-backed author API。放在旧 skills router 前：/api/skills/mine 必须先
-    # 于任何 {skill_id} 路由注册，旧文件系统路由在 Task 15 前继续保留。
+    # Git-backed author API. Must be registered before the generic skills router:
+    # /api/skills/mine has to win over any /skills/{skill_id} route.
     application.include_router(skill_drafts.router, prefix="/api")
-    # Admin review API. Its literal /reviews routes are declared before any
-    # /{skill_id} route inside the router, so "reviews" is never a skill id.
-    application.include_router(skill_reviews.router, prefix="/api")
     application.include_router(skills.router, prefix="/api")
     # Human-facing knowledge base; same /api prefix as the rest of the browser API.
     application.include_router(knowledge.router, prefix="/api")

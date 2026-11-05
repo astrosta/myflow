@@ -142,7 +142,4 @@ def classify_turn(
     if value in extra:
         return TurnDecision("skip", reason="extra_skip_token")
 
-    if value in _TASK_CONTEXT_TOKENS:
-        return TurnDecision("capture", reason="task_context")
-
     return TurnDecision("capture", reason="default_capture")

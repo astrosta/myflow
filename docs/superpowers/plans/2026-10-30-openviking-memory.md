@@ -73,7 +73,7 @@ def test_idle_only_policy_disables_thresholds():
     assert policy["message_count_threshold"] == 0
     assert policy["idle_timeout_seconds"] == 86400
     assert "profile" not in DEFAULT_MEMORY_TYPES
-    assert len(DEFAULT_MEMORY_TYPES) == 8
+    assert len(DEFAULT_MEMORY_TYPES) == 7  # query catalog; session skills are separate
 
 def test_default_config_uses_explicit_session_policy():
     config = OpenVikingMemoryConfig()

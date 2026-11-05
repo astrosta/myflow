@@ -113,12 +113,7 @@ class SkillRegistry:
     def prefs(self) -> Mapping[str, bool]:
         return read_user_skill_prefs(self.user_id, path=self.prefs_path)
 
-    def _snapshot_skills(
-        self,
-        *,
-        prefs: Mapping[str, bool] | None,
-        available_skills: frozenset[str] | None,
-    ) -> list[Skill]:
+    def _snapshot_skills(self, *, available_skills: frozenset[str] | None) -> list[Skill]:
         snapshot = self.snapshot
         if snapshot is None:  # pragma: no cover - guarded by callers
             return []
@@ -134,7 +129,6 @@ class SkillRegistry:
             for skill in snapshot._visible_for(
                 self.user_id,
                 available_skills=available_skills,
-                prefs=prefs,
             )
         ]
 
@@ -170,7 +164,7 @@ class SkillRegistry:
     def _catalog_skills(self) -> list[Skill]:
         """catalog/filesystem 的原始行：不含内置 overlay，也不做个人过滤。"""
         if self.snapshot is not None:
-            return self._snapshot_skills(prefs=None, available_skills=None)
+            return self._snapshot_skills(available_skills=None)
         if self.config is None:
             raise ValueError("SkillRegistry needs config when no snapshot is supplied")
         return load_skills(self.config, enabled_map=self.enabled_map())
@@ -178,9 +172,7 @@ class SkillRegistry:
     def _catalog_visible(self) -> list[Skill]:
         """现有可见性逻辑：两层开关 + agent 白名单，只作用于 catalog/filesystem 行。"""
         if self.snapshot is not None:
-            return self._snapshot_skills(
-                prefs=self.prefs(), available_skills=self.available_skills
-            )
+            return self._snapshot_skills(available_skills=self.available_skills)
         prefs = self.prefs()
         allowed = self.available_skills
         return [
@@ -201,7 +193,7 @@ class SkillRegistry:
         读不出来时它仍然留在索引和 slash 里。
 
         include_builtin=False 是**检索**口径：只返回 catalog 行本身，不加载内置技能，
-        也不隐藏同名的 catalog 行——公共技能恰好和内置技能同名时检索仍要能找到它。
+        也不隐藏同名的 catalog 行——用户技能恰好和内置技能同名时检索仍要能找到它。
         """
         try:
             catalog = self._catalog_visible()

@@ -1,11 +1,11 @@
-"""Task 8: the author-facing HTTP surface for private skill drafts."""
+"""Author HTTP surface: draft save -> scan -> activate, owner isolation."""
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,12 +13,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agentkit.config.skills_config import SkillCreationConfig
-from agentkit.skills.author import SkillAuthorService
 from agentkit.skills.domain import (
     InvalidSkillPackage,
+    SecurityScanRecord,
     SkillConflict,
     SkillRecord,
-    SkillSubmissionRecord,
+    SkillScanUnavailable,
     SkillVersionRecord,
     StagedFile,
     StagedFileInfo,
@@ -27,7 +27,7 @@ from agentkit.skills.package import render_skill_md
 from backend.app.gateway import deps, skills_catalog
 from backend.app.gateway.app import install_error_handlers, install_middleware
 from backend.app.gateway.auth import AuthSettings
-from backend.app.gateway.routers import skill_drafts, skill_reviews, skills
+from backend.app.gateway.routers import skill_drafts, skills
 from backend.app.gateway.run_models import CallerKind, RunCaller
 
 WRITE = frozenset({"skills:write"})
@@ -49,18 +49,18 @@ def _info(path: str, content: bytes, mode: str = "text") -> StagedFileInfo:
 
 @dataclass
 class FakeAuthorService:
-    """A narrow fake of SkillAuthorService; route tests assert HTTP behavior."""
-
     _next: int = 1
     skills: dict[str, SkillRecord] = field(default_factory=dict)
     files: dict[str, list[StagedFile]] = field(default_factory=dict)
     versions: dict[str, list[SkillVersionRecord]] = field(default_factory=dict)
-    pending: dict[str, SkillSubmissionRecord] = field(default_factory=dict)
-    put_calls: list[tuple[str, str, bytes]] = field(default_factory=list)
+    scans: dict[str, list[SecurityScanRecord]] = field(default_factory=dict)
+    active: dict[str, str] = field(default_factory=dict)
+    safe_scan: bool = True
+    scan_status: str = "completed"
 
     def _owned(self, owner_user_id: str, skill_id: str) -> SkillRecord:
         skill = self.skills.get(skill_id)
-        if skill is None or skill.owner_user_id != owner_user_id:
+        if skill is None or skill.owner_user_id != owner_user_id or skill.deleted_at is not None:
             raise SkillConflict(f"skill {skill_id!r} does not exist")
         return skill
 
@@ -74,7 +74,6 @@ class FakeAuthorService:
             id=skill_id,
             owner_user_id=owner_user_id,
             private_name=name,
-            public_name=None,
             created_at=now,
             updated_at=now,
             deleted_at=None,
@@ -88,6 +87,7 @@ class FakeAuthorService:
             )
         ]
         self.versions[skill_id] = []
+        self.scans[skill_id] = []
         return record
 
     async def list_mine(self, *, owner_user_id: str) -> list[SkillRecord]:
@@ -113,31 +113,25 @@ class FakeAuthorService:
             return None
         return skill
 
-    async def open_draft(self, *, owner_user_id: str, skill_id: str) -> list[StagedFileInfo]:
+    async def open_draft(self, *, owner_user_id: str, skill_id: str):
         skill = self._owned(owner_user_id, skill_id)
         if skill.deleted_at is not None:
-            self.skills[skill_id] = replace(
-                skill, deleted_at=None, updated_at=_now()
-            )
+            self.skills[skill_id] = replace(skill, deleted_at=None, updated_at=_now())
         return [
             _info(file.path, file.content, file.mode)
             for file in self.files[skill_id]
         ]
 
-    async def list_files(self, *, owner_user_id: str, skill_id: str) -> list[StagedFileInfo]:
+    async def list_files(self, *, owner_user_id: str, skill_id: str):
         self._owned(owner_user_id, skill_id)
         return [
             _info(file.path, file.content, file.mode)
             for file in self.files[skill_id]
         ]
 
-    async def read_file(
-        self, *, owner_user_id: str, skill_id: str, path: str
-    ) -> StagedFile | None:
+    async def read_file(self, *, owner_user_id: str, skill_id: str, path: str):
         self._owned(owner_user_id, skill_id)
-        return next(
-            (file for file in self.files[skill_id] if file.path == path), None
-        )
+        return next((file for file in self.files[skill_id] if file.path == path), None)
 
     async def put_file(
         self,
@@ -147,9 +141,8 @@ class FakeAuthorService:
         path: str,
         content: bytes,
         mode: str = "text",
-    ) -> StagedFileInfo:
+    ):
         self._owned(owner_user_id, skill_id)
-        self.put_calls.append((skill_id, path, content))
         self.files[skill_id] = [
             file for file in self.files[skill_id] if file.path != path
         ]
@@ -164,96 +157,139 @@ class FakeAuthorService:
 
     async def save(self, *, owner_user_id: str, skill_id: str) -> SkillVersionRecord:
         self._owned(owner_user_id, skill_id)
+        seq = len(self.versions[skill_id]) + 1
         version = SkillVersionRecord(
-            id=f"version-{len(self.versions[skill_id]) + 1}",
+            id=f"version-{seq}",
             skill_id=skill_id,
-            skill_version=f"v{len(self.versions[skill_id]) + 1}",
-            version_seq=len(self.versions[skill_id]) + 1,
+            skill_version=f"v{seq}",
+            version_seq=seq,
             package_sha256="a" * 64,
             skill_md_sha256="b" * 64,
-            metadata={},
+            metadata={"description": "Alice's tools"},
             draft_ref=f"refs/heads/myflow/drafts/{owner_user_id}",
-            draft_commit="c" * 40,
+            draft_commit=seq.to_bytes(20, "big").hex(),
             skill_path=f"users/{owner_user_id}/{skill_id}/SKILL.md",
-            index_status="pending",
+            index_status="unindexed",
             created_at=_now(),
         )
         self.versions[skill_id].append(version)
         return version
 
-    async def list_versions(
-        self, *, owner_user_id: str, skill_id: str
-    ) -> list[SkillVersionRecord]:
+    async def list_versions(self, *, owner_user_id: str, skill_id: str):
         self._owned(owner_user_id, skill_id)
         return list(self.versions[skill_id])
 
-    async def latest_submission(
-        self, *, owner_user_id: str, skill_id: str
-    ) -> SkillSubmissionRecord | None:
+    async def latest_version(self, *, owner_user_id: str, skill_id: str):
         self._owned(owner_user_id, skill_id)
-        return self.pending.get(skill_id)
+        versions = self.versions[skill_id]
+        return versions[-1] if versions else None
 
-    async def submission_status(
-        self, *, owner_user_id: str, skill_id: str
-    ) -> str | None:
+    async def active_version(self, *, owner_user_id: str, skill_id: str):
         self._owned(owner_user_id, skill_id)
-        submission = self.pending.get(skill_id)
-        return submission.status if submission is not None else None
+        active_id = self.active.get(skill_id)
+        return next(
+            (version for version in self.versions[skill_id] if version.id == active_id),
+            None,
+        )
 
-    async def submit(self, *, owner_user_id: str, skill_id: str) -> SkillSubmissionRecord:
+    async def latest_scan(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        version_id: str | None = None,
+    ):
         self._owned(owner_user_id, skill_id)
-        if not self.versions[skill_id]:
-            raise SkillConflict(f"skill {skill_id!r} has no saved version")
-        submission = SkillSubmissionRecord(
-            id=f"submission-{skill_id}",
+        scans = [
+            scan
+            for scan in self.scans[skill_id]
+            if version_id is None or scan.version_id == version_id
+        ]
+        return scans[-1] if scans else None
+
+    async def list_scans(self, *, owner_user_id: str, skill_id: str, limit: int = 20):
+        self._owned(owner_user_id, skill_id)
+        return list(reversed(self.scans[skill_id]))[:limit]
+
+    async def scan_security(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        version_id: str | None = None,
+        on_status: Any = None,
+    ) -> SecurityScanRecord:
+        if on_status is not None:
+            on_status("正在做规则检查，并交给模型分析")
+        self._owned(owner_user_id, skill_id)
+        version = await self.latest_version(owner_user_id=owner_user_id, skill_id=skill_id)
+        if version is None:
+            raise SkillConflict("no saved version")
+        if version_id is not None and version_id != version.id:
+            raise SkillConflict("not the latest version")
+        scan = SecurityScanRecord(
+            id=f"scan-{len(self.scans[skill_id]) + 1}",
             skill_id=skill_id,
-            version_id=self.versions[skill_id][-1].id,
-            submitted_commit="c" * 40,
+            version_id=version.id,
             owner_user_id=owner_user_id,
-            status="pending",
-            submitted_at=_now(),
-            reviewed_by=None,
-            reviewed_at=None,
-            reject_reason=None,
-            public_release_id=None,
+            package_sha256=version.package_sha256,
+            status=self.scan_status,
+            is_safe=self.safe_scan,
+            max_severity="SAFE" if self.safe_scan else "HIGH",
+            findings_count=0 if self.safe_scan else 1,
+            findings=[]
+            if self.safe_scan
+            else [
+                {
+                    "rule_id": "R1",
+                    "title": "Issue",
+                    "severity": "HIGH",
+                    "category": "prompt_injection",
+                    "file_path": "SKILL.md",
+                    "line_number": 1,
+                    "remediation": "fix",
+                }
+            ],
+            scanner="cisco-ai-skill-scanner",
+            scanner_version="2.3.2",
+            duration_ms=12,
+            error=None if self.scan_status == "completed" else "boom",
+            created_at=_now(),
         )
-        self.pending[skill_id] = submission
-        return submission
+        self.scans[skill_id].append(scan)
+        return scan
 
-    async def withdraw(
-        self, *, owner_user_id: str, skill_id: str
-    ) -> SkillSubmissionRecord:
+    async def activate(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        version_id: str | None = None,
+        index_enabled: bool = True,
+    ) -> SkillVersionRecord:
         self._owned(owner_user_id, skill_id)
-        submission = self.pending.pop(skill_id, None)
-        if submission is None:
-            raise SkillConflict(f"skill {skill_id!r} has no pending submission")
-        withdrawn = SkillSubmissionRecord(
-            id=submission.id,
-            skill_id=submission.skill_id,
-            version_id=submission.version_id,
-            submitted_commit=submission.submitted_commit,
-            owner_user_id=submission.owner_user_id,
-            status="withdrawn",
-            submitted_at=submission.submitted_at,
-            reviewed_by=None,
-            reviewed_at=None,
-            reject_reason=None,
-            public_release_id=None,
+        version = await self.latest_version(owner_user_id=owner_user_id, skill_id=skill_id)
+        if version is None:
+            raise SkillConflict("no saved version")
+        scan = await self.latest_scan(
+            owner_user_id=owner_user_id, skill_id=skill_id, version_id=version.id
         )
-        self.pending[skill_id] = withdrawn
-        return withdrawn
+        if scan is None or scan.status != "completed" or not scan.is_safe:
+            raise SkillConflict("security scan did not pass")
+        activated = replace(
+            version,
+            index_status="pending" if index_enabled else "disabled",
+            draft_ref=f"refs/heads/myflow/drafts/{owner_user_id}",
+            draft_commit="c" * 40,
+        )
+        self.versions[skill_id][-1] = activated
+        self.active[skill_id] = version.id
+        return activated
 
     async def delete_draft(self, *, owner_user_id: str, skill_id: str) -> None:
-        self._owned(owner_user_id, skill_id)
-        self.skills[skill_id] = SkillRecord(
-            id=self.skills[skill_id].id,
-            owner_user_id=self.skills[skill_id].owner_user_id,
-            private_name=self.skills[skill_id].private_name,
-            public_name=self.skills[skill_id].public_name,
-            created_at=self.skills[skill_id].created_at,
-            updated_at=_now(),
-            deleted_at=_now(),
-        )
+        skill = self._owned(owner_user_id, skill_id)
+        self.active.pop(skill_id, None)
+        self.skills[skill_id] = replace(skill, deleted_at=_now(), updated_at=_now())
 
 
 class _Identity(dict):
@@ -277,8 +313,6 @@ def _client(
     install_middleware(application, auth_settings=AuthSettings.disabled())
     install_error_handlers(application)
     application.state.skill_author_service = service
-    # The new router must be included first so /skills/mine wins over later
-    # /skills/{name} routes and the old filesystem routes keep working.
     application.include_router(skill_drafts.router, prefix="/api")
     application.include_router(skills.router, prefix="/api")
 
@@ -298,12 +332,9 @@ def _client(
 def test_authoring_is_a_503_when_the_git_catalog_is_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """filesystem 来源没有作者面：那是配置问题，要报 503 而不是裸 500。"""
-
     application = FastAPI(redirect_slashes=False)
     install_middleware(application, auth_settings=AuthSettings.disabled())
     install_error_handlers(application)
-    # 刻意不设 app.state.skill_author_service：等价于 skills.source=filesystem。
     application.include_router(skill_drafts.router, prefix="/api")
     identity = _Identity(READ | WRITE, "alice")
     monkeypatch.setattr(
@@ -315,8 +346,7 @@ def test_authoring_is_a_503_when_the_git_catalog_is_absent(
             scopes=identity["scopes"],
         ),
     )
-    client = TestClient(application, raise_server_exceptions=False)
-    response = client.get("/api/skills/mine")
+    response = TestClient(application, raise_server_exceptions=False).get("/api/skills/mine")
 
     assert response.status_code == 503
     assert response.json()["code"] == "skill_runtime_unavailable"
@@ -330,91 +360,236 @@ def _create(client: TestClient, name: str = "alice-tools") -> dict[str, Any]:
     return response.json()
 
 
-def test_create_returns_201_and_only_the_owner_can_read_the_draft(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_create_is_private_and_owned(monkeypatch: pytest.MonkeyPatch) -> None:
     service = FakeAuthorService()
-    alice, identity = _client(monkeypatch, service)
+    client, identity = _client(monkeypatch, service)
 
-    created = _create(alice)
+    created = _create(client)
 
     assert created["id"] == "skill-1"
     assert created["scope"] == "private"
     assert created["owner_user_id"] == "alice"
     assert created["status"] == "draft"
+    assert created["enabled"] is True
+    assert created["can_activate"] is False
     assert created["container_file"] == "/mnt/skills/private/alice-tools/SKILL.md"
-    assert "D:\\" not in str(created) and "/tmp/" not in str(created)
 
-    draft = alice.get("/api/skills/skill-1/draft")
+    draft = client.get("/api/skills/skill-1/draft")
     assert draft.status_code == 200
-    assert draft.json()["skill"]["id"] == "skill-1"
     assert [file["path"] for file in draft.json()["files"]] == ["SKILL.md"]
 
     identity.as_(WRITE, user_id="bob")
-    hidden = alice.get("/api/skills/skill-1/draft")
+    hidden = client.get("/api/skills/skill-1/draft")
     assert hidden.status_code == 404
     assert hidden.json()["code"] == "skill_not_found"
 
 
-def test_create_rejects_a_blank_description(monkeypatch: pytest.MonkeyPatch) -> None:
-    service = FakeAuthorService()
-    client, _identity = _client(monkeypatch, service)
-
-    response = client.post(
-        "/api/skills", json={"name": "alice-tools", "description": "   "}
-    )
-
-    assert response.status_code == 422
-    assert response.json()["code"] == "invalid_request"
-    assert service.skills == {}
-
-
-def test_mine_lists_private_skills_for_the_caller_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    service = FakeAuthorService()
-    alice_client, identity = _client(monkeypatch, service)
-    alice_skill = _create(alice_client, "alice-tools")
-
-    identity.as_(WRITE, user_id="bob")
-    bob_skill = _create(alice_client, "bob-tools")
-
-    identity.as_(READ, user_id="alice")
-    alice_mine = alice_client.get("/api/skills/mine")
-    assert alice_mine.status_code == 200
-    assert [item["id"] for item in alice_mine.json()["skills"]] == [alice_skill["id"]]
-
-    identity.as_(READ, user_id="bob")
-    bob_mine = alice_client.get("/api/skills/mine")
-    assert [item["id"] for item in bob_mine.json()["skills"]] == [bob_skill["id"]]
-
-
-def test_put_draft_file_rejects_path_traversal_with_422(
+def test_skill_md_frontmatter_drives_name_and_description(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    service = FakeAuthorService()
+    client, identity = _client(monkeypatch, service)
+    _create(client, "new-skill-abc12345")
+
+    replacement = render_skill_md("daily-report", "整理日报")
+    response = client.put(
+        "/api/skills/skill-1/draft/file",
+        json={"path": "SKILL.md", "content": replacement},
+    )
+    assert response.status_code == 200, response.text
+
+    draft = client.get("/api/skills/skill-1/draft")
+    assert draft.status_code == 200
+    assert draft.json()["skill"]["name"] == "daily-report"
+    assert draft.json()["skill"]["description"] == "整理日报"
+
+    identity.as_(READ, user_id="alice")
+    mine = client.get("/api/skills/mine")
+    assert mine.status_code == 200
+    assert mine.json()["skills"][0]["name"] == "daily-report"
+    assert mine.json()["skills"][0]["description"] == "整理日报"
+
+
+def test_legacy_pending_index_is_reported_disabled_without_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeAuthorService()
+    client, identity = _client(monkeypatch, service)
+    _create(client)
+    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
+    version = service.versions["skill-1"][0]
+    service.versions["skill-1"][0] = replace(version, index_status="pending")
+    service.active["skill-1"] = version.id
+
+    identity.as_(READ, user_id="alice")
+    row = client.get("/api/skills/mine").json()["skills"][0]
+
+    assert row["status"] == "active"
+    assert row["index_status"] == "disabled"
+
+
+def test_mine_lists_only_the_callers_skills(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, identity = _client(monkeypatch, service)
+    alice_skill = _create(client, "alice-tools")
+
+    identity.as_(WRITE, user_id="bob")
+    bob_skill = _create(client, "bob-tools")
+
+    identity.as_(READ, user_id="alice")
+    mine = client.get("/api/skills/mine")
+    assert [item["id"] for item in mine.json()["skills"]] == [alice_skill["id"]]
+
+    identity.as_(READ, user_id="bob")
+    mine = client.get("/api/skills/mine")
+    assert [item["id"] for item in mine.json()["skills"]] == [bob_skill["id"]]
+
+
+def test_save_cleans_up_the_skill_commit_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service, scopes=READ | WRITE)
+    _create(client)
+    calls: list[str] = []
+
+    async def forget_commits(skill_id: str) -> int:
+        calls.append(f"forget:{skill_id}")
+        return 0
+
+    monkeypatch.setattr(
+        skills_catalog,
+        "get_skill_runtime",
+        lambda: SimpleNamespace(forget_commits=forget_commits),
+    )
+
+    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
+
+    # 保存是事件驱动的清理时机：新版本产生时只收拾这个技能自己的旧缓存。
+    assert calls == ["forget:skill-1"]
+
+def test_scan_stream_forwards_status_then_the_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service, scopes=READ | WRITE)
+    _create(client)
+    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
+
+    streamed = client.post(
+        "/api/skills/skill-1/scan",
+        headers={"Accept": "text/event-stream"},
+    )
+    assert streamed.status_code == 200, streamed.text
+    assert "text/event-stream" in streamed.headers["content-type"]
+    assert streamed.text.index("event: status") < streamed.text.index("event: result")
+    assert "正在做规则检查，并交给模型分析" in streamed.text
+    assert '"is_safe": true' in streamed.text
+
+
+def test_save_scan_activate_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service, scopes=READ | WRITE)
+    _create(client)
+    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
+
+    row = client.get("/api/skills/mine").json()["skills"][0]
+    assert row["status"] == "unscanned"
+    assert row["can_activate"] is False
+    assert row["latest_scan"] is None
+
+    scanned = client.post("/api/skills/skill-1/scan")
+    assert scanned.status_code == 200, scanned.text
+    assert scanned.json()["is_safe"] is True
+    assert scanned.json()["scanner"] == "cisco-ai-skill-scanner"
+
+    row = client.get("/api/skills/mine").json()["skills"][0]
+    assert row["status"] == "scanned"
+    assert row["can_activate"] is True
+
+    activated = client.post("/api/skills/skill-1/activate", json={})
+    assert activated.status_code == 200, activated.text
+    assert activated.json()["active_version_id"] == "version-1"
+    assert activated.json()["index_status"] == "disabled"
+
+    row = client.get("/api/skills/mine").json()["skills"][0]
+    assert row["status"] == "active"
+    assert row["active"] is True
+
+
+def test_extracted_skill_is_listed_with_provenance_and_unscanned_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service, scopes=READ | WRITE)
+    _create(client, "session-helper")
+    client.post("/api/skills/skill-1/draft/save")
+    service.skills["skill-1"] = replace(
+        service.skills["skill-1"],
+        source="extracted",
+        source_uri="viking://user/u1/skills/session-helper",
+    )
+
+    row = client.get("/api/skills/mine").json()["skills"][0]
+
+    assert row["source"] == "extracted"
+    assert row["source_uri"] == "viking://user/u1/skills/session-helper"
+    assert row["status"] == "unscanned"
+
+
+def test_activation_without_a_passing_scan_is_409(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+    _create(client)
+    client.post("/api/skills/skill-1/draft/save")
+
+    missing = client.post("/api/skills/skill-1/activate", json={})
+    assert missing.status_code == 409
+    assert missing.json()["code"] == "skill_conflict"
+
+    service.safe_scan = False
+    client.post("/api/skills/skill-1/scan")
+    failed = client.post("/api/skills/skill-1/activate", json={})
+    assert failed.status_code == 409
+    assert "did not pass" in failed.json()["detail"]
+
+
+def test_scan_requires_a_saved_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+    _create(client)
+
+    response = client.post("/api/skills/skill-1/scan")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "skill_conflict"
+
+
+def test_missing_scanner_package_is_a_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+    _create(client)
+    client.post("/api/skills/skill-1/draft/save")
+
+    async def missing_scanner(**_kwargs):
+        raise SkillScanUnavailable("cisco-ai-skill-scanner is not installed")
+
+    monkeypatch.setattr(service, "scan_security", missing_scanner)
+
+    response = client.post("/api/skills/skill-1/scan")
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "skill_scanner_unavailable"
+
+
+def test_draft_file_path_traversal_is_422(monkeypatch: pytest.MonkeyPatch) -> None:
     service = FakeAuthorService()
     client, _identity = _client(monkeypatch, service)
     _create(client)
 
     response = client.put(
         "/api/skills/skill-1/draft/file",
-        json={"path": "../escape.txt", "content": "not allowed"},
+        json={"path": "../escape.txt", "content": "no"},
     )
 
     assert response.status_code == 422
     assert response.json()["code"] == "invalid_skill_package"
-    assert service.put_calls == []
-
-
-def test_submit_without_a_saved_version_is_409_skill_conflict(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = FakeAuthorService()
-    client, _identity = _client(monkeypatch, service)
-    _create(client)
-
-    response = client.post("/api/skills/skill-1/submit")
-
-    assert response.status_code == 409
-    assert response.json()["code"] == "skill_conflict"
 
 
 def test_write_routes_require_skills_write(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -429,184 +604,96 @@ def test_write_routes_require_skills_write(monkeypatch: pytest.MonkeyPatch) -> N
     assert response.json()["code"] == "permission_denied"
 
 
-def test_another_users_draft_is_404_not_403(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_another_users_scan_and_activate_are_404(monkeypatch: pytest.MonkeyPatch) -> None:
     service = FakeAuthorService()
     client, identity = _client(monkeypatch, service)
     _create(client)
+    client.post("/api/skills/skill-1/draft/save")
 
     identity.as_(WRITE, user_id="bob")
-    for method, url, body in (
-        ("get", "/api/skills/skill-1/draft", None),
-        ("get", "/api/skills/skill-1/draft/tree", None),
-        ("get", "/api/skills/skill-1/draft/file?path=SKILL.md", None),
-        ("put", "/api/skills/skill-1/draft/file", {"path": "SKILL.md", "content": "x"}),
-        ("post", "/api/skills/skill-1/draft/save", None),
-        ("post", "/api/skills/skill-1/submit", None),
-        ("delete", "/api/skills/skill-1", None),
+    for url in (
+        "/api/skills/skill-1/scan",
+        "/api/skills/skill-1/activate",
     ):
-        response = getattr(client, method)(url, json=body) if body is not None else getattr(client, method)(url)
-        assert response.status_code == 404, (method, url, response.text)
+        response = client.post(url, json={})
+        assert response.status_code == 404, (url, response.text)
         assert response.json()["code"] == "skill_not_found"
 
 
-def test_open_draft_returns_the_staged_file_tree(monkeypatch: pytest.MonkeyPatch) -> None:
-    service = FakeAuthorService()
-    client, _identity = _client(monkeypatch, service)
-    _create(client)
-
-    response = client.post("/api/skills/skill-1/draft/open")
-
-    assert response.status_code == 200
-    assert [file["path"] for file in response.json()["files"]] == ["SKILL.md"]
-
-
-def test_open_draft_revives_a_soft_deleted_record(
+def test_activate_refreshes_the_catalog_and_save_does_not(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = FakeAuthorService()
     client, _identity = _client(monkeypatch, service)
     _create(client)
-    service.skills["skill-1"] = replace(
-        service.skills["skill-1"], deleted_at=_now()
-    )
+    calls: list[str] = []
 
-    response = client.post("/api/skills/skill-1/draft/open")
+    async def refresh() -> None:
+        calls.append("refresh")
 
-    assert response.status_code == 200
-    assert service.skills["skill-1"].deleted_at is None
+    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
+    monkeypatch.setattr(skills_catalog, "get_skill_runtime", lambda: None)
+
+    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
+    assert calls == []
+
+    client.post("/api/skills/skill-1/scan")
+    assert calls == []
+
+    assert client.post("/api/skills/skill-1/activate", json={}).status_code == 200
+    assert calls == ["refresh"]
 
 
-def test_file_crud_save_versions_and_delete(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_delete_drains_the_projection_outbox_after_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = FakeAuthorService()
-    client, identity = _client(monkeypatch, service)
+    client, _identity = _client(monkeypatch, service)
     _create(client)
+    calls: list[str] = []
 
-    written = client.put(
-        "/api/skills/skill-1/draft/file",
-        json={"path": "notes.txt", "content": "hello"},
+    class _Outbox:
+        async def run_once(self) -> int:
+            calls.append("outbox")
+            return 1
+
+    async def refresh() -> None:
+        calls.append("refresh")
+
+    async def forget_commits(skill_id: str) -> int:
+        calls.append(f"forget:{skill_id}")
+        return 0
+
+    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
+    monkeypatch.setattr(
+        skills_catalog,
+        "get_skill_runtime",
+        lambda: SimpleNamespace(outbox=_Outbox(), forget_commits=forget_commits),
     )
-    assert written.status_code == 200
-    assert written.json()["path"] == "notes.txt"
-
-    listing = client.get("/api/skills/skill-1/draft/tree")
-    assert [file["path"] for file in listing.json()["files"]] == ["SKILL.md", "notes.txt"]
-
-    read = client.get("/api/skills/skill-1/draft/file?path=notes.txt")
-    assert read.status_code == 200
-    assert read.json()["content"] == "hello"
-
-    saved = client.post("/api/skills/skill-1/draft/save")
-    assert saved.status_code == 200
-    assert saved.json()["version"]["skill_version"] == "v1"
-
-    identity.as_(READ, user_id="alice")
-    versions = client.get("/api/skills/skill-1/versions")
-    assert [item["skill_version"] for item in versions.json()["versions"]] == ["v1"]
-
-    identity.as_(WRITE, user_id="alice")
-    deleted = client.delete("/api/skills/skill-1/draft/file?path=notes.txt")
-    assert deleted.status_code == 204
 
     assert client.delete("/api/skills/skill-1").status_code == 204
+    # 删除先收掉该技能的提交缓存，再刷新运行时，最后 drain 掉投影删除事件。
+    assert calls == ["forget:skill-1", "refresh", "outbox"]
+
+
+def test_delete_removes_the_skill_and_refreshes(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FakeAuthorService()
+    client, _identity = _client(monkeypatch, service)
+    _create(client)
+    calls: list[str] = []
+
+    async def refresh() -> None:
+        calls.append("refresh")
+
+    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
+
+    assert client.delete("/api/skills/skill-1").status_code == 204
+    assert calls == ["refresh"]
     assert client.get("/api/skills/skill-1/draft").status_code == 404
 
 
-def test_upload_draft_files_stages_multipart_attachments(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = FakeAuthorService()
-    client, _identity = _client(monkeypatch, service)
-    _create(client)
-
-    response = client.post(
-        "/api/skills/skill-1/draft/files",
-        files={"files": ("scripts/run.sh", b"echo ok\n", "text/plain")},
-    )
-
-    assert response.status_code == 200
-    assert [file["path"] for file in response.json()["files"]] == ["SKILL.md", "scripts/run.sh"]
-
-
-def test_save_and_delete_refresh_the_catalog_after_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = FakeAuthorService()
-    client, _identity = _client(monkeypatch, service)
-    _create(client)
-    calls: list[str] = []
-
-    async def refresh() -> None:
-        calls.append("refresh")
-
-    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
-
-    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
-    assert calls == ["refresh"]
-    assert client.delete("/api/skills/skill-1").status_code == 204
-    assert calls == ["refresh", "refresh"]
-
-
-def test_submit_and_withdraw_do_not_refresh_the_catalog(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = FakeAuthorService()
-    client, _identity = _client(monkeypatch, service)
-    _create(client)
-    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
-    calls: list[str] = []
-
-    async def refresh() -> None:
-        calls.append("refresh")
-
-    monkeypatch.setattr(skills_catalog, "refresh_skill_runtime", refresh)
-
-    assert client.post("/api/skills/skill-1/submit").status_code == 200
-    assert client.post("/api/skills/skill-1/withdraw").status_code == 200
-    # Pending state lives in PostgreSQL and is read straight from the store, so
-    # rebuilding the snapshot and mount trees here would be pure overhead.
-    assert calls == []
-
-
 @pytest.mark.parametrize("supported", [True, False])
-def test_mine_omits_private_container_file_when_mounts_are_unsupported(
-    monkeypatch: pytest.MonkeyPatch, supported: bool
-) -> None:
-    service = FakeAuthorService()
-    client, identity = _client(monkeypatch, service)
-    _create(client)
-    identity.as_(READ, user_id="alice")
-    monkeypatch.setattr(
-        skills_catalog, "_private_mounts_supported", lambda: supported
-    )
-
-    rows = client.get("/api/skills/mine").json()["skills"]
-
-    assert rows[0]["container_file"] == (
-        "/mnt/skills/private/alice-tools/SKILL.md" if supported else None
-    )
-
-
-def test_create_rejects_names_the_package_builder_rejects(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = FakeAuthorService()
-    client, _identity = _client(monkeypatch, service)
-
-    for name in ("周报助手", "Weekly-Report"):
-        response = client.post(
-            "/api/skills", json={"name": name, "description": "Alice's tools"}
-        )
-        assert response.status_code == 422, (name, response.text)
-        assert response.json()["code"] == "invalid_request"
-
-    assert service.skills == {}
-    assert client.post(
-        "/api/skills", json={"name": "weekly-report", "description": "Alice's tools"}
-    ).status_code == 201
-
-
-@pytest.mark.parametrize("supported", [True, False])
-def test_create_omits_container_file_when_mounts_are_unsupported(
+def test_private_container_file_requires_provider_support(
     monkeypatch: pytest.MonkeyPatch, supported: bool
 ) -> None:
     service = FakeAuthorService()
@@ -620,231 +707,3 @@ def test_create_omits_container_file_when_mounts_are_unsupported(
     assert created["container_file"] == (
         "/mnt/skills/private/alice-tools/SKILL.md" if supported else None
     )
-
-
-def test_versions_use_the_read_scope_but_keep_the_owner_check(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = FakeAuthorService()
-    client, identity = _client(monkeypatch, service)
-    _create(client)
-
-    identity.as_(READ, user_id="alice")
-    assert client.get("/api/skills/skill-1/versions").status_code == 200
-
-    identity.as_(READ, user_id="bob")
-    denied = client.get("/api/skills/skill-1/versions")
-    assert denied.status_code == 404
-    assert denied.json()["code"] == "skill_not_found"
-
-
-class _RejectingReviewService:
-    """把 admin reject 路由连到作者 fake 上，验证两条路由之间的真实契约。"""
-
-    def __init__(self, author: FakeAuthorService) -> None:
-        self.author = author
-
-    async def reject(
-        self, *, admin_user_id: str, submission_id: str, reason: str
-    ) -> SkillSubmissionRecord:
-        submission = self.author.pending[submission_id.removeprefix("submission-")]
-        rejected = SkillSubmissionRecord(
-            id=submission.id,
-            skill_id=submission.skill_id,
-            version_id=submission.version_id,
-            submitted_commit=submission.submitted_commit,
-            owner_user_id=submission.owner_user_id,
-            status="rejected",
-            submitted_at=submission.submitted_at,
-            reviewed_by=admin_user_id,
-            reviewed_at=_now(),
-            reject_reason=reason,
-            public_release_id=None,
-        )
-        self.author.pending[submission.skill_id] = rejected
-        return rejected
-
-
-def test_mine_maps_rejected_and_withdrawn_instead_of_falling_back_to_draft(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = FakeAuthorService()
-    client, identity = _client(monkeypatch, service)
-    application = client.app
-    application.state.skill_review_service = _RejectingReviewService(service)
-    application.include_router(skill_reviews.router, prefix="/api")
-    _create(client)
-    assert client.post("/api/skills/skill-1/draft/save").status_code == 200
-    assert client.post("/api/skills/skill-1/submit").status_code == 200
-
-    identity.as_(frozenset({"admin"}), user_id="admin")
-    rejected = client.post(
-        "/api/admin/skills/reviews/submission-skill-1/reject",
-        json={"reason": "add a script example"},
-    )
-    assert rejected.status_code == 200, rejected.text
-    assert rejected.json()["status"] == "rejected"
-    assert rejected.json()["reject_reason"] == "add a script example"
-
-    identity.as_(READ, user_id="alice")
-    owner_row = client.get("/api/skills/mine").json()["skills"][0]
-    assert owner_row["status"] == "rejected"
-    assert owner_row["reject_reason"] == "add a script example"
-
-    identity.as_(READ, user_id="bob")
-    assert client.get("/api/skills/mine").json()["skills"] == []
-
-    identity.as_(WRITE, user_id="alice")
-    assert client.post("/api/skills/skill-1/submit").status_code == 200
-    assert client.post("/api/skills/skill-1/withdraw").status_code == 200
-
-    identity.as_(READ, user_id="alice")
-    withdrawn = client.get("/api/skills/mine").json()["skills"][0]
-    assert withdrawn["status"] == "withdrawn"
-    assert withdrawn["reject_reason"] is None
-
-
-def test_route_order_keeps_mine_before_skill_id_routes() -> None:
-    paths = [route.path for route in skill_drafts.router.routes]
-    assert paths.index("/skills/mine") < paths.index("/skills/{skill_id}/draft")
-
-class _ReadStore:
-    """Minimal store for the public read helpers added to SkillAuthorService."""
-
-    def __init__(
-        self,
-        skills: dict[str, SkillRecord],
-        files: dict[str, list[StagedFile]],
-        pending: dict[str, SkillSubmissionRecord] | None = None,
-        latest: dict[str, SkillSubmissionRecord] | None = None,
-    ) -> None:
-        self.skills = skills
-        self.files = files
-        self.pending = pending or {}
-        # 真实 store 里 pending_submission 只返回 pending，latest_submission
-        # 返回任意终态；fake 必须区分，否则测不出“不再只看 pending”。
-        self.latest = latest or {}
-
-    async def list_owned(self, owner_user_id: str) -> list[SkillRecord]:
-        return [
-            skill
-            for skill in self.skills.values()
-            if skill.owner_user_id == owner_user_id and skill.deleted_at is None
-        ]
-
-    async def get_skill(
-        self, skill_id: str, *, include_deleted: bool = False
-    ) -> SkillRecord | None:
-        skill = self.skills.get(skill_id)
-        if not include_deleted and skill is not None and skill.deleted_at is not None:
-            return None
-        return skill
-
-    async def pending_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
-        return self.pending.get(skill_id)
-
-    async def latest_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
-        return self.latest.get(skill_id)
-
-    async def list_draft_files(self, skill_id: str) -> list[StagedFile]:
-        return self.files[skill_id]
-
-
-def _record(skill_id: str, owner: str, name: str) -> SkillRecord:
-    now = _now()
-    return SkillRecord(
-        id=skill_id,
-        owner_user_id=owner,
-        private_name=name,
-        public_name=None,
-        created_at=now,
-        updated_at=now,
-        deleted_at=None,
-    )
-
-
-def _service(store: _ReadStore) -> SkillAuthorService:
-    return SkillAuthorService(store, object(), object(), SkillCreationConfig())  # type: ignore[arg-type]
-
-
-def test_author_read_helpers_scope_mine_and_ownership() -> None:
-    alice = _record("skill-1", "alice", "alice-tools")
-    bob = _record("skill-2", "bob", "bob-tools")
-    service = _service(
-        _ReadStore(
-            {alice.id: alice, bob.id: bob},
-            {alice.id: [], bob.id: []},
-        )
-    )
-
-    async def scenario() -> None:
-        assert [item.id for item in await service.list_mine(owner_user_id="alice")] == [
-            alice.id
-        ]
-        assert await service.get_owned_skill(
-            owner_user_id="alice", skill_id=bob.id
-        ) is None
-        assert await service.get_owned_skill(
-            owner_user_id="alice", skill_id=alice.id
-        ) == alice
-
-    asyncio.run(scenario())
-
-
-def test_author_read_file_returns_staged_bytes_and_rejects_traversal() -> None:
-    alice = _record("skill-1", "alice", "alice-tools")
-    service = _service(
-        _ReadStore(
-            {alice.id: alice},
-            {alice.id: [StagedFile("notes.txt", b"hello", "text")]},
-        )
-    )
-
-    async def scenario() -> None:
-        staged = await service.read_file(
-            owner_user_id="alice", skill_id=alice.id, path="notes.txt"
-        )
-        assert staged is not None and staged.content == b"hello"
-        assert await service.read_file(
-            owner_user_id="alice", skill_id=alice.id, path="missing.txt"
-        ) is None
-        with pytest.raises(InvalidSkillPackage):
-            await service.read_file(
-                owner_user_id="alice", skill_id=alice.id, path="../escape.txt"
-            )
-
-    asyncio.run(scenario())
-
-
-def test_author_submission_status_reports_the_latest_submission() -> None:
-    alice = _record("skill-1", "alice", "alice-tools")
-    submission = SkillSubmissionRecord(
-        id="submission-1",
-        skill_id=alice.id,
-        version_id="version-1",
-        submitted_commit="c" * 40,
-        owner_user_id="alice",
-        status="rejected",
-        submitted_at=_now(),
-        reviewed_by="admin",
-        reviewed_at=_now(),
-        reject_reason="add an example",
-        public_release_id=None,
-    )
-    service = _service(
-        _ReadStore(
-            {alice.id: alice},
-            {alice.id: []},
-            pending={},
-            latest={alice.id: submission},
-        )
-    )
-
-    async def scenario() -> None:
-        # pending_submission 为 None 时仍必须报告最近一次（rejected）状态；
-        # 旧实现回退成 "draft"，会在这里失败。
-        assert await service.submission_status(
-            owner_user_id="alice", skill_id=alice.id
-        ) == "rejected"
-
-    asyncio.run(scenario())

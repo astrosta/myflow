@@ -25,8 +25,9 @@ from urllib.parse import unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
-#: The six automatic memory types the management page exposes. `tools` /
-#: `skills` stay on the OpenViking Studio/CLI operations surface.
+#: The seven memory types the management page exposes. `skills` remains an
+#: agent-retrievable type but stays on the OpenViking Studio/CLI operations
+#: surface; `tools` is managed here because tool usage is user-visible.
 MEMORY_LIBRARY_TYPES: tuple[str, ...] = (
     "preferences",
     "entities",
@@ -34,6 +35,7 @@ MEMORY_LIBRARY_TYPES: tuple[str, ...] = (
     "cases",
     "trajectories",
     "experiences",
+    "tools",
 )
 
 MEMORY_TYPE_LABELS: dict[str, str] = {
@@ -43,6 +45,7 @@ MEMORY_TYPE_LABELS: dict[str, str] = {
     "cases": "案例",
     "trajectories": "轨迹",
     "experiences": "经验",
+    "tools": "工具",
 }
 
 MAX_LIST_LIMIT = 200

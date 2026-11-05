@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { BookOpenIcon, MemoryIcon, SettingsIcon, ToolIcon, UserIcon } from "@/components/ui/icons";
+import { BookOpenIcon, MemoryIcon, ToolIcon, UserIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { ThreadSummary } from "@/core/types";
 import { cn, formatTimestamp } from "@/lib/utils";
@@ -22,9 +22,9 @@ const NEW_CHAT_CLASS =
   "flex h-9 w-full items-center justify-center rounded-md border border-neutral-300 bg-white text-xs font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900";
 
 /**
- * 导航项（我的画像 / 记忆管理 / 技能中心 / 知识库 / 审核）共用一套形制。
+ * 导航项（我的画像 / 记忆管理 / 技能中心 / 知识库）共用一套形制。
  *
- * 这些入口是同一类东西——"去哪"，形状就得一致；各写一份 class 的话，
+ * 四个入口是同一类东西——"去哪"，形状就得一致；各写一份 class 的话，
  * 新增入口时高亮态迟早会跟已有入口不一样。
  */
 function navItemClass(active: boolean): string {
@@ -54,20 +54,18 @@ export interface SidebarProps {
   knowledgeActive?: boolean;
   /** 当前是否在技能路由（/workspace/skills 及其子路由） */
   skillsActive?: boolean;
-  /** 当前是否在审核路由（/workspace/admin/skills） */
-  reviewActive?: boolean;
   /** 当前是否在「我的画像」 */
   profileActive?: boolean;
   /** 当前是否在「记忆管理」 */
   memoryActive?: boolean;
   /**
-   * 当前会话是不是管理员；只决定要不要画「审核」入口。
+   * 点了某个会话标题。
    *
-   * **这是展示层的显隐，不是权限闸门。** 真正的闸门在后端 /admin 路由的
-   * admin scope 上：普通用户直接访问 /workspace/admin/skills 会拿到 403。
-   * 藏起来只是"别给一个必然失败的链接"，任何客户端判断都不能替代服务端。
+   * **不拦导航**：链接照常把地址换成目标会话；这个回调只用来通知聊天区
+   * "用户明确选了一个会话，把消息拉到最新一条"。点当前会话时地址不变，
+   * 回调就是让列表回到底部的唯一途径。
    */
-  isAdmin?: boolean;
+  onThreadClick?: (threadId: string) => void;
   className?: string;
 }
 
@@ -80,16 +78,26 @@ export function Sidebar({
   onNewChat,
   knowledgeActive = false,
   skillsActive = false,
-  reviewActive = false,
   profileActive = false,
   memoryActive = false,
-  isAdmin = false,
+  onThreadClick,
   className,
 }: SidebarProps) {
   return (
     <aside
       aria-label="工作区导航"
-      className={cn("flex h-full w-64 shrink-0 flex-col border-r border-neutral-200 bg-neutral-50", className)}
+      className={cn(
+        /**
+         * **只有下面的「最近对话」nav 可以滚，整个侧栏不能滚。**
+         *
+         * 侧栏自己也 overflow-y-auto 的话，滚标题列表滚到底后会链式带动
+         * 整个侧栏（品牌行、导航、标题一起动），看起来像"最近会话跟着
+         * title 列表在跑"。这里用 overflow-hidden 把外层锁死，nav 再用
+         * overscroll-contain 截断滚动链。
+         */
+        "flex h-full min-h-0 w-64 shrink-0 flex-col overflow-hidden border-r border-neutral-200 bg-neutral-50",
+        className,
+      )}
     >
       <div className="flex items-center gap-2 px-3 py-3">
         <Link className="text-sm font-semibold text-neutral-900" href="/">
@@ -151,24 +159,19 @@ export function Sidebar({
           <BookOpenIcon className="shrink-0" size={15} />
           知识库
         </Link>
-        {/**
-         * 「审核」只对管理员画出来：普通用户看不到这个链接。
-         * 再次强调——藏起来不等于挡住，闸门在后端 admin scope。
-         */}
-        {isAdmin ? (
-          <Link
-            aria-current={reviewActive ? "page" : undefined}
-            className={navItemClass(reviewActive)}
-            href="/workspace/admin/skills"
-          >
-            <SettingsIcon className="shrink-0" size={15} />
-            审核
-          </Link>
-        ) : null}
       </nav>
 
-      <nav aria-label="最近对话" className="thin-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
-        <h2 className="flex items-baseline gap-1.5 px-2 pb-1.5 text-[11px] font-medium text-neutral-400">
+      <div className="flex min-h-0 flex-1 flex-col">
+        {/**
+         * 标题**放在滚动区外面**，不是 sticky 在里面。
+         *
+         * 这样"最近对话"和条数从一开始就不参与滚动：往下翻 title 列表时，
+         * 它不会跟着列表跑。结构上保证，比算 sticky 的 top/背景更稳。
+         */}
+        <h2
+          className="flex shrink-0 items-baseline gap-1.5 px-4 pb-1.5 text-[11px] font-medium text-neutral-400"
+          id="recent-threads-heading"
+        >
           最近对话
           {/**
            * 条数用 aria-hidden 挂在标题后面：读屏念一遍导航名就够了，
@@ -181,46 +184,52 @@ export function Sidebar({
           ) : null}
         </h2>
 
-        {loading && threads.length === 0 ? (
-          <div className="space-y-2 px-1" aria-hidden>
-            <Skeleton className="h-9 w-full" />
-            <Skeleton className="h-9 w-full" />
-            <Skeleton className="h-9 w-full" />
-          </div>
-        ) : null}
+        <nav
+          aria-labelledby="recent-threads-heading"
+          className="thin-scrollbar min-h-0 flex-1 touch-pan-y overflow-y-auto overscroll-contain px-2 pb-3"
+        >
+          {loading && threads.length === 0 ? (
+            <div className="space-y-2 px-1" aria-hidden>
+              <Skeleton className="h-9 w-full" />
+              <Skeleton className="h-9 w-full" />
+              <Skeleton className="h-9 w-full" />
+            </div>
+          ) : null}
 
-        {error ? (
-          <p className="px-2 py-1 text-[11px] leading-relaxed text-red-600" role="alert">
-            {error}
-          </p>
-        ) : null}
+          {error ? (
+            <p className="px-2 py-1 text-[11px] leading-relaxed text-red-600" role="alert">
+              {error}
+            </p>
+          ) : null}
 
-        {!loading && !error && threads.length === 0 ? (
-          <p className="px-2 py-2 text-xs leading-relaxed text-neutral-400">还没有会话，点上面的「新对话」开始。</p>
-        ) : null}
+          {!loading && !error && threads.length === 0 ? (
+            <p className="px-2 py-2 text-xs leading-relaxed text-neutral-400">还没有会话，点上面的「新对话」开始。</p>
+          ) : null}
 
-        <ul className="space-y-0.5">
-          {threads.map((thread) => {
-            const active = thread.thread_id === activeThreadId;
-            const title = thread.display_name?.trim() ? thread.display_name : "新对话";
-            return (
-              <li key={thread.thread_id}>
-                <Link
-                  aria-current={active ? "page" : undefined}
-                  className={cn(
-                    "block rounded-md px-2 py-1.5 transition-colors",
-                    active ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-600 hover:bg-white/70 hover:text-neutral-900",
-                  )}
-                  href={"/workspace/chats/" + thread.thread_id}
-                >
-                  <span className="block truncate text-xs">{title}</span>
-                  <span className="block text-[10px] text-neutral-400">{formatTimestamp(thread.updated_at)}</span>
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
-      </nav>
+          <ul className="space-y-0.5">
+            {threads.map((thread) => {
+              const active = thread.thread_id === activeThreadId;
+              const title = thread.display_name?.trim() ? thread.display_name : "新对话";
+              return (
+                <li key={thread.thread_id}>
+                  <Link
+                    aria-current={active ? "page" : undefined}
+                    className={cn(
+                      "block rounded-md px-2 py-1.5 transition-colors",
+                      active ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-600 hover:bg-white/70 hover:text-neutral-900",
+                    )}
+                    href={"/workspace/chats/" + thread.thread_id}
+                    onClick={() => onThreadClick?.(thread.thread_id)}
+                  >
+                    <span className="block truncate text-xs">{title}</span>
+                    <span className="block text-[10px] text-neutral-400">{formatTimestamp(thread.updated_at)}</span>
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
+        </nav>
+      </div>
     </aside>
   );
 }

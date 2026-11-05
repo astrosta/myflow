@@ -1,4 +1,4 @@
-"""Task 1: skill catalog tables, partial uniques, PAT scope, and config defaults."""
+"""Skill catalog tables, partial uniques, PAT scope, and config defaults."""
 
 from __future__ import annotations
 
@@ -15,10 +15,21 @@ from agentkit.persistence.schema import Base
 from backend.app.gateway.auth.models import PAT_SCOPE_MENU
 
 EXPECTED = {
-    "skills", "skill_versions", "skill_submissions", "skill_release_batches",
-    "skill_releases", "skill_public_active", "skill_private_active",
-    "skill_settings", "skill_audit_events", "skill_draft_files", "skill_index_outbox",
+    "skills",
+    "skill_versions",
+    "skill_private_active",
+    "skill_security_scans",
+    "skill_audit_events",
+    "skill_draft_files",
+    "skill_index_outbox",
     "skill_catalog_epoch",
+}
+REMOVED = {
+    "skill_submissions",
+    "skill_release_batches",
+    "skill_releases",
+    "skill_public_active",
+    "skill_settings",
 }
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 
@@ -37,29 +48,29 @@ def engine_fixture():
         engine.dispose()
 
 
-def test_skill_tables_and_scope_are_registered():
-    assert EXPECTED <= set(Base.metadata.tables)
+def test_only_user_private_skill_tables_are_registered():
+    tables = set(Base.metadata.tables)
+    assert EXPECTED <= tables
+    assert not (REMOVED & tables)
     assert "skills:write" in PAT_SCOPE_MENU
 
 
-def test_skills_config_keeps_filesystem_source_and_catalog_defaults():
+def test_skills_config_has_no_review_or_public_branch_defaults():
     config = SkillsConfig()
 
     assert config.source == "filesystem"
     assert config.creation.enabled is True
     assert config.creation.max_drafts_per_user == 20
-    assert config.creation.max_pending_submissions_per_user == 5
     assert config.creation.max_package_bytes == 5_242_880
     assert config.creation.max_file_bytes == 1_048_576
     assert config.creation.max_files == 200
     assert config.git.repository == ""
-    assert config.git.public_branch == "main"
+    assert not hasattr(config.git, "public_branch")
     assert config.git.draft_ref_prefix == "refs/heads/myflow/drafts"
     assert config.git.cache_dir == ".myflow/skills"
     assert config.git.ssh_key == ""
     assert config.git.command_timeout_seconds == 120
-    assert config.review.require_admin is True
-    assert config.review.allow_self_approval is True
+    assert not hasattr(config, "review")
     assert config.index.outbox_poll_seconds == 2.0
     assert config.index.catalog_poll_seconds == 5.0
     assert config.index.reconciliation_interval_minutes == 10
@@ -95,37 +106,6 @@ def _seed_skill_and_version(connection) -> None:
     )
 
 
-def _pending_submission(submission_id: str) -> dict[str, object]:
-    return {
-        "id": submission_id,
-        "skill_id": "skill-1",
-        "version_id": "version-1",
-        "submitted_commit": "c" * 40,
-        "owner_user_id": "user-1",
-        "status": "pending",
-        "submitted_at": NOW,
-        "created_at": NOW,
-    }
-
-
-def test_only_one_pending_submission_per_skill(engine):
-    with engine.begin() as connection:
-        _seed_skill_and_version(connection)
-        connection.execute(
-            Base.metadata.tables["skill_submissions"].insert().values(
-                _pending_submission("submission-1")
-            )
-        )
-
-    with pytest.raises(IntegrityError):
-        with engine.begin() as connection:
-            connection.execute(
-                Base.metadata.tables["skill_submissions"].insert().values(
-                    _pending_submission("submission-2")
-                )
-            )
-
-
 def test_private_name_is_unique_per_owner_while_not_deleted(engine):
     with engine.begin() as connection:
         connection.execute(
@@ -146,6 +126,60 @@ def test_private_name_is_unique_per_owner_while_not_deleted(engine):
                     owner_user_id="user-1",
                     private_name="alpha",
                     created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+
+    # Another owner may use the same name; there is no global public namespace.
+    with engine.begin() as connection:
+        connection.execute(
+            Base.metadata.tables["skills"].insert().values(
+                id="skill-3",
+                owner_user_id="user-2",
+                private_name="alpha",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+
+
+def test_one_active_pointer_per_skill_and_scan_fk(engine):
+    with engine.begin() as connection:
+        _seed_skill_and_version(connection)
+        connection.execute(
+            Base.metadata.tables["skill_private_active"].insert().values(
+                skill_id="skill-1",
+                owner_user_id="user-1",
+                version_id="version-1",
+                updated_at=NOW,
+            )
+        )
+        connection.execute(
+            Base.metadata.tables["skill_security_scans"].insert().values(
+                id="scan-1",
+                skill_id="skill-1",
+                version_id="version-1",
+                owner_user_id="user-1",
+                package_sha256="a" * 64,
+                status="completed",
+                is_safe=True,
+                max_severity="SAFE",
+                findings_count=0,
+                findings_json=[],
+                scanner="cisco-ai-skill-scanner",
+                scanner_version="2.3.2",
+                duration_ms=1,
+                created_at=NOW,
+            )
+        )
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                Base.metadata.tables["skill_private_active"].insert().values(
+                    skill_id="skill-1",
+                    owner_user_id="user-1",
+                    version_id="version-1",
                     updated_at=NOW,
                 )
             )

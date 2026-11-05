@@ -1,8 +1,8 @@
-"""Wire models for the Git-backed skill author and admin review APIs.
+"""Wire models for the user-isolated Git skill author API.
 
 The author surface deliberately exposes container paths, never host cache paths.
-Private details (owner id and container_file) are only filled for the owner.
-Review detail is supplied by SkillReviewService from the submitted Git commit.
+Private details (owner id, scan findings and container_file) are only returned to
+the owner.  There is no admin review/release wire model in v2.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agentkit.skills.parser import SKILL_NAME_RE
 
-# 请求模型和打包器共用同一条规则：API 拒绝的名字必须正好是 build_package 拒绝的名字。
 _SKILL_NAME = SKILL_NAME_RE
 
 
@@ -34,16 +33,10 @@ class CreateDraftRequest(BaseModel):
 
 
 class WriteFileRequest(BaseModel):
-    """Text-file write into the private staging table.
-
-    The content field is UTF-8 text; binary attachments go through the
-    multipart upload route so a JSON string is never mistaken for bytes.
-    """
+    """Text-file write into the private staging table."""
 
     model_config = ConfigDict(extra="forbid")
 
-    # 和 agentkit.skills.package.MAX_SKILL_PATH_CHARS 同一个上限：写进来的路径
-    # 必须能通过包校验，也不该撑爆 skill_draft_files 的 (skill_id, path) 主键。
     path: str = Field(min_length=1, max_length=MAX_SKILL_PATH_CHARS)
     content: str
     mode: Literal["text", "executable"] = "text"
@@ -73,28 +66,67 @@ class SkillVersionResponse(BaseModel):
     created_at: str
 
 
-class SkillListItem(BaseModel):
-    """A public or private catalog row.
+class SecurityFindingResponse(BaseModel):
+    rule_id: str = ""
+    title: str = ""
+    severity: str = "SAFE"
+    category: str = ""
+    file_path: str | None = None
+    line_number: int | None = None
+    remediation: str | None = None
 
-    The id field is the catalog skill id (the brief's exact field name).  The
-    container_file path is a sandbox path and is only present for the owner of
-    a private draft.
-    """
+
+class SecurityScanResponse(BaseModel):
+    scan_id: str
+    skill_id: str
+    version_id: str
+    status: Literal["completed", "failed"]
+    is_safe: bool
+    max_severity: str
+    findings_count: int
+    findings: list[SecurityFindingResponse] = Field(default_factory=list)
+    scanner: str
+    scanner_version: str | None = None
+    duration_ms: int
+    error: str | None = None
+    created_at: str
+
+
+class SecurityScanSummary(BaseModel):
+    scan_id: str
+    version_id: str
+    status: Literal["completed", "failed"]
+    is_safe: bool
+    max_severity: str
+    findings_count: int
+    scanner_version: str | None = None
+    duration_ms: int = 0
+    created_at: str
+
+
+class SkillListItem(BaseModel):
+    """One owner-visible catalog row with lifecycle and latest scan state."""
 
     id: str
     name: str
     description: str
-    scope: Literal["public", "private"]
+    scope: Literal["private"]
     owner_user_id: str | None = None
     skill_version: str | None = None
     version_id: str | None = None
     git_commit: str | None = None
     skill_path: str | None = None
-    status: str
+    status: Literal["draft", "unscanned", "scan_failed", "scanned", "active"]
+    source: Literal["manual", "extracted"] = "manual"
+    source_uri: str | None = None
     enabled: bool = True
-    global_enabled: bool | None = None
     container_file: str | None = None
-    reject_reason: str | None = None
+    index_status: str | None = None
+    active_version_id: str | None = None
+    active: bool = False
+    latest_scan: SecurityScanSummary | None = None
+    can_activate: bool = False
+    activation_blocked_reason: str | None = None
 
 
 class SkillListResponse(BaseModel):
@@ -108,114 +140,52 @@ class DraftTreeResponse(BaseModel):
 class DraftView(BaseModel):
     skill: SkillListItem
     files: list[DraftFileInfo]
-    pending: bool = False
+    latest_version: SkillVersionResponse | None = None
+    latest_scan: SecurityScanResponse | None = None
 
 
 class SaveResponse(BaseModel):
     version: SkillVersionResponse
 
 
-class SubmissionResponse(BaseModel):
-    submission_id: str
-    skill_id: str
-    version_id: str
-    status: str
-    submitted_at: str
-    owner_user_id: str
-    reject_reason: str | None = None
-
-
 class VersionListResponse(BaseModel):
     versions: list[SkillVersionResponse]
 
 
-class RejectRequest(BaseModel):
-    """Admin rejection reason; whitespace alone is not a reason."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = Field(min_length=1, max_length=2000)
-
-    @field_validator("reason")
-    @classmethod
-    def reason_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("reason must not be blank")
-        return value
-
-
-class ReviewSummary(BaseModel):
-    submission_id: str
-    skill_id: str
-    name: str
-    version: str
-    owner_user_id: str
-    submitted_at: str
-    submitted_commit: str
-
-
-class ReviewDetailResponse(ReviewSummary):
-    files: list[DraftFileInfo]
-    skill_md: str
-    diff: str
-    metadata: dict[str, Any]
-    package_bytes: int
-
-
-class ReviewQueueResponse(BaseModel):
-    items: list[ReviewSummary]
-
-
-class ReindexResponse(BaseModel):
-    """一次强制重建的结果：修了多少投影行、投影文本是哪个版本。"""
-
-    repaired: int
-    projection_text_version: int
-
-
-class ReleaseResponse(BaseModel):
-    release_id: str
-    skill_id: str
-    skill_version: str
-    git_repository: str
-    git_commit: str
-    skill_path: str
-    public_name: str
-    source_commit: str | None = None
-    approved_by: str
-    created_at: str
-
-
-class UnpublishResponse(BaseModel):
-    skill_id: str
-    unpublished: bool = True
+class ScanListResponse(BaseModel):
+    scans: list[SecurityScanResponse]
 
 
 class ActivateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    release_id: str = Field(min_length=1, max_length=128)
+    version_id: str | None = Field(default=None, max_length=64)
+
+
+class ActivateResponse(BaseModel):
+    version: SkillVersionResponse
+    active_version_id: str
+    active: bool = True
+    index_status: str
+    indexed: bool | None = None
 
 
 __all__ = [
     "ActivateRequest",
+    "ActivateResponse",
     "CreateDraftRequest",
     "DraftFileContentResponse",
     "DraftFileInfo",
     "DraftTreeResponse",
     "DraftView",
-    "RejectRequest",
-    "ReleaseResponse",
-    "SKILL_NAME_RE",
-    "ReviewDetailResponse",
-    "ReviewQueueResponse",
-    "ReviewSummary",
     "SaveResponse",
+    "ScanListResponse",
+    "SecurityFindingResponse",
+    "SecurityScanResponse",
+    "SecurityScanSummary",
     "SkillListItem",
     "SkillListResponse",
     "SkillVersionResponse",
-    "SubmissionResponse",
-    "UnpublishResponse",
     "VersionListResponse",
     "WriteFileRequest",
 ]

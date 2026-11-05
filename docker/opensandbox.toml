@@ -1,0 +1,51 @@
+# OpenSandbox server（Docker runtime）。
+# 给 docker-compose.yml 的 opensandbox 服务挂到 /etc/opensandbox/config.toml。
+# 镜像自带的默认配置是 Kubernetes，容器里不换这份文件起不来。
+# 控制面地址对齐 config.yaml：sandbox.opensandbox.domain = 127.0.0.1:8080。
+# api_key 留空，与 config.yaml 一致；非交互启动要设 OPENSANDBOX_INSECURE_SERVER=YES。
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# 必须盖住 sandbox.opensandbox.timeout_seconds（1800）。
+max_sandbox_timeout_seconds = 86400
+
+[proxy]
+# 服务端在 compose 网络里，沙箱容器走 Docker 默认 bridge。
+# 服务端访问不到沙箱的 bridge IP，改走宿主上发布的端口。
+resolve_internal = false
+
+[log]
+level = "INFO"
+
+[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:v1.1.0"
+
+[storage]
+# 1.2 起空列表是全部拒绝，[""] 也会被丢掉。必须盖住 Gateway 提交的 host_root。
+allowed_host_paths = ["/home/liyuanbo/python/myflow"]
+
+[store]
+type = "sqlite"
+path = "/var/lib/opensandbox/opensandbox.db"
+
+[docker]
+network_mode = "bridge"
+# 服务端在容器内时，回连宿主上的沙箱端口。compose 里要有 host.docker.internal。
+host_ip = "host.docker.internal"
+port_range_min = 40000
+port_range_max = 60000
+drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+no_new_privileges = true
+apparmor_profile = ""
+pids_limit = 4096
+seccomp_profile = ""
+
+[ingress]
+mode = "direct"
+
+[egress]
+image = "opensandbox/egress:v1.1.7"
+mode = "dns"
+readiness_timeout_seconds = 30.0

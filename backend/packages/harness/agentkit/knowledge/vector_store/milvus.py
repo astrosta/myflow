@@ -466,7 +466,10 @@ class MilvusVectorStore:
                 AnnSearchRequest(
                     data=[vector],
                     anns_field="embedding",
-                    param={"metric_type": self._config.metric_type, "params": {}},
+                    param={
+                        "metric_type": self._config.metric_type,
+                        "params": {},
+                    },
                     limit=limit,
                     expr=expression,
                 ),

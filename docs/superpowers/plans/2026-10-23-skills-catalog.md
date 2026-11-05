@@ -1,5 +1,11 @@
 # Skill Git Catalog, Private Drafts, Review, and Retrieval Implementation Plan
 
+> **SUPERSEDED (2026-11-02):** 本计划里的管理员审核、公共发布、公共向量行和
+> `/api/admin/skills/*` 已在 v2 中移除。实现以
+> [用户隔离技能、安全扫描与生效设计](../specs/2026-10-23-skill-package-git-release-design.md)
+> 为准：保存 = 草稿，安全扫描通过后由用户点击生效，技能只对所有者可见。
+> 保留本文仅作历史记录。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace filesystem-scanned skills with a Git-backed catalog where users author private skill packages, admins review and publish them, and search uses an active Milvus projection confirmed by PostgreSQL.

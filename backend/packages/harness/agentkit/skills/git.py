@@ -236,9 +236,8 @@ def _validate_message(message: str) -> str:
 def _source_directory(source_path: str) -> str:
     """Return the directory for a tree path, accepting SKILL.md itself.
 
-    Task 7 stores the release path as public/<name>/SKILL.md while Task 5's
-    publish API names a directory.  Both are unambiguous, so normalise the
-    documented file form to its containing skill directory.
+    Callers may pass either the directory or its SKILL.md.  Both are
+    unambiguous, so normalise the file form to its containing skill directory.
     """
 
     path = validate_skill_path(source_path)
@@ -660,53 +659,6 @@ class SkillGitRepository:
             base_commit=base,
             directory=path,
             files=normalized,
-            message=message,
-            ref=ref,
-        )
-        return GitCommit(commit=commit, ref=ref, path=path)
-
-    async def publish_public(
-        self,
-        *,
-        public_name: str,
-        source_commit: str,
-        source_path: str,
-        message: str,
-    ) -> GitCommit:
-        name = _validate_path_segment(public_name, "public_name")
-        source = _validate_commit_id(source_commit)
-        source_dir = _source_directory(source_path)
-        message = _validate_message(message)
-        branch = _validate_ref_segment(self.config.public_branch, "public_branch")
-        ref = _validate_ref(f"refs/heads/{branch}")
-        path = f"public/{name}"
-
-        await self.ensure_ready()
-        if not await self._fetch_ref(ref, ref):
-            raise GitCommandError(
-                ("pygit2", "fetch", ref), 2, f"public branch not found: {ref}"
-            )
-        await self._ensure_commit_available(source)
-        entries = await self._tree_entries(source, source_dir)
-        if not entries:
-            raise InvalidSkillPackage(f"source tree has no files: {source}:{source_dir}")
-        payload: list[tuple[str, bytes, bool]] = []
-        for entry in entries:
-            rel = entry.path
-            if rel == source_dir:
-                rel = PurePosixPath(source_dir).name
-            elif rel.startswith(source_dir + "/"):
-                rel = rel[len(source_dir) + 1 :]
-            else:
-                raise InvalidSkillPackage(f"tree entry escapes its source: {entry.path!r}")
-            data = await self._read_blob(entry.oid)
-            payload.append((rel, data, entry.mode == "100755"))
-
-        base = await self.head(ref)
-        commit = await self._commit_and_push(
-            base_commit=base,
-            directory=path,
-            files=payload,
             message=message,
             ref=ref,
         )

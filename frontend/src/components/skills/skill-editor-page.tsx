@@ -1,64 +1,164 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  activateSkill,
   deleteSkill,
   getDraft,
   listDraftFiles,
   readDraftFile,
   saveDraft,
+  scanSkill,
   SkillApiError,
-  submitSkill,
   uploadDraftFiles,
-  withdrawSkill,
   writeDraftFile,
-  type SkillVersion,
+  type SecurityFinding,
+  type SecurityScan,
 } from "@/core/api/skills";
 
 import { SkillEditorActions } from "./skill-editor-actions";
 import { SkillFileTree } from "./skill-file-tree";
+import { skillIndexStatusLabel } from "./skill-index-status";
 import { SkillStatusBadge } from "./skill-status-badge";
 
 export interface SkillEditorPageProps {
   skillId: string;
 }
 
-/** 所有草稿相关查询都挂在这个前缀下，一次失效就把树、正文、pending 一起刷新。 */
+/** 所有草稿相关查询都挂在这个前缀下，一次失效就把树、正文、扫描一起刷新。 */
 const draftKey = (skillId: string) => ["skills", "draft", skillId] as const;
 
-type Busy = "save" | "submit" | "withdraw" | "delete" | "upload" | null;
+type Busy = "save" | "scan" | "activate" | "delete" | "upload" | null;
 
-const DELETE_PENDING_MESSAGE = "审核中，请先撤回审核，再删除草稿。";
-const SUBMIT_UNSAVED_MESSAGE = "技能尚未保存，请先保存，再提交审核。";
-
-/** 接口错误给一句人读的话；409 是审核流程里最常见的一种，单独说清楚。 */
 function readableError(error: unknown): string {
   if (error instanceof SkillApiError) {
-    if (error.status === 409) {
-      return error.detail || "已有待审核的提交，请先撤回后再提交";
-    }
     return error.detail || "请求失败（HTTP " + error.status + "）";
   }
   if (error instanceof Error) return error.message;
   return String(error);
 }
 
-/** 提交审核的 409 不一定是“已有待审”：新草稿没保存过也会冲突。 */
-function readableSubmitError(error: unknown): string {
-  if (
-    error instanceof SkillApiError &&
-    error.status === 409 &&
-    error.detail.toLowerCase().includes("no saved version")
-  ) {
-    return SUBMIT_UNSAVED_MESSAGE;
-  }
-  return readableError(error);
+/** 严重性降序：CRITICAL > HIGH > MEDIUM > LOW > INFO > SAFE，未知值排最后。 */
+const SEVERITY_RANK: Record<string, number> = {
+  CRITICAL: 5,
+  HIGH: 4,
+  MEDIUM: 3,
+  LOW: 2,
+  INFO: 1,
+  SAFE: 0,
+};
+
+const SEVERITY_TONE: Record<string, string> = {
+  CRITICAL: "bg-red-100 text-red-700",
+  HIGH: "bg-orange-100 text-orange-700",
+  MEDIUM: "bg-amber-100 text-amber-700",
+  LOW: "bg-sky-100 text-sky-700",
+  INFO: "bg-neutral-100 text-neutral-600",
+  SAFE: "bg-emerald-100 text-emerald-700",
+};
+
+/** 滑动窗口一次显示几组发现。 */
+const FINDINGS_PER_WINDOW = 3;
+/** 每组等高 + 固定视口高度：滚动时窗口里永远整整齐齐是 3 组，不会露出半张卡。 */
+const FINDING_CARD_HEIGHT = "6rem";
+const FINDING_GAP = "0.5rem";
+const FINDINGS_WINDOW_HEIGHT = `calc(${FINDING_CARD_HEIGHT} * ${FINDINGS_PER_WINDOW} + ${FINDING_GAP} * ${FINDINGS_PER_WINDOW - 1})`;
+
+function severityRank(severity: string): number {
+  return SEVERITY_RANK[severity.toUpperCase()] ?? -1;
+}
+
+/** 码元序比较：规则 id 是标识符不是自然语言，localeCompare 的忽略标点会打乱顺序。 */
+function compareText(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+/** 严重性降序；同级别按规则名、文件、行号稳定排序，滑动顺序才可预期。 */
+function sortFindings(findings: readonly SecurityFinding[]): SecurityFinding[] {
+  return [...findings].sort((left, right) => {
+    const bySeverity = severityRank(right.severity) - severityRank(left.severity);
+    if (bySeverity !== 0) return bySeverity;
+    return (
+      compareText(left.rule_id, right.rule_id) ||
+      compareText(left.file_path ?? "", right.file_path ?? "") ||
+      (left.line_number ?? 0) - (right.line_number ?? 0)
+    );
+  });
+}
+
+function FindingCard({ finding }: { finding: SecurityFinding }) {
+  const tone = SEVERITY_TONE[finding.severity.toUpperCase()] ?? "bg-neutral-100 text-neutral-600";
+  return (
+    <div className="h-full overflow-hidden rounded border border-neutral-200 bg-white px-3 py-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={"rounded px-1.5 py-0.5 font-mono text-[10px] " + tone}>
+          {finding.severity}
+        </span>
+        <span className="text-xs font-medium text-neutral-800">{finding.title}</span>
+        <span className="font-mono text-[10px] text-neutral-400">{finding.rule_id}</span>
+      </div>
+      {finding.file_path ? (
+        <p className="mt-1 font-mono text-[11px] text-neutral-500">
+          {finding.file_path}
+          {finding.line_number ? ":" + finding.line_number : ""}
+        </p>
+      ) : null}
+      {finding.remediation ? (
+        <p className="mt-1 text-[11px] leading-relaxed text-neutral-600">{finding.remediation}</p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * 发现的滑动窗口：窗口高度固定为 3 组，其余内容上下滚动查看。
+ *
+ * 顺序按严重性降序（同级别按规则名/文件/行号），所以窗口顶部永远是最该先看的那条；
+ * 卡片等高 + 固定视口高度，滚动时不会出现"半张卡"，snap 让每一停都对齐一组。
+ */
+function FindingCarousel({ scan }: { scan: SecurityScan }) {
+  const ordered = useMemo(() => sortFindings(scan.findings), [scan.findings]);
+  const total = ordered.length;
+  const overflow = Math.max(0, total - FINDINGS_PER_WINDOW);
+
+  return (
+    <div className="mt-3" role="group" aria-label="扫描发现">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <p className="text-[11px] text-neutral-500">
+          发现按严重性排序 · 共 {total} 组
+          {overflow > 0 ? "，上下滑动查看其余 " + overflow + " 组" : ""}
+        </p>
+        <span className="text-[10px] text-neutral-400">窗口 {FINDINGS_PER_WINDOW} 组</span>
+      </div>
+      <ul
+        aria-label="扫描发现列表"
+        className={cn(
+          "mt-2 space-y-2 overflow-y-auto pr-1 snap-y snap-proximity",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-300",
+        )}
+        style={{ height: FINDINGS_WINDOW_HEIGHT }}
+        tabIndex={overflow > 0 ? 0 : -1}
+      >
+        {ordered.map((finding) => (
+          <li
+            className="snap-start"
+            key={finding.rule_id + ":" + (finding.file_path ?? "") + ":" + (finding.line_number ?? "")}
+            style={{ height: FINDING_CARD_HEIGHT }}
+          >
+            <FindingCard finding={finding} />
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 function MetaItem({ label, value }: { label: string; value: string }) {
@@ -72,28 +172,77 @@ function MetaItem({ label, value }: { label: string; value: string }) {
   );
 }
 
+function ScanPanel({ scan }: { scan: SecurityScan | null }) {
+  if (!scan) {
+    return (
+      <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+        当前草稿尚未做安全扫描（规则 + LLM）。保存后点击「安全扫描」，通过后才能生效。
+      </p>
+    );
+  }
+  const failed = scan.status !== "completed" || !scan.is_safe;
+  return (
+    <section
+      className={
+        "mt-3 rounded-lg border px-4 py-3 " +
+        (failed ? "border-red-200 bg-red-50/70" : "border-emerald-200 bg-emerald-50/60")
+      }
+      aria-label="安全扫描结果"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <h2 className="text-xs font-semibold text-neutral-800">安全扫描</h2>
+          <span
+            className={
+              "rounded-full border px-2 py-0.5 text-[11px] " +
+              (failed
+                ? "border-red-300 bg-white text-red-700"
+                : "border-emerald-300 bg-white text-emerald-700")
+            }
+          >
+            {scan.status === "failed" ? "执行失败" : scan.is_safe ? "通过" : "未通过"}
+          </span>
+        </div>
+        <span className="text-[11px] text-neutral-500">
+          最高 {scan.max_severity} · {scan.findings_count} 个发现 · {scan.duration_ms} ms
+        </span>
+      </div>
+      <p className="mt-1 text-[11px] text-neutral-500">
+        {scan.scanner}
+        {scan.scanner_version ? " " + scan.scanner_version : ""} ·{" "}
+        {new Date(scan.created_at).toLocaleString()}
+      </p>
+      {scan.error ? (
+        <p className="mt-2 rounded border border-red-200 bg-white px-2 py-1.5 font-mono text-[11px] text-red-700">
+          {scan.error}
+        </p>
+      ) : null}
+      {scan.findings.length > 0 ? (
+        // key 换成 scan_id：重新扫描之后窗口回到第 1 页，不会停在上一次的偏移上。
+        <FindingCarousel key={scan.scan_id} scan={scan} />
+      ) : null}
+    </section>
+  );
+}
+
 /**
- * 私有技能草稿编辑器。
+ * 私有技能编辑器：文件树 + 正文 + 保存 / 安全扫描 / 生效 / 删除。
  *
- * 取数分三层：getDraft（技能行 + pending）、listDraftFiles（文件树）、
- * readDraftFile（当前选中的文件）。正文和选中路径都是**本地状态**，用户不点
- * 保存就永远不写后端——自动保存会让"改坏了想撤销"变成不可能。
- *
- * 动作成功后统一失效 ["skills","mine"] 和 ["skills","draft",skill_id] 前缀：
- * 列表页看到的状态、pending、文件树都来自这两个缓存。
+ * 保存只产生草稿版本；扫描针对最新已保存版本；生效把最新版本设为 active 并
+ * 写入索引 outbox。正文和选中路径是本地状态，不点保存永远不写后端。
  */
 export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   const router = useRouter();
   const queryClient = useQueryClient();
   const [selectedPath, setSelectedPath] = useState("SKILL.md");
-  // 本地编辑区只在"用户改过当前文件"时存在：服务端内容到达时由下文的 text 派生，
-  // 不在 effect 里 setState——那会触发级联渲染，而且用户切文件时会把旧的本地
-  // 内容盖回去。不点保存就永远不写后端。
   const [edit, setEdit] = useState<{ path: string; text: string } | null>(null);
-  const [lastVersion, setLastVersion] = useState<SkillVersion | null>(null);
   const [busy, setBusy] = useState<Busy>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [scanStatus, setScanStatus] = useState<string | null>(null);
+  // 上传会立即写入暂存目录，但只有 save 才生成版本；先记下来，避免上传后
+  // 因为没有正文改动而无法保存，也避免扫描/生效越过未保存的附件。
+  const [pendingUpload, setPendingUpload] = useState(false);
 
   const draftQuery = useQuery({
     queryKey: draftKey(skillId),
@@ -109,7 +258,6 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
     enabled: selectedPath.length > 0,
   });
 
-  // 编辑区正文：改过就用本地那份，否则直接用服务端读回来的。
   const serverText = fileQuery.data?.content ?? "";
   const text = edit?.path === selectedPath ? edit.text : serverText;
   const dirty = text !== serverText;
@@ -117,13 +265,19 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
 
   const draft = draftQuery.data;
   const files = filesQuery.data ?? draft?.files ?? [];
-  const pending = draft?.pending ?? false;
   const pageError = draftQuery.error ?? filesQuery.error;
   const loading = draftQuery.isLoading || filesQuery.isLoading;
+  const scan = draft?.latest_scan ?? null;
+  const hasUnsavedChanges = dirty || pendingUpload;
+  // 新技能还没有任何版本：即使正文没改，也需要第一次保存来生成 v1。
+  const canSave = hasUnsavedChanges || !draft?.latest_version;
+  const canScan = !hasUnsavedChanges && Boolean(draft?.latest_version);
+  const canActivate = Boolean(draft?.skill.can_activate) && !hasUnsavedChanges;
 
   const invalidateDraft = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["skills", "mine"] }),
+      queryClient.invalidateQueries({ queryKey: ["skills", "catalog"] }),
       queryClient.invalidateQueries({ queryKey: draftKey(skillId) }),
     ]);
   };
@@ -142,14 +296,17 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   };
 
   const save = async () => {
-    if (busy || pending) return;
+    if (busy || !canSave) return;
     begin("save");
     try {
-      await writeDraftFile(skillId, { path: selectedPath, content: text });
+      if (dirty) {
+        await writeDraftFile(skillId, { path: selectedPath, content: text });
+      }
+      await saveDraft(skillId);
       setEdit(null);
-      setLastVersion(await saveDraft(skillId));
+      setPendingUpload(false);
       await invalidateDraft();
-      setNotice("已保存");
+      setNotice("已保存草稿。运行安全扫描后才能生效。");
     } catch (cause) {
       setActionError(readableError(cause));
     } finally {
@@ -162,8 +319,9 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
     begin("upload");
     try {
       await uploadDraftFiles(skillId, selected);
+      setPendingUpload(true);
       await invalidateDraft();
-      setNotice("已上传 " + selected.length + " 个文件");
+      setNotice("已上传 " + selected.length + " 个文件，保存草稿后才能扫描和生效。");
     } catch (cause) {
       setActionError(readableError(cause));
     } finally {
@@ -171,33 +329,56 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
     }
   };
 
-  const submit = async () => {
-    if (busy || pending) return;
-    // 新草稿还没有任何版本时，服务端必然拒绝；先把原因说清楚，不白跑一次请求。
-    if (!lastVersion?.version_id && !draft?.skill.version_id) {
+  const scanNow = async () => {
+    if (busy) return;
+    if (hasUnsavedChanges) {
       setNotice(null);
-      setActionError(SUBMIT_UNSAVED_MESSAGE);
+      setActionError("有未保存的修改，请先保存，再运行安全扫描。");
       return;
     }
-    begin("submit");
+    if (!draft?.latest_version) {
+      setNotice(null);
+      setActionError("技能尚未保存，请先保存，再运行安全扫描。");
+      return;
+    }
+    begin("scan");
+    setScanStatus(null);
     try {
-      await submitSkill(skillId);
+      const result = await scanSkill(skillId, setScanStatus);
       await invalidateDraft();
-      router.push("/workspace/skills");
+      setNotice(
+        result.status === "failed"
+          ? "安全扫描执行失败，请查看错误后重试。"
+          : result.is_safe
+            ? "安全扫描通过，可以点击「生效」。"
+            : "安全扫描未通过，请修复发现的问题后重新扫描。",
+      );
     } catch (cause) {
-      setActionError(readableSubmitError(cause));
+      setActionError(readableError(cause));
     } finally {
       setBusy(null);
+      setScanStatus(null);
     }
   };
 
-  const withdraw = async () => {
-    if (busy || !pending) return;
-    begin("withdraw");
+  const activate = async () => {
+    if (busy) return;
+    if (!draft?.skill.can_activate) {
+      setNotice(null);
+      setActionError(draft?.skill.activation_blocked_reason || "当前版本还不能生效。");
+      return;
+    }
+    if (hasUnsavedChanges) {
+      setNotice(null);
+      setActionError("有未保存的修改，请先保存并重新扫描。");
+      return;
+    }
+    begin("activate");
     try {
-      await withdrawSkill(skillId);
+      await activateSkill(skillId, draft.skill.version_id);
       await invalidateDraft();
-      setNotice("已撤回，可以继续编辑");
+      // 生效成功后直接回列表，让用户在列表里看到新的 active 状态。
+      router.push("/workspace/skills");
     } catch (cause) {
       setActionError(readableError(cause));
     } finally {
@@ -207,22 +388,14 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
 
   const remove = async () => {
     if (busy) return;
-    if (pending) {
-      setNotice(null);
-      setActionError(DELETE_PENDING_MESSAGE);
-      return;
-    }
     begin("delete");
     try {
       await deleteSkill(skillId);
       await queryClient.invalidateQueries({ queryKey: ["skills", "mine"] });
+      await queryClient.invalidateQueries({ queryKey: ["skills", "catalog"] });
       router.push("/workspace/skills");
     } catch (cause) {
-      setActionError(
-        cause instanceof SkillApiError && cause.status === 409
-          ? DELETE_PENDING_MESSAGE
-          : readableError(cause),
-      );
+      setActionError(readableError(cause));
       setBusy(null);
     }
   };
@@ -236,7 +409,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
               className="text-[11px] text-neutral-500 hover:text-neutral-900"
               href="/workspace/skills"
             >
-              ← 返回技能列表
+              ← 返回技能中心
             </Link>
             <div className="mt-1 flex flex-wrap items-center gap-2">
               <h1 className="truncate text-xl font-semibold tracking-tight text-neutral-900">
@@ -244,8 +417,11 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
               </h1>
               {draft ? <SkillStatusBadge status={draft.skill.status} /> : null}
             </div>
-            <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-              私有草稿只有你自己能看到；保存到版本后可以提交审核。
+            <p className="mt-1 text-xs leading-relaxed text-neutral-700">
+              {draft?.skill.description || "在 SKILL.md 的 frontmatter 中填写技能描述。"}
+            </p>
+            <p className="mt-1 text-[11px] leading-relaxed text-neutral-400">
+              技能名称和描述来自 SKILL.md。技能只有你自己可见；保存后扫描通过并生效才会进入运行时与检索。
             </p>
           </div>
         </header>
@@ -270,37 +446,33 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
           <>
             <dl className="mt-5 grid grid-cols-2 gap-3 rounded-lg border border-neutral-200 bg-neutral-50/60 px-4 py-3 sm:grid-cols-4">
               <MetaItem
-                label="版本"
-                value={lastVersion?.version_id ?? draft.skill.version_id ?? "—"}
+                label="当前草稿版本"
+                value={draft.latest_version?.skill_version ?? "—"}
               />
               <MetaItem
                 label="草稿提交"
-                value={lastVersion?.draft_commit ?? draft.skill.git_commit ?? "—"}
+                value={draft.latest_version?.draft_commit?.slice(0, 12) ?? "—"}
               />
-              <MetaItem label="索引状态" value={lastVersion?.index_status ?? "—"} />
-              <div>
-                <dt className="text-[11px] text-neutral-400">审核状态</dt>
-                <dd className="mt-0.5">
-                  <SkillStatusBadge status={draft.skill.status} />
-                </dd>
-              </div>
+              <MetaItem
+                label="索引状态"
+                value={skillIndexStatusLabel(draft.skill.index_status)}
+              />
+              <MetaItem
+                label="已生效版本"
+                value={draft.skill.active_version_id ? draft.skill.active_version_id.slice(0, 12) : "—"}
+              />
             </dl>
 
-            {draft.skill.reject_reason ? (
-              <p
-                className="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700"
-                role="status"
-              >
-                驳回原因：{draft.skill.reject_reason}
+            {draft.skill.active_version_id &&
+            draft.skill.active_version_id !== draft.skill.version_id ? (
+              <p className="mt-3 rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 text-xs text-sky-800" role="status">
+                已生效版本仍是旧的；当前草稿需要重新扫描并通过后才能覆盖运行时版本。
               </p>
             ) : null}
 
-            {pending ? (
-              <p
-                className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800"
-                role="status"
-              >
-                审核中，请先撤回
+            {draft.skill.activation_blocked_reason ? (
+              <p className="mt-3 text-[11px] text-neutral-500">
+                {draft.skill.activation_blocked_reason}
               </p>
             ) : null}
 
@@ -359,7 +531,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
                     <Textarea
                       aria-label="文件内容"
                       className="min-h-[24rem] font-mono text-xs"
-                      disabled={pending}
+                      disabled={busy !== null}
                       id="skill-file-content"
                       onChange={(event) => setText(event.target.value)}
                       spellCheck={false}
@@ -368,20 +540,24 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
                   </label>
                 )}
 
-                {pending ? (
-                  <p className="mt-2 text-[11px] text-neutral-500">
-                    审核中的提交不能修改；撤回后才能继续编辑。
+                {busy === "scan" && scanStatus ? (
+                  <p className="mt-3 text-xs text-neutral-600" role="status">
+                    {scanStatus}
                   </p>
                 ) : null}
 
+                <ScanPanel scan={scan} />
+
                 <div className="mt-3">
                   <SkillEditorActions
-                    busy={busy === "upload" ? null : busy}
+                    busy={busy}
+                    canActivate={canActivate}
+                    canSave={canSave}
+                    canScan={canScan}
+                    onActivate={() => void activate()}
                     onDelete={() => void remove()}
                     onSave={() => void save()}
-                    onSubmit={() => void submit()}
-                    onWithdraw={() => void withdraw()}
-                    pending={pending}
+                    onScan={() => void scanNow()}
                   />
                 </div>
               </section>

@@ -1,10 +1,15 @@
-"""Author-facing orchestration for private skill drafts.
+"""Author-facing orchestration for private skill drafts and activation.
 
-The service deliberately keeps Git and SQL separate: Git commits happen before
-the catalog transaction that records them, and a per-skill advisory lock keeps
-two saves for the same skill from racing each other.  PostgreSQL uses a
-session-level advisory lock on a dedicated connection; SQLite relies on its
-transactional write lock plus an in-process lock for the same skill.
+The service keeps Git and SQL separate: Git commits happen before the catalog
+transaction that records them, and a per-skill advisory lock serializes saves,
+scans and activation for the same skill.  PostgreSQL uses a session-level
+advisory lock on a dedicated connection; SQLite relies on its transactional
+write lock plus an in-process lock.
+
+Lifecycle:
+    create -> stage -> save (immutable Git draft version)
+           -> scan (cisco-ai-skill-scanner over the saved commit)
+           -> activate (passing scan -> active pointer + outbox)
 """
 
 from __future__ import annotations
@@ -12,28 +17,31 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 
-from sqlalchemy import func, select, text
+from sqlalchemy import text
 
 from agentkit.config.skills_config import SkillCreationConfig
 from agentkit.skills.content import SkillContentStore
 from agentkit.skills.domain import (
     InvalidSkillPackage,
+    SecurityScanRecord,
     SkillConflict,
     SkillRecord,
-    SkillReleaseRecord,
-    SkillScope,
-    SkillSubmissionRecord,
     SkillVersionRecord,
     StagedFile,
     StagedFileInfo,
 )
 from agentkit.skills.git import GitCommit, SkillGitRepository
 from agentkit.skills.package import build_package, render_skill_md, validate_skill_path
-from agentkit.skills.store.model import SkillRow, SkillSubmissionRow
+from agentkit.skills.parser import FRONTMATTER_RE, SkillParseError, parse_skill_text
+from agentkit.skills.security_scan import (
+    CiscoSkillScanner,
+    SkillSecurityScanner,
+)
 from agentkit.skills.store.sql import SqlSkillStore
 from agentkit.skills.types import SKILL_FILE_NAME
 
@@ -50,12 +58,7 @@ def _staged_info(file: StagedFile) -> StagedFileInfo:
 
 
 def _skill_directory(raw_path: str) -> str:
-    """Return the containing directory for a release path.
-
-    Releases record the SKILL.md path (public/name/SKILL.md), while Git
-    returns the directory it wrote.  Both forms are accepted here.
-    """
-
+    """Return the containing directory for a saved version path."""
     path = validate_skill_path(raw_path)
     if PurePosixPath(path).name == SKILL_FILE_NAME:
         parent = str(PurePosixPath(path).parent)
@@ -66,7 +69,7 @@ def _skill_directory(raw_path: str) -> str:
 
 
 class SkillAuthorService:
-    """Create, edit, save, submit, and delete one owner's private skill drafts."""
+    """Create, edit, save, scan, activate, and delete one owner's skills."""
 
     def __init__(
         self,
@@ -76,17 +79,19 @@ class SkillAuthorService:
         creation: SkillCreationConfig,
         *,
         reserved_names: Callable[[], frozenset[str]] | None = None,
+        scanner: SkillSecurityScanner | None = None,
     ) -> None:
         self._store = store
         self._git = git
         self._content = content
         self._creation = creation
         self._reserved_names = reserved_names
+        self._scanner = scanner or CiscoSkillScanner()
         self._local_locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
 
     # ------------------------------------------------------------------
-    # lifecycle
+    # identity and drafts
     # ------------------------------------------------------------------
 
     async def create_draft(
@@ -94,10 +99,12 @@ class SkillAuthorService:
     ) -> SkillRecord:
         """Create a private skill and stage its initial SKILL.md.
 
-        This never writes Git.  The first save is what produces a version and
-        a private active pointer.
+        This never writes Git and never creates a version.  The first save is
+        what produces a draft version.
         """
 
+        if not self._creation.enabled:
+            raise SkillConflict("skill creation is disabled")
         if self._reserved_names is not None and name in self._reserved_names():
             raise SkillConflict("name is reserved by a built-in skill")
 
@@ -106,8 +113,6 @@ class SkillAuthorService:
             content=render_skill_md(name, description).encode("utf-8"),
             mode="text",
         )
-        # Validate the generated frontmatter and the package limits before an
-        # orphan skill row can be created.
         build_package(
             {initial.path: initial},
             max_files=self._creation.max_files,
@@ -118,8 +123,6 @@ class SkillAuthorService:
         owned = await self._store.list_owned(owner_user_id)
         if len(owned) >= self._creation.max_drafts_per_user:
             raise SkillConflict("draft quota exceeded")
-        if await self._public_name_taken(name):
-            raise SkillConflict(f"public name {name!r} is already in use")
 
         skill = await self._store.create_skill(
             owner_user_id=owner_user_id, private_name=name
@@ -129,48 +132,80 @@ class SkillAuthorService:
         )
         return skill
 
+    async def import_extracted_skill(
+        self,
+        *,
+        owner_user_id: str,
+        skill_md: str,
+        source_uri: str,
+        source_task_id: str | None = None,
+    ) -> SkillRecord:
+        """Import an OpenViking session-skill as an extracted, unscanned draft.
+
+        The generated SKILL.md is saved as a normal inert draft version. It is
+        deliberately not scanned or activated: the user reviews it in the skills
+        page, runs the security scan, and activates it explicitly. Re-importing
+        the same source URI is idempotent.
+        """
+
+        if not self._creation.enabled:
+            raise SkillConflict("skill creation is disabled")
+        try:
+            parsed = parse_skill_text(skill_md)
+        except SkillParseError as exc:
+            raise InvalidSkillPackage(str(exc)) from exc
+        if not parsed.name:
+            raise InvalidSkillPackage("extracted skill has no name")
+
+        owned = await self._store.list_owned(owner_user_id)
+        for existing in owned:
+            if existing.source_uri == source_uri:
+                return existing
+        if self._reserved_names is not None and parsed.name in self._reserved_names():
+            raise SkillConflict("name is reserved by a built-in skill")
+        if len(owned) >= self._creation.max_drafts_per_user:
+            raise SkillConflict("draft quota exceeded")
+
+        private_name = _unique_skill_name(
+            parsed.name, {skill.private_name for skill in owned}, source_uri
+        )
+        if private_name != parsed.name:
+            skill_md = _rename_skill_md(skill_md, private_name)
+        skill = await self._store.create_skill(
+            owner_user_id=owner_user_id,
+            private_name=private_name,
+            source="extracted",
+            source_uri=source_uri,
+        )
+        staged = StagedFile(
+            path=SKILL_FILE_NAME,
+            content=skill_md.encode("utf-8"),
+            mode="text",
+        )
+        await self._store.put_draft_file(
+            skill.id, staged.path, staged.content, staged.mode
+        )
+        await self.save(
+            owner_user_id=owner_user_id,
+            skill_id=skill.id,
+            extra_metadata={
+                "source": "extracted",
+                "source_uri": source_uri,
+                "source_task_id": source_task_id,
+            },
+        )
+        return skill
+
     async def open_draft(
         self, *, owner_user_id: str, skill_id: str
     ) -> list[StagedFileInfo]:
-        """Return staged files, seeding an empty draft from the public release."""
-
-        # 重新打开是公共状态路径：作者删掉私有草稿后，记录仍是软删，
-        # 但已发布的版本还在。先确认所有权并恢复记录，再按需从公共版本播种。
+        """Return staged files, reviving a soft-deleted record if necessary."""
         await self._owned_skill(owner_user_id, skill_id, include_deleted=True)
         await self._store.revive_private_draft(
             skill_id=skill_id, owner_user_id=owner_user_id
         )
         existing = await self._store.list_draft_files(skill_id)
-        if existing:
-            return [_staged_info(file) for file in existing]
-
-        release = await self._public_active_for(owner_user_id, skill_id)
-        if release is None:
-            return []
-        directory = _skill_directory(release.skill_path)
-        staged: list[StagedFile] = []
-        for listed in await self._git.list_tree(release.git_commit, directory):
-            relative = self._relative_tree_path(listed, directory)
-            content = await self._git.read_file(
-                release.git_commit, f"{directory}/{relative}"
-            )
-            staged.append(StagedFile(relative, content, "text"))
-
-        # Refuse to seed a package Git cannot have produced as a valid skill.
-        build_package(
-            {file.path: file for file in staged},
-            max_files=self._creation.max_files,
-            max_file_bytes=self._creation.max_file_bytes,
-            max_package_bytes=self._creation.max_package_bytes,
-        )
-        infos: list[StagedFileInfo] = []
-        for file in sorted(staged, key=lambda item: item.path):
-            infos.append(
-                await self._store.put_draft_file(
-                    skill_id, file.path, file.content, file.mode
-                )
-            )
-        return infos
+        return [_staged_info(file) for file in existing]
 
     async def list_versions(
         self, *, owner_user_id: str, skill_id: str
@@ -178,13 +213,20 @@ class SkillAuthorService:
         await self._owned_skill(owner_user_id, skill_id)
         return await self._store.list_versions(skill_id)
 
+    async def latest_version(
+        self, *, owner_user_id: str, skill_id: str
+    ) -> SkillVersionRecord | None:
+        await self._owned_skill(owner_user_id, skill_id)
+        return await self._store.latest_version(skill_id)
+
+    async def active_version(
+        self, *, owner_user_id: str, skill_id: str
+    ) -> SkillVersionRecord | None:
+        await self._owned_skill(owner_user_id, skill_id)
+        return await self._store.private_active(skill_id)
+
     async def list_mine(self, *, owner_user_id: str) -> list[SkillRecord]:
-        """Owned, non-deleted skills, including drafts that have no version yet.
-
-        The route layer needs this before a first save; visible_for_user() only
-        contains rows with an active version, so it cannot back /skills/mine.
-        """
-
+        """Owned, non-deleted skills, including drafts with no version yet."""
         return await self._store.list_owned(owner_user_id)
 
     async def get_owned_skill(
@@ -195,29 +237,10 @@ class SkillAuthorService:
         include_deleted: bool = False,
     ) -> SkillRecord | None:
         """Return the skill only when this caller owns it; None for absent/foreign."""
-
         skill = await self._store.get_skill(skill_id, include_deleted=include_deleted)
         if skill is None or skill.owner_user_id != owner_user_id:
             return None
         return skill
-
-    async def latest_submission(
-        self, *, owner_user_id: str, skill_id: str
-    ) -> SkillSubmissionRecord | None:
-        """The most recent submission, whatever its status."""
-
-        await self._owned_skill(owner_user_id, skill_id)
-        return await self._store.latest_submission(skill_id)
-
-    async def submission_status(
-        self, *, owner_user_id: str, skill_id: str
-    ) -> str | None:
-        """The latest submission status, or None when nothing was ever submitted."""
-
-        latest = await self.latest_submission(
-            owner_user_id=owner_user_id, skill_id=skill_id
-        )
-        return latest.status if latest is not None else None
 
     # ------------------------------------------------------------------
     # staging
@@ -233,7 +256,6 @@ class SkillAuthorService:
         mode: str = "text",
     ) -> StagedFileInfo:
         await self._owned_skill(owner_user_id, skill_id)
-        await self._reject_pending(skill_id)
         staged = {
             file.path: file for file in await self._store.list_draft_files(skill_id)
         }
@@ -245,7 +267,6 @@ class SkillAuthorService:
         self, *, owner_user_id: str, skill_id: str, path: str
     ) -> None:
         await self._owned_skill(owner_user_id, skill_id)
-        await self._reject_pending(skill_id)
         validate_skill_path(path)
         await self._store.delete_draft_file(skill_id, path)
 
@@ -260,7 +281,6 @@ class SkillAuthorService:
         self, *, owner_user_id: str, skill_id: str, path: str
     ) -> StagedFile | None:
         """Read one staged file; None means the path is not staged for this skill."""
-
         await self._owned_skill(owner_user_id, skill_id)
         validate_skill_path(path)
         for file in await self._store.list_draft_files(skill_id):
@@ -269,7 +289,7 @@ class SkillAuthorService:
         return None
 
     # ------------------------------------------------------------------
-    # save, submit, withdraw
+    # save
     # ------------------------------------------------------------------
 
     async def save(
@@ -277,13 +297,12 @@ class SkillAuthorService:
         *,
         owner_user_id: str,
         skill_id: str,
-        extra_metadata: Mapping[str, Any] | None = None,
+        extra_metadata: Mapping[str, object] | None = None,
     ) -> SkillVersionRecord:
-        """Commit the exact staging tree, then record it in the catalog."""
+        """Commit the exact staging tree and record an inert draft version."""
 
         async with self._skill_lock(skill_id):
             await self._owned_skill(owner_user_id, skill_id)
-            await self._reject_pending(skill_id)
             files = await self._store.list_draft_files(skill_id)
             manifest = self._build({file.path: file for file in files})
 
@@ -305,58 +324,155 @@ class SkillAuthorService:
                 extra_metadata=extra_metadata,
             )
 
-    async def submit(
-        self, *, owner_user_id: str, skill_id: str
-    ) -> SkillSubmissionRecord:
+    # ------------------------------------------------------------------
+    # security scan and activation
+    # ------------------------------------------------------------------
+
+    async def latest_scan(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        version_id: str | None = None,
+    ) -> SecurityScanRecord | None:
         await self._owned_skill(owner_user_id, skill_id)
-        if await self._store.pending_submission(skill_id) is not None:
-            raise SkillConflict(f"skill {skill_id!r} already has a pending submission")
+        return await self._store.latest_security_scan(skill_id, version_id)
 
-        pending_count = await self._pending_submission_count(owner_user_id)
-        if pending_count >= self._creation.max_pending_submissions_per_user:
-            raise SkillConflict("pending submission quota exceeded")
+    async def list_scans(
+        self, *, owner_user_id: str, skill_id: str, limit: int = 20
+    ) -> list[SecurityScanRecord]:
+        await self._owned_skill(owner_user_id, skill_id)
+        return await self._store.list_security_scans(skill_id, limit=limit)
 
-        version = await self._private_active_version(owner_user_id, skill_id)
-        if version is None or not version.draft_ref:
-            raise SkillConflict(f"skill {skill_id!r} has no saved version")
+    async def scan_security(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        version_id: str | None = None,
+        on_status: Callable[[str], None] | None = None,
+    ) -> SecurityScanRecord:
+        """Scan the latest saved version with the imported Cisco scanner.
 
-        # The branch head is authoritative for review.  The whole package,
-        # not only SKILL.md, must match the saved version, otherwise an
-        # attachment could change between save and review.
-        submitted_commit = await self._git.head(version.draft_ref)
-        submitted_package = await self._git.package_sha256(
-            submitted_commit, version.skill_path
-        )
-        if submitted_package != version.package_sha256:
-            raise SkillConflict(
-                f"skill {skill_id!r} draft changed since the saved version"
+        The scan target is immutable Git content from the commit cache, never
+        the mutable staging table.  A scan of an older version is rejected so
+        the editor cannot show a misleading "passed" state for current content.
+        """
+        async with self._skill_lock(skill_id):
+            await self._owned_skill(owner_user_id, skill_id)
+            version = await self._store.latest_version(skill_id)
+            if version is None or not version.draft_commit:
+                raise SkillConflict(f"skill {skill_id!r} has no saved version")
+            if version_id is not None and version_id != version.id:
+                raise SkillConflict(
+                    f"version {version_id!r} is not the latest saved version"
+                )
+
+            try:
+                root = await self._content.ensure(version.draft_commit)
+            except Exception as exc:  # noqa: BLE001 - never leak a cache/Git path
+                logger.warning(
+                    "Could not materialize skill %s for scanning (%s)",
+                    skill_id,
+                    type(exc).__name__,
+                )
+                raise SkillConflict(
+                    "saved skill content is unavailable; save the skill again and retry"
+                ) from exc
+            directory = _skill_directory(version.skill_path)
+            target = root / PurePosixPath(directory)
+            if target.is_symlink() or not target.is_dir():
+                raise SkillConflict(
+                    f"skill {skill_id!r} content is not available for scanning"
+                )
+
+            # The scanner is synchronous CPU work; keep the event loop free.
+            # on_status is only forwarded to the Cisco adapter. Test doubles
+            # implement the one-argument protocol and must keep working.
+            if on_status is None:
+                outcome = await asyncio.to_thread(self._scanner.scan, target)
+            else:
+                outcome = await asyncio.to_thread(
+                    self._scanner.scan, target, on_status=on_status
+                )
+            return await self._store.record_security_scan(
+                skill_id=skill_id,
+                owner_user_id=owner_user_id,
+                version_id=version.id,
+                status=outcome.status,
+                is_safe=outcome.is_safe,
+                max_severity=outcome.max_severity,
+                findings=outcome.findings,
+                scanner="cisco-ai-skill-scanner",
+                scanner_version=outcome.scanner_version,
+                duration_ms=outcome.duration_ms,
+                error=outcome.error,
             )
 
-        return await self._store.create_submission(
-            skill_id=skill_id,
-            version=version,
-            owner_user_id=owner_user_id,
-            submitted_commit=submitted_commit,
-        )
+    async def activate(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        version_id: str | None = None,
+        index_enabled: bool = True,
+    ) -> SkillVersionRecord:
+        """Activate the latest version only when its latest scan passed."""
+        async with self._skill_lock(skill_id):
+            await self._owned_skill(owner_user_id, skill_id)
+            version = await self._store.latest_version(skill_id)
+            if version is None:
+                raise SkillConflict(f"skill {skill_id!r} has no saved version")
+            if version_id is not None and version_id != version.id:
+                raise SkillConflict(
+                    f"version {version_id!r} is not the latest saved version"
+                )
 
-    async def withdraw(
-        self, *, owner_user_id: str, skill_id: str
-    ) -> SkillSubmissionRecord:
-        await self._owned_skill(owner_user_id, skill_id)
-        pending = await self._store.pending_submission(skill_id)
-        if pending is None:
-            raise SkillConflict(f"skill {skill_id!r} has no pending submission")
-        if pending.owner_user_id != owner_user_id:
-            raise SkillConflict(f"skill {skill_id!r} does not exist")
-        return await self._store.set_submission_status(
-            pending.id, status="withdrawn"
-        )
+            scan = await self._store.latest_security_scan(skill_id, version.id)
+            if scan is None:
+                raise SkillConflict("run a security scan before activating this skill")
+            if scan.status != "completed":
+                raise SkillConflict(
+                    "the latest security scan failed; fix it and scan again"
+                )
+            if not scan.is_safe:
+                raise SkillConflict(
+                    "the latest security scan did not pass; fix the findings and scan again"
+                )
+            return await self._store.activate_version(
+                skill_id=skill_id,
+                owner_user_id=owner_user_id,
+                version_id=version.id,
+                scan_id=scan.id,
+                actor=owner_user_id,
+                index_enabled=index_enabled,
+            )
+
+    async def set_enabled(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        enabled: bool,
+        index_enabled: bool = True,
+    ) -> SkillRecord:
+        """Toggle an active private skill without touching its content or version."""
+        async with self._skill_lock(skill_id):
+            await self._owned_skill(owner_user_id, skill_id)
+            return await self._store.set_skill_enabled(
+                skill_id=skill_id,
+                owner_user_id=owner_user_id,
+                enabled=enabled,
+                index_enabled=index_enabled,
+            )
+
+    # ------------------------------------------------------------------
+    # delete
+    # ------------------------------------------------------------------
 
     async def delete_draft(self, *, owner_user_id: str, skill_id: str) -> None:
-        """Delete private staging and the private pointer, never public state."""
-
+        """Delete the owner's skill, active pointer and projection row intent."""
         await self._owned_skill(owner_user_id, skill_id)
-        await self._reject_pending(skill_id)
         deleted = await self._store.delete_private_draft(
             skill_id=skill_id, owner_user_id=owner_user_id, actor=owner_user_id
         )
@@ -377,10 +493,6 @@ class SkillAuthorService:
             raise SkillConflict(f"skill {skill_id!r} does not exist")
         return skill
 
-    async def _reject_pending(self, skill_id: str) -> None:
-        if await self._store.pending_submission(skill_id) is not None:
-            raise SkillConflict(f"skill {skill_id!r} has a pending submission")
-
     def _build(self, files: dict[str, StagedFile]):
         return build_package(
             files,
@@ -388,62 +500,6 @@ class SkillAuthorService:
             max_file_bytes=self._creation.max_file_bytes,
             max_package_bytes=self._creation.max_package_bytes,
         )
-
-    async def _public_name_taken(self, name: str) -> bool:
-        async with self._store._sf() as session:  # type: ignore[attr-defined]
-            found = await session.scalar(
-                select(SkillRow.id)
-                .where(SkillRow.public_name == name)
-                .limit(1)
-            )
-            return found is not None
-
-    async def _public_active_for(
-        self, owner_user_id: str, skill_id: str
-    ) -> SkillReleaseRecord | None:
-        """Find an owned public active release through the visibility projection."""
-
-        for visible in await self._store.visible_for_user(owner_user_id):
-            if (
-                visible.scope == SkillScope.PUBLIC
-                and visible.skill.skill_id == skill_id
-                and visible.skill.owner_user_id == owner_user_id
-            ):
-                return visible.release
-        return None
-
-    async def _private_active_version(
-        self, owner_user_id: str, skill_id: str
-    ) -> SkillVersionRecord | None:
-        for visible in await self._store.visible_for_user(owner_user_id):
-            if (
-                visible.scope == SkillScope.PRIVATE
-                and visible.skill.skill_id == skill_id
-                and visible.skill.owner_user_id == owner_user_id
-            ):
-                return visible.version
-        return None
-
-    async def _pending_submission_count(self, owner_user_id: str) -> int:
-        async with self._store._sf() as session:  # type: ignore[attr-defined]
-            count = await session.scalar(
-                select(func.count())
-                .select_from(SkillSubmissionRow)
-                .where(
-                    SkillSubmissionRow.owner_user_id == owner_user_id,
-                    SkillSubmissionRow.status == "pending",
-                )
-            )
-            return int(count or 0)
-
-    @staticmethod
-    def _relative_tree_path(listed: str, directory: str) -> str:
-        if listed == directory:
-            return PurePosixPath(directory).name
-        prefix = directory.rstrip("/") + "/"
-        if listed.startswith(prefix):
-            return listed[len(prefix) :]
-        return listed
 
     @staticmethod
     def _skill_path(commit: GitCommit) -> str:
@@ -474,8 +530,7 @@ class SkillAuthorService:
 
     @asynccontextmanager
     async def _skill_lock(self, skill_id: str) -> AsyncIterator[None]:
-        """Serialize saves for one skill without holding a DB transaction."""
-
+        """Serialize saves/scans/activation for one skill without holding a DB txn."""
         async with await self._local_lock(skill_id):
             bind = self._bind()
             dialect = getattr(bind, "dialect", None)
@@ -506,6 +561,33 @@ class SkillAuthorService:
                             "could not release skill author advisory lock",
                             exc_info=True,
                         )
+
+
+def _rename_skill_md(text: str, name: str) -> str:
+    match = FRONTMATTER_RE.match(text)
+    if match is None:
+        return text
+    front, count = re.subn(
+        r"(?m)^name:\s*.*$",
+        f"name: {name}",
+        match.group(1),
+        count=1,
+    )
+    if count == 0:
+        return text
+    return text[: match.start(1)] + front + text[match.end(1) :]
+
+
+def _unique_skill_name(base: str, taken: set[str], source_uri: str) -> str:
+    if base not in taken:
+        return base
+    suffix = hashlib.sha256(source_uri.encode("utf-8")).hexdigest()[:8]
+    candidate = f"{base}-{suffix}"
+    index = 2
+    while candidate in taken:
+        candidate = f"{base}-{suffix}-{index}"
+        index += 1
+    return candidate
 
 
 __all__ = ["SkillAuthorService"]

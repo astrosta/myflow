@@ -1,9 +1,9 @@
-"""Milvus active projection for public and private skills.
+"""Milvus active projection for user-private skills.
 
 The collection is a materialized view, not a version index: one row per active
-public skill and one row per active private skill.  PostgreSQL remains the
-authority; Milvus only narrows the candidate set and every hit is confirmed
-against the active pointers before it becomes visible.
+private skill, keyed by projection_key and carrying owner_user_id.  PostgreSQL
+remains the authority; Milvus only narrows the candidate set and every hit is
+confirmed against the caller's active pointer before it becomes visible.
 
 pymilvus is imported lazily so importing the catalog does not require the
 optional Milvus client until the active projection is actually used.
@@ -39,17 +39,51 @@ OUTPUT_FIELDS = [
 ]
 
 _QUERY_LIMIT = 16384
-_SCOPES = frozenset({"public", "private"})
+_SCOPES = frozenset({"private"})
 _SCALAR_INDEX_FIELDS = ("scope", "owner_user_id", "enabled")
+_VECTOR_FIELD = "embedding"
+
+#: Milvus 700 = IndexNotExist.  Loading a collection without a vector index always
+#: fails this way, so it is a repairable state, not a terminal one.
+_MISSING_INDEX_HINTS = (
+    "index not found",
+    "index not exist",
+    "index doesn't exist",
+    "no vector index",
+    "index hasn't been created",
+)
+#: Two workers may create the same index concurrently; the loser is told so.
+_INDEX_EXISTS_HINTS = ("already exist", "duplicate index")
 
 
 class ProjectionUnavailable(RuntimeError):
     """The active Milvus projection cannot be read or written."""
 
 
+def _error_code(exc: BaseException) -> int | None:
+    code = getattr(exc, "code", None)
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_missing_index_error(exc: BaseException) -> bool:
+    """True when Milvus refused the call because the collection has no index."""
+    text = str(exc).lower()
+    if any(hint in text for hint in _MISSING_INDEX_HINTS):
+        return True
+    return _error_code(exc) == 700
+
+
+def _is_index_exists_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(hint in text for hint in _INDEX_EXISTS_HINTS)
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionRow:
-    """One active public or private skill row."""
+    """One active private skill row."""
 
     projection_key: str
     scope: str
@@ -88,12 +122,11 @@ class SkillProjectionStore(Protocol):
         self,
         *,
         user_id: str,
-        private_skill_ids: Sequence[str],
         vector: Sequence[float],
         limit: int,
     ) -> list[ProjectionHit]: ...
 
-    async def list_projection_keys(self) -> list[str]: ...
+    async def scan_projection_keys(self, *, limit: int) -> tuple[list[str], bool]: ...
 
     async def aclose(self) -> None: ...
 
@@ -165,7 +198,6 @@ class MilvusSkillProjection:
         self,
         *,
         user_id: str,
-        private_skill_ids: Sequence[str],
         vector: Sequence[float],
         limit: int,
     ) -> list[ProjectionHit]:
@@ -177,19 +209,20 @@ class MilvusSkillProjection:
             )
         if int(limit) <= 0:
             raise ValueError("limit must be positive")
-        expression = self._filter(user_id, private_skill_ids)
+        expression = self._filter(user_id)
         rows = await asyncio.to_thread(
             self._search_sync, expression, values, int(limit)
         )
         return self._to_hits(rows)
 
-    async def list_projection_keys(self) -> list[str]:
-        rows = await asyncio.to_thread(self._list_keys_sync)
-        return [
-            str(row["pk"])
-            for row in rows
-            if isinstance(row, dict) and row.get("pk")
-        ]
+    async def scan_projection_keys(self, *, limit: int) -> tuple[list[str], bool]:
+        """Stream the projection primary keys, stopping after limit.
+
+        Returns (keys, truncated).  A single bounded query silently truncates at
+        16384 rows and every row beyond the window then looks missing, so the
+        integrity sweep walks the collection with a query iterator instead.
+        """
+        return await asyncio.to_thread(self._scan_keys_sync, int(limit))
 
     async def aclose(self) -> None:
         client = self._client
@@ -256,35 +289,82 @@ class MilvusSkillProjection:
             ) from exc
         return self._first_rows(result)
 
-    def _list_keys_sync(self) -> list[dict]:
+    def _scan_keys_sync(self, limit: int) -> tuple[list[str], bool]:
+        if limit <= 0:
+            return [], False
         client = self._client_instance()
+        self._ensure_collection_sync(client)
+        make_iterator = getattr(client, "query_iterator", None)
+        if not callable(make_iterator):
+            # 老客户端没有 iterator：退回单次 query，并且如实报告可能被截断。
+            try:
+                rows = client.query(
+                    collection_name=self._collection,
+                    filter="",
+                    output_fields=["pk"],
+                    limit=min(limit, _QUERY_LIMIT),
+                )
+            except Exception as exc:  # noqa: BLE001 - mapped to the projection error
+                raise ProjectionUnavailable(
+                    f"Milvus projection query failed: {type(exc).__name__}"
+                ) from exc
+            keys = [str(row["pk"]) for row in (rows or []) if isinstance(row, dict) and row.get("pk")]
+            truncated = len(keys) >= min(limit, _QUERY_LIMIT)
+            return keys[:limit], truncated
         try:
-            self._ensure_collection_sync(client)
-            result = client.query(
+            iterator = make_iterator(
                 collection_name=self._collection,
+                batch_size=min(1000, limit),
+                limit=-1,
                 filter="",
                 output_fields=["pk"],
-                limit=_QUERY_LIMIT,
             )
-        except ProjectionUnavailable:
-            raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - mapped to the projection error
             raise ProjectionUnavailable(
                 f"Milvus projection query failed: {type(exc).__name__}"
             ) from exc
-        if isinstance(result, dict):
-            result = result.get("data") or []
-        return list(result or [])
+        keys: list[str] = []
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                for row in batch:
+                    if isinstance(row, dict) and row.get("pk"):
+                        keys.append(str(row["pk"]))
+                        if len(keys) >= limit:
+                            return keys, True
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - closing is best effort
+                    logger.debug("Could not close Milvus iterator", exc_info=True)
+        return keys, False
 
     def _ensure_collection_sync(self, client: Any | None = None) -> None:
+        """Converge to "exists + right dimensions + indexed + loaded".
+
+        "The collection exists" is not the same as "the collection is usable": a
+        creation that dies between create_collection and create_index, or an index
+        dropped by hand, leaves a collection whose load fails with 700 index not
+        found.  Assuming it was ready made every retry fail the same way, so an
+        existing collection is inspected and repaired instead of trusted.
+        """
         client = client or self._client_instance()
-        if client.has_collection(self._collection):
-            load = getattr(client, "load_collection", None)
-            if callable(load):
-                load(self._collection)
-            self._inspect_collection(client)
+        if not client.has_collection(self._collection):
+            self._create_collection(client)
             return
-        self._create_collection(client)
+        self._inspect_collection(client)
+        if not self._has_vector_index(client):
+            logger.warning(
+                "Milvus skill projection %s exists without a vector index; "
+                "creating it before loading",
+                self._collection,
+            )
+            self._create_indexes(client)
+        self._load(client)
 
     def _inspect_collection(self, client: Any) -> None:
         describe = getattr(client, "describe_collection", None)
@@ -307,6 +387,117 @@ class MilvusSkillProjection:
                     f"expected {self._dimensions}, got {dim}"
                 )
 
+    def _load(self, client: Any) -> None:
+        """Load the collection, repairing a missing index exactly once."""
+        load = getattr(client, "load_collection", None)
+        if not callable(load):
+            return
+        try:
+            load(self._collection)
+            return
+        except Exception as exc:  # noqa: BLE001 - only the index case is repairable
+            if not _is_missing_index_error(exc):
+                raise ProjectionUnavailable(
+                    f"Milvus skill projection load failed: {type(exc).__name__}"
+                ) from exc
+            logger.warning(
+                "Milvus skill projection %s refused to load without an index; "
+                "creating the index and retrying once",
+                self._collection,
+            )
+        # Covers an index that only just became visible and a collection that lost
+        # its index between the check above and this load.  A second failure is a
+        # real failure: the outbox backs off and tries again later.
+        self._create_indexes(client)
+        try:
+            load(self._collection)
+        except Exception as exc:  # noqa: BLE001 - mapped to the projection error
+            raise ProjectionUnavailable(
+                f"Milvus skill projection load failed: {type(exc).__name__}"
+            ) from exc
+
+    def _has_vector_index(self, client: Any) -> bool:
+        """Whether the embedding field already has an index.
+
+        Unknown answers return True: a client without introspection should not
+        trigger a blind create_index on every call, and the load path repairs a
+        genuinely missing index anyway.  Milvus names an index after its field by
+        default, so both the index name and describe_index count as evidence.
+        """
+        list_indexes = getattr(client, "list_indexes", None)
+        if not callable(list_indexes):
+            return True
+        try:
+            names = [str(name) for name in (list_indexes(self._collection) or [])]
+        except Exception:  # noqa: BLE001 - introspection is advisory only
+            logger.debug(
+                "Could not list Milvus skill projection indexes", exc_info=True
+            )
+            return True
+        if not names:
+            return False
+        if _VECTOR_FIELD in names:
+            return True
+        describe = getattr(client, "describe_index", None)
+        if not callable(describe):
+            return True
+        for name in names:
+            try:
+                described = describe(self._collection, name)
+            except Exception:  # noqa: BLE001 - try the next index name
+                logger.debug("Could not describe Milvus index %s", name, exc_info=True)
+                continue
+            if isinstance(described, dict) and described.get("field_name") == _VECTOR_FIELD:
+                return True
+        return False
+
+    def _create_indexes(self, client: Any) -> None:
+        try:
+            index_params = client.prepare_index_params()
+            index_params.add_index(
+                field_name=_VECTOR_FIELD,
+                index_type=self._config.index_type,
+                metric_type=self._config.metric_type,
+                params={},
+            )
+            for field_name in _SCALAR_INDEX_FIELDS:
+                index_params.add_index(
+                    field_name=field_name,
+                    index_type="INVERTED",
+                )
+            # Milvus refuses to build an index on a loaded collection.
+            self._release(client)
+            try:
+                client.create_index(
+                    collection_name=self._collection, index_params=index_params
+                )
+            except Exception as exc:  # noqa: BLE001 - another worker may have won
+                if not _is_index_exists_error(exc):
+                    raise
+                logger.info(
+                    "Milvus skill projection %s already has this index; continuing",
+                    self._collection,
+                )
+        except ProjectionUnavailable:
+            raise
+        except Exception as exc:
+            raise ProjectionUnavailable(
+                "Milvus skill projection index creation failed: "
+                f"{type(exc).__name__}"
+            ) from exc
+
+    def _release(self, client: Any) -> None:
+        release = getattr(client, "release_collection", None)
+        if not callable(release):
+            return
+        try:
+            release(self._collection)
+        except Exception:  # noqa: BLE001 - "not loaded" is the normal case here
+            logger.debug(
+                "Could not release Milvus skill projection %s", self._collection,
+                exc_info=True,
+            )
+
     def _create_collection(self, client: Any) -> None:
         try:
             from pymilvus import DataType
@@ -314,6 +505,7 @@ class MilvusSkillProjection:
             raise ProjectionUnavailable(
                 "pymilvus is not installed; install the skills extra"
             ) from exc
+        created = False
         try:
             schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
             schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=255)
@@ -329,33 +521,47 @@ class MilvusSkillProjection:
             schema.add_field("skill_md_sha256", DataType.VARCHAR, max_length=128)
             schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self._dimensions)
 
-            index_params = client.prepare_index_params()
-            index_params.add_index(
-                field_name="embedding",
-                index_type=self._config.index_type,
-                metric_type=self._config.metric_type,
-                params={},
-            )
-            for field_name in _SCALAR_INDEX_FIELDS:
-                index_params.add_index(
-                    field_name=field_name,
-                    index_type="INVERTED",
-                )
+            # Indexes are created after the collection, never through
+            # create_collection(index_params=...): a failure between the two steps
+            # used to leave a collection that could never be loaded, and every
+            # retry then took the "already exists" path straight into 700.
             client.create_collection(
                 collection_name=self._collection,
                 schema=schema,
-                index_params=index_params,
                 consistency_level=self._consistency_level,
             )
-            load = getattr(client, "load_collection", None)
-            if callable(load):
-                load(self._collection)
+            created = True
+            self._create_indexes(client)
+            self._load(client)
         except ProjectionUnavailable:
+            self._discard_half_created(client, created=created)
             raise
         except Exception as exc:
+            self._discard_half_created(client, created=created)
             raise ProjectionUnavailable(
                 f"Milvus skill projection creation failed: {type(exc).__name__}"
             ) from exc
+
+    def _discard_half_created(self, client: Any, *, created: bool) -> None:
+        """Drop the collection this call just created so no ghost is left behind."""
+        if not created:
+            return
+        drop = getattr(client, "drop_collection", None)
+        if not callable(drop):
+            return
+        try:
+            drop(self._collection)
+            logger.warning(
+                "Dropped half-created Milvus skill projection %s so the next "
+                "retry starts clean",
+                self._collection,
+            )
+        except Exception:  # noqa: BLE001 - cleanup is best effort
+            logger.warning(
+                "Could not drop half-created Milvus skill projection %s",
+                self._collection,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # records, filters, and hits
@@ -388,14 +594,11 @@ class MilvusSkillProjection:
         }
 
     @staticmethod
-    def _filter(user_id: str, private_skill_ids: Sequence[str]) -> str:
-        public = 'scope == "public" and enabled == true'
-        ids = list(private_skill_ids)
-        if not ids:
-            return public
-        public += f" and skill_id not in {json.dumps(ids)}"
-        private = f'scope == "private" and owner_user_id == {json.dumps(user_id)}'
-        return f"({public}) or ({private})"
+    def _filter(user_id: str) -> str:
+        return (
+            'scope == "private" and enabled == true and owner_user_id == '
+            f"{json.dumps(user_id)}"
+        )
 
     @staticmethod
     def _first_rows(result: Any) -> list[dict]:

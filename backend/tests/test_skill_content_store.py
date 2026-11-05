@@ -15,7 +15,6 @@ from fakes.git_repo import make_bare_remote
 from agentkit.config.skills_config import SkillGitConfig
 from agentkit.skills.content import SkillContentStore
 from agentkit.skills.domain import (
-    SkillReleaseRecord,
     SkillScope,
     SkillVersionRecord,
     StagedFile,
@@ -86,59 +85,6 @@ def _private(
             index_status="ready",
             created_at=NOW,
         ),
-        release=None,
-    )
-
-
-def _public(
-    *,
-    skill_id: str,
-    public_name: str,
-    owner: str,
-    version_commit: str,
-    version_path: str,
-    release_commit: str,
-    release_path: str,
-) -> VisibleSkill:
-    version = SkillVersionRecord(
-        id=f"version-{skill_id}",
-        skill_id=skill_id,
-        skill_version="v1",
-        version_seq=1,
-        package_sha256="0" * 64,
-        skill_md_sha256="0" * 64,
-        metadata={},
-        draft_ref=f"refs/heads/myflow/drafts/{owner}",
-        draft_commit=version_commit,
-        skill_path=version_path,
-        index_status="ready",
-        created_at=NOW,
-    )
-    release = SkillReleaseRecord(
-        id=f"release-{skill_id}",
-        batch_id="batch",
-        version_id=version.id,
-        skill_id=skill_id,
-        skill_version="v1",
-        git_repository="origin",
-        git_commit=release_commit,
-        skill_path=release_path,
-        public_name=public_name,
-        source_commit=version_commit,
-        approved_by="admin",
-        created_at=NOW,
-    )
-    return VisibleSkill(
-        skill=_skill(
-            skill_id=skill_id,
-            name=public_name,
-            owner=owner,
-            scope=SkillScope.PUBLIC,
-            version_id=version.id,
-        ),
-        scope=SkillScope.PUBLIC,
-        version=version,
-        release=release,
     )
 
 
@@ -149,7 +95,6 @@ class ContentFixture:
     cache_dir: Path
     draft_one: object
     draft_two: object
-    public: object
 
 
 @pytest.fixture(name="content_fixture")
@@ -158,7 +103,6 @@ def content_fixture(tmp_path: Path):
     cache_dir = tmp_path / "cache"
     config = SkillGitConfig(
         repository=remote.as_posix(),
-        public_branch="main",
         cache_dir=str(cache_dir),
         command_timeout_seconds=30,
     )
@@ -182,19 +126,12 @@ def content_fixture(tmp_path: Path):
             files=[StagedFile("SKILL.md", b"---\nname: bar\ndescription: two\n---\n")],
             message="two",
         )
-        public = await repo.publish_public(
-            public_name="foo",
-            source_commit=draft_one.commit,
-            source_path="users/u1/s1",
-            message="approve",
-        )
         return ContentFixture(
             repo=repo,
             content=content,
             cache_dir=cache_dir,
             draft_one=draft_one,
             draft_two=draft_two,
-            public=public,
         )
 
     return asyncio.run(_build())
@@ -222,31 +159,6 @@ async def test_read_and_ensure_reject_unsafe_commit_or_path(content_fixture: Con
         await content_fixture.content.read_text(
             content_fixture.draft_one.commit, "../outside"
         )
-
-
-@pytest.mark.asyncio
-async def test_materialize_public_uses_the_release_commit_and_replaces_stale_entries(
-    content_fixture: ContentFixture,
-):
-    visible = _public(
-        skill_id="s1",
-        public_name="foo",
-        owner="u1",
-        version_commit=content_fixture.draft_one.commit,
-        version_path="users/u1/s1/SKILL.md",
-        release_commit=content_fixture.public.commit,
-        release_path="public/foo/SKILL.md",
-    )
-    tree = await content_fixture.content.materialize_public([visible])
-    assert tree == content_fixture.cache_dir / "active" / "public"
-    assert (tree / "foo/SKILL.md").read_bytes().startswith(b"---")
-    assert (tree / "foo/scripts/run.sh").read_bytes() == b"echo one\n"
-
-    (tree / "old").mkdir()
-    (tree / "old/SKILL.md").write_bytes(b"stale")
-    tree_again = await content_fixture.content.materialize_public([visible])
-    assert tree_again == tree
-    assert not (tree / "old").exists()
 
 
 @pytest.mark.asyncio
@@ -335,6 +247,66 @@ async def test_prune_keeps_unreferenced_caches_inside_the_ttl_window(
     assert not (commits / fresh).exists()
 
 @pytest.mark.asyncio
+async def test_forget_commits_deletes_only_the_named_caches(
+    content_fixture: ContentFixture,
+):
+    """事件驱动清理：只删调用方点名的提交，绝不扫别人目录。"""
+    keep = content_fixture.draft_one.commit
+    stale = "4" * 40
+    untouched = "5" * 40
+    commits = content_fixture.cache_dir / "commits"
+    await content_fixture.content.ensure(keep)
+    for name in (stale, untouched):
+        (commits / name).mkdir(parents=True)
+        (commits / name / "SKILL.md").write_bytes(b"---\n")
+
+    assert await content_fixture.content.forget_commits({stale}) == 1
+
+    assert not (commits / stale).exists()
+    assert (commits / keep).is_dir()
+    assert (commits / untouched).is_dir()  # 不在候选里就不动
+
+
+@pytest.mark.asyncio
+async def test_forget_commits_honours_the_ttl_window(
+    content_fixture: ContentFixture,
+):
+    fresh = "6" * 40
+    old = "7" * 40
+    commits = content_fixture.cache_dir / "commits"
+    for name in (fresh, old):
+        (commits / name).mkdir(parents=True)
+        (commits / name / "SKILL.md").write_bytes(b"---\n")
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(commits / old / "SKILL.md", (two_days_ago, two_days_ago))
+    os.utime(commits / old, (two_days_ago, two_days_ago))
+
+    assert (
+        await content_fixture.content.forget_commits({fresh, old}, min_age_seconds=86400)
+        == 1
+    )
+    assert not (commits / old).exists()
+    assert (commits / fresh).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_a_forgotten_commit_is_re_materialized_from_git(
+    content_fixture: ContentFixture,
+):
+    """缓存只是缓存：删掉之后下一次读会从 Git 重新物化。"""
+    commit = content_fixture.draft_one.commit
+    await content_fixture.content.ensure(commit)
+    assert await content_fixture.content.forget_commits({commit}) == 1
+    assert not (content_fixture.cache_dir / "commits" / commit).exists()
+
+    text = await content_fixture.content.read_text(
+        commit, "users/u1/s1/SKILL.md"
+    )
+
+    assert "name:" in text
+    assert (content_fixture.cache_dir / "commits" / commit).is_dir()
+
+@pytest.mark.asyncio
 async def test_a_second_text_read_is_served_from_the_lru(
     content_fixture: ContentFixture,
 ):
@@ -406,7 +378,6 @@ async def test_refresh_prunes_the_real_tree_of_an_owner_who_lost_every_skill(
         git=None,
         content=content_fixture.content,
         author=None,
-        review=None,
         catalog=None,
     )
 

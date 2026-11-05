@@ -40,12 +40,22 @@ interface ChatSessionValue {
   activeThreadId: string | null;
   /** 换会话的世代号。它是 ChatSession 的 key，变了才重挂载 */
   epoch: number;
+  /**
+   * "点侧栏会话标题，把消息列表拉回最底下"的请求号。
+   *
+   * 换会话时列表会因 key 变化重挂载，本来就会落到底部；但用户点的若是
+   * **当前会话**，thread id 不变、列表不重挂载。递增这个数就是那种情况下
+   * 唯一能通知到消息列表的信号。
+   */
+  scrollToBottomRequest: number;
   /** 路由段带来的会话（进入既有会话时由 ChatRoute 上报） */
   setActiveThreadId: (threadId: string | null) => void;
   /** 会话刚建好：更新高亮 + 只把地址栏换掉，不触发导航 */
   reportThreadCreated: (threadId: string) => void;
   /** 开一个新会话 */
   newChat: () => void;
+  /** 用户点了某个会话标题：让消息列表滚到最新一条 */
+  requestScrollToBottom: () => void;
 }
 
 const ChatSessionContext = createContext<ChatSessionValue | null>(null);
@@ -54,6 +64,7 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
   const router = useRouter();
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [epoch, setEpoch] = useState(0);
+  const [scrollToBottomRequest, setScrollToBottomRequest] = useState(0);
 
   const reportThreadCreated = useCallback((threadId: string) => {
     setActiveThreadId(threadId);
@@ -67,6 +78,10 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
     window.history.replaceState(null, "", "/workspace/chats/" + threadId);
   }, []);
 
+  const requestScrollToBottom = useCallback(() => {
+    setScrollToBottomRequest((n) => n + 1);
+  }, []);
+
   const newChat = useCallback(() => {
     setActiveThreadId(null);
     setEpoch((n) => n + 1);
@@ -78,8 +93,16 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
   }, [router]);
 
   const value = useMemo(
-    () => ({ activeThreadId, epoch, newChat, reportThreadCreated, setActiveThreadId }),
-    [activeThreadId, epoch, newChat, reportThreadCreated],
+    () => ({
+      activeThreadId,
+      epoch,
+      newChat,
+      reportThreadCreated,
+      requestScrollToBottom,
+      scrollToBottomRequest,
+      setActiveThreadId,
+    }),
+    [activeThreadId, epoch, newChat, reportThreadCreated, requestScrollToBottom, scrollToBottomRequest],
   );
 
   return <ChatSessionContext.Provider value={value}>{children}</ChatSessionContext.Provider>;

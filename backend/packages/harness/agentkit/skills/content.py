@@ -1,9 +1,10 @@
-"""Immutable commit cache and read-only active skill trees.
+"""Immutable commit cache and read-only per-user active skill trees.
 
 Git objects are immutable, so a commit can be exported once into
-cache_dir/commits/<commit> and served without touching a working tree.  Active
-trees are rebuilt from those caches into temporary sibling directories and
-swapped into place, so a reader never sees a half-copied skill.
+cache_dir/commits/<commit> and served without touching a working tree.  Each
+owner's active tree is rebuilt from those caches into a temporary sibling
+directory and swapped into place, so a reader never sees a half-copied skill.
+There is no shared/public active tree in v2.
 """
 
 from __future__ import annotations
@@ -168,18 +169,6 @@ class SkillContentStore:
     # active trees
     # ------------------------------------------------------------------
 
-    async def materialize_public(self, active: Sequence[VisibleSkill]) -> Path:
-        specs: list[tuple[str, str, str]] = []
-        for visible in active:
-            if visible.scope is not SkillScope.PUBLIC or not visible.skill.enabled:
-                continue
-            release = visible.release
-            if release is None or not release.git_commit:
-                raise InvalidSkillPackage("public active skill has no release commit")
-            name = _validate_name(release.public_name, "public_name")
-            specs.append((name, release.git_commit, _skill_directory(release.skill_path)))
-        return await self._materialize_active(self.active_dir / "public", specs)
-
     async def materialize_private(
         self, owner_user_id: str, active: Sequence[VisibleSkill]
     ) -> Path:
@@ -274,6 +263,43 @@ class SkillContentStore:
         return await asyncio.to_thread(
             self._prune_sync, set(keep_commits), float(min_age_seconds)
         )
+
+    async def forget_commits(
+        self, commits: set[str], *, min_age_seconds: float = 0.0
+    ) -> int:
+        """Delete exactly these cached commits (event-driven retention).
+
+        The periodic sweep that compared the whole cache directory against the
+        catalog is gone: callers already know which commits one skill no longer
+        needs, so this deletes only those and never walks another skill cache.
+        A missing cache is harmless: ensure() re-materializes from Git on the
+        next read.
+        """
+        return await asyncio.to_thread(
+            self._forget_sync, set(commits), float(min_age_seconds)
+        )
+
+    def _forget_sync(self, commits: set[str], min_age_seconds: float) -> int:
+        cutoff = time.time() - max(0.0, min_age_seconds)
+        removed = 0
+        for raw in commits:
+            try:
+                source = _validate_commit_id(raw)
+            except InvalidSkillPackage:
+                continue
+            target = self.commits_dir / source
+            if target.is_symlink() or not target.is_dir():
+                continue
+            if min_age_seconds > 0:
+                try:
+                    newest = _newest_mtime(str(target))
+                except OSError:  # 读不到就当它还新：宁可少删
+                    continue
+                if newest > cutoff:
+                    continue
+            shutil.rmtree(target, ignore_errors=True)
+            removed += 1
+        return removed
 
     def _prune_sync(self, keep_commits: set[str], min_age_seconds: float) -> int:
         if not self.commits_dir.is_dir() or self.commits_dir.is_symlink():

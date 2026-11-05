@@ -1,4 +1,4 @@
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { AnchorHTMLAttributes, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -40,7 +40,8 @@ describe("侧栏的最近对话栏", () => {
     );
 
     const nav = view.getByRole("navigation", { name: "最近对话" });
-    expect(nav.textContent).toContain("最近对话");
+    const heading = view.getByRole("heading", { name: /最近对话/ });
+    expect(nav.getAttribute("aria-labelledby")).toBe(heading.id);
     expect(nav.textContent).toContain("第一个会话");
     expect(nav.textContent).toContain("第二个会话");
     // 会话是列表项：不是一串散落的链接
@@ -48,7 +49,22 @@ describe("侧栏的最近对话栏", () => {
     expect(view.getAllByRole("listitem").length).toBe(2);
   });
 
-  it("分区标题在会话列表之上，「新对话」和「知识库」又在标题之上", () => {
+  it("「最近对话」标题在滚动区外面：滚 title 列表时标题不跟着走", () => {
+    const view = render(<Sidebar threads={[makeThread("t1", "第一个会话")]} />);
+
+    const heading = view.getByRole("heading", { name: /最近对话/ });
+    const nav = view.getByRole("navigation", { name: "最近对话" });
+
+    // 结构上不在滚动容器里，标题就不可能被列表带走
+    expect(nav.contains(heading)).toBe(false);
+    expect(
+      heading.compareDocumentPosition(nav) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(nav.className).toContain("overflow-y-auto");
+    expect(nav.className).toContain("overscroll-contain");
+  });
+
+  it("分区标题在会话列表之上，「新对话」和功能导航又在标题之上", () => {
     const view = render(<Sidebar threads={[makeThread("t1", "第一个会话")]} />);
 
     const heading = view.getByRole("heading", { name: /最近对话/ });
@@ -67,15 +83,6 @@ describe("侧栏的最近对话栏", () => {
 
     expect(view.getByRole("heading", { name: /最近对话/ })).toBeTruthy();
     expect(view.getByText(/还没有会话/)).toBeTruthy();
-  });
-
-  it("导航里有「记忆管理」，按当前路由高亮", () => {
-    const view = render(<Sidebar memoryActive threads={[]} />);
-
-    const memory = view.getByRole("link", { name: /记忆管理/ });
-    expect(memory.getAttribute("href")).toBe("/workspace/memory");
-    expect(memory.getAttribute("aria-current")).toBe("page");
-    expect(view.getByRole("link", { name: /我的画像/ }).getAttribute("aria-current")).toBeNull();
   });
 
   it("功能导航按我的画像、记忆管理、技能中心、知识库排列", () => {
@@ -97,6 +104,23 @@ describe("侧栏的最近对话栏", () => {
     ]);
   });
 
+  it("技能入口叫「技能中心」，按当前路由高亮", () => {
+    const view = render(<Sidebar skillsActive threads={[]} />);
+
+    const skills = view.getByRole("link", { name: /技能中心/ });
+    expect(skills.getAttribute("href")).toBe("/workspace/skills");
+    expect(skills.getAttribute("aria-current")).toBe("page");
+  });
+
+  it("导航里有「记忆管理」，按当前路由高亮", () => {
+    const view = render(<Sidebar memoryActive threads={[]} />);
+
+    const memory = view.getByRole("link", { name: /记忆管理/ });
+    expect(memory.getAttribute("href")).toBe("/workspace/memory");
+    expect(memory.getAttribute("aria-current")).toBe("page");
+    expect(view.getByRole("link", { name: /我的画像/ }).getAttribute("aria-current")).toBeNull();
+  });
+
   it("当前会话高亮：aria-current 只挂在它自己身上", () => {
     const view = render(
       <Sidebar activeThreadId="t2" threads={[makeThread("t1", "第一个会话"), makeThread("t2", "第二个会话")]} />,
@@ -104,5 +128,21 @@ describe("侧栏的最近对话栏", () => {
 
     expect(view.getByRole("link", { name: /第二个会话/ }).getAttribute("aria-current")).toBe("page");
     expect(view.getByRole("link", { name: /第一个会话/ }).getAttribute("aria-current")).toBeNull();
+  });
+
+  it("点会话标题会通知外层：即使点的就是当前会话，也要能回到最新一条", () => {
+    const onThreadClick = vi.fn();
+    const view = render(
+      <Sidebar
+        activeThreadId="t2"
+        onThreadClick={onThreadClick}
+        threads={[makeThread("t1", "第一个会话"), makeThread("t2", "第二个会话")]}
+      />,
+    );
+
+    fireEvent.click(view.getByRole("link", { name: /第二个会话/ }));
+
+    // 不 preventDefault：导航照旧，回调只负责滚动
+    expect(onThreadClick).toHaveBeenCalledWith("t2");
   });
 });

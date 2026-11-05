@@ -53,7 +53,8 @@ def test_l0_is_the_only_place_the_index_appears(tmp_path):
         )
     }
 
-    assert "search_and_load_skills" in names
+    assert "search_skills" in names
+    assert "load_skills" in names
     assert "describe_skill" not in names
 
 

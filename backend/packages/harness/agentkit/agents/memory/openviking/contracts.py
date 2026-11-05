@@ -13,7 +13,6 @@ MemoryType = Literal[
     "trajectories",
     "experiences",
     "tools",
-    "skills",
 ]
 SignalKind = Literal[
     "TASK_BOUNDARY",
@@ -35,6 +34,25 @@ class TurnDecision:
     disposition: TurnDisposition
     signals: tuple[SignalKind, ...] = ()
     reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SignalContext:
+    """Inputs for CommitSignalDetector.
+
+    Signals already present here are authoritative: the detector returns them
+    unchanged instead of adding a second opinion. That is how the built-in
+    explicit-memory tool and the heuristic detector stay out of each other's
+    way.
+    """
+
+    user_text: str = ""
+    assistant_text: str = ""
+    signals: tuple[SignalKind, ...] = ()
+    has_tool_error: bool = False
+    has_recovery: bool = False
+    run_status: RunStatus | None = None
+    recent_turns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,10 +8,11 @@ import pytest
 from langchain.tools import ToolRuntime
 from pydantic import ValidationError
 
-from agentkit.agents.memory.openviking.contracts import MemoryHit
+from agentkit.agents.memory.openviking.contracts import MemoryHit, TurnDecision
 from agentkit.agents.memory.openviking.tools import (
     make_memory_overview_tool,
     make_memory_read_tool,
+    make_memory_remember_tool,
     make_memory_search_tool,
 )
 
@@ -94,14 +95,15 @@ async def test_search_tool_rejects_invalid_type_and_mixed_time_filter() -> None:
     facade = FakeFacade()
     tool = make_memory_search_tool(facade)
 
-    with pytest.raises(ValidationError, match="memory_types"):
-        await tool.ainvoke(
-            {
-                "query": "style",
-                "memory_types": ["profile"],
-                "runtime": runtime({"user_id": "u1"}),
-            }
-        )
+    for invalid_type in ("profile", "identity", "semantic", "skills"):
+        with pytest.raises(ValidationError, match="memory_types"):
+            await tool.ainvoke(
+                {
+                    "query": "style",
+                    "memory_types": [invalid_type],
+                    "runtime": runtime({"user_id": "u1"}),
+                }
+            )
 
     mixed = json.loads(
         await tool.ainvoke(
@@ -114,6 +116,73 @@ async def test_search_tool_rejects_invalid_type_and_mixed_time_filter() -> None:
         )
     )
     assert mixed["error"] == "time_filter_requires_events"
+
+
+@pytest.mark.asyncio
+async def test_search_tool_accepts_tools_type() -> None:
+    facade = FakeFacade()
+    tool = make_memory_search_tool(facade)
+
+    await tool.ainvoke(
+        {
+            "query": "usage",
+            "memory_types": ["tools"],
+            "runtime": runtime({"user_id": "u1"}),
+        }
+    )
+
+    assert [call[3] for call in facade.calls] == [["tools"]]
+
+
+@pytest.mark.asyncio
+async def test_explicit_remember_tool_marks_the_current_turn_decision() -> None:
+    tool = make_memory_remember_tool()
+    context = {
+        "user_id": "u1",
+        "capture_decision": TurnDecision("capture", reason="default_capture"),
+    }
+
+    result = json.loads(
+        await tool.ainvoke(
+            {
+                "text": "我喜欢吃苹果",
+                "runtime": runtime(context),
+            }
+        )
+    )
+
+    assert result == {"ok": True, "status": "queued", "signal": "EXPLICIT_REMEMBER"}
+    assert context["capture_decision"].signals == ("EXPLICIT_REMEMBER",)
+
+
+@pytest.mark.asyncio
+async def test_explicit_remember_tool_does_not_duplicate_the_signal() -> None:
+    tool = make_memory_remember_tool()
+    context = {
+        "user_id": "u1",
+        "capture_decision": TurnDecision("capture", signals=("EXPLICIT_REMEMBER",)),
+    }
+
+    await tool.ainvoke(
+        {"text": "我喜欢吃苹果", "runtime": runtime(context)}
+    )
+
+    assert context["capture_decision"].signals == ("EXPLICIT_REMEMBER",)
+
+
+@pytest.mark.asyncio
+async def test_explicit_remember_tool_still_marks_a_missing_decision() -> None:
+    tool = make_memory_remember_tool()
+    context = {"user_id": "u1"}
+
+    result = json.loads(
+        await tool.ainvoke(
+            {"text": "我喜欢吃苹果", "runtime": runtime(context)}
+        )
+    )
+
+    assert result["status"] == "queued"
+    assert context["memory_explicit_remember"] is True
 
 
 @pytest.mark.asyncio

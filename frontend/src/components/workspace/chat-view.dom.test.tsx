@@ -1,5 +1,5 @@
-import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { MessageGroup } from "@/core/messages/group";
 import type { ChatController } from "@/core/threads/chat-controller";
@@ -55,7 +55,7 @@ function renderView(controller: ChatController) {
   );
 }
 
-describe("ChatView 的图级中断", () => {
+describe("图级中断", () => {
   it("有待确认项时显示确认面板并锁住输入框", () => {
     const view = renderView(
       makeController({
@@ -81,10 +81,10 @@ describe("空会话：输入框在页面中间", () => {
     expect(view.getByText(HERO_TEXT)).toBeDefined();
   });
 
-  it("空会话不渲染产物面板（「这一轮还没有产物」在落地态只是噪声）", () => {
+  it("空会话不渲染产物面板", () => {
     const view = renderView(makeController());
 
-    expect(view.queryByText("这一轮还没有产物。")).toBeNull();
+    expect(view.queryByRole("complementary", { name: "产物" })).toBeNull();
   });
 
   it("**拉历史时不算空会话** —— 否则每个已有会话首屏都会闪一下 hero", () => {
@@ -117,10 +117,41 @@ describe("对话开始后：输入框落到底部", () => {
     expect(started.getByRole("textbox", { name: "消息输入框" })).toBeDefined();
   });
 
-  it("有产物时才渲染产物面板", () => {
-    const view = renderView(makeController({ groups: [humanGroup], artifacts: ["a.txt"] }));
+  it("用户上翻历史后发送消息，会跳回最底部", async () => {
+    const submit = vi.fn(async () => {});
+    const view = renderView(
+      makeController({
+        groups: [humanGroup],
+        messages: [humanGroup.message],
+        submit,
+      }),
+    );
 
-    expect(view.queryByText("这一轮还没有产物。")).toBeNull();
+    const viewport = view.container.querySelector<HTMLElement>(".overflow-y-auto");
+    if (!viewport) throw new Error("没找到消息滚动容器");
+    // happy-dom 没有布局：给滚动容器补一份固定尺寸，才能验证"上翻"和"回到底部"
+    Object.defineProperty(viewport, "scrollHeight", { configurable: true, value: 1_200 });
+    Object.defineProperty(viewport, "clientHeight", { configurable: true, value: 400 });
+    viewport.scrollTop = 0;
+    fireEvent.scroll(viewport);
+
+    fireEvent.change(view.getByRole("textbox", { name: "消息输入框" }), {
+      target: { value: "新问题" },
+    });
+    fireEvent.click(view.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => {
+      expect(viewport.scrollTop).toBeGreaterThanOrEqual(800);
+    });
+    expect(submit).toHaveBeenCalledWith("新问题", []);
+  });
+
+  it("有产物时才渲染产物面板；没有产物时右边什么都不留", () => {
+    const withoutArtifacts = renderView(makeController({ groups: [humanGroup] }));
+    expect(withoutArtifacts.queryByRole("complementary", { name: "产物" })).toBeNull();
+    cleanup();
+
+    const view = renderView(makeController({ groups: [humanGroup], artifacts: ["a.txt"] }));
     expect(view.getByRole("complementary", { name: "产物" })).toBeDefined();
   });
 });

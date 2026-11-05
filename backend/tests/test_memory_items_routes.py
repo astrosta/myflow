@@ -103,7 +103,7 @@ def _client(library: FakeLibrary | None = None, *, unavailable: bool = False) ->
     return TestClient(app, raise_server_exceptions=False)
 
 
-def test_types_endpoint_lists_the_six_chinese_labels() -> None:
+def test_types_endpoint_lists_manageable_types_without_skills() -> None:
     client = _client()
 
     body = client.get("/api/memory/items/types").json()
@@ -115,7 +115,9 @@ def test_types_endpoint_lists_the_six_chinese_labels() -> None:
         ("cases", "案例"),
         ("trajectories", "轨迹"),
         ("experiences", "经验"),
+        ("tools", "工具"),
     ]
+    assert all(item["type"] != "skills" for item in body["items"])
 
 
 def test_list_maps_summaries_and_forwards_type_and_limit() -> None:
@@ -145,7 +147,7 @@ def test_unknown_type_is_422_without_touching_the_library() -> None:
     fake = FakeLibrary()
     client = _client(fake)
 
-    response = client.get("/api/memory/items?type=tools")
+    response = client.get("/api/memory/items?type=skills")
 
     assert response.status_code == 422
     assert response.json()["code"] == "invalid_memory_uri"

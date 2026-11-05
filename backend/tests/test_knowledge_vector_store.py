@@ -258,6 +258,7 @@ async def test_search_filters_by_user_and_optional_bases_and_threshold() -> None
     assert call["filter"] == 'user_id == "u1" and knowledge_base_id in ["b1"]'
     assert call["limit"] == 5
     assert call["data"] == [[1.0, 0.0, 0.0, 0.0]]
+    assert call["search_params"]["params"] == {}
     await store.aclose()
 
 
@@ -292,6 +293,7 @@ async def test_hybrid_search_fuses_both_channels_with_rrf() -> None:
     assert sparse.expr == dense.expr
     assert dense.anns_field == "embedding"
     assert dense.data == [[1.0, 0.0, 0.0, 0.0]]
+    assert dense.param["params"] == {}
     assert sparse.anns_field == "sparse"
     assert sparse.data == ["E1024"]
     assert sparse.param["metric_type"] == "BM25"
@@ -397,6 +399,8 @@ async def test_collection_is_created_with_bm25_sparse_field_and_analyzer() -> No
     sparse_index = next(i for i in fake.index_params.indexes if i["field_name"] == "sparse")
     assert sparse_index["metric_type"] == "BM25"
     assert sparse_index["params"] == {"bm25_k1": 1.5, "bm25_b": 0.7}
+    embedding_index = next(i for i in fake.index_params.indexes if i["field_name"] == "embedding")
+    assert embedding_index["params"] == {}
     assert fake.created[0]["collection_name"] == "kb"
     await store.aclose()
 

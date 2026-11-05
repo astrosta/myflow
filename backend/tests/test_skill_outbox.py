@@ -59,8 +59,9 @@ class FakeProjection:
         if projection_key in self.keys:
             self.keys.remove(projection_key)
 
-    async def list_projection_keys(self) -> list[str]:
-        return list(self.keys)
+    async def scan_projection_keys(self, *, limit: int) -> tuple[list[str], bool]:
+        keys = list(self.keys)[: max(0, int(limit))]
+        return keys, len(self.keys) > len(keys)
 
 
 class FakeContent:
@@ -146,36 +147,29 @@ async def save_skill(
         skill_path=path,
     )
     harness.content.texts[(commit, path)] = body
-    return skill, version
 
-
-async def publish_skill(
-    harness: Harness,
-    *,
-    owner: str,
-    skill: object,
-    version: object,
-    seq: int,
-    public_name: str | None = None,
-) -> object:
-    submission = await harness.store.create_submission(
+    # v2 lifecycle: saving is inert; a passing scan + explicit activation is what
+    # produces the projection event these worker tests consume.
+    scan = await harness.store.record_security_scan(
         skill_id=skill.id,
-        version=version,
         owner_user_id=owner,
-        submitted_commit=version.draft_commit,
+        version_id=version.id,
+        status="completed",
+        is_safe=True,
+        max_severity="SAFE",
+        findings=[],
+        scanner="cisco-ai-skill-scanner",
+        scanner_version="2.3.2",
+        duration_ms=1,
     )
-    commit = ("1" if seq == 0 else COMMITS[seq % len(COMMITS)]) * 40
-    release = await harness.store.record_public_release(
-        submission=submission,
-        public_name=public_name or skill.private_name,
-        git_repository="https://example.invalid/skills.git",
-        git_commit=commit,
-        skill_path=f"public/{public_name or skill.private_name}/SKILL.md",
-        source_commit=version.draft_commit,
-        actor="admin",
+    await harness.store.activate_version(
+        skill_id=skill.id,
+        owner_user_id=owner,
+        version_id=version.id,
+        scan_id=scan.id,
+        actor=owner,
     )
-    harness.content.texts[(commit, release.skill_path)] = f"# public body {seq}\n"
-    return release
+    return skill, version
 
 
 async def outbox_rows(
@@ -234,28 +228,20 @@ async def test_pending_upsert_embeds_and_marks_the_current_version_ready(
 
 
 @pytest.mark.asyncio
-async def test_public_upsert_uses_the_release_public_name_without_reading_the_body(
-    harness: Harness,
-) -> None:
+async def test_toggle_event_writes_the_new_enabled_flag(harness: Harness) -> None:
     skill, version = await save_skill(harness, owner="u1", name="pdf-tools", seq=1)
-    release = await publish_skill(
-        harness, owner="u1", skill=skill, version=version, seq=1
-    )
+    worker = harness.worker()
+    await worker.run_once()
 
-    assert await harness.worker().run_once() == 3
-
-    public = next(
-        row
-        for row in harness.projection.upserts
-        if row.projection_key == f"public:{skill.id}"
+    await harness.store.set_skill_enabled(
+        skill_id=skill.id,
+        owner_user_id="u1",
+        enabled=False,
+        index_enabled=True,
     )
-    assert public.scope == "public"
-    assert public.owner_user_id is None
-    assert public.name == "pdf-tools"
-    assert public.version_id == version.id
-    assert public.enabled is True
-    # 公共名进投影，但不读正文：正文不再参与 embedding。
-    assert harness.content.reads == []
+    assert await worker.run_once() >= 1
+
+    assert harness.projection.rows[f"private:u1:{skill.id}"].enabled is False
     assert await version_status(harness, version.id) == "ready"
 
 
@@ -327,36 +313,6 @@ async def test_old_upsert_after_a_newer_private_pointer_is_skipped_and_done(
 
 
 @pytest.mark.asyncio
-async def test_stale_enabled_payload_is_skipped_after_a_settings_change(
-    harness: Harness,
-) -> None:
-    skill, version = await save_skill(harness, owner="u1", name="pdf-tools", seq=1)
-    await publish_skill(harness, owner="u1", skill=skill, version=version, seq=1)
-    key = f"public:{skill.id}"
-    rows = [row for row in await outbox_rows(harness, skill_id=skill.id) if row.projection_key == key]
-    assert len(rows) == 1
-    old_event = rows[0]
-    await harness.store.set_global_enabled(skill.id, False, actor="admin")
-    rows = [row for row in await outbox_rows(harness, skill_id=skill.id) if row.projection_key == key]
-    assert len(rows) == 2
-    newest = next(row for row in rows if row.id != old_event.id)
-    async with harness.session_factory() as session:
-        row = await session.get(SkillIndexOutboxRow, newest.id)
-        assert row is not None
-        row.status = "done"
-        await session.commit()
-        old = await session.get(SkillIndexOutboxRow, old_event.id)
-        assert old is not None and old.status == "pending"
-
-    assert await harness.worker().run_once() >= 1
-
-    assert all(row.projection_key != key for row in harness.projection.upserts)
-    async with harness.session_factory() as session:
-        old = await session.get(SkillIndexOutboxRow, old_event.id)
-        assert old is not None and old.status == "done"
-
-
-@pytest.mark.asyncio
 async def test_newest_pending_event_wins_for_one_projection_key(harness: Harness) -> None:
     skill, first = await save_skill(harness, owner="u1", name="pdf-tools", seq=1)
     _skill, second = await save_skill(
@@ -407,116 +363,145 @@ async def test_exhausted_event_marks_the_version_failed_and_finishes(harness: Ha
 
 
 @pytest.mark.asyncio
-async def test_reconcile_upserts_all_active_rows_and_deletes_orphan_keys(
+async def test_repair_upserts_pending_versions_and_verify_deletes_orphan_keys(
     harness: Harness,
 ) -> None:
-    u1_skill, u1_version = await save_skill(harness, owner="u1", name="one", seq=1)
-    u2_skill, u2_version = await save_skill(harness, owner="u2", name="two", seq=2)
-    public_skill, public_version = await save_skill(
-        harness, owner="u3", name="three", seq=3
-    )
-    release = await publish_skill(
-        harness, owner="u3", skill=public_skill, version=public_version, seq=3
-    )
-    harness.projection.keys = [
-        f"private:u1:{u1_skill.id}",
-        f"private:u2:{u2_skill.id}",
-        f"public:{public_skill.id}",
-        "public:gone",
-        "private:u9:gone",
-    ]
+    u1_skill, _u1_version = await save_skill(harness, owner="u1", name="one", seq=1)
+    u2_skill, _u2_version = await save_skill(harness, owner="u2", name="two", seq=2)
+    u3_skill, u3_version = await save_skill(harness, owner="u3", name="three", seq=3)
 
-    assert await harness.worker().reconcile() == 6
+    stats = await harness.worker().repair_missing(budget_rows=50, budget_seconds=5.0)
 
+    assert (stats.scanned, stats.repaired, stats.failed) == (3, 3, 0)
     upserted = {row.projection_key: row for row in harness.projection.upserts}
     assert set(upserted) == {
         f"private:u1:{u1_skill.id}",
         f"private:u2:{u2_skill.id}",
-        f"private:u3:{public_skill.id}",
-        f"public:{public_skill.id}",
+        f"private:u3:{u3_skill.id}",
     }
-    assert upserted[f"private:u1:{u1_skill.id}"].version_id == u1_version.id
-    assert upserted[f"private:u2:{u2_skill.id}"].version_id == u2_version.id
-    assert upserted[f"public:{public_skill.id}"].version_id == public_version.id
-    assert upserted[f"public:{public_skill.id}"].name == "three"
-    # 对账不再读正文（嵌入文本只有元数据），只对齐 key 与版本状态。
-    assert harness.content.reads == []
+    assert harness.content.reads == []  # 投影文本只有元数据，不读正文
+    assert await version_status(harness, u3_version.id) == "ready"
+
+    # 巡查：Milvus 少了 u3，多了两条孤儿。巡检自己不 embedding。
+    harness.projection.keys = [
+        f"private:u1:{u1_skill.id}",
+        f"private:u2:{u2_skill.id}",
+        "public:gone",
+        "private:u9:gone",
+    ]
+    harness.projection.upserts.clear()
+    verify = await harness.worker().verify_projection(budget_rows=50, budget_seconds=5.0)
+
+    assert verify.missing == 1
+    assert harness.projection.upserts == []
     assert set(harness.projection.deletes) == {"public:gone", "private:u9:gone"}
-    assert set(harness.projection.keys) == set(upserted)
-    assert await version_status(harness, u1_version.id) == "ready"
-    assert await version_status(harness, public_version.id) == "ready"
+    assert await version_status(harness, u3_version.id) == "pending"
+
+    # 快路径把巡查发现的缺失补回来。
+    again = await harness.worker().repair_missing(budget_rows=50, budget_seconds=5.0)
+    assert again.repaired == 1
+    assert [row.projection_key for row in harness.projection.upserts] == [
+        f"private:u3:{u3_skill.id}"
+    ]
+    assert await version_status(harness, u3_version.id) == "ready"
 
 
 @pytest.mark.asyncio
-async def test_projection_text_is_name_and_description_only(
+async def test_a_truncated_verify_cannot_claim_a_key_is_missing(
     harness: Harness,
 ) -> None:
-    """正文改了不重新 embedding；描述改了才重新 embedding。"""
+    """扫描被预算截断时不能把"没看到"当成"不存在"，否则会把健康行标回 pending。"""
+    _skill, version = await save_skill(harness, owner="u1", name="one", seq=1)
+    await harness.worker().repair_missing(budget_rows=50, budget_seconds=5.0)
+    harness.projection.keys = ["private:u9:gone", "private:u8:gone"]
 
-    skill, version = await save_skill(harness, owner='u1', name='pdf-tools', seq=1)
-    assert await harness.worker().run_once() == 1
-    first = harness.embedder.calls[0]
+    verify = await harness.worker().verify_projection(budget_rows=1, budget_seconds=5.0)
 
-    # 同一描述、新正文：只有 body 变了。
-    changed_body, version_two = await save_skill(
-        harness,
-        owner='u1',
-        name='pdf-tools',
-        seq=2,
-        description='pdf-tools description 1',
-        skill=skill,
-    )
-    assert changed_body.id == skill.id
-    await harness.worker().run_once()
-
-    texts = [call[0] for call in harness.embedder.calls]
-    assert texts[0] == texts[1]
-    assert 'body' not in texts[0].lower()
-
-
-@pytest.mark.asyncio
-async def test_reconcile_is_cheap_in_steady_state_and_repairs_real_drift(
-    harness: Harness,
-) -> None:
-    """对账不能每 10 分钟把整个目录重新 embedding 一遍。
-
-    稳态（key 在、版本 ready）= 0 次 upsert；真正漂移的三种情况必须修：
-    collection 被清空、事件丢了（版本一直 pending）、以及 --force 全量重刷。
-    """
-    skill, version = await save_skill(harness, owner="u1", name="one", seq=1)
-    key = f"private:u1:{skill.id}"
-
-    # 第一轮：pending → 建行 + 标 ready。
-    assert await harness.worker().reconcile() == 1
+    assert verify.truncated is True
+    assert verify.missing == 0
     assert await version_status(harness, version.id) == "ready"
+
+
+@pytest.mark.asyncio
+async def test_repair_is_cheap_in_steady_state_and_backs_off_a_failing_row(
+    harness: Harness,
+) -> None:
+    skill, version = await save_skill(harness, owner="u1", name="one", seq=1)
+    worker = harness.worker()
+
+    assert (await worker.repair_missing(budget_rows=50, budget_seconds=5.0)).repaired == 1
     harness.projection.upserts.clear()
     embedded = len(harness.embedder.calls)
 
-    # 稳态：什么都不做，尤其不重新 embedding。
-    assert await harness.worker().reconcile() == 0
+    steady = await worker.repair_missing(budget_rows=50, budget_seconds=5.0)
+    assert (steady.scanned, steady.repaired) == (0, 0)
     assert harness.projection.upserts == []
     assert len(harness.embedder.calls) == embedded
 
-    # collection 被清空：key 不在 Milvus 里了，必须补回来。
-    harness.projection.keys = []
-    harness.projection.rows = {}
-    assert await harness.worker().reconcile() == 1
-    assert [row.projection_key for row in harness.projection.upserts] == [key]
-
-    # 事件丢了 / 重试耗尽：版本状态不是 ready，必须重刷。
-    harness.projection.upserts.clear()
+    # 坏行失败一次就退避：下一轮不再为它花一次 provider 调用。
+    harness.embedder.fail = True
     await harness.store.set_version_index_status(version.id, "pending")
-    assert await harness.worker().reconcile() == 1
-    assert await version_status(harness, version.id) == "ready"
+    failed = await worker.repair_missing(budget_rows=50, budget_seconds=5.0)
+    assert failed.failed == 1
+    assert (await worker.repair_missing(budget_rows=50, budget_seconds=5.0)).scanned == 0
 
-    # 运维手工修过 collection：--force 全量重刷，即使看起来是健康的。
-    harness.projection.upserts.clear()
-    assert await harness.worker().reconcile(force=True) == 1
-    assert [row.projection_key for row in harness.projection.upserts] == [key]
+    async with harness.session_factory() as session:
+        row = await session.get(SkillVersionRow, version.id)
+        assert row is not None
+        assert row.index_status == "failed"
+        assert row.index_attempts == 1
+        assert row.index_next_attempt_at is not None
+        assert row.index_last_error and "RuntimeError" in row.index_last_error
 
 
 @pytest.mark.asyncio
-async def test_prune_keeps_active_pending_and_recent_versions_only(
+async def test_repair_stops_at_its_row_budget_and_reports_truncation(
+    harness: Harness,
+) -> None:
+    for index in range(3):
+        await save_skill(harness, owner=f"u{index}", name=f"skill-{index}", seq=index + 1)
+    worker = harness.worker()
+
+    first = await worker.repair_missing(budget_rows=2, budget_seconds=5.0)
+    assert (first.scanned, first.repaired, first.truncated) == (2, 2, True)
+
+    second = await worker.repair_missing(budget_rows=2, budget_seconds=5.0)
+    assert (second.scanned, second.repaired, second.truncated) == (1, 1, False)
+
+
+@pytest.mark.asyncio
+async def test_a_version_past_its_attempt_limit_is_left_for_an_operator(
+    harness: Harness,
+) -> None:
+    _skill, version = await save_skill(harness, owner="u1", name="one", seq=1)
+    worker = SkillIndexOutboxWorker(
+        harness.store,
+        harness.content,  # type: ignore[arg-type]
+        harness.embedder,
+        harness.projection,  # type: ignore[arg-type]
+        repair_max_attempts=2,
+    )
+    harness.embedder.fail = True
+
+    assert (await worker.repair_missing(budget_rows=10, budget_seconds=5.0)).failed == 1
+    async with harness.session_factory() as session:
+        row = await session.get(SkillVersionRow, version.id)
+        assert row is not None
+        row.index_next_attempt_at = None  # 到期：模拟退避时间已过
+        await session.commit()
+    assert (await worker.repair_missing(budget_rows=10, budget_seconds=5.0)).failed == 1
+
+    async with harness.session_factory() as session:
+        row = await session.get(SkillVersionRow, version.id)
+        assert row is not None
+        assert row.index_attempts == 2
+        assert row.index_next_attempt_at is None
+    # 到达上限之后不再自动重试，也不会被"到期"重新捡起来。
+    assert (await worker.repair_missing(budget_rows=10, budget_seconds=5.0)).scanned == 0
+
+
+@pytest.mark.asyncio
+async def test_forget_commits_keeps_active_pending_and_recent_versions(
     harness: Harness, tmp_path: Path
 ) -> None:
     skill, versions = None, []
@@ -528,7 +513,7 @@ async def test_prune_keeps_active_pending_and_recent_versions_only(
     assert skill is not None
     await mark_all_done(harness)
 
-    # v1 is referenced by a pending event even though it is older than keep 2.
+    # v1 比"最近 2 版"更旧，但还有一条待处理事件引用它。
     await harness.store.enqueue_outbox(
         op="upsert_active",
         projection_key="private:u1:queued",
@@ -557,40 +542,46 @@ async def test_prune_keeps_active_pending_and_recent_versions_only(
         harness.embedder,
         harness.projection,  # type: ignore[arg-type]
     )
-    active_key = f"private:u1:{skill.id}"
-    harness.projection.keys = [active_key, "private:u1:queued", "public:orphan"]
 
-    async with harness.session_factory() as session:
-        versions_before = await session.scalar(
-            select(func.count()).select_from(SkillVersionRow)
-        )
-        skills_before = await session.scalar(select(func.count()).select_from(SkillRow))
-
-    assert await worker.prune(keep_versions_per_skill=2) == 3
+    assert await worker.forget_commits(skill.id, keep_versions=2) == 1
 
     assert (commits_dir / pending_commit).is_dir()
     assert (commits_dir / versions[2].draft_commit).is_dir()
     assert (commits_dir / versions[3].draft_commit).is_dir()
     assert not (commits_dir / prunable_commit).exists()
-    assert not (commits_dir / orphan_commit).exists()
-    assert harness.projection.deletes == ["public:orphan"]
-    assert "private:u1:queued" in harness.projection.keys
-
-    async with harness.session_factory() as session:
-        assert await session.scalar(
-            select(func.count()).select_from(SkillVersionRow)
-        ) == versions_before
-        assert await session.scalar(select(func.count()).select_from(SkillRow)) == skills_before
-        [event] = (await session.scalars(
-            select(SkillIndexOutboxRow).where(
-                SkillIndexOutboxRow.projection_key == "private:u1:queued"
-            )
-        )).all()
-        assert event.status == "pending"
+    # 别的技能的提交不在候选里：事件驱动清理只做这个技能自己的账。
+    assert (commits_dir / orphan_commit).is_dir()
+    assert harness.projection.deletes == []
 
 
 @pytest.mark.asyncio
-async def test_prune_normalizes_commit_ids_for_the_content_cache(
+async def test_forget_commits_clears_everything_for_a_deleted_skill(
+    harness: Harness, tmp_path: Path
+) -> None:
+    skill, version = await save_skill(harness, owner="u1", name="pdf-tools", seq=1)
+    await mark_all_done(harness)
+    commit = version.draft_commit
+    assert commit is not None
+    cache_dir = tmp_path / "cache"
+    (cache_dir / "commits" / commit).mkdir(parents=True)
+
+    await harness.store.delete_private_draft(
+        skill_id=skill.id, owner_user_id="u1", actor="u1"
+    )
+    content = SkillContentStore(cache_dir, None)  # type: ignore[arg-type]
+    worker = SkillIndexOutboxWorker(
+        harness.store,
+        content,
+        harness.embedder,
+        harness.projection,  # type: ignore[arg-type]
+    )
+
+    assert await worker.forget_commits(skill.id, keep_versions=20) == 1
+    assert not (cache_dir / "commits" / commit).exists()
+
+
+@pytest.mark.asyncio
+async def test_forget_commits_normalizes_commit_ids(
     harness: Harness, tmp_path: Path
 ) -> None:
     _skill, version = await save_skill(harness, owner="u1", name="pdf-tools", seq=1)
@@ -616,5 +607,6 @@ async def test_prune_normalizes_commit_ids_for_the_content_cache(
         harness.projection,  # type: ignore[arg-type]
     )
 
-    assert await worker.prune(keep_versions_per_skill=1) == 0
+    # 大写 commit 仍然指向同一个缓存目录，保留集必须能认出来。
+    assert await worker.forget_commits(_skill.id, keep_versions=1) == 0
     assert (cache_dir / "commits" / commit).is_dir()

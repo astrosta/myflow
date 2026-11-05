@@ -18,7 +18,6 @@ from agentkit.persistence.schema import (
     Base,
     SkillDraftFileRow,
     SkillIndexOutboxRow,
-    SkillReleaseRow,
     SkillVersionRow,
 )
 from agentkit.skills.domain import StagedFile, StagedFileInfo
@@ -129,7 +128,7 @@ def test_put_draft_file_upserts_bytes_sha_size_and_mode(harness: Harness) -> Non
     harness.run(scenario)
 
 
-def test_delete_all_draft_files_keeps_versions_and_releases(harness: Harness) -> None:
+def test_delete_all_draft_files_keeps_versions_and_outbox(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.store.create_skill(owner_user_id="u1", private_name="pdf-tools")
         manifest = build_package(
@@ -152,20 +151,24 @@ def test_delete_all_draft_files_keeps_versions_and_releases(harness: Harness) ->
             draft_commit="a" * 40,
             skill_path=f"users/u1/{skill.id}/SKILL.md",
         )
-        submission = await harness.store.create_submission(
+        scan = await harness.store.record_security_scan(
             skill_id=skill.id,
-            version=version,
             owner_user_id="u1",
-            submitted_commit=version.draft_commit,
+            version_id=version.id,
+            status="completed",
+            is_safe=True,
+            max_severity="SAFE",
+            findings=[],
+            scanner="cisco-ai-skill-scanner",
+            scanner_version="2.3.2",
+            duration_ms=1,
         )
-        await harness.store.record_public_release(
-            submission=submission,
-            public_name="pdf-tools",
-            git_repository="https://example.invalid/skills.git",
-            git_commit="b" * 40,
-            skill_path="public/pdf-tools/SKILL.md",
-            source_commit=submission.submitted_commit,
-            actor="admin",
+        await harness.store.activate_version(
+            skill_id=skill.id,
+            owner_user_id="u1",
+            version_id=version.id,
+            scan_id=scan.id,
+            actor="u1",
         )
         await harness.store.put_draft_file(skill.id, "SKILL.md", b"# staged\n")
 
@@ -175,18 +178,12 @@ def test_delete_all_draft_files_keeps_versions_and_releases(harness: Harness) ->
                 .select_from(SkillVersionRow)
                 .where(SkillVersionRow.skill_id == skill.id)
             )
-            releases_before = await session.scalar(
-                select(func.count())
-                .select_from(SkillReleaseRow)
-                .where(SkillReleaseRow.skill_id == skill.id)
-            )
             outbox_before = await session.scalar(
                 select(func.count())
                 .select_from(SkillIndexOutboxRow)
                 .where(SkillIndexOutboxRow.skill_id == skill.id)
             )
         assert versions_before == 1
-        assert releases_before == 1
         assert outbox_before >= 1
 
         await harness.store.delete_all_draft_files(skill.id)
@@ -205,11 +202,6 @@ def test_delete_all_draft_files_keeps_versions_and_releases(harness: Harness) ->
                 .select_from(SkillVersionRow)
                 .where(SkillVersionRow.skill_id == skill.id)
             ) == versions_before
-            assert await session.scalar(
-                select(func.count())
-                .select_from(SkillReleaseRow)
-                .where(SkillReleaseRow.skill_id == skill.id)
-            ) == releases_before
             assert await session.scalar(
                 select(func.count())
                 .select_from(SkillIndexOutboxRow)

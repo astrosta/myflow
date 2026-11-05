@@ -8,7 +8,10 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
+from agentkit.agents.memory.openviking.config import (
+    DEFAULT_SESSION_MEMORY_TYPES,
+    OpenVikingMemoryConfig,
+)
 from agentkit.agents.memory.openviking.session import (
     SessionAlreadyExists,
     SessionManager,
@@ -40,7 +43,12 @@ class FakeClient:
             "memory_policy": options["memory_policy"],
             "auto_commit_policy": options["auto_commit_policy"],
         }
-        return self.sessions[session_id]
+        # OpenViking 0.5.2 create_session does not echo memory_policy; the
+        # effective policy is only visible from a subsequent get_session.
+        return {
+            "session_id": session_id,
+            "auto_commit_policy": options["auto_commit_policy"],
+        }
 
     async def update_session_config(self, session_id: str, *, options: dict) -> dict:
         self.calls.append(("update", session_id, options))
@@ -100,12 +108,14 @@ async def test_ensure_session_creates_with_explicit_policy(manager) -> None:
     ref = await session_manager.resolve_capture_context("u1", "t1")
     await session_manager.ensure_session(ref)
 
+    assert [call[0] for call in client.calls] == ["get", "create", "get"]
     assert client.calls[0] == ("get", ref.ov_session_id, False)
-    assert client.calls[1][0] == "create"
     options = client.calls[1][2]
     assert options["auto_commit_policy"]["idle_timeout_seconds"] == 86400
     assert options["auto_commit_policy"]["pending_token_threshold"] == 0
-    assert options["memory_policy"]["memory_types"] == list(OpenVikingMemoryConfig().session.memory_types)
+    assert options["memory_policy"]["memory_types"] == list(
+        DEFAULT_SESSION_MEMORY_TYPES
+    )
 
 
 @pytest.mark.asyncio

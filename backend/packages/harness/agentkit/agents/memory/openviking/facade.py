@@ -112,6 +112,11 @@ class MemoryFacade:
             **metadata,
         )
 
+    async def commit_session(self, session: SessionRef) -> None:
+        """Commit one thread session so OpenViking extracts the appended messages."""
+
+        await self._sessions.commit(session)
+
     async def process(self, captured: CapturedMessage) -> str:
         return await self._worker.process(captured)
 

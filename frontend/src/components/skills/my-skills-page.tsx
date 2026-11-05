@@ -8,31 +8,27 @@ import { Button } from "@/components/ui/button";
 import { BookOpenIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  createSkill,
   listMySkills,
   listSkills,
-  openDraft,
+  setSkillPreference,
   SkillApiError,
   type SkillListItem,
 } from "@/core/api/skills";
-import { useSession } from "@/core/auth/use-session";
 
-import { CreateSkillDialog } from "./create-skill-dialog";
+import { skillIndexStatusLabel } from "./skill-index-status";
 import { SkillStatusBadge } from "./skill-status-badge";
 
 /**
- * 「我的技能」：左半是**我自己的私有草稿**（/skills/mine，作者路由），
- * 右半是**已发布的公共目录**（/skills?scope=public）：内置技能单独只读列出，
- * 公共行只读 + 自己的那一行可回编辑器。
+ * 「技能中心」：只展示当前用户自己的技能。
  *
- * 两个列表必须分开取：mine 是 author 路由，行主键叫 id、永远 scope=private；
- * 公共目录是运行时快照，行是 skill_id、来源可能是 filesystem（skill_id
- * 为空时客户端回退到 name）。scope=public 还能避免作者自己的私有副本把同名
- * 公共行压掉；否则审核中的草稿会混进公共目录，已发布版本也会对作者隐身。
+ * - /skills/mine 是权威作者列表：草稿、待扫描、扫描未通过、已扫描、已生效都在这里；
+ * - /skills 只用来取内置技能（内置于服务端，不写 Git/数据库）。
  *
- * 页面只负责装配：取数、空态、错误、创建后失效与跳转。
+ * 没有公共目录，也没有管理员审核入口。保存后的版本必须经过安全扫描并点击生效，
+ * 才会出现在运行时与向量索引里。
  */
 
-/** 接口错误给一句人读的话：网关的 detail 最具体，没有就退回 status。 */
 function readableError(error: unknown): string {
   if (error instanceof SkillApiError) {
     return error.detail || "请求失败（HTTP " + error.status + "）";
@@ -42,107 +38,83 @@ function readableError(error: unknown): string {
 }
 
 const editorHref = (skillId: string) => "/workspace/skills/" + encodeURIComponent(skillId);
-
 const ROW_CLASS = "rounded-lg border border-neutral-200 bg-white p-4 transition-colors";
 
-/**
- * 公共目录。新网关用 ?scope=public 直接拿已发布行；还没重启的旧网关会
- * 把 scope 判成 422，此时退回 effective 并在客户端剔除草稿。
- *
- * 回退分支只认 approved 的私有行，因为旧快照里作者自己的公共版本会被
- * 同名私有行压掉；这不是新的权威来源，只是为了滚动升级期间页面能打开。
- */
-async function fetchPublicCatalog(): Promise<SkillListItem[]> {
-  try {
-    return await listSkills("public");
-  } catch (cause) {
-    if (
-      !(cause instanceof SkillApiError) ||
-      cause.status !== 422 ||
-      !cause.detail.includes("query.scope")
-    ) {
-      throw cause;
-    }
-    const rows = await listSkills();
-    return rows.reduce<SkillListItem[]>((visible, skill) => {
-      if (skill.scope === "public" || skill.scope === "builtin") {
-        visible.push(skill);
-      } else if (skill.scope === "private" && skill.status === "approved") {
-        visible.push({ ...skill, scope: "public" });
-      }
-      return visible;
-    }, []);
-  }
+const NEW_SKILL_DESCRIPTION = "在 SKILL.md 中填写技能说明";
+
+/** 新建时先落一个可编辑的占位技能；真正的名称和描述以 SKILL.md 为准。 */
+function newSkillIdentity(): { name: string; description: string } {
+  const suffix = Math.random().toString(36).slice(2, 10) || Date.now().toString(36);
+  return {
+    name: "new-skill-" + suffix,
+    description: NEW_SKILL_DESCRIPTION,
+  };
 }
 
 export function MySkillsPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
-  const { user } = useSession();
   const [creating, setCreating] = useState(false);
-  const [openingId, setOpeningId] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [toggleError, setToggleError] = useState<string | null>(null);
 
   const mineQuery = useQuery({
     queryKey: ["skills", "mine"],
     queryFn: listMySkills,
     staleTime: 5_000,
   });
-  const catalogQuery = useQuery({
-    queryKey: ["skills", "public"],
-    queryFn: fetchPublicCatalog,
+  // 内置技能来自目录接口；目录里的用户行是 active 副本，这里只取内置。
+  const builtinQuery = useQuery({
+    queryKey: ["skills", "catalog"],
+    queryFn: listSkills,
     staleTime: 5_000,
   });
 
   const mine = mineQuery.data ?? [];
-  const catalog = catalogQuery.data ?? [];
-  // 公共目录只接收已发布行；内置技能仍从同一快照里单列。
-  const builtins = catalog.filter((skill) => skill.scope === "builtin");
-  const publicSkills = catalog.filter((skill) => skill.scope === "public");
-  // 已发布版本在 /skills/mine 里仍是一条私有记录。只有它的版本和公共目录
-  // 当前发布版本一致时才从草稿区隐藏；作者已经开始改下一版时仍留在草稿区。
-  const publishedVersionIds = new Set(
-    publicSkills
-      .map((skill) => skill.version_id)
-      .filter((versionId): versionId is string => versionId !== null),
-  );
-  const drafts = mine.filter((skill) => {
-    if (skill.status !== "approved" || skill.version_id === null) return true;
-    return !publishedVersionIds.has(skill.version_id);
-  });
-  const error = mineQuery.error ?? catalogQuery.error;
-  const loading = mineQuery.isLoading || catalogQuery.isLoading;
+  const drafts = mine.filter((skill) => skill.status !== "active");
+  const activeSkills = mine.filter((skill) => skill.status === "active");
+  const builtins = (builtinQuery.data ?? []).filter((skill) => skill.scope === "builtin");
+  const error = mineQuery.error ?? builtinQuery.error;
+  const loading = mineQuery.isLoading || builtinQuery.isLoading;
+  const empty = !loading && !error && mine.length === 0 && builtins.length === 0;
 
   const openEditor = (skill: SkillListItem) => {
     router.push(editorHref(skill.skill_id));
   };
 
-  const created = (skill: SkillListItem) => {
-    setCreating(false);
-    void queryClient.invalidateQueries({ queryKey: ["skills", "mine"] });
-    openEditor(skill);
-  };
-
-  /**
-   * 公共技能的「编辑」＝先开一份草稿（后端把公共版本复制进私有草稿），
-   * 再进编辑器。openDraft 失败就停在原地报错，不要跳到一个打不开的页面。
-   */
-  const editOwnPublic = async (skill: SkillListItem) => {
-    if (openingId) return;
-    setOpeningId(skill.skill_id);
-    setActionError(null);
+  const toggleEnabled = async (skill: SkillListItem) => {
+    if (togglingId) return;
+    setTogglingId(skill.skill_id);
+    setToggleError(null);
     try {
-      await openDraft(skill.skill_id);
-      void queryClient.invalidateQueries({ queryKey: ["skills", "mine"] });
-      openEditor(skill);
+      await setSkillPreference(skill.skill_id, !skill.enabled);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["skills", "mine"] }),
+        queryClient.invalidateQueries({ queryKey: ["skills", "catalog"] }),
+      ]);
     } catch (cause) {
-      setActionError(readableError(cause));
+      setToggleError(readableError(cause));
     } finally {
-      setOpeningId(null);
+      setTogglingId(null);
     }
   };
 
-  const empty = !loading && !error && mine.length === 0 && catalog.length === 0;
+  const create = async () => {
+    if (creating) return;
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const skill = await createSkill(newSkillIdentity());
+      void queryClient.invalidateQueries({ queryKey: ["skills", "mine"] });
+      void queryClient.invalidateQueries({ queryKey: ["skills", "catalog"] });
+      openEditor(skill);
+    } catch (cause) {
+      setCreateError(readableError(cause));
+    } finally {
+      setCreating(false);
+    }
+  };
 
   return (
     <div className="h-full overflow-y-auto bg-white">
@@ -151,18 +123,18 @@ export function MySkillsPage() {
           <div>
             <div className="flex items-center gap-2">
               <BookOpenIcon className="text-neutral-500" size={18} />
-              <h1 className="text-xl font-semibold tracking-tight text-neutral-900">技能</h1>
+              <h1 className="text-xl font-semibold tracking-tight text-neutral-900">技能中心</h1>
             </div>
             <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-              私有草稿只有你自己能看到；提交审核并通过后才会进入公共目录。
+              技能按用户隔离。保存后先做安全扫描，扫描通过再点击生效。
             </p>
           </div>
           <div className="flex gap-2">
             <Button
-              disabled={mineQuery.isFetching || catalogQuery.isFetching}
+              disabled={mineQuery.isFetching || builtinQuery.isFetching}
               onClick={() => {
                 void mineQuery.refetch();
-                void catalogQuery.refetch();
+                void builtinQuery.refetch();
               }}
               size="sm"
               type="button"
@@ -170,12 +142,13 @@ export function MySkillsPage() {
               刷新
             </Button>
             <Button
-              onClick={() => setCreating(true)}
+              disabled={creating}
+              onClick={() => void create()}
               size="sm"
               type="button"
               variant="primary"
             >
-              ＋ 新建技能
+              {creating ? "创建中…" : "＋ 新建技能"}
             </Button>
           </div>
         </header>
@@ -196,12 +169,21 @@ export function MySkillsPage() {
           </p>
         ) : null}
 
-        {actionError ? (
+        {createError ? (
           <p
             className="mt-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700"
             role="alert"
           >
-            {actionError}
+            {createError}
+          </p>
+        ) : null}
+
+        {toggleError ? (
+          <p
+            className="mt-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700"
+            role="alert"
+          >
+            {toggleError}
           </p>
         ) : null}
 
@@ -210,47 +192,50 @@ export function MySkillsPage() {
             <BookOpenIcon className="mx-auto text-neutral-300" size={28} />
             <p className="mt-3 text-sm font-medium text-neutral-700">还没有技能</p>
             <p className="mt-1 text-xs text-neutral-500">
-              新建一个草稿，写好 SKILL.md 后提交审核；通过后团队里的所有人都能用。
+              新建一个技能，保存后做安全扫描；扫描通过并点击生效后进入运行时与检索。
             </p>
             <Button
               className="mt-4"
-              onClick={() => setCreating(true)}
+              disabled={creating}
+              onClick={() => void create()}
               size="sm"
               type="button"
               variant="primary"
             >
-              新建技能
+              {creating ? "创建中…" : "新建技能"}
             </Button>
           </div>
         ) : null}
 
         {drafts.length > 0 ? (
-          <section className="mt-6">
-            <h2 className="text-xs font-medium text-neutral-500">我的草稿</h2>
+          <section aria-label="技能草稿" className="mt-6">
+            <h2 className="text-xs font-medium text-neutral-500">技能草稿</h2>
             <ul className="mt-3 grid gap-3 sm:grid-cols-2">
               {drafts.map((skill) => (
-                <li className={ROW_CLASS} key={skill.skill_id || skill.name}>
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <h3 className="truncate text-sm font-semibold text-neutral-900">
-                        {skill.name || "未命名技能"}
-                      </h3>
-                      <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                        <ScopeTag scope={skill.scope} />
-                        <SkillStatusBadge status={skill.status} />
-                      </div>
-                    </div>
-                    <SkillEditButton
-                      disabled={openingId !== null}
-                      onClick={() => openEditor(skill)}
-                    />
-                  </div>
-                  {skill.description ? (
-                    <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-neutral-500">
-                      {skill.description}
-                    </p>
-                  ) : null}
-                </li>
+                <SkillCard
+                  key={skill.skill_id || skill.name}
+                  onEdit={openEditor}
+                  onToggle={toggleEnabled}
+                  skill={skill}
+                  toggling={togglingId === skill.skill_id}
+                />
+              ))}
+            </ul>
+          </section>
+        ) : null}
+
+        {activeSkills.length > 0 ? (
+          <section aria-label="我的技能" className="mt-6">
+            <h2 className="text-xs font-medium text-neutral-500">我的技能</h2>
+            <ul className="mt-3 grid gap-3 sm:grid-cols-2">
+              {activeSkills.map((skill) => (
+                <SkillCard
+                  key={skill.skill_id || skill.name}
+                  onEdit={openEditor}
+                  onToggle={toggleEnabled}
+                  skill={skill}
+                  toggling={togglingId === skill.skill_id}
+                />
               ))}
             </ul>
           </section>
@@ -279,76 +264,143 @@ export function MySkillsPage() {
           </section>
         ) : null}
 
-        {publicSkills.length > 0 ? (
-          <section className="mt-6">
-            <h2 className="text-xs font-medium text-neutral-500">公共技能</h2>
-            <ul className="mt-3 grid gap-3 sm:grid-cols-2">
-              {publicSkills.map((skill) => {
-                const owned = Boolean(user?.id) && skill.owner_user_id === user?.id;
-                return (
-                  <li className={ROW_CLASS} key={skill.skill_id || skill.name}>
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <h3 className="truncate text-sm font-semibold text-neutral-900">
-                          {skill.name || "未命名技能"}
-                        </h3>
-                        <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                          <ScopeTag scope={skill.scope} />
-                          <SkillStatusBadge status={skill.status} />
-                          {skill.skill_version ? (
-                            <span className="text-[11px] text-neutral-400">
-                              v{skill.skill_version}
-                            </span>
-                          ) : null}
-                        </div>
-                      </div>
-                      {owned ? (
-                        <SkillEditButton
-                          disabled={openingId !== null}
-                          onClick={() => void editOwnPublic(skill)}
-                        />
-                      ) : null}
-                    </div>
-                    {skill.description ? (
-                      <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-neutral-500">
-                        {skill.description}
-                      </p>
-                    ) : null}
-                  </li>
-                );
-              })}
-            </ul>
-          </section>
-        ) : null}
-
         <p className="mt-8 text-[11px] text-neutral-400">
-          技能按用户隔离编辑；公共目录只展示已通过审核的版本。
+          技能只有你自己能看到、检索和使用。内置技能随服务端发布，只读。
         </p>
       </div>
-
-      {creating ? <CreateSkillDialog onClose={() => setCreating(false)} onCreated={created} /> : null}
     </div>
   );
 }
 
-/** 草稿和公共技能共用同一颗编辑按钮，避免两个区块的卡片各长一样。 */
-function SkillEditButton({ disabled, onClick }: { disabled: boolean; onClick: () => void }) {
+function SkillCard({
+  skill,
+  onEdit,
+  onToggle,
+  toggling,
+}: {
+  skill: SkillListItem;
+  onEdit: (skill: SkillListItem) => void;
+  onToggle: (skill: SkillListItem) => void;
+  toggling: boolean;
+}) {
   return (
-    <Button disabled={disabled} onClick={onClick} size="sm" type="button">
-      编辑
-    </Button>
+    <li className={ROW_CLASS}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="truncate text-sm font-semibold text-neutral-900">
+            {skill.name || "未命名技能"}
+          </h3>
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+            <ScopeTag scope={skill.scope} />
+            {skill.source === "extracted" ? <ExtractedTag /> : null}
+            <SkillStatusBadge status={skill.status} />
+            {skill.skill_version ? (
+              <span className="text-[11px] text-neutral-400">{skill.skill_version}</span>
+            ) : null}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {skill.status === "active" ? (
+            <SkillEnabledSwitch
+              enabled={Boolean(skill.enabled)}
+              onToggle={() => onToggle(skill)}
+              pending={toggling}
+            />
+          ) : null}
+          <Button
+            disabled={!skill.skill_id}
+            onClick={() => onEdit(skill)}
+            size="sm"
+            type="button"
+          >
+            编辑
+          </Button>
+        </div>
+      </div>
+      {skill.description ? (
+        <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-neutral-500">
+          {skill.description}
+        </p>
+      ) : null}
+      {skill.latest_scan ? (
+        <p className="mt-2 text-[11px] text-neutral-400">
+          安全扫描：{skill.latest_scan.is_safe ? "通过" : "未通过"} · 最高{" "}
+          {skill.latest_scan.max_severity} · {skill.latest_scan.findings_count} 个发现
+        </p>
+      ) : null}
+      {skill.active ? (
+        <p
+          className={
+            "mt-1 text-[11px] " + (skill.enabled ? "text-emerald-600" : "text-neutral-500")
+          }
+        >
+          已生效 · {skill.enabled ? "已启用" : "已停用，不参与技能检索"}
+          {skill.index_status ? " · " + skillIndexStatusLabel(skill.index_status) : ""}
+        </p>
+      ) : null}
+    </li>
   );
 }
 
-/** 私有/公共/内置。和状态徽标分开：一个说"谁能看"，一个说"审核到哪了"。 */
+/** 启用开关：轨道 30×16、滑块 12，开=绿色(emerald-500)、关=中性灰，180ms 过渡。
+ *
+ * 尺寸与配色对齐 DeepSeek Harness 技能中心：细轨 + 小滑块 + 极短动画，
+ * 不再用「整体着色 + 大滑块」那种按钮化外观。
+ */
+function SkillEnabledSwitch({
+  enabled,
+  onToggle,
+  pending,
+}: {
+  enabled: boolean;
+  onToggle: () => void;
+  pending: boolean;
+}) {
+  return (
+    <button
+      aria-checked={enabled}
+      aria-label={enabled ? "停用技能" : "启用技能"}
+      className="inline-flex shrink-0 cursor-pointer items-center rounded-full border-0 bg-transparent p-0.5 outline-none disabled:cursor-not-allowed disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-emerald-500/40"
+      disabled={pending}
+      onClick={onToggle}
+      role="switch"
+      title={enabled ? "已启用：参与技能检索" : "已停用：不参与技能检索"}
+      type="button"
+    >
+      <span
+        aria-hidden="true"
+        className={
+          "relative block h-4 w-[30px] shrink-0 rounded-full transition-colors duration-[180ms] " +
+          (enabled ? "bg-emerald-500" : "bg-neutral-300")
+        }
+      >
+        <span
+          className={
+            "absolute top-0.5 h-3 w-3 rounded-full bg-white shadow-[0_1px_2px_rgba(0,0,0,0.25)] transition-[left] duration-[180ms] " +
+            (enabled ? "left-4" : "left-0.5")
+          }
+        />
+      </span>
+    </button>
+  );
+}
+
+/** 会话提交后由 OpenViking 提炼、导入到私有草稿的技能。 */
+function ExtractedTag() {
+  return (
+    <span className="inline-flex shrink-0 items-center rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[11px] leading-none text-violet-700">
+      提炼
+    </span>
+  );
+}
+
+/** 私有 / 内置。审核状态已移除：生命周期由 SkillStatusBadge 单独表达。 */
 function ScopeTag({ scope }: { scope: SkillListItem["scope"] }) {
-  const label = scope === "private" ? "私有" : scope === "builtin" ? "内置" : "公共";
+  const label = scope === "builtin" ? "内置" : "私有";
   const tone =
-    scope === "private"
-      ? "border-sky-200 bg-sky-50 text-sky-700"
-      : scope === "builtin"
-        ? "border-amber-200 bg-amber-50 text-amber-700"
-        : "border-violet-200 bg-violet-50 text-violet-700";
+    scope === "builtin"
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : "border-sky-200 bg-sky-50 text-sky-700";
   return (
     <span
       className={

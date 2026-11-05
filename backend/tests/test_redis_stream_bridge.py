@@ -332,6 +332,16 @@ def test_injected_client_is_not_closed_by_the_bridge() -> None:
     _run(scenario)
 
 
+def test_socket_timeout_must_outlive_xread_block() -> None:
+    """XREAD BLOCK 占着 socket 直到 Redis 回空包；客户端超时不大于阻塞时间就会先炸。"""
+
+    config = StreamBridgeConfig()
+    assert config.socket_timeout_seconds >= config.read_block_seconds + 5
+
+    with pytest.raises(ValueError, match="socket_timeout_seconds"):
+        StreamBridgeConfig(socket_timeout_seconds=5, read_block_seconds=5)
+
+
 def test_config_defaults_and_validation() -> None:
     config = StreamBridgeConfig()
     assert config.backend == "memory"

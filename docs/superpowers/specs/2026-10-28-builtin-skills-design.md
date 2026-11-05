@@ -1,6 +1,9 @@
 # 随项目发布的内置技能设计
 
-> 状态：已确认（2026-10-28）
+> 状态：已确认（2026-10-28；2026-11-03 工具拆分修订）
+> 2026-11-03 修订：技能工具拆分为 `search_skills`（skill-finder 元数据检索）与
+> `load_skills`（系统内置正文加载）；内置技能仍不参与二者，发现只走索引、read_file
+> 或 slash。个人开关已从 `skills_prefs.json` 移到 `skills.enabled`，内置技能仍不参与。
 > 适用范围：MyFlow 的技能系统（Git catalog + filesystem 兼容层）
 > 方案：A（完整内置技能层），但不提供个人开关
 
@@ -23,7 +26,7 @@
 2. 内置技能有独立的 scope（builtin）和容器目录（/mnt/skills/builtin）。
 3. 不受全局开关和个人偏好影响，始终启用。
 4. 支持系统提示词索引、/name 激活、read_file、沙箱挂载。
-5. 采用渐进式加载：索引常驻，正文只在 read_file 或 /name 激活时进入上下文；**不参与 search_and_load_skills 检索**。
+5. 采用渐进式加载：索引常驻，正文只在 read_file 或 /name 激活时进入上下文；**不参与 search_skills / load_skills**。
 6. 在 GET /api/skills 和技能页回显；UI 只读，不可编辑、提交审核或删除。
 7. 不写 Git，不写 PostgreSQL，不需要数据库迁移。
 8. Git catalog 不可用时，内置技能仍然能被列表、提示词和沙箱使用。
@@ -33,7 +36,7 @@
 - 内置技能的个人开关、管理员全局开关。
 - 在 UI 编辑、删除、提交审核内置技能。
 - 把内置技能写入 Milvus 投影或做独立的语义召回/精排。
-- 让内置技能出现在 search_and_load_skills 的候选或结果里。
+- 让内置技能出现在 search_skills 的候选或 load_skills 的结果里。
 - 内置技能与公共技能之间的版本、审核、所有权关系。
 - 嵌套技能目录、内置技能包自动安装、远程下载。
 - 通过配置热切换 skills.builtin.path 后重建沙箱挂载。
@@ -52,9 +55,9 @@
 - 沙箱只静态挂载 <container_path>/public 和按用户的 <container_path>/private。
 - GET /api/skills 在 Git 模式下从 snapshot 输出；runtime 缺失时 fail-closed 为空。
 - SkillResponse.scope 和前端 SkillScope 只接受 public/private。
-- 个人偏好按 skill_id（catalog）或 name（filesystem）存储，effective_enabled 会参与可见性判断。
-- 搜索服务 SkillSearchService 以 PostgreSQL active 指针和 Milvus 投影为权威，正文从 commit cache 读。
-- search_and_load_skills 是一条“检索并加载正文”的路径；内置技能不使用它，走索引 → read_file / slash 的渐进式加载。
+- 私有技能开关存于 `skills.enabled`；内置技能没有个人开关。
+- 搜索服务 SkillSearchService 以 PostgreSQL active 指针、enabled 开关和 Milvus 投影为权威。
+- `search_skills` 仅返回元数据；`load_skills` 按 skill_id 返回私有技能正文，内置技能都不使用。
 
 因此内置技能必须作为独立来源 overlay 接入，而不是伪装成 catalog 行。
 
@@ -153,7 +156,7 @@ SkillRegistry 增加可选的 builtin 注入点（默认从当前 SkillsConfig �
 4. 按 name 去重：内置技能优先，同名 catalog 条目被隐藏并 warning；
 5. 返回值排序仍按 (category, name)，因此 builtin 行稳定在索引前部。
 
-search_and_load_skills 不走“全量可见技能”：它在 filesystem 分支调用 visible(include_builtin=False)，只检索 public/custom；Git 分支的 SkillSearchService 从不接收 builtin。内置技能因此不会出现在检索结果里。
+search_skills 不走“全量可见技能”：它在 filesystem 分支调用 visible(include_builtin=False)，只检索 public/custom；Git 分支的 SkillSearchService 从不接收 builtin。load_skills 只接受数据库私有 skill_id。内置技能因此不会出现在检索或加载结果里。
 
 SkillRegistry.find() 走合并后的 visible()，所以 /name 天然优先解析到内置技能。
 index_by_container_file() 同时包含内置容器路径，工具策略和 durable context 不需要新分支。
@@ -163,8 +166,8 @@ index_by_container_file() 同时包含内置容器路径，工具策略和 durab
 ### 5.4 始终启用
 
 - Skill.enabled=True。
-- visible() 对 builtin 跳过 effective_enabled / global_enabled_map / read_user_skill_prefs。
-- 即使 skills_prefs.json 里有同名 false，内置技能仍在索引和 slash 解析中。
+- visible() 对 builtin 跳过 enabled/全局开关/个人开关。
+- 内置技能没有数据库 `skills.enabled` 行，也不能通过 preference API 切换。
 - available_skills 是 agent 级白名单，不是个人开关，仍生效；默认 None 时对主 agent 全部可见。
 - 不做 PUT /api/skills/{id}/preference 的内置分支；builtin 没有 skill_id，现有路由无法定位它。
 - 不做 PATCH /api/skills/{id} 的全局开关；部署级开关只有 skills.builtin.enabled。
@@ -252,14 +255,14 @@ SkillResponse 扩展：
 2. **L1 正文**：模型用 read_file 读 <container>/builtin/<name>/SKILL.md，或用 /name 显式激活；正文进入本次调用上下文，并由 DurableContextMiddleware 记入 <active_skills>。
 3. **L2 资源**：脚本、模板、示例按需 read_file，不预先注入。
 
-关键约束：**内置技能不参与 search_and_load_skills**。
+关键约束：**内置技能不参与 search_skills / load_skills**。
 
 - Git 模式：SkillSearchService 不注入 builtin，Milvus/PG/commit-cache 路径完全不变；内置技能不会成为检索候选。
-- filesystem 模式：search_and_load_skills 现在用 SkillRegistry.visible() 建候选；该调用改为 visible(include_builtin=False)，只检索 public/custom。内置技能不进入 build_payload。
+- filesystem 模式：search_skills 用 SkillRegistry.visible() 建候选；该调用改传 visible(include_builtin=False)，只检索 public/custom。内置技能不进入 metadata payload；load_skills 也不加载 builtin。
 - SkillRegistry.visible(include_builtin: bool = True) 是唯一开关；提示词、slash、policy、durable context 保持默认 True，搜索工具显式传 False。
 - include_builtin=False 时完全不加载内置技能，也不做“同名内置遮蔽”：catalog 的 public/custom 行原样参与检索。遮蔽只发生在面向用户的合并视图（默认 True 和 API 列表）。
 - 不修改 router.py、loader.py、SkillSearchService 的评分/预算逻辑；不引入 builtin 的 embedding、BM25 或精排。
-- 即使 keyword.enabled=true，内置技能也不会被 search_and_load_skills 命中；这是产品语义，不是配置遗漏。
+- 即使 keyword.enabled=true，内置技能也不会被 search_skills 命中；这是产品语义，不是配置遗漏。
 - 检索不可用或 keyword 关闭，不影响内置技能的索引、read_file 和 slash 路径。
 
 渐进式加载的可见效果：
@@ -305,8 +308,10 @@ SkillResponse 扩展：
   - 根目录三段说明；builtin marker 已由 scope 泛化。
 - backend/packages/harness/agentkit/skills/prefs.py
   - effective_enabled 对 builtin 返回 True（或由 registry 绕过）。
-- backend/packages/harness/agentkit/tools/builtin/search_and_load_skills.py
-  - filesystem 分支改调 visible(include_builtin=False)，内置技能不参与检索。
+- backend/packages/harness/agentkit/tools/builtin/search_skills.py
+  - 只返回 metadata；filesystem 分支传 visible(include_builtin=False)，内置技能不参与检索。
+- backend/packages/harness/agentkit/tools/builtin/load_skills.py
+  - 仅加载数据库私有 skill_id；内置技能走 read_file / slash。
 - backend/packages/harness/agentkit/sandbox/local/local_sandbox_provider.py
   - builtin 静态只读映射；路径解析 helper。
 - backend/app/gateway/skills_catalog.py
@@ -364,8 +369,9 @@ SkillResponse 扩展：
   - runtime 缺失时 POST /skills/reload 仍返回 503，但 builtin 指纹缓存和 prompt LRU 已被清空。
 - test_builtin_mounts.py（新）
   - 静态映射存在且只读；路径解析到 host builtin；operator mount 不能覆盖。
-- test_search_and_load_skills_tool.py
-  - builtin 不出现在检索结果（filesystem 的 visible(include_builtin=False) 与 Git 的 SkillSearchService 都不含它）。
+- test_skill_tools.py（2026-11-03：原 test_search_and_load_skills_tool.py 已随工具拆分重写）
+  - builtin 不出现在 `search_skills` / `load_skills` 的结果里（filesystem 的
+    visible(include_builtin=False) 与 Git 的 SkillSearchService 都不含它）。
   - 同一内置技能仍能通过索引、read_file 和 /name 激活使用。
   - public/custom 的检索结果和预算不变。
 - test_skill_author_service.py / test_skill_review_service.py
@@ -386,7 +392,7 @@ SkillResponse 扩展：
       backend/tests/test_skill_activation_request_only.py \
       backend/tests/test_skills_catalog_routes.py \
       backend/tests/test_builtin_mounts.py \
-      backend/tests/test_search_and_load_skills_tool.py -v
+      backend/tests/test_skill_tools.py -v
 
     cd frontend
     pnpm vitest run src/components/skills/my-skills-page.dom.test.tsx
@@ -402,7 +408,7 @@ SkillResponse 扩展：
 
 ## 9. 风险与已定取舍
 
-1. agent 白名单：内置技能在 registry（提示词/slash/policy）仍受 available_skills 限制；search_and_load_skills 完全不含内置技能，不存在“检索绕过白名单”的问题。
+1. agent 白名单：内置技能在 registry（提示词/slash/policy）仍受 available_skills 限制；search_skills / load_skills 完全不含内置技能，不存在“检索绕过白名单”的问题。
 2. 检索能力：内置技能明确不参与检索，也不接 Milvus/embedding。若未来要支持检索，需要重新设计候选类型、评分和权限；V1 不做。
 3. 同名策略：内置优先并隐藏同名 catalog 行。若希望“公共覆盖内置”，需要反转优先级并调整保留名检查。
 4. 热更新：SKILL.md 内容变化通过指纹自动生效；skills.builtin.path 变化需要重启（沙箱静态映射）。
@@ -414,7 +420,7 @@ SkillResponse 扩展：
 - 在 skills/builtin/demo/SKILL.md 放入合法技能后，无需 Git/DB 操作，下一轮模型调用索引出现 demo [builtin]。
 - 用户个人偏好里把 demo 设为 false，索引仍出现；API 返回 enabled=true。
 - /demo 能激活并注入正文；/mnt/skills/builtin/demo/SKILL.md 可读且不可写。
-- search_and_load_skills 不返回 demo；但索引、read_file、/demo 都可用，且读过的正文进入 <active_skills>。
+- search_skills：不返回 demo；load_skills：不接受内置技能的 skill_id；索引、read_file、/demo 都可用，且读过的正文进入 <active_skills>。
 - GET /api/skills 回显 builtin 行；技能页有“内置技能”区且没有编辑/开关。
 - 公共技能、私有草稿、审核队列、个人偏好、Git catalog 行为不变。
 - 删除 skills/builtin/demo 后，索引/列表/沙箱解析不再出现该技能（重启或 reload 后；指纹扫描可更早发现）。
@@ -424,6 +430,6 @@ SkillResponse 扩展：
 以下四项在 builder check 中被提出，设计阶段直接定案，不再阻塞计划：
 
 1. **filesystem 模式的根目录文本**：_root_convention() 先看来源和实际 scope；source=filesystem 且快照注入 public/private 时仍用 catalog 文本（保留旧测试），只有“纯 filesystem + builtin”才用 filesystem+builtin 三段文本。无 builtin 的纯 filesystem 部署继续用旧文本。
-2. **检索边界**：内置技能不参与 search_and_load_skills；filesystem 分支显式传 visible(include_builtin=False)，Git 分支不注入 builtin。渐进式加载只走索引 → read_file / slash。
+2. **检索边界**：内置技能不参与 search_skills / load_skills；filesystem 分支显式传 visible(include_builtin=False)，Git 分支不注入 builtin。渐进式加载只走索引 → read_file / slash。
 3. **部署与缺失路径**：skills/builtin 随 project_root 发布，提交 .gitkeep；enabled=true 且路径缺失时 warning 一次，不阻止启动。API 与沙箱使用同一宿主路径。
 4. **runtime 缺失时的 reload**：先清 builtin 指纹缓存；prompt LRU 在 runtime 缺失路径和成功路径各清一次（不重复），runtime 缺失仍返回现有 503，不伪装成功。

@@ -98,7 +98,6 @@ def git_fixture(tmp_path: Path):
     cache_dir = tmp_path / "cache"
     config = SkillGitConfig(
         repository=remote.as_posix(),
-        public_branch="main",
         cache_dir=str(cache_dir),
         command_timeout_seconds=30,
     )
@@ -148,45 +147,13 @@ async def test_save_draft_pushes_private_tree(git_fixture: GitFixture):
 
 
 @pytest.mark.asyncio
-async def test_save_and_publish_preserve_the_executable_bit(git_fixture: GitFixture):
+async def test_save_preserves_the_executable_bit(git_fixture: GitFixture):
     draft_mode = file_mode(
         git_fixture.remote,
         git_fixture.draft.commit,
         "users/u1/s1/scripts/run.sh",
     )
     assert draft_mode == b"100755"
-
-    public = await git_fixture.repo.publish_public(
-        public_name="foo",
-        source_commit=git_fixture.draft.commit,
-        source_path="users/u1/s1",
-        message="approve",
-    )
-    public_mode = file_mode(
-        git_fixture.remote,
-        public.commit,
-        "public/foo/scripts/run.sh",
-    )
-    assert public_mode == b"100755"
-
-
-@pytest.mark.asyncio
-async def test_publish_public_copies_the_exact_tree_and_survives_draft_deletion(
-    git_fixture: GitFixture,
-):
-    public = await git_fixture.repo.publish_public(
-        public_name="foo",
-        source_commit=git_fixture.draft.commit,
-        source_path="users/u1/s1",
-        message="approve",
-    )
-    assert public.ref == "refs/heads/main"
-    assert public.path == "public/foo"
-    assert (
-        await git_fixture.repo.read_file(public.commit, "public/foo/SKILL.md")
-    ).startswith(b"---")
-    await git_fixture.delete_draft_ref()
-    assert await git_fixture.repo.read_file(public.commit, "public/foo/SKILL.md")
 
 
 @pytest.mark.asyncio
@@ -220,37 +187,6 @@ async def test_second_save_replaces_only_that_skill_directory(git_fixture: GitFi
 
 
 @pytest.mark.asyncio
-async def test_publish_replaces_the_old_public_directory(git_fixture: GitFixture):
-    first = await git_fixture.repo.publish_public(
-        public_name="foo",
-        source_commit=git_fixture.draft.commit,
-        source_path="users/u1/s1",
-        message="first",
-    )
-    assert await git_fixture.repo.list_tree(first.commit, "public/foo") == [
-        "SKILL.md",
-        "scripts/run.sh",
-    ]
-
-    changed = await git_fixture.repo.save_draft(
-        owner_user_id="u1",
-        skill_id="s1",
-        files=[StagedFile("SKILL.md", b"---\nname: foo\ndescription: v2\n---\n")],
-        message="changed",
-    )
-    second = await git_fixture.repo.publish_public(
-        public_name="foo",
-        source_commit=changed.commit,
-        source_path="users/u1/s1/SKILL.md",
-        message="second",
-    )
-    assert await git_fixture.repo.list_tree(second.commit, "public/foo") == ["SKILL.md"]
-    assert await git_fixture.repo.read_file(
-        second.commit, "public/foo/SKILL.md"
-    ) == b"---\nname: foo\ndescription: v2\n---\n"
-
-
-@pytest.mark.asyncio
 async def test_parent_traversal_is_rejected_before_git(git_fixture: GitFixture):
     with pytest.raises(InvalidSkillPackage):
         await git_fixture.repo.save_draft(
@@ -273,13 +209,6 @@ async def test_newline_in_a_ref_or_path_segment_is_rejected(git_fixture: GitFixt
     with pytest.raises(InvalidSkillPackage):
         await git_fixture.repo.save_draft(
             owner_user_id="u1", skill_id="s1\nfoo", files=files, message="bad"
-        )
-    with pytest.raises(InvalidSkillPackage):
-        await git_fixture.repo.publish_public(
-            public_name="foo\nbar",
-            source_commit=git_fixture.draft.commit,
-            source_path="users/u1/s1",
-            message="bad",
         )
 
 

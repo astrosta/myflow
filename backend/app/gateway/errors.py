@@ -142,7 +142,7 @@ class McpServerNotFound(Exception):
 
 
 class SkillNotFound(Exception):
-    """PATCH /api/skills/{name} 的目录没被扫描收进目录（M7 §2.4）。"""
+    """技能不存在、已被删除，或不属于当前用户。"""
 
     status_code: ClassVar[int] = 404
     code: ClassVar[str] = "skill_not_found"
@@ -155,6 +155,13 @@ class SkillRuntimeUnavailable(Exception):
     code: ClassVar[str] = "skill_runtime_unavailable"
 
 
+class SkillScannerUnavailable(Exception):
+    """cisco-ai-skill-scanner 没有安装或无法导入。"""
+
+    status_code: ClassVar[int] = 503
+    code: ClassVar[str] = "skill_scanner_unavailable"
+
+
 class SkillPackageInvalid(Exception):
     """A staging path or package failed validation (Git catalog author API)."""
 
@@ -163,7 +170,7 @@ class SkillPackageInvalid(Exception):
 
 
 class SkillConflictAPI(Exception):
-    """A pending submission, quota, or version precondition blocked a write."""
+    """A quota, scan gate, or version precondition blocked a write."""
 
     status_code: ClassVar[int] = 409
     code: ClassVar[str] = "skill_conflict"
@@ -264,6 +271,7 @@ def install_error_handlers(app: FastAPI) -> None:
         McpServerNotFound,
         SkillNotFound,
         SkillRuntimeUnavailable,
+        SkillScannerUnavailable,
         SkillPackageInvalid,
         SkillConflictAPI,
         StdioCommandRejected,

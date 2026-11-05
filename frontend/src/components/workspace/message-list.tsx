@@ -40,6 +40,14 @@ export interface MessageListProps {
   onLoadOlder?: () => void;
   /** 正在做 gap 恢复（§5.2）：步骤面板不能说"已完成" */
   recovering?: boolean;
+  /**
+   * 用户在侧栏点了一次会话标题。
+   *
+   * 换会话时 ChatRoute 会重挂载列表，本来就会落到底部；但**点的是当前会话**
+   * 时 thread id 没变，列表不会重挂载。这个递增的请求号是那种情况下
+   * "把我拉回最新一条"的唯一信号。
+   */
+  scrollToBottomRequest?: number;
   className?: string;
 }
 
@@ -51,6 +59,7 @@ export function MessageList({
   loadingOlder = false,
   onLoadOlder,
   recovering = false,
+  scrollToBottomRequest = 0,
   className,
 }: MessageListProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -66,7 +75,14 @@ export function MessageList({
       pinnedRef.current =
         element.scrollHeight - element.scrollTop - element.clientHeight <= PIN_THRESHOLD_PX;
     };
-    onScroll();
+    /**
+     * **不要在挂载时立刻调一次 onScroll()。**
+     *
+     * 点回一个已经缓存过的会话时，React Query 的 messages 会在首帧就带着
+     * 整页历史进来；此时视口天然在 scrollTop=0，一调 onScroll 就会把它判成
+     * "用户正在往上翻"，随后的 groups effect 于是拒绝滚到底部——表现就是
+     * 打开一个旧会话停在最上面。用户还没动过滚轮，pinned 必须保持初始的 true。
+     */
     element.addEventListener("scroll", onScroll, { passive: true });
     return () => element.removeEventListener("scroll", onScroll);
   }, []);
@@ -87,6 +103,23 @@ export function MessageList({
     if (!element) return;
     if (pinnedRef.current) element.scrollTop = element.scrollHeight;
   }, [groups]);
+
+  /**
+   * 明确的"回到最新一条"请求：点侧栏会话标题，或用户自己发送一条消息。
+   *
+   * 放在 groups 的跟随 effect **之后**：这两种动作是用户当下最强的意图，
+   * 不应该被同一帧里的高度补偿或跟随判断覆盖。这里同时把 pinned 重置回 true，
+   * 让后续到达的流式内容继续跟随。
+   */
+  const lastScrollRequestRef = useRef(scrollToBottomRequest);
+  useEffect(() => {
+    if (lastScrollRequestRef.current === scrollToBottomRequest) return;
+    lastScrollRequestRef.current = scrollToBottomRequest;
+    const element = viewportRef.current;
+    if (!element) return;
+    pinnedRef.current = true;
+    element.scrollTop = element.scrollHeight;
+  }, [scrollToBottomRequest]);
 
   const handleLoadOlder = useCallback(() => {
     const element = viewportRef.current;

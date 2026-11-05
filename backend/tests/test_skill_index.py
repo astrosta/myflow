@@ -202,28 +202,11 @@ def test_the_render_cache_is_cleared_on_reload(tmp_path):
     assert "- two [" in _index(tmp_path)
 
 
-def test_a_catalog_snapshot_uses_two_roots_and_scope_markers(tmp_path):
-    def catalog_skill(name, scope, owner):
-        return Skill(
-            name=name,
-            description="Does a thing",
-            license=None,
-            skill_dir=Path("unused"),
-            skill_file=Path("unused/SKILL.md"),
-            relative_path=Path(name),
-            category=SkillCategory.CUSTOM,
-            enabled=True,
-            scope=scope,
-            owner_user_id=owner,
-            skill_id=name,
-            version_id=f"{name}-v1",
-        )
-
+def test_a_catalog_snapshot_uses_the_private_root(tmp_path):
     snapshot = SkillSnapshot(
         epoch="e1",
-        public=(catalog_skill("public-one", SkillScope.PUBLIC, "u9"),),
         private_by_owner={
-            "u1": (catalog_skill("private-one", SkillScope.PRIVATE, "u1"),)
+            "u1": (_catalog_skill("private-one", SkillScope.PRIVATE, "u1"),)
         },
     )
     config = skills_config(tmp_path)
@@ -234,10 +217,9 @@ def test_a_catalog_snapshot_uses_two_roots_and_scope_markers(tmp_path):
         registry=SkillRegistry(config=config, snapshot=snapshot, user_id="u1"),
     )
 
-    assert "/mnt/skills/public/" in section
     assert "/mnt/skills/private/" in section
+    assert "/mnt/skills/public/" not in section
     assert "- private-one [private]:" in section
-    assert "- public-one [public]:" in section
 
 
 def _catalog_skill(name: str, scope: SkillScope, owner: str) -> Skill:
@@ -279,7 +261,6 @@ def test_git_source_renders_the_snapshot_instead_of_scanning_disk(tmp_path):
     write_skill(tmp_path, "public", "legacy-on-disk")
     snapshot = SkillSnapshot(
         epoch="e1",
-        public=(_catalog_skill("public-one", SkillScope.PUBLIC, "alice"),),
         private_by_owner={
             "alice": (_catalog_skill("alice-private", SkillScope.PRIVATE, "alice"),)
         },
@@ -291,13 +272,9 @@ def test_git_source_renders_the_snapshot_instead_of_scanning_disk(tmp_path):
         owner_less = build_skills_section(config=config)
         bob = build_skills_section(config=config, user_id="bob")
 
-    assert "- public-one [public]:" in alice
     assert "- alice-private [private]:" in alice
     assert "legacy-on-disk" not in alice
-    assert "- public-one [public]:" in owner_less
     assert "alice-private" not in owner_less
-    # 别人的私有技能不进 bob 的提示词，公共技能照旧。
-    assert "- public-one [public]:" in bob
     assert "alice-private" not in bob
 
 
@@ -306,7 +283,7 @@ def test_git_source_with_an_empty_snapshot_renders_nothing(tmp_path):
     write_skill(tmp_path, "public", "legacy-on-disk")
     config = skills_config(tmp_path, source="git")
 
-    with _Published(SkillSnapshot(epoch="", public=(), private_by_owner={})):
+    with _Published(SkillSnapshot(epoch="")):
         assert build_skills_section(config=config, user_id="alice") == ""
 
     assert SkillRegistry(config=config).visible() != []  # 显式 registry 仍是旧行为
@@ -314,18 +291,13 @@ def test_git_source_with_an_empty_snapshot_renders_nothing(tmp_path):
 
 def test_filesystem_source_still_scans_the_disk(tmp_path):
     write_skill(tmp_path, "public", "on-disk")
-    snapshot = SkillSnapshot(
-        epoch="e1",
-        public=(_catalog_skill("public-one", SkillScope.PUBLIC, "alice"),),
-        private_by_owner={},
-    )
+    snapshot = SkillSnapshot(epoch="e1", private_by_owner={})
     config = skills_config(tmp_path, source="filesystem")
 
     with _Published(snapshot):
         section = build_skills_section(config=config, user_id="alice")
 
     assert "- on-disk [" in section
-    assert "public-one" not in section
 
 
 # --- built-in overlay (always-on, never a preference) -------------------------
@@ -467,7 +439,7 @@ def test_filesystem_convention_is_unchanged_without_builtins(tmp_path):
     assert "private" not in section
 
 
-def test_git_convention_with_builtin_names_all_three_roots(tmp_path):
+def test_git_convention_with_builtin_names_private_and_builtin_roots(tmp_path):
     write_skill(tmp_path, "builtin", "demo")
     config = skills_config(
         tmp_path,
@@ -477,14 +449,15 @@ def test_git_convention_with_builtin_names_all_three_roots(tmp_path):
     registry = SkillRegistry(
         config=config,
         builtin_skills=load_builtin_skills(config),
-        snapshot=SkillSnapshot("e", (), {}),
+        snapshot=SkillSnapshot("e"),
     )
     section = build_skills_section(config=config, registry=registry)
     assert "private" in section
     assert "builtin" in section
     assert "/mnt/skills/private/<name>/SKILL.md" in section
     assert "/mnt/skills/builtin/<name>/SKILL.md" in section
-    assert "同名时内置技能优先于 public 和 private；catalog 内部 private 仍覆盖 public" in section
+    assert "/mnt/skills/public/" not in section
+    assert "同名时内置技能优先" in section
 
 
 def test_filesystem_snapshot_with_builtin_keeps_catalog_text_and_adds_builtin(
@@ -497,7 +470,6 @@ def test_filesystem_snapshot_with_builtin_keeps_catalog_text_and_adds_builtin(
     )
     snapshot = SkillSnapshot(
         epoch="e-fs",
-        public=(),
         private_by_owner={
             "u1": (_catalog_skill("private-one", SkillScope.PRIVATE, "u1"),)
         },

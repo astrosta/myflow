@@ -3,8 +3,8 @@
 > 状态：已实施（canonical legacy 已删除）
 > 日期：2026-10-29；修订：2026-10-30
 > 方案：A 方案——薄适配 + OpenViking 原生记忆
-> 适用版本：OpenViking Server `0.4.19`（镜像 digest 在 Phase 0 锁定）；Python 客户端 `openviking-sdk==0.1.17`（PyPI 最新 SDK；`0.4.19` 是 Server 版本，不存在同号 SDK）
-> 修订（2026-10-29）：`profile.md` 改为 PostgreSQL `memory_profile_documents`；`identity.md` / `soul.md` 仍是项目内本地文件，三者都不由 MyFlow 写入 OpenViking。`profile` 是用户身份，`identity` 是助手身份，`soul` 是助手原则。OpenViking 只承载自动抽取的记忆类型：`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools` / `skills`。前端只保留“我的画像”结构化表单，用于修改/删除 `profile`。
+> 适用版本：设计基线 OpenViking Server `0.4.19`；当前联调验证 Server `0.5.2.1`（见 2026-11-03 修订）；Python 客户端 `openviking-sdk==0.1.17`（PyPI 最新 SDK；`0.4.19` 是 Server 版本，不存在同号 SDK）
+> 修订（2026-10-29）：`profile.md` 改为 PostgreSQL `memory_profile_documents`；`identity.md` / `soul.md` 仍是项目内本地文件，三者都不由 MyFlow 写入 OpenViking。`profile` 是用户身份，`identity` 是助手身份，`soul` 是助手原则。OpenViking 只承载自动抽取的记忆类型：`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools`。`skills` 是独立的 Session Skill 资产，导入 MyFlow 技能目录，不作为 memory type。前端只保留“我的画像”结构化表单，用于修改/删除 `profile`。
 > 修订（2026-10-29，写入/注入方式）：`before_agent` 负责抓取门控；CAPTURE 后 human / AI / ToolMessage 每产生一条就按顺序写入 Redis Stream，worker 按 OpenViking Sessions API 的 `role/parts` 契约转换并 append/commit。`identity.md` / `soul.md` 渲染进 lead agent 系统提示（替换当前直接返回空串的 `_build_soul_section()`）；DB `profile` 在 run assembly 时拼进 `<user_profile>` 系统提示段；不再注入隐藏画像消息。`ProfileService` / `PersonalizationService` 属于 `agentkit/agents/memory/personalization/`，不经过 SDK。
 > 修订（2026-10-29，审计决策）：profile 改为 PostgreSQL；写入改为 before_agent 门控 + 按 thread 分片的 Redis Stream 异步抓取；取消数据迁移；`memory_search` 只返回 `find` 实际字段。
 > 修订（2026-10-29，审计结论）：写入改为按 thread 分片的 Redis Stream（同 thread 单分片串行）；新增 `memory_capture_dedup` 持久去重键；压缩窗口不再进入捕获链路；ProfileSuggester 改为持久化 suggestion 表；session 增加 incarnation/epoch 防跨会话污染；所有记忆注入统一走内容包裹与绝对 URI；当前无旧数据，不做迁移/回滚。
@@ -12,17 +12,32 @@
 > `memory_overview`，改为委派内置子代理 `memory-researcher`（内部仍是这三个只读工具）。
 > 详见 `2026-11-02-retrieval-subagents-design.md`。
 > 修订（2026-11-02，记忆管理）：新增前端「记忆管理」页，按 `preferences` / `entities` / `events` /
-> `cases` / `trajectories` / `experiences` 六类筛选、查看、编辑、删除 OpenViking 记忆；全部读写
+> `cases` / `trajectories` / `experiences` / `tools` 七类筛选、查看、编辑、删除 OpenViking 记忆；全部读写
 > 直接调用 OpenViking 协议（`find` 无 query + filter、`overview`、`read`、`write`、`rm`），MyFlow 不
 > 保存记忆副本。撤销 §1.4“不实现前端记忆界面”的取舍；`profile` / `identity` / `soul` 与
-> `tools` / `skills` 仍不在该页展示。
+> `skills` 仍不在该页展示；`tools` 已加入记忆管理页。
 > 修订（2026-11-02，画像字段收敛）：删除 `identity.pronouns` 与 `identity.timezone`，画像字段从 14 个
 > 收敛为 12 个；`identity` 组只剩称呼与地区。库里旧行残留的 `pronouns` / `timezone` frontmatter 键会被
 > 忽略，并在下一次写入时丢弃（无需迁移）。
 > 修订（2026-11-02，画像全字段表单 + 写入工具）：`我的画像` 改为**始终展示全部受支持字段**
 > （无值即空白，可填写后一次保存）；新增内置工具 `update_user_profile`，只在用户**显式、持久**
 > 陈述画像信息时由模型调用，写入仍走 `ProfileService`（etag CAS）。原子抽取链路依旧不写画像。
-> 修订（2026-10-30，审计决议 v2）：删除压缩窗口捕获与自动召回；OpenViking session 使用 **idle-only auto-commit**（86400 秒）；创建 session 必须显式设置 8 类 `memory_policy` 与 idle-only `auto_commit_policy`；`get_session(auto_create=True)` 不再用于新建；强制单 `memory_worker`；`memory_sync_state` 增加 session 生命周期字段；ToolPart / PII / API 契约按 OpenViking Server 0.4.19 修正。
+> 修订（2026-10-30，审计决议 v2）：删除压缩窗口捕获与自动召回；OpenViking session 使用 **idle-only auto-commit**（86400 秒）；创建 session 固定显式设置 `DEFAULT_SESSION_MEMORY_TYPES`（6 类）`memory_policy` 与 idle-only `auto_commit_policy`；`get_session(auto_create=True)` 不再用于新建；强制单 `memory_worker`；`memory_sync_state` 增加 session 生命周期字段；ToolPart / PII / API 契约按 OpenViking Server 0.4.19 修正。
+> 修订（2026-11-03，记忆类型与会话技能分离）：记忆查询、模型工具与记忆管理页支持
+> **7 类**：`preferences` / `entities` / `events` / `cases` / `trajectories` /
+> `experiences` / `tools`。`skills` **不是记忆类型**，不再进入
+> `memory_search` / `memory_types` / 记忆管理页；它由独立的 Session Skill 链路处理。
+>
+> `create_session` 固定使用 `DEFAULT_SESSION_MEMORY_TYPES`（当前 6 类）；
+> `0.5.2.1` 不接受 `tools` / `skills` 作为 session memory type，且 create 响应不含
+> `memory_policy`，所以 create 后重新 GET 校验 effective policy。
+>
+> Session Skill 链路：worker 等 Session Commit 后台任务结束，读取任务结果
+> `session_skill_uris`；对每个生成的 skill 读取 `SKILL.md`，导入用户私有技能目录，
+> 标记为 **extracted（提炼）**，保存一个不扫描的草稿版本（状态 `unscanned` / 待扫描），
+> 等用户在前端「技能」页编辑、扫描、生效。`skills` 仍不在记忆管理页展示。
+>
+> 下文所有“8 类 / skills 作为 memory type / tools、skills 都不在前端”描述以本修订为准。
 >
 > 参考：
 >
@@ -45,7 +60,7 @@
 | 常驻层 | 读取数据库中的 `profile.md`、项目内 `identity.md` / `soul.md` 并注入 | 只承载自动抽取的记忆类型；不保存这三个人设文件 |
 | 写入层 | before_agent 门控、逐消息 Redis Stream 投递 | session、archive、异步记忆抽取、memory_diff |
 | 检索层 | 工具门面、token 预算、结果映射 | `find` / L0/L1/L2（无 context search / 自动召回） |
-| 治理层 | 提供“我的画像”结构化表单（profile 修改/删除）与“记忆管理”页（六类记忆的查看/编辑/删除，直接走 OpenViking 协议）；identity/soul 随项目文件发布 | 文件系统、版本化归档；记忆正文与索引 |
+| 治理层 | 提供“我的画像”结构化表单（profile 修改/删除）与“记忆管理”页（七类记忆的查看/编辑/删除，直接走 OpenViking 协议）；identity/soul 随项目文件发布 | 文件系统、版本化归档；记忆正文与索引 |
 
 核心决策：
 
@@ -57,12 +72,12 @@
 6. **只有纯招呼/告别/致谢跳过抓取。** `SKIP` 不进入 message 抓取流，不抓取本轮 human/tool/AI 消息；告别可投递一个无消息的 `SESSION_END` control job。“可以”“继续”“好的”“收到”“完成”“记住”等全部按 `CAPTURE` 处理，由信号决定是否 commit。
 7. **profile 存数据库，identity/soul 是项目文件，但 OpenViking 自带同名类型。** `profile.md` 是用户身份，存 `memory_profile_documents`；`identity.md` / `soul.md` 仍是项目内本地文件。Server 0.4.19 的 `profile` / `identity` / `soul` 是默认启用的内置 memory types，MyFlow 必须通过 `memory_policy.memory_types` 白名单显式排除，不能声称它们“不是 memory_type”。MyFlow 只提供 `profile` 的结构化表单（修改/删除）与内置工具 `update_user_profile`
 （仅当用户在本轮显式陈述画像信息时调用），两者都写同一张 `memory_profile_documents`。自动记忆的查看/编辑/删除走“记忆管理”页，直接调用 OpenViking 协议。
-8. **OpenViking 只承载自动抽取的记忆。** 自动抽取启用 `preferences`、`entities`、`events`、`cases`、`trajectories`、`experiences`、`tools`、`skills`；不定义 `myflow_fact` 等自定义类型。
+8. **OpenViking 只承载自动抽取的记忆。** 自动抽取启用 `preferences`、`entities`、`events`、`cases`、`trajectories`、`experiences`、`tools`；`skills` 走独立 Session Skill 导入；不定义 `myflow_fact` 等自定义类型。
 9. **删除 pending_review、字段级置信度、画像 CAS/墓碑、程序性记忆、Skill 候选。** 这些是 A 方案的产品取舍；如果它们是硬性合规要求，需要走 C 方案。
 10. **直接使用 `openviking-sdk`，不使用 `langchain-openviking`（运行时和适配器都不用）。** `AsyncHTTPClient` 绑定事件循环，client cache 必须按 loop 隔离；同步 Agent 路径不得复用异步 worker 的 client。
 11. **多租户使用 trusted 模式。** MyFlow 网关持有 root key，为每个用户构造绑定身份的 client；用户 ID 做 HMAC 后写入 OpenViking URI。所有 OpenViking 记忆的 URI 都使用绝对形式 `viking://user/<ov_user>/...`，不依赖 `~`。
 12. **原始 session 默认保留 30 天，自动提交靠 idle。** OpenViking 会保存 session 消息和 archive；每 24h 无新消息时由 idle auto-commit 归档并抽取，避免普通 `NONE` 轮次永远不 commit。如果要求“抽取后立即不留原始 transcript”，需要缩短 retention 并接受审计/摘要不可回看。
-13. **记忆管理页是 OpenViking 的只读视图 + 受控写入面，不是第二套记忆库。** 列表用 `find`（无 query + filter + `level=2`）拿摘要，详情用 `overview` 渲染目录，正文用 `read`，编辑用 `write(edit_source=manual)`，删除用 `rm`；MyFlow 不落库、不缓存正文。只暴露 6 类自动记忆，`.abstract.md` / `.overview.md` 只读不可编辑删除。
+13. **记忆管理页是 OpenViking 的只读视图 + 受控写入面，不是第二套记忆库。** 列表用 `find`（无 query + filter + `level=2`）拿摘要，详情用 `overview` 渲染目录，正文用 `read`，编辑用 `write(edit_source=manual)`，删除用 `rm`；MyFlow 不落库、不缓存正文。只暴露 7 类可管理记忆（含 `tools`，不含 `skills`），`.abstract.md` / `.overview.md` 只读不可编辑删除。
 14. **当前不存在旧记忆数据，因此不做迁移、不做旧版本回滚。** 新链路从空记忆开始；旧代码/表在 P5 直接删除，不保留作为回退边界；上线后若需回退，只能回到空记忆状态，不能恢复旧模块数据。
 
 ### 0.1 本轮审计决议（规范性，优先于后文重复描述）
@@ -73,8 +88,8 @@
 2. **持久去重是 at-least-once + reconcile，不是 exactly-once。** `memory_capture_dedup` 以 `(user_id, thread_id, session_epoch, session_incarnation, message_id)` 为唯一键，状态为 `pending|appending|appended`，并记录 `turn_id/sequence/content_sha256/lease_owner/lease_until/attempts`。worker 先 reserve；append 成功后标 `appended`，再 `XACK`。append 成功但 DB 标记失败时，该行只能停在 `pending/appending`（不可能凭成功响应之外写成 `appended`）；重启时只对这些**不确定行**按 `source_message_ids` 对账 OpenViking 的 live messages 和可读 archive：已存在则直接标 `appended`，否则重试 append；无法对账时接受 at-least-once，并告警，**不再声称“绝不重复 append”**。**正常的 `appended` 行是终态，不做全量对账**；只有 `appended_at IS NULL` 的异常行才进入对账。`XACK` 之后才允许清理 dedup 行，TTL 不小于 session retention。
 3. **压缩窗口不进入记忆捕获链路。** 删除 `MemorySummarizationHook` 的投递逻辑、`message_kind=compaction`、压缩 orphan buffer 和相关 commit。自动/手动压缩都不得把“即将丢弃的消息”补投到 Redis；正常 turn 已经在产生时进入捕获流，压缩不再二次抓取。接受“压缩前从未成功捕获的消息永久丢失”，不把它伪装成 24h 兜底。
 4. **idle-only auto-commit。** OpenViking Server 0.4.19 使用 `memory.session_auto_commit.default_enabled=true` + `idle_enabled=true`；每个 session 显式设置 `auto_commit_policy={pending_token_threshold:0, message_count_threshold:0, idle_timeout_seconds:86400, keep_recent_count:0, min_commit_interval_seconds:0}`。阈值 0 表示关闭对应触发，因此自动提交只由 24h idle 触发；显式语义 commit / 管理员 flush 仍可存在，但不属于 auto-commit。普通 `NONE` turn 由 idle 自动提交兜底，不再“永不 commit”。
-5. **Session 创建必须显式。** 禁止把 `get_session(auto_create=True)` 作为新建路径。`SessionManager` 先 `get_session(auto_create=False)`；NotFound 才 `create_session`，并显式传 8 类 `memory_policy` 与上面的 idle-only `auto_commit_policy`；AlreadyExists 则 GET。创建后校验 effective `memory_policy` / `auto_commit_policy`：auto policy 不匹配用 `update_session_config(auto_commit_policy=...)` 修正；memory policy 不匹配只能删除重建或 fail-closed。`remember` 的一次性 session 同样走这条路径。
-6. **profile / identity / soul 是 OpenViking 内置类型，但 MyFlow 不启用。** Server 0.4.19 的 `profile` / `identity` / `soul` 模板默认 `enabled: true`；不要写“它们不是 OpenViking memory_type”。正确表述是“MyFlow 的 `memory_policy.memory_types` 白名单只列 8 类，显式排除这三类”。`memory_read` / `memory_overview` 还必须拒绝 `memories/profile.md`、`memories/identity.md`、`memories/soul.md`、`peers/`、`sessions/`、`privacy/`。
+5. **Session 创建必须显式。** 禁止把 `get_session(auto_create=True)` 作为新建路径。`SessionManager` 先 `get_session(auto_create=False)`；NotFound 才 `create_session`，固定显式传 `DEFAULT_SESSION_MEMORY_TYPES`（6 类）与上面的 idle-only `auto_commit_policy`；AlreadyExists 则 GET。创建后校验 effective `memory_policy` / `auto_commit_policy`：auto policy 不匹配用 `update_session_config(auto_commit_policy=...)` 修正；memory policy 不匹配只能删除重建或 fail-closed。`remember` 的一次性 session 同样走这条路径。
+6. **profile / identity / soul 是 OpenViking 内置类型，但 MyFlow 不启用。** Server 0.4.19 的 `profile` / `identity` / `soul` 模板默认 `enabled: true`；不要写“它们不是 OpenViking memory_type”。正确表述是“MyFlow 的 `memory_policy.memory_types` 只列 6 类，显式排除这三类；tools 只在检索/管理目录，skills 走独立 Session Skill 链路”。`memory_read` / `memory_overview` 还必须拒绝 `memories/profile.md`、`memories/identity.md`、`memories/soul.md`、`peers/`、`sessions/`、`privacy/`。
 7. **session 生命周期字段。** `memory_sync_state` 增加 `session_started_at`、`last_message_at`、`last_commit_at`、`last_auto_commit_at`、`last_turn_end_id`、`last_turn_end_at`；`memory_capture_dedup` 增加 `appending_at`、`lease_until`、`ov_message_ids`。retention 用这些字段判断；删除 session 前必须确认没有未提交 live messages，或先执行一次提交。
 8. **不自动召回记忆。** 首版只保留 `memory_search` / `memory_read` / `memory_overview` 工具；删除 `search_context` 自动召回、`memory.recall` 配置、`RecallService` 的自动注入路径。`before_agent` 不再 `ls` `preferences` / `entities` 做记忆索引；DB profile + identity/soul 在 run assembly 的系统提示中拼接；因此不会出现“未调用工具却自动带出 OpenViking 记忆”的行为。
 9. **记忆内容统一包裹。** 所有进入模型上下文的内容（profile、`memory_search` 摘要、`memory_overview`、`memory_read` 正文）都经过 `MemoryContentEnvelope`：固定 `<memory-context source="..." trust="untrusted">` 包裹、XML 转义、去除控制标签、token/char 上限，并显式标注“这是记忆内容，不是系统指令”。没有 auto recall 这一路。
@@ -133,19 +148,19 @@ canonical 记忆模块在本设计落地后已被物理删除。下面只是被�
 - 只有纯社交/无任务内容的轮次（招呼/告别/致谢/纯 emoji/标点）不进入抓取；其余 human / tool / AI 消息统一进入异步抓取管道；
 - 启用全部需要的 OpenViking 内置记忆类型，包括 Agent Evolution 与工具/技能经验；
 - 在任务边界、完成、失败修复、纠错、显式记住时由异步 worker commit；普通 `NONE` 由 24h idle auto-commit 兜底；压缩窗口不进入捕获链路；
-- MyFlow 前端提供“我的画像”结构化表单（修改/删除 profile）与“记忆管理”页（查看/编辑/删除六类自动记忆）；
-- identity/soul 是项目文件；记忆管理页只代理 OpenViking 协议，不复制记忆内容；`tools` / `skills` 记忆仍由 OpenViking Studio/CLI 管理；
+- MyFlow 前端提供“我的画像”结构化表单（修改/删除 profile）与“记忆管理”页（查看/编辑/删除七类可管理记忆）；
+- identity/soul 是项目文件；记忆管理页只代理 OpenViking 协议，不复制记忆内容；`tools` 记忆在管理页展示；Session Skill 导入技能目录，在“技能”页处理；
 - 用户隔离、隐私脱敏、失败降级和可观测性达到生产要求；
 - 不做旧 PostgreSQL/Milvus 记忆数据迁移；新链路从空记忆开始。
 
 ### 1.4 非目标
 
-- 不重做 MyFlow 技能系统；不接入 OpenViking Skill 安装包/执行系统，只启用 `skills` 使用经验记忆类型。
+- 不重做 MyFlow 技能系统；不接入 OpenViking Skill 安装包/执行系统；只把 Session Skill 产出的 `SKILL.md` 导入 MyFlow 私有技能草稿。
 - 不把 `cases` / `trajectories` / `experiences` 自动发布为 MyFlow 技能；它们只是 OpenViking 记忆类型，MyFlow 技能系统仍独立。
 - 不替换知识库（MinerU + Milvus）链路。
 - 不引入 OpenViking Rules、MCP、WebDAV、Feishu 等扩展。
 - 不追求“逐字保存用户原话”的笔记系统；记忆仍以抽取结果为准。
-- 不在前端展示或修改 `identity`、`soul`（项目文件）以及 `tools` / `skills` 记忆；这些仍由 OpenViking Studio/CLI 管理。
+- 不在记忆管理页展示或修改 `identity`、`soul`（项目文件）以及 `skills`；`tools` 记忆进入管理页，Session Skill 在“技能”页以提炼草稿出现。
 - 不实现记忆**搜索**页（没有 query 输入的检索界面）；记忆管理页只做按类型筛选、列表、详情、编辑、删除。
 - 不复制 OpenViking 记忆正文到 MyFlow 数据库；页面每次打开都实时调用 OpenViking。
 
@@ -157,7 +172,7 @@ canonical 记忆模块在本设计落地后已被物理删除。下面只是被�
 4. **没有原生字段级 CAS/墓碑：** OpenViking 的 `write`/`batch_write` 不提供条件写；`profile.md` 存在 MyFlow 数据库，用行级 etag 检测冲突；OpenViking 侧的记忆编辑是最后写入者胜出。
 5. **SDK 是 HTTP-only：** 需要独立运行 OpenViking Server；SDK 的 `AsyncHTTPClient` 绑定事件循环，不能跨 loop 复用。
 6. **OpenViking 是新的单点：** 它成为记忆 SoT 后，备份、恢复、容量、版本升级都要单独纳入运维。
-7. **只使用内置 memory type：** 不新增 `myflow_fact` 等自定义 schema；自动抽取落到 `preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools` / `skills`。`profile` 是数据库中的用户身份资料；`identity` / `soul` 是项目内本地 Markdown；三者都不加入 MyFlow 的 `memory_policy.memory_types`。OpenViking 0.4.19 自带同名内置类型且默认启用，必须显式排除。
+7. **只使用内置 memory type：** 不新增 `myflow_fact` 等自定义 schema；自动抽取落到 `preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools`；`skills` 由 Session Skill 链路导入技能目录。`profile` 是数据库中的用户身份资料；`identity` / `soul` 是项目内本地 Markdown；三者都不加入 MyFlow 的 `memory_policy.memory_types`。OpenViking 0.4.19 自带同名内置类型且默认启用，必须显式排除。
 
 ### 1.6 方案取舍
 
@@ -230,7 +245,7 @@ OpenViking Server
   |-- Session / Archive / Memory Extraction
   |-- idle auto-commit（86400 秒；阈值 0 仅保留 idle）
   |-- memory types: preferences / entities / events / cases / trajectories /
-  |                 experiences / tools / skills
+  |                 experiences / tools
   |-- 未启用：profile / identity / soul（内置类型，但 MyFlow 白名单排除）
 ```
 
@@ -240,7 +255,7 @@ OpenViking Server
 |---|---|---|
 | `MemoryFacade` | 对 Agent/HTTP 暴露统一异步接口；映射错误；组织服务 | 不实现存储、向量、抽取 |
 | `OpenVikingClientFactory` | 按 `(event_loop, account, ov_user)` 构造并缓存 client；health 检查；在 owner loop 关闭 | 不决定用户身份；不跨 loop 复用 |
-| `SessionManager` | 先 `get_session(auto_create=False)`，NotFound 才显式 create；维护 8 类 memory policy + idle-only auto policy、epoch + incarnation、生命周期字段；提供 `resolve_capture_context`（只写 DB，不访问 OpenViking）；删除 tombstone；删除前检查 shard/phase 2 | 不用 `auto_create=True` 新建；不决定是否抓取 |
+| `SessionManager` | 先 `get_session(auto_create=False)`，NotFound 才显式 create；维护 `DEFAULT_SESSION_MEMORY_TYPES`（6 类）memory policy + idle-only auto policy、epoch + incarnation、生命周期字段；提供 `resolve_capture_context`（只写 DB，不访问 OpenViking）；删除 tombstone；删除前检查 shard/phase 2 | 不用 `auto_create=True` 新建；不决定是否抓取 |
 | `ProfileService` | 读写 `memory_profile_documents`；字段校验；etag；删除字段/清空；`update_fields()` 供工具使用（读当前 etag 后 CAS，冲突重读重试一次） | 不写 OpenViking；不自动抽取 profile；不做冲突合并 |
 | `update_user_profile` tool | 把用户在对话里显式陈述的画像信息写进 `memory_profile_documents`；参数校验失败返回结构化 tool error | 不写 OpenViking；不写事实记忆；不猜、不补全、不写敏感值 |
 | `MemoryLibraryService` | 记忆管理页的协议适配：`find`（无 query + filter）列摘要、`overview` 解析目录、`read` 读正文、`write` 保存、`rm` 删除；URI 白名单与 sidecar 保护 | 不保存记忆副本；不写 profile；不允许改 `.abstract.md` / `.overview.md` / 目录；不做语义搜索 |
@@ -269,7 +284,7 @@ OpenViking Server
 - **子代理：** `MemoryMiddleware` 只挂 lead；子代理内部的 human/AI/tool 消息不直接抓取，只把 lead 可见的 `task` ToolMessage 及其摘要作为证据。需要完整子代理轨迹时另立设计，不把本设计伪装成全链路捕获。
 - **技能系统：** 继续使用现有技能包/Git/审核；OpenViking Skills 不接入首版。
 - **认证：** MyFlow user_id → OpenViking user 的 HMAC 映射；不把 MyFlow 原始 ID 暴露在 URI。
-- **前端：** 访问 `/api/memory/profile` 做画像表单，访问 `/api/memory/items` 做记忆管理；不访问 identity/soul；`tools` / `skills` 记忆仍在 OpenViking Studio/CLI，前端不下发 root key。
+- **前端：** 访问 `/api/memory/profile` 做画像表单，访问 `/api/memory/items` 做记忆管理；不访问 identity/soul；`tools` 记忆在管理页展示，Session Skill 在“技能”页处理，前端不下发 root key。
 
 ## 3. 身份与多租户
 
@@ -359,7 +374,7 @@ SDK 会在请求上带：
 - `profile` 是用户身份，`identity` 是助手身份，`soul` 是助手原则；三者不要混用；
 - `identity` / `soul` 是项目级文件，随代码发布、由项目维护者审查修改，运行时不自动改写；
 - `profile` 按 `user_id` 在数据库中隔离；不写本地 `data/personalization/`，不依赖共享文件系统；
-- MyFlow 不启用 OpenViking 的 `profile` / `identity` / `soul` 三个内置类型；它们仍在服务端模板中默认 `enabled: true`，所以每个 session 的 `memory_policy.memory_types` 必须显式只列 8 类，不能省略；
+- MyFlow 不启用 OpenViking 的 `profile` / `identity` / `soul` 三个内置类型；它们仍在服务端模板中默认 `enabled: true`，所以每个 session 的 `memory_policy.memory_types` 必须显式列出白名单（6 类），不能省略；
 - 三者不参与 MyFlow 的 memory_diff / 自动抽取；服务端若因策略遗漏写入同名文件，`memory_read` 必须拒绝读取；
 - 注入位置：`profile`、`identity`、`soul` 都进入 lead agent 的系统提示；`profile` 位于 `<user_profile>` 标签下，见 §5.1；
 - 本设计对“MyFlow 不保存记忆正文”的例外是 `memory_profile_documents`（用户明确维护的身份资料）和 `memory_profile_suggestions.evidence_quote`（脱敏、限长的建议证据；见 §4.7）。
@@ -383,18 +398,18 @@ OpenViking 只保存自动抽取的记忆：
 本设计**不使用** context search / 分桶配额 / 自动召回；所有 OpenViking 检索都走 `find`（`memory_search` 工具），因此不依赖 bucket 配额：
 
 - 默认检索：`preferences` / `entities` / `events`
-- 显式请求：`cases` / `trajectories` / `experiences` / `tools` / `skills`
+- 显式请求：`cases` / `trajectories` / `experiences` / `tools`
 
 `profile` 在 PostgreSQL；`identity` / `soul` 是项目内本地文件；三者都不在 MyFlow 的检索白名单。OpenViking 0.4.19 自带同名内置类型，但 MyFlow 不启用。
 
-自动抽取只作用于 OpenViking 的 `preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools` / `skills`；`profile` / `identity` / `soul` 不加入 `memory_types`。
+自动抽取只作用于 OpenViking 的 `preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools`；`profile` / `identity` / `soul` 不加入 `memory_types`。
 
 启用条件：
 
 - `cases` / `trajectories` / `experiences` 需要 OpenViking `agent_evolution.enabled=true`；`experiences` 会自动联动启用 `cases` 和 `trajectories`；
-- `tools` / `skills` 内置模板默认 `enabled: false`，必须通过 `memory.custom_templates_dir` 覆盖同名内置模板并把 `enabled` 改为 `true`；这不是新增自定义类型，只是启用内置类型；
-- `tools` / `skills` 需要 session 中有有界的 `ToolPart` 证据，否则抽取质量很低；
-- `skills` 记忆类型是“技能使用经验”，不是 MyFlow 技能包，也不是 OpenViking 的 `viking://~/skills/` 安装包。
+- `tools` 模板在 0.5.2 需要服务端安装/启用；它不是新增自定义类型，只是启用同名记忆模板；
+- `tools` 需要 session 中有有界的 `ToolPart` 证据，否则抽取质量很低；
+- `skills` 不是记忆模板：它由 `session_skill_extraction_enabled` 控制，产出 `SKILL.md` 包，再由 §6.8 导入 MyFlow 技能目录。
 
 本设计不定义 `myflow_fact` 或其他自定义 memory type。所有记忆必须落到 OpenViking 内置类型，路由规则如下：
 
@@ -430,7 +445,9 @@ OpenViking 只保存自动抽取的记忆：
 | `trajectories` | `.../memories/trajectories/` | 复用操作契约 | 用户偏好、静态实体 |
 | `experiences` | `.../memories/experiences/` | 成功/失败提炼的经验 | 原始轨迹、用户画像 |
 | `tools` | `.../memories/tools/` | 工具调用统计与最佳实践 | 用户偏好、Skill 包 |
-| `skills` | `.../memories/skills/` | 技能使用经验（不是 Skill 包） | MyFlow 技能包、OpenViking Skill 安装包 |
+
+`skills` 不是 memory type；Session Skill 写入 `viking://user/<ov_user>/skills/<name>/SKILL.md`，
+由 §6.8 导入 MyFlow 技能目录。
 
 ### 4.4 我的画像结构化表单
 
@@ -506,7 +523,7 @@ boundaries: [不要主动发邮件]
 - 自动抽取、`USER_CORRECTION`、`EXPLICIT_REMEMBER` 都不会写 `memory_profile_documents`；画像只由表单与内置工具 `update_user_profile` 写入；
 - `PersonalizationService` 每轮 `before_agent` 读取当前 etag 并注入；写入成功后更新本进程缓存并删除旧 etag 缓存，其他 worker 下一轮通过 etag 发现变化。
 
-`profile` 不在 OpenViking 中，也不出现在 `memory_types`；因此没有“自动抽取写 profile”的路径。OpenViking 的 `memory_types` 只列 §4.1 的 8 类自动记忆。
+`profile` 不在 OpenViking 中，也不出现在 `memory_types`；因此没有“自动抽取写 profile”的路径。OpenViking 的 `memory_types` 固定列 `DEFAULT_SESSION_MEMORY_TYPES` 的 6 类。
 
 #### 画像字段清单与前端渲染（2026-11-02）
 
@@ -675,7 +692,7 @@ memory_profile_suggestions
 - MyFlow 前端不展示、不提供编辑入口；需要改人设时由项目维护者改文件并发布；
 - `identity.md` 中的头像/二进制资产只作为元数据，不进入系统提示；系统提示只渲染名称、气质、自我介绍等文本 section，避免把路径或二进制内容送到模型。
 
-`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` 由 OpenViking 自动抽取维护，MyFlow 在“记忆管理”页提供查看/编辑/删除（§4.9）；`tools` / `skills` 仍只在 OpenViking Studio/CLI 维护。
+`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools` 由 OpenViking 自动抽取维护，MyFlow 在“记忆管理”页提供查看/编辑/删除（§4.9）；Session Skill 导入“技能”页。
 
 ### 4.6 原生 memory_type
 
@@ -683,7 +700,7 @@ memory_profile_suggestions
 
 | 用途 | 来源 |
 |---|---|
-| 可检索的 OpenViking 记忆 | `memory_type`：`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools` / `skills` |
+| 可检索的 OpenViking 记忆 | `memory_type`：`preferences` / `entities` / `events` / `cases` / `trajectories` / `experiences` / `tools` |
 | 启动注入 | `profile`（`memory_profile_documents.content`，种子模板 `config/personalization/profile.md`）/ `identity`（`config/personalization/identity.md`）/ `soul`（`config/personalization/soul.md`） |
 
 规则：
@@ -826,7 +843,7 @@ memory_capture_dedup
 
 #### 4.9.1 范围与中文名
 
-只管理六类自动记忆（`DEFAULT_MEMORY_TYPES` 去掉默认关闭的 `tools` / `skills`）：
+只管理七类记忆（六类基础类型 + `tools`；`skills` 不展示）：
 
 | memory_type | 中文名 | 典型文件结构 |
 |---|---|---|
@@ -836,9 +853,10 @@ memory_capture_dedup
 | cases | 案例 | `memories/cases/<case>.md` |
 | trajectories | 轨迹 | `memories/trajectories/<name>_<ts>.md` |
 | experiences | 经验 | `memories/experiences/<name>.md` |
+| tools | 工具 | `memories/tools/<tool>.md` |
 
-`profile` / `identity` / `soul` 与 `tools` / `skills` 不出现：`profile` 由“我的画像”页管理，
-`identity` / `soul` 是项目文件，`tools` / `skills` 仍是 OpenViking Studio/CLI 的运维面。
+`profile` / `identity` / `soul` 与 `skills` 不出现：`profile` 由“我的画像”页管理，
+`identity` / `soul` 是项目文件，`skills` 仍是 OpenViking Studio/CLI 的运维面。
 
 #### 4.9.2 L0/L1/L2 与界面的对应
 
@@ -847,7 +865,7 @@ OpenViking 的 L0/L1 是**目录级 sidecar**（`.abstract.md` / `.overview.md`�
 
 | 界面元素 | OpenViking 调用 | 说明 |
 |---|---|---|
-| 类型筛选 | `GET /api/memory/items/types` | 六类 + 中文名，来自代码常量 |
+| 类型筛选 | `GET /api/memory/items/types` | 七类 + 中文名，来自代码常量 |
 | 列表项摘要 | `find(query="", target_uri=[<type>], filter=…, level=[2])` | 用记录里的 `abstract`；网关截断到 500 字符并标记 `abstract_truncated`；空摘要显示“暂无摘要” |
 | 详情目录（TOC） | `overview(<folder>)` | `.overview.md` 正文；网关解析成 `toc`（标题 + 相对链接）返回，前端渲染成可点击目录 |
 | 点击目录项 | `read(<file_uri>)` | L2 正文；同时返回 `sha256`，编辑时做乐观并发 |
@@ -862,7 +880,7 @@ OpenViking 的 L0/L1 是**目录级 sidecar**（`.abstract.md` / `.overview.md`�
 #### 4.9.3 服务端保护（安全边界）
 
 1. URI 必须是绝对形式 `viking://user/<ov_user>/memories/<type>/.../<name>.md`；`~`、`..`、编码穿越一律拒绝；
-2. `<type>` ∈ 六类白名单；路径段不得包含 `peers` / `sessions` / `privacy` / `rules`；
+2. `<type>` ∈ 七类白名单；路径段不得包含 `peers` / `sessions` / `privacy` / `rules`；
 3. 只允许以 `.md` 结尾的**文件**；`rm` 固定 `recursive=False`；删除前先 `read` 确认目标是文件；
 4. **禁止写入/删除 `.abstract.md`、`.overview.md`**（含 `*.abstract.md` 之类的变体）；它们由 OpenViking
    语义处理生成，界面没有编辑/删除入口；
@@ -968,7 +986,7 @@ targets = [f"viking://user/{ov_user}/memories/{memory_type}" for memory_type in 
 
 - 只允许当前用户的绝对前缀 `viking://user/<ov_user>/memories/`；先做 URI parser + path normalization，拒绝 `..`、编码穿越、`peers/`、`sessions/`、`privacy/`、`profile.md`、`identity.md`、`soul.md`；`~` 形式统一拒绝，不做隐式展开；
 - 默认最多 8000 字符，硬上限 16000；`max_chars` 超限返回 tool error；返回内容带 `truncated` 标记，并经过 `MemoryContentEnvelope` 包裹；
-- `memories/skills/` 是技能经验记忆，允许读；`viking://user/<ov_user>/skills/` 是 Skill 安装包，不在允许前缀内；
+- `viking://user/<ov_user>/skills/` 是 Session Skill 目录，由 §6.8 导入器读取，不通过 `memory_read` 暴露；
 - 不暴露 `write`、`rm` 给模型。
 
 `memory_overview(uri)`：
@@ -986,10 +1004,15 @@ targets = [f"viking://user/{ov_user}/memories/{memory_type}" for memory_type in 
   不是 HTTP 错误；模型可据此修正后重试；
 - 只有 lead agent 注册；子代理不写画像。
 
-可选 `memory_remember(text)`：
+内置工具 `memory_remember(text)`：
 
-- 见 §6.5；对话内的“记住”优先复用 thread session；
-- 外部 API/工具可直接使用一次性 session；接口为 `MemoryFacade.remember(user_id, text)`。
+- 只在 lead agent 注册；模型在用户**明确要求长期记住**时调用，不用于普通事实陈述或提问；
+- 工具不直接写 OpenViking，也不等待抽取；它把当前 turn 的 `TurnDecision.signals`
+  置为 `EXPLICIT_REMEMBER`（已有 signal 不重复添加），返回 `queued`；
+- worker 在 append 当前 turn 后按 signal commit；对话内不复用一次性 session，避免同一条
+  消息被重复抽取（§6.5）；
+- 只读的 `memory_search` / `memory_read` / `memory_overview` 仍只挂在
+  `memory-researcher` 子代理上，显式记忆工具不参与检索委派。
 
 ### 5.3 自动召回（已删除）
 
@@ -1262,11 +1285,7 @@ await client.create_session(
             "self": {"enabled": True},
             "peer": {"enabled": False},
             "working_memory": {"enabled": False},
-            "memory_types": [
-                "preferences", "entities", "events",
-                "cases", "trajectories", "experiences",
-                "tools", "skills",
-            ],
+            "memory_types": list(DEFAULT_SESSION_MEMORY_TYPES),
         },
         # 0 = 关闭该阈值；只保留 24h idle。
         "auto_commit_policy": {
@@ -1316,8 +1335,8 @@ OpenViking Server 0.4.19 服务端配置：
 | `TASK_BOUNDARY` | 上一任务结束、新任务开始 | 写入当前 turn 前先 commit 旧 pending | 旧任务单独归档 |
 | `TASK_COMPLETE` | 用户显式完成，或 run 成功且有明确交付物（规则/轻量模型确认） | 写入当前 turn 后 commit | 及时固化任务结果 |
 | `FAILURE_RECOVERY` | 工具失败后重试成功，或 run 以错误结束 | 写入当前 turn 后 commit | 失败与修复在同一/相邻归档 |
-| `USER_CORRECTION` | 用户纠正持久事实/偏好/决定 | 先 commit 旧 pending，写入纠错 turn，再 commit | 旧状态与纠正分开 |
-| `EXPLICIT_REMEMBER` | 用户明确要求记住 | 先 commit 旧 pending，写入当前 turn，再 commit | 立即触发抽取 |
+| `USER_CORRECTION` | 用户纠正持久事实/偏好/决定 | 写入当前 turn 后 commit | 保留纠正上下文，并让抽取器看到旧值→新值 |
+| `EXPLICIT_REMEMBER` | 用户明确要求记住，或内置 `memory_remember` 工具标记 | 写入当前 turn 后 commit | 立即触发抽取 |
 | `SESSION_END` | 再见/拜拜/明确结束 | 只为之前 pending commit；SKIP 轮不写消息 | 收割尾巴 |
 | `NONE` | 普通聊天 | 不显式 commit | 留给后续信号、idle auto-commit 或管理员 flush |
 
@@ -1382,12 +1401,13 @@ elif ctx.has_tool_error and ctx.has_recovery:
 worker 操作：
 
 ```text
-1. commit(thread_session, reason="correction_before")
-2. append(纠错 turn 的消息)
-3. commit(thread_session, reason="correction_after")
+1. append(纠错 turn 的消息)
+2. commit(thread_session, reason="user_correction")
 ```
 
-如果第 1 步失败：继续 append，turn_end 标记 `degraded=true`；第 3 步或 idle auto-commit 最终会合并两段。`degraded` 写入 `memory_sync_state` 和日志/指标，不阻塞后续轮次。
+不在 append 前额外 commit 旧 pending：旧值与纠错放在同一段连续上下文中，由抽取器
+识别 update/supersede；commit 只在当前 turn 完整写入后执行一次。commit 失败时 control
+event 留在 PEL，下一次 claim 只重试 commit，不重复 append。
 
 #### EXPLICIT_REMEMBER
 
@@ -1417,16 +1437,18 @@ worker 操作（对话内）：
 重要：不要新建一次性 session 再把同一条消息写一遍，否则会重复抽取。
 
 ```text
-1. commit(thread_session, reason="pre_explicit_remember")
-2. append(当前 turn 的消息)
-3. commit(thread_session, reason="explicit_remember")
-4. 轮询 task，读取 memory_diff，更新 state
+1. append(当前 turn 的消息)
+2. commit(thread_session, reason="explicit_remember")
+3. 轮询 task，读取 memory_diff，更新 state
 ```
+
+不在 append 前额外 commit 旧 pending；本轮消息完整写入后只 commit 一次。`memory_remember`
+工具只负责把 signal 放进 turn_end，commit 仍由 worker 在 append 之后执行。
 
 操作（API/工具直接写入）：
 
 ```text
-create_session("mf-rem-<uuid>", memory_policy=<8 类>, auto_commit_policy=<idle-only>)
+create_session("mf-rem-<uuid>", memory_policy=<DEFAULT_SESSION_MEMORY_TYPES>, auto_commit_policy=<idle-only>)
 add_message(user, content)
 commit_session(keep_recent_count=0)   # 显式 commit；不是 auto-commit
 get_task(task_id)
@@ -1454,7 +1476,7 @@ get_task(task_id)
 - 收到第一个 `turn_end`，或超过 `missing_turn_end_timeout_seconds`，按顺序批量 append；append 不触发 commit；
 - 用 `CaptureDedupStore` 做 pending/appending/appended + 租约 + 重启对账；不声称 exactly-once；
 - 调用 `SessionManager.ensure_session`（显式 create/get，不用 auto_create）；
-- 仅在 `turn_end` 携带显式信号时调用 `commit_session(keep_recent_count=0)`；
+- 仅在 `turn_end` 携带显式信号，或 worker 内 `CommitSignalDetector` 在当前 turn append 后检测到信号时，调用 `commit_session(keep_recent_count=0)`；
 - 记录 `task_id / archive_uri / reason / last_turn_end_id`；
 - 轮询 `get_task`，完成后读取 `memory_diff`；
 - 失败只记录日志/指标，不做 DB outbox；Redis pending 由单 worker 的 `XAUTOCLAIM` 按 shard 重试。
@@ -1525,7 +1547,7 @@ DELETED（tombstone；拒绝新消息，等待清理）
 
 - key 为 `(user_id, thread_id)`；session_id 由 §3.1 的 HMAC 公式生成，包含 `session_incarnation`；`memory_sync_state` 记录 `session_epoch + session_incarnation + stream_shard`。
 - `resolve_capture_context`：只读写 `memory_sync_state`，生成/读取 shard/epoch/incarnation；不访问 OpenViking，供 `before_agent` 投递前使用。若 state 是 `deleted`，返回 tombstoned/skip，拒绝新消息；不得自动复活旧 thread。只有全新的 thread（无 state 行）才创建新 incarnation；若产品要复用 thread ID，必须显式 admin reset 并生成新 incarnation。
-- `ensure_session`：由 worker 在 append 前调用；先查 state；没有则创建随机 incarnation，**只调用 `create_session`** 并显式传 8 类 `memory_policy` + idle-only `auto_commit_policy`；遇到 `AlreadyExistsError` 直接 `get_session(auto_create=False)`；禁止用 `get_session(auto_create=True)` 作为新建路径。
+- `ensure_session`：由 worker 在 append 前调用；先查 state；没有则创建随机 incarnation，**只调用 `create_session`** 并显式传 `DEFAULT_SESSION_MEMORY_TYPES`（6 类）`memory_policy` + idle-only `auto_commit_policy`；遇到 `AlreadyExistsError` 直接 `get_session(auto_create=False)`；禁止用 `get_session(auto_create=True)` 作为新建路径。
 - 运行中遇到 `NotFoundError`：同一 incarnation 内 `session_epoch++`，按同一 policy 重新创建 session；清空本 thread 的旧 append 游标；旧 archive 不追回。
 - 删除 thread/用户：先写 `memory_sync_state.state=deleted` / `deleted_at` tombstone，停止该 thread 新消息投递；等待 shard 清空或 `missing_turn_end_timeout`；确认 phase 2 完成后才删 session。删除会话不删除已抽取 memories；删除前若仍有 live messages，先 `commit_session(keep_recent_count=0)` 或延后。
 - `SessionRetentionWorker` 删除过期 session 前也执行同一 tombstone/stream/phase 2 检查；有未完成 stream/phase 2 则延后；用 `last_message_at` / `last_commit_at` 判断，而不是只靠 `updated_at`。
@@ -1545,6 +1567,36 @@ DELETED（tombstone；拒绝新消息，等待清理）
 | 缺 `turn_end` | `missing_turn_end_timeout_seconds` 到期后按序 append；不 commit，等 idle auto-commit |
 
 压缩链路不产生任何 Redis 消息；因此不再需要 `MemorySummarizationHook`、`message_kind=compaction` 或压缩 orphan buffer。
+
+### 6.8 Session Skill 导入（2026-11-03）
+
+OpenViking 的 Session Skill 是独立于 memory types 的资产：commit task 完成时，任务结果
+返回 `session_skills_extracted` 与 `session_skill_uris`；每个 URI 是
+`viking://user/<ov_user>/skills/<skill_name>` 的根目录，目录内有 `SKILL.md`。
+
+流程：
+
+```text
+commit accepted -> task_id
+worker 轮询 get_task(task_id) 直到 completed/failed/timeout
+completed -> result.session_skill_uris
+for each uri:
+  read(<uri>/SKILL.md)
+  SkillAuthorService.import_extracted_skill(...)
+  -> SkillRecord.source="extracted", source_uri=<uri>
+  -> 保存一个 inert draft version（不扫描、不生效）
+  -> 前端技能页显示「提炼 · 待扫描」
+用户在前端编辑/安全扫描/生效
+```
+
+约束：
+
+- 导入不是 memory 写入，不进入 `memory_policy.memory_types`，也不出现在记忆管理页；
+- 同一个 `source_uri` 重复导入是幂等的；
+- 用户手动技能与提炼技能重名时自动加稳定后缀，不覆盖手动技能；
+- 生成技能只创建草稿版本，绝不自动扫描或自动生效；
+- 任务失败、超时或单个 URI 读取失败只记录日志，不影响已成功的 commit；
+- `session_skills.enabled=false` 或技能 runtime 不可用时跳过等待与导入。
 
 ## 7. 轻量分类器与打招呼过滤
 
@@ -1676,7 +1728,7 @@ SignalKind = Literal[
 ]
 MemoryType = Literal[
     "preferences", "entities", "events", "cases",
-    "trajectories", "experiences", "tools", "skills",
+    "trajectories", "experiences", "tools",
 ]
 
 
@@ -1923,7 +1975,7 @@ class MemoryFacade:
 
 ### 8.2 HTTP API
 
-MyFlow 提供“我的画像”、画像建议、onboarding 与“记忆管理”API；identity/soul 是项目内文件；`tools` / `skills` 记忆与导出仍在 OpenViking Studio/CLI。
+MyFlow 提供“我的画像”、画像建议、onboarding、“记忆管理”与“技能”API；identity/soul 是项目内文件；`tools` 记忆在管理页展示，Session Skill 导入“技能”页。
 
 | 方法 | 路径 | scope | 说明 |
 |---|---|---|---|
@@ -1937,7 +1989,7 @@ MyFlow 提供“我的画像”、画像建议、onboarding 与“记忆管理�
 | POST | `/api/memory/profile/suggestions/{id}/dismiss` | `memory:write` | 只改本人 suggestion 状态，不删除源记忆 |
 | GET | `/api/memory/profile/onboarding` | `memory:read` | 返回 onboarding 状态与是否展示；active run 由网关 run store 判断 |
 | POST | `/api/memory/profile/onboarding` | `memory:write` | `seen` / `snooze` / `dismiss` / `completed` |
-| GET | `/api/memory/items/types` | `memory:read` | 六类记忆的中文名与顺序（`preferences`→偏好 …） |
+| GET | `/api/memory/items/types` | `memory:read` | 七类记忆的中文名与顺序（`preferences`→偏好 …） |
 | GET | `/api/memory/items?type=&limit=` | `memory:read` | 过滤型 `find` 的列表：`{items:[{uri,name,folder,memory_type,abstract,abstract_truncated,updated_at}], has_more, limit}` |
 | GET | `/api/memory/items/detail?uri=` | `memory:read` | `overview` 渲染目录：`{uri,folder,memory_type,name,overview,toc:[{kind,title,depth,uri}],overview_missing}` |
 | GET | `/api/memory/items/content?uri=` | `memory:read` | `read` 正文：`{uri,content,sha256,size_bytes}` |
@@ -1973,8 +2025,8 @@ MyFlow 提供“我的画像”、画像建议、onboarding 与“记忆管理�
 | 记忆编辑 | `write(file_uri, content, mode="replace", options={"edit_source":"manual"})` |
 | 记忆删除 | `rm(file_uri, recursive=False)` |
 | identity / soul | 项目文件：`config/personalization/identity.md` / `soul.md`，不经 SDK |
-| 记忆管理（六类自动记忆） | `/api/memory/items`：`find` 列表、`overview` 目录、`read` 正文、`write` 编辑、`rm` 删除 |
-| `tools` / `skills` 记忆与导出 | 不在 MyFlow 内提供；由 OpenViking Studio/CLI 完成 |
+| 记忆管理（七类记忆） | `/api/memory/items`：`find` 列表、`overview` 目录、`read` 正文、`write` 编辑、`rm` 删除 |
+| Session Skill 导入 | commit task 的 `session_skill_uris` → `/api/skills/mine` 的 extracted 草稿（不在记忆管理页） |
 | 健康 | `health` |
 
 ### 8.4 错误映射
@@ -2007,7 +2059,7 @@ MyFlow 提供“我的画像”、画像建议、onboarding 与“记忆管理�
 - 左侧导航保留“我的画像”（`/workspace/profile`），新增“记忆管理”（`/workspace/memory`）；
 - `/workspace` 空状态（新用户、没有 thread）显示可关闭的“完善画像”卡片，点击进入 `/workspace/profile`；
 - 不再有“个性化”“待确认记忆”入口；
-- 我的画像页只编辑 `profile`，不展示 identity/soul；六类自动记忆在“记忆管理”页（§9.5）；
+- 我的画像页只编辑 `profile`，不展示 identity/soul；七类可管理记忆在“记忆管理”页（§9.5）；
 - 页面不使用 raw Markdown 编辑器，只使用结构化表单。
 
 ### 9.2 我的画像表单
@@ -2055,7 +2107,7 @@ Onboarding 卡片：
 ### 9.3 identity / soul 与其他记忆
 
 - `identity.md` / `soul.md` 是项目文件，不在 MyFlow 前端展示或编辑；修改走项目 PR/发布；
-- 六类自动记忆在“记忆管理”页查看/编辑/删除（§9.5）；`tools` / `skills` 仍不在 MyFlow 前端展示；
+- 七类可管理记忆在“记忆管理”页查看/编辑/删除（§9.5）；`tools` 已展示；`skills` 不在记忆管理页，而是在“技能”页以「提炼 · 待扫描」出现；
 - MyFlow 只保留可选的**管理员/运维入口链接** `openviking.studio_url`，不嵌入 Studio 页面；
 - 普通终端用户没有 identity/soul 入口；记忆管理只代理当前认证用户自己的记忆，不暴露 `ov_user`；
 - 由于 MyFlow 使用 HMAC 后的 `ov_user`，普通用户直接登录 OpenViking Studio 需要额外的用户体系/SSO 映射；首版把 Studio 定为管理员/运维工具。
@@ -2214,7 +2266,7 @@ memory:
 - `profile` **不加入** `memory_types`：它是 `memory_profile_documents` 中的用户身份资料；
 - `identity` / `soul` 不加入 `memory_types`：它们是项目文件；
 - **注意**：OpenViking 0.4.19 的 `profile` / `identity` / `soul` 是默认启用的内置类型；不加入白名单才会阻止抽取，不能只靠“MyFlow 不使用”这个意图；
-- `tools`/`skills` 必须先在 OpenViking 服务端启用内置模板；`experiences` 需要 effective `agent_evolution.enabled=true`（Account 级可覆盖，不能只看 server 启动默认）；
+- `tools` 在当前 OpenViking 0.5.2 没有内置记忆模板，需要服务端安装/启用同名模板后才能产生；`skills` 走独立的 `session_skill_extraction_enabled`，不在 session `memory_types`；`experiences` 需要 effective `agent_evolution.enabled=true`（Account 级可覆盖，不能只看 server 启动默认）；
 - 不要加入未注册的类型，否则 `create_session` 会返回 `InvalidArgumentError`；
 - `working_memory.enabled=false`：关闭 OpenViking 的 working-memory 摘要，只保留 archive；
 - **必须配置 session 级 idle-only `auto_commit_policy`**；0 表示关闭 threshold，只有 `idle_timeout_seconds=86400` 生效；普通 `NONE` turn 由它兜底；
@@ -2269,8 +2321,8 @@ memory:
 - embedding 和 VLM 是 OpenViking 的配置，不再由 MyFlow 负责；
 - `agent_evolution.enabled=true` 是 `cases` / `trajectories` / `experiences` 抽取的前提；它是 server 启动默认值，Account/Cluster 可覆盖，Phase 0 必须验证 **effective** 值为 true，而不是只看这一段 JSON；
 - 0.4.19 的 `session_auto_commit.default_enabled=true` + `idle_enabled=true` 是硬要求；session 级 policy 再把 token/message 阈值设为 0，只保留 idle=86400。不要写成 0.5.x 的 `enabled` 字段；
-- `tools.yaml` / `skills.yaml` 内置模板默认 `enabled: false`；复制到 `/etc/openviking/memory-templates/`，只把 `enabled` 改为 `true`；
-- `skills` 记忆类型是技能使用经验，不是 `viking://~/skills/` 下的 Skill 安装包；
+- OpenViking 0.5.2 不再内置 `tools` 记忆模板；`tools` 需要服务端安装同名模板；`skills` 不是 memory type，由 `memory.session_skill_extraction_enabled` 控制，生成结果通过 `session_skill_uris` 回报；
+- Session Skill 是实际技能资产（`SKILL.md` 包），由 §6.8 导入 MyFlow 技能目录，不是“技能使用经验”记忆；
 - 抽取模型建议与聊天模型分开；
 - 先在 Phase 0 验证模型抽取质量；
 - 不要假设任何 OpenAI-compatible 模型都能稳定输出 OpenViking 的 memory schema。
@@ -2368,7 +2420,7 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 ### 13.1 Phase 0 Spike 清单
 
 - trusted 模式 + per-user client + 隔离；
-- session 显式 `get_session(auto_create=False)` → `create_session`（8 类 memory policy + idle-only auto policy）→ AlreadyExists 恢复；禁止 `auto_create=True` 新建；
+- session 显式 `get_session(auto_create=False)` → `create_session`（`DEFAULT_SESSION_MEMORY_TYPES` 6 类 memory policy + idle-only auto policy）→ AlreadyExists 恢复；禁止 `auto_create=True` 新建；
 - 逐条 human/AI/tool 投递 → turn_end → append → 显式 commit 或 24h idle auto-commit → phase 2 → `memory_diff`；
 - OpenViking 0.4.19 `session_auto_commit.default_enabled=true` / `idle_enabled=true`；session policy 的 token/message 阈值为 0，只有 idle=86400 触发；验证普通 `NONE` turn 24h 后确实产生 archive；
 - `memory_capture_dedup` 的 pending/appending/appended 重试语义；`turn_id`/`source_message_ids` 只作对账证据，不作为唯一幂等保证；
@@ -2381,11 +2433,11 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - profile 表单写入后格式可回读、删除字段/清空是否生效；
 - profile 行缺失时由种子模板创建；profile 只存 DB，不写 `data/personalization/`；
 - profile / identity / soul 是否确实被 `memory_policy.memory_types` 白名单排除（注意它们是 0.4.19 默认启用的内置类型）；
-- 自动抽取路由：preferences / entities / events / cases / trajectories / experiences / tools / skills 是否都能被抽取；
+- 自动抽取路由：preferences / entities / events / cases / trajectories / experiences / tools 是否都能被抽取；Session Skill 是否通过 `session_skill_uris` 单独产出；
 - `agent_evolution.enabled=true` 后 cases / trajectories / experiences 是否产生 `memory_diff`；
-- `tools` / `skills` 自定义模板是否加载、`memory_types` 校验是否通过、是否产生使用经验记忆；
-- `ToolPart` 是否完整包含 `tool_id/tool_name/tool_input/tool_output/tool_output_sha256/duration_ms/tool_status`，是否足够支撑 tools/skills/experiences 抽取，且不包含原始输出；
-- `memory_search(memory_types=...)` 只接受 8 类原生 type；传 semantic/episodic/ profile/identity/soul 返回结构化 tool error；
+- `tools` 自定义模板是否加载、`memory_types` 校验是否通过；Session Skill 的 `session_skill_uris` 是否可导入为待扫描草稿；
+- `ToolPart` 是否完整包含 `tool_id/tool_name/tool_input/tool_output/tool_output_sha256/duration_ms/tool_status`，是否足够支撑 tools/experiences 抽取，且不包含原始输出；
+- `memory_search(memory_types=...)` 只接受 7 类原生 type；传 semantic/episodic/ profile/identity/soul 返回结构化 tool error；
 - `find` 返回字段与 `MemoryHit` 一致（无 overview/updated_at，level 缺省处理，memory_type 从 URI 推导）；
 - ProfileSuggester 持久化建议；accept 校验 user/status/etag 后才写 profile，dismiss 后 TTL 内不再出现；
 - onboarding 展示条件、seen/snooze/dismiss/completed 状态转换是否生效；
@@ -2414,7 +2466,8 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - `CommitSignalDetector` schema/证据校验/超时降级；
 - `CommitCoordinator` 状态机、重试、无 SQL debounce；idle auto-commit 与显式 signal 的边界；
 - `MemoryFacade` 错误映射；
-- `memory_types` 配置包含全部启用类型；`tools`/`skills` 模板启用校验；
+- `memory_types` 固定为 `DEFAULT_SESSION_MEMORY_TYPES`；7 类查询目录与 `tools` 模板校验；
+- Session Skill：commit task 完成/失败/超时、`session_skill_uris` 解析、SKILL.md 导入、source=extracted、待扫描草稿、重复导入幂等；
 - `ProfileService` DB profile 解析/重建、字段校验、etag 冲突、删除字段/清空；
 - `update_fields()` 读 etag 后 CAS、冲突重读重试一次、二次冲突报错不覆盖；
 - `profile_schema` 是唯一字段来源：`validate_profile_value` 与 spec 一致（枚举/长度/列表项/语言标签/密钥扫描）、
@@ -2425,7 +2478,7 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
   子代理拿不到；没有 profile 服务时不注册；
 - 前端全字段表单：12 个字段全渲染、空值渲染空控件、只提交变化字段、清空提交 `null`、409 提示与撤销；
 - 记忆管理服务：过滤型 `find` 的 target/filter/level 参数、摘要截断、按 URI 排序、`has_more`；
-- 记忆管理 URI 白名单：`~`/`..`/编码穿越、跨用户、非六类、非 `.md`、目录、`.abstract.md`/`.overview.md` 全部拒绝；
+- 记忆管理 URI 白名单：`~`/`..`/编码穿越、跨用户、非七类、非 `.md`、目录、`.abstract.md`/`.overview.md` 全部拒绝；
 - 记忆管理详情：`overview` 解析成 `toc`（标题层级 + 链接解析）；缺 overview 时用 `ls` 降级；
 - 记忆管理写：`expected_sha256` 一致才 `write(edit_source=manual)`；不一致 409；内容超长/空 422；
 - 记忆管理删：`rm(recursive=False)`；先读再删；删除后 404 处理；
@@ -2453,8 +2506,8 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - onboarding 只在 profile 页/workspace 空状态出现，不阻塞聊天；
 - 画像建议接受后写入 profile，忽略后 TTL 内不再出现；
 - profile 表单可修改/删除字段，清空后 GET 返回空 profile（不是 404）；
-- identity/soul 只能通过代码仓库 PR 修改；六类自动记忆在记忆管理页查看/编辑/删除，`tools` / `skills` 仍由管理员通过 OpenViking Studio/CLI 处理；
-- 一次包含 lead 工具调用/ToolMessage 的 turn 经 sharded MemoryCaptureStream 能产生 cases/trajectories/experiences/tools/skills 记忆；子代理内部步骤不在本设计抓取范围内；
+- identity/soul 只能通过代码仓库 PR 修改；七类可管理记忆在记忆管理页查看/编辑/删除，`tools` 已进入管理页，Session Skill 导入“技能”页并停在待扫描；
+- 一次包含 lead 工具调用/ToolMessage 的 turn 经 sharded MemoryCaptureStream 能产生 cases/trajectories/experiences/tools 记忆；Session Skill 通过 `session_skill_uris` 导入技能目录；子代理内部步骤不在本设计抓取范围内；
 - 纯招呼/告别/致谢不投递消息流、不 append；告别只投递无消息的 SESSION_END control event；
 - “可以/继续/好了/完成”进入 CAPTURE；“好了/完成”由 worker commit；
 - 纠错由 worker 两段 commit；
@@ -2474,14 +2527,14 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - 新表只写 `memory_profile_documents` / `memory_sync_state` / `memory_profile_onboarding` / `memory_profile_suggestions` / `memory_capture_dedup`；
 - 不再调用 LangMem、embedding、outbox、projector；
 - 纯招呼/告别/致谢轮次后 OpenViking `message_count` 不增加，且不产生消息流记录；告别仅产生无消息的 SESSION_END control event；
-- 自动抽取落 preferences / entities / events / cases / trajectories / experiences / tools / skills 八类内置类型；`profile` 由结构化表单写入 `memory_profile_documents`，`identity`/`soul` 是 `config/personalization/` 下的项目文件；三者不由 MyFlow 启用/写入 OpenViking；
-- `agent_evolution.enabled=true`，`tools`/`skills` 内置模板已启用；
-- MyFlow 前端提供“我的画像”结构化表单/建议/onboarding 与“记忆管理”页（六类），不展示 identity/soul；
+- 自动抽取落 preferences / entities / events / cases / trajectories / experiences / tools 七类内置类型；`profile` 由结构化表单写入 `memory_profile_documents`，`identity`/`soul` 是 `config/personalization/` 下的项目文件；三者不由 MyFlow 启用/写入 OpenViking；
+- `agent_evolution.enabled=true`；`tools` 记忆模板已启用；Session Skill 由 `session_skill_extraction_enabled` 控制；
+- MyFlow 前端提供“我的画像”结构化表单/建议/onboarding 与“记忆管理”页（七类），不展示 identity/soul；
 - profile 表单始终展示全部受支持字段，空白字段可直接填写并一次保存；
 - 内置工具 `update_user_profile` 只在用户显式陈述画像信息时写入，冲突不覆盖表单；
 - onboarding 不阻塞聊天，建议接受后才写 profile；敏感字段必须二次确认；
 - 新建用户的 profile 由种子模板写入 DB，identity/soul 随代码仓库存在；
-- 六类自动记忆的查看/编辑/删除由记忆管理页承担；`tools` / `skills` 与导出仍由 OpenViking Studio/CLI 承担；
+- 七类可管理记忆的查看/编辑/删除由记忆管理页承担；`tools` 已展示；Session Skill 导入技能页，等待用户扫描/生效；
 - 语义 commit 的原因可在 `memory_sync_state`/run event 中查到；
 - 用户 A 检索不到用户 B；
 - 删除后检索不到；
@@ -2489,7 +2542,7 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - 同一 thread 的消息在单 worker/分片 stream 中按顺序 append；不同 thread 可并行；
 - 压缩窗口不进入捕获流；没有 `message_kind=compaction`；
 - 所有记忆内容经 `MemoryContentEnvelope` 包裹；URI 穿越/跨用户/内置 profile 文件读取被拒绝；
-- session 显式创建；8 类 memory policy 白名单；idle-only auto policy（thresholds 0、idle 86400）；服务端 `default_enabled/idle_enabled=true`；
+- session 显式创建；`DEFAULT_SESSION_MEMORY_TYPES` 6 类 memory policy 白名单；idle-only auto policy（thresholds 0、idle 86400）；服务端 `default_enabled/idle_enabled=true`；
 - 普通 `NONE` turn 在 24h 内可被 idle auto-commit 抽取；不会出现“永不 commit”；
 - **当前无旧数据，不做迁移/回滚**；P5 删除旧表前必须完成旧表计数为 0 + 备份；
 - P95：profile 读取+注入 < 120ms（无 OpenViking 调用），`before_agent` 总预算 < 1s，after_agent 入队 < 50ms，工具搜索 < 2s；
@@ -2519,7 +2572,7 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 
 | 阶段 | 内容 | 退出条件 |
 |---|---|---|
-| P0 | Spike、版本锁定、AGPL/保留策略确认；agent_evolution、tools/skills 模板、thread-sharded stream、dedup、session 生命周期、idle-only auto-commit 验证 | 关键 API/抽取/隔离/stream/dedup/session 验证通过；法务结论 |
+| P0 | Spike、版本锁定、AGPL/保留策略确认；agent_evolution、tools 模板、session skill extraction、thread-sharded stream、dedup、session 生命周期、idle-only auto-commit 验证 | 关键 API/抽取/隔离/stream/dedup/session 验证通过；法务结论 |
 | P1 | 配置、loop-aware client factory、五张表 migration、SessionManager、MemoryFacade、ProfileService/Personalization/Recall/ChangeFeed、fake server 测试 | schema/单测通过；无 UI 依赖 |
 | P2 | CaptureGate、MemoryMessagePublisher、MemoryCaptureStream、CaptureDedupStore、TurnCaptureWorker（含 missing turn_end timeout）、TurnPolicy、CommitSignalDetector、middleware；**不含压缩 hook** | 门控/分片顺序/append/去重/工具证据/单 worker 集成测试通过 |
 | P3 | “我的画像”结构化表单 + onboarding + 持久化画像建议；删除其他记忆 UI/API；保留 admin 状态/Studio 链接 | E2E 通过；旧入口 410；P1-4/P1-6 关闭 |
@@ -2534,8 +2587,8 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 | 原始 transcript 留存 | 隐私/合规 | 30 天 retention；必要时抽取后删 session |
 | 无 pending_review | 错误记忆直接生效 | 通过 OpenViking Studio/CLI 事后处理；MyFlow 不做审批门 |
 | profile 不自动抽取 | 新用户画像为空，需要用户主动填写 | onboarding + 全字段表单 + 显式陈述时由 `update_user_profile` 写入 + 持久化 ProfileSuggester；不注入 preferences/entities 索引 |
-| 记忆抽错 | 六类自动记忆抽错时需要可修正 | 记忆管理页直接编辑/删除具体记忆；identity/soul 仍是项目文件，`tools`/`skills` 走 Studio/CLI |
-| tools/skills 默认 disabled | 配置漏了模板启用，`memory_types` 校验失败或抽取为空 | 部署检查：自定义模板加载日志 + `memory_types` 校验（P1-5） |
+| 记忆抽错 | 七类可管理记忆抽错时需要可修正 | 记忆管理页直接编辑/删除具体记忆；identity/soul 仍是项目文件，`tools` 走管理页，Session Skill 走技能页 |
+| tools 默认 disabled / session skills 未开启 | `tools` 抽取为空，或 commit task 不返回 `session_skill_uris` | 部署检查 tools 模板、`session_skill_extraction_enabled` 与任务日志（P1-5） |
 | Agent Evolution 成本 | cases/trajectories/experiences 增加抽取调用和存储 | 只在需要的 workspace 启用；监控 task 时长/成本；保留关闭开关 |
 | ToolPart 隐私 | 工具输入/输出可能含密钥/PII | 只写有界摘要/hash；统一脱敏；禁止原始输出（P1-8） |
 | 建议过期/昂贵 | 用户打开页面时建议已变，或 LLM 调用增加成本 | 规则优先；持久化建议 + 7 天 TTL；接受时重校验；独立模型/超时（P1-4） |

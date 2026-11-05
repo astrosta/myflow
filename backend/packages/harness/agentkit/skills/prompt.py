@@ -29,6 +29,7 @@ from agentkit.skills.catalog import get_skill_snapshot
 from agentkit.skills.domain import SkillScope
 from agentkit.skills.storage import SkillRegistry
 from agentkit.skills.types import Skill
+from agentkit.skills.usage import top_skill_ids
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +47,9 @@ SKILL_ROOT_CONVENTION = (
     "写在索引行的方括号里；同名时 custom 覆盖 public）。"
 )
 SKILL_CATALOG_ROOT_CONVENTION = (
-    "技能根目录：公共技能在 `{public_root}`，私有技能在 `{private_root}`。"
+    "技能根目录：你的私有技能在 `{private_root}`。"
     "每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的 `SKILL.md`，"
-    "即 `{public_root}/<name>/SKILL.md`（公共）或 `{private_root}/<name>/SKILL.md`（私有）；"
-    "索引行方括号里的 public / private 标明作用域，同名时私有优先。"
+    "即 `{private_root}/<name>/SKILL.md`；索引行方括号里的 private 标明作用域。"
 )
 #: filesystem 源 + 内置技能：public / custom / builtin 三个目录（同一棵树里）。
 SKILL_FILESYSTEM_BUILTIN_ROOT_CONVENTION = (
@@ -57,18 +57,17 @@ SKILL_FILESYSTEM_BUILTIN_ROOT_CONVENTION = (
     "{root}/custom/<name>/SKILL.md，内置技能在 {root}/builtin/<name>/SKILL.md；"
     "目录名就是技能名，同名时内置技能优先于 custom 和 public；custom 仍覆盖 public。"
 )
-#: catalog 快照（git 源）同时有内置技能：public / private / builtin 三个根。
+#: catalog 快照（git 源）同时有内置技能：private / builtin 两个根。
 SKILL_CATALOG_BUILTIN_ROOT_CONVENTION = (
-    "技能根目录：公共技能在 `{public_root}`，私有技能在 `{private_root}`，内置技能在 "
-    "`{builtin_root}`。每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的 "
-    "`SKILL.md`，即 `{public_root}/<name>/SKILL.md`（公共）、"
-    "`{private_root}/<name>/SKILL.md`（私有）或 `{builtin_root}/<name>/SKILL.md`（内置）；"
-    "索引行方括号里的 public / private / builtin 标明作用域，同名时内置技能优先于 public 和 private；"
-    "catalog 内部 private 仍覆盖 public。"
+    "技能根目录：你的私有技能在 `{private_root}`，内置技能在 `{builtin_root}`。"
+    "每个技能一个目录，**目录名就是技能名**，SOP 固定是该目录下的 `SKILL.md`，"
+    "即 `{private_root}/<name>/SKILL.md`（私有）或 `{builtin_root}/<name>/SKILL.md`（内置）；"
+    "索引行方括号里的 private / builtin 标明作用域，同名时内置技能优先。"
 )
 SKILL_INDEX_PREAMBLE = (
-    "下面是技能索引 `<available_skills>`：每个已启用技能一行，只有名字、类别和截断描述"
-    "（需要密钥的会标出来），**不含正文**。已加载技能的名字与正文在持久上下文的 "
+    "下面是技能索引 `<available_skills>`：每个已启用技能一行，只有名字、类别、"
+    "skill_id、路径和截断描述（需要密钥的会标出来），**不含正文**。私有技能超过 "
+    "10 个时只列最常用的 10 个。已加载技能的名字与正文在持久上下文的 "
     "`<active_skills>` 里。"
 )
 
@@ -80,12 +79,17 @@ def _entry_marker(skill: Skill) -> tuple[str, str]:
     """Return (name suffix, trailing hint) for one index row.
 
     A catalog skill is marked by visibility scope; legacy filesystem skills keep
-    the public/custom category marker.  A directory name that differs from the
+    the legacy public/custom category marker.  A directory name that differs from the
     frontmatter name would make the root convention point at the wrong path, so
     that row gets an explicit dir=.
     """
     scope = getattr(skill.scope, "value", skill.scope)
     marker = scope if scope is not None else skill.category.value
+    if scope == SkillScope.PRIVATE.value:
+        return (
+            f" [{marker}]",
+            f" | id={skill.skill_id or '-'} | path={skill.container_file}",
+        )
     if skill.relative_path.as_posix() == skill.name:
         return f" [{marker}]", ""
     return "", f" | dir={skill.container_dir}"
@@ -147,7 +151,11 @@ def build_skills_section(
         config=config, user_id=user_id, available_skills=available_skills
     )
     try:
-        skills = live.visible()
+        skills = _select_prompt_skills(
+            live.visible(),
+            user_id=user_id,
+            limit=config.usage.prompt_top_k,
+        )
     except Exception:
         logger.exception("Skill registry unavailable; rendering an empty index")
         return ""
@@ -175,26 +183,62 @@ def clear_skill_prompt_cache() -> None:
     _index_cache.clear()
 
 
+def _select_prompt_skills(
+    skills: Sequence[Skill],
+    *,
+    user_id: str | None,
+    limit: int,
+) -> list[Skill]:
+    """Keep builtins, cap private skills at the Redis/DB top-K when over limit."""
+    private = [
+        skill
+        for skill in skills
+        if getattr(skill.scope, "value", skill.scope) == SkillScope.PRIVATE.value
+    ]
+    others = [skill for skill in skills if skill not in private]
+    if len(private) <= limit:
+        return [*others, *private]
+
+    by_id = {skill.skill_id: skill for skill in private if skill.skill_id}
+    selected: list[Skill] = []
+    for skill_id in top_skill_ids(user_id) or ():
+        skill = by_id.get(skill_id)
+        if skill is not None and skill not in selected:
+            selected.append(skill)
+        if len(selected) >= limit:
+            break
+    if len(selected) < limit:
+        chosen = {skill.skill_id for skill in selected}
+        fallback = sorted(
+            (skill for skill in private if skill.skill_id not in chosen),
+            key=lambda skill: (
+                -int(skill.load_count or 0),
+                skill.name,
+                skill.skill_id or "",
+            ),
+        )
+        selected.extend(fallback[: limit - len(selected)])
+    return [*others, *selected]
+
+
 def _root_convention(skills: Sequence[Skill], config: SkillsConfig) -> str:
     """按"来源 + 实际 scope"选根目录说明。
 
-    catalog 行（public/private scope）用两段或三段文本；纯 filesystem 的 public/custom
+    catalog 行（private scope）用一段或两段文本；纯 filesystem 的 public/custom
     目录用旧的一段文本——**没有内置技能时措辞一个字不改**，旧提示词与旧测试都不动。
     内置技能是独立 overlay：它出现在 filesystem 索引里时只是多一个根，不改变其余约定。
     """
     scopes = {getattr(skill.scope, "value", skill.scope) for skill in skills}
     has_builtin = SkillScope.BUILTIN in scopes
-    has_catalog_scope = bool(scopes & {SkillScope.PUBLIC, SkillScope.PRIVATE})
+    has_catalog_scope = SkillScope.PRIVATE in scopes
     root = config.container_path.rstrip("/") or config.container_path
     if config.source == "git" or has_catalog_scope:
         if has_builtin:
             return SKILL_CATALOG_BUILTIN_ROOT_CONVENTION.format(
-                public_root=f"{root}/public",
                 private_root=f"{root}/private",
                 builtin_root=f"{root}/builtin",
             )
         return SKILL_CATALOG_ROOT_CONVENTION.format(
-            public_root=f"{root}/public",
             private_root=f"{root}/private",
         )
     if has_builtin:
@@ -212,7 +256,10 @@ def _cache_key(skills: Sequence[Skill], max_description_chars: int) -> str:
                 getattr(skill.scope, "value", skill.scope),
                 skill.owner_user_id,
                 skill.version_id,
+                skill.skill_id,
+                skill.load_count,
                 skill.container_dir,
+                skill.container_file,
                 [item.name for item in skill.required_secrets],
             ]
             for skill in sorted(skills, key=lambda item: (item.category.value, item.name))

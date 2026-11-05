@@ -2,28 +2,22 @@
 
 from agentkit.skills.store.model import (
     SkillAuditEventRow,
+    SkillCatalogEpochRow,
     SkillDraftFileRow,
     SkillIndexOutboxRow,
     SkillPrivateActiveRow,
-    SkillPublicActiveRow,
-    SkillReleaseBatchRow,
-    SkillReleaseRow,
     SkillRow,
-    SkillSettingsRow,
-    SkillSubmissionRow,
+    SkillSecurityScanRow,
     SkillVersionRow,
 )
 
 __all__ = [
     "SkillAuditEventRow",
+    "SkillCatalogEpochRow",
     "SkillDraftFileRow",
     "SkillIndexOutboxRow",
     "SkillPrivateActiveRow",
-    "SkillPublicActiveRow",
-    "SkillReleaseBatchRow",
-    "SkillReleaseRow",
     "SkillRow",
-    "SkillSettingsRow",
-    "SkillSubmissionRow",
+    "SkillSecurityScanRow",
     "SkillVersionRow",
 ]

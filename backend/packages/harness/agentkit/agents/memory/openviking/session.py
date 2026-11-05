@@ -56,6 +56,10 @@ class SessionClient(Protocol):
         self, session_id: str, *, keep_recent_count: int = 0
     ) -> dict[str, Any]: ...
 
+    async def get_task(self, task_id: str) -> dict[str, Any] | None: ...
+
+    async def read(self, uri: str) -> str: ...
+
 
 def _hmac_hex(salt: str, value: str) -> str:
     if len(salt) < 32:
@@ -122,12 +126,16 @@ class SessionManager:
             response = await client.get_session(ref.ov_session_id, auto_create=False)
         except SessionNotFound:
             try:
-                response = await client.create_session(
+                await client.create_session(
                     ref.ov_session_id,
                     options=self._config.session_create_options(),
                 )
             except SessionAlreadyExists:
-                response = await client.get_session(ref.ov_session_id, auto_create=False)
+                pass
+            # OpenViking 0.5.2 create_session does not echo memory_policy.
+            # Re-read the session so validation and auto-policy repair use the
+            # effective server state, not the request we just sent.
+            response = await client.get_session(ref.ov_session_id, auto_create=False)
         except SessionAlreadyExists:
             response = await client.get_session(ref.ov_session_id, auto_create=False)
 
@@ -148,13 +156,23 @@ class SessionManager:
             await client.delete_session(row.ov_session_id)
         await self._sync_store.mark_deleted(user_id, thread_id)
 
-    async def commit(self, ref: SessionRef) -> dict[str, Any]:
+    async def commit(
+        self, ref: SessionRef, *, reason: str = "admin_flush"
+    ) -> dict[str, Any]:
         client = await self._client_for(ref.ov_user)
         response = await client.commit_session(ref.ov_session_id, keep_recent_count=0)
         await self._sync_store.mark_committed(
-            ref.user_id, ref.thread_id, reason="admin_flush"
+            ref.user_id, ref.thread_id, reason=reason
         )
         return response
+
+    async def get_task(self, ref: SessionRef, task_id: str) -> dict[str, Any] | None:
+        client = await self._client_for(ref.ov_user)
+        return await client.get_task(task_id)
+
+    async def read_text(self, ov_user: str, uri: str) -> str:
+        client = await self._client_for(ov_user)
+        return await client.read(uri)
 
     async def recover_after_not_found(self, user_id: str, thread_id: str) -> SessionRef:
         row = await self._sync_store.get(user_id, thread_id)

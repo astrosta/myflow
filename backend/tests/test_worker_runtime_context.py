@@ -60,3 +60,54 @@ def test_stream_graph_passes_context_to_astream() -> None:
     assert "__pregel_runtime" not in (captured["config"] or {}).get("configurable", {})
     assert "context" not in (captured["config"] or {})
     assert captured["version"] == "v2", "帧形状走 LangGraph v2（unpack_stream_part 认的是它）"
+
+def test_stream_graph_appends_the_langfuse_handler_without_replacing_existing_callbacks() -> None:
+    captured: dict = {}
+
+    async def astream(
+        input, config=None, *, context=None, stream_mode=None, subgraphs=False, version=None
+    ):
+        captured["config"] = config
+        if False:
+            yield None
+
+    existing = object()
+    langfuse = object()
+    tracing = SimpleNamespace(handler=langfuse)
+
+    record = RunRecord(
+        run_id="run-1",
+        thread_id="t1",
+        assistant_id=None,
+        status=RunStatus.running,
+        on_disconnect="continue",
+        user_id="alice",
+    )
+    ctx = RunContext(
+        checkpointer=SimpleNamespace(),
+        thread_store=SimpleNamespace(),
+        run_store=SimpleNamespace(),
+        run_config={
+            "context": {"user_id": "alice"},
+            "configurable": {},
+            "callbacks": [existing],
+        },
+        graph_input={"messages": []},
+        stream_modes=("values",),
+    )
+    bridge = SimpleNamespace(publish=AsyncMock())
+
+    asyncio.run(
+        _stream_graph(
+            bridge,
+            record,
+            ctx,
+            SimpleNamespace(astream=astream),
+            UsageCollector(SimpleNamespace(), "run-1"),
+            None,
+            tracing=tracing,
+        )
+    )
+
+    assert captured["config"]["callbacks"][0] is existing
+    assert captured["config"]["callbacks"][-1] is langfuse

@@ -1,4 +1,4 @@
-"""Task 6: the author-facing orchestration for private drafts."""
+"""Author service: save -> scan -> activate for one owner's private skills."""
 
 from __future__ import annotations
 
@@ -16,12 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from agentkit.config.skills_config import SkillCreationConfig
 from agentkit.persistence.schema import (
     Base,
-    SkillAuditEventRow,
-    SkillDraftFileRow,
     SkillIndexOutboxRow,
     SkillPrivateActiveRow,
-    SkillPublicActiveRow,
-    SkillReleaseRow,
     SkillRow,
 )
 from agentkit.skills.author import SkillAuthorService
@@ -33,16 +29,11 @@ from agentkit.skills.domain import (
 )
 from agentkit.skills.git import GitCommit
 from agentkit.skills.package import render_skill_md
+from agentkit.skills.parser import parse_skill_text
+from agentkit.skills.security_scan import SecurityScanOutcome
 from agentkit.skills.store.sql import SqlSkillStore
 
 T = TypeVar("T")
-
-
-class FakeContent:
-    """The author service under test does not need a materialized cache."""
-
-    async def ensure(self, commit: str) -> Path:  # pragma: no cover - defensive
-        raise AssertionError(f"unexpected content.ensure({commit!r})")
 
 
 @dataclass
@@ -50,7 +41,6 @@ class FakeGit:
     commits: dict[str, dict[str, StagedFile]] = field(default_factory=dict)
     heads: dict[str, str] = field(default_factory=dict)
     save_calls: list[tuple[str, str, list[StagedFile], str]] = field(default_factory=list)
-    fail_save: bool = False
     _counter: int = 0
 
     def _new_commit(self, files: dict[str, StagedFile]) -> str:
@@ -67,8 +57,6 @@ class FakeGit:
         files: Sequence[StagedFile],
         message: str,
     ) -> GitCommit:
-        if self.fail_save:
-            raise RuntimeError("git failed")
         copied = [StagedFile(item.path, item.content, item.mode) for item in files]
         self.save_calls.append((owner_user_id, skill_id, copied, message))
         ref = f"refs/heads/myflow/drafts/{owner_user_id}"
@@ -79,7 +67,6 @@ class FakeGit:
             )
             for item in copied
         }
-        # A real draft ref keeps every skill directory on the owner branch.
         combined = dict(self.commits.get(self.heads.get(ref, ""), {}))
         combined.update(committed)
         commit = self._new_commit(combined)
@@ -89,66 +76,41 @@ class FakeGit:
     async def head(self, ref: str) -> str:
         return self.heads[ref]
 
-    async def list_tree(self, commit: str, path: str) -> list[str]:
-        prefix = path.rstrip("/") + "/"
-        return sorted(
-            key[len(prefix) :]
-            for key in self.commits[commit]
-            if key.startswith(prefix)
+
+class FakeContent:
+    """Materialize the fake commit into a real temporary directory for scanning."""
+
+    def __init__(self, root: Path, git: FakeGit) -> None:
+        self._root = root
+        self._git = git
+
+    async def ensure(self, commit: str) -> Path:
+        target = self._root / commit
+        for path, staged in self._git.commits[commit].items():
+            file = target / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(staged.content)
+        return target
+
+
+@dataclass
+class FakeScanner:
+    outcome: SecurityScanOutcome = field(
+        default_factory=lambda: SecurityScanOutcome(
+            status="completed",
+            is_safe=True,
+            max_severity="SAFE",
+            scanner_version="2.3.2",
+            duration_ms=9,
         )
+    )
+    calls: list[Path] = field(default_factory=list)
+    saw_skill_md: list[bool] = field(default_factory=list)
 
-    async def read_file(self, commit: str, path: str) -> bytes:
-        return self.commits[commit][path].content
-
-    async def package_sha256(self, commit: str, path: str) -> str:
-        suffix = "/SKILL.md"
-        directory = path[: -len(suffix)] if path.endswith(suffix) else path.rstrip("/")
-        prefix = directory + "/"
-        relative = {
-            key[len(prefix) :]: staged
-            for key, staged in self.commits[commit].items()
-            if key.startswith(prefix)
-        }
-        if not relative:
-            raise InvalidSkillPackage(f"source tree has no files: {commit}:{directory}")
-        if "SKILL.md" not in relative:
-            raise InvalidSkillPackage("package is missing SKILL.md")
-        hasher = hashlib.sha256()
-        for rel in sorted(relative):
-            staged = relative[rel]
-            hasher.update(rel.encode("utf-8"))
-            hasher.update(b"\x00")
-            hasher.update(staged.mode.encode("utf-8"))
-            hasher.update(b"\x00")
-            hasher.update(staged.content)
-            hasher.update(b"\x00")
-        return hasher.hexdigest()
-
-    def rewrite_skill(self, ref: str, content: bytes) -> None:
-        current = dict(self.commits[self.heads[ref]])
-        path = next(key for key in current if key.endswith("/SKILL.md"))
-        current[path] = StagedFile(path, content, "text")
-        self.heads[ref] = self._new_commit(current)
-
-    def rewrite_file(
-        self, ref: str, path: str, content: bytes, mode: str = "text"
-    ) -> None:
-        current = dict(self.commits[self.heads[ref]])
-        current[path] = StagedFile(path, content, mode)
-        self.heads[ref] = self._new_commit(current)
-
-    def publish(self, source_commit: str, public_name: str) -> str:
-        source = self.commits[source_commit]
-        source_dir = next(iter(source)).rsplit("/", 1)[0]
-        public = {
-            f"public/{public_name}/{path[len(source_dir) + 1 :]}": StagedFile(
-                f"public/{public_name}/{path[len(source_dir) + 1 :]}",
-                item.content,
-                item.mode,
-            )
-            for path, item in source.items()
-        }
-        return self._new_commit(public)
+    def scan(self, skill_directory: Path) -> SecurityScanOutcome:
+        self.calls.append(skill_directory)
+        self.saw_skill_md.append((skill_directory / "SKILL.md").is_file())
+        return self.outcome
 
 
 @dataclass
@@ -156,6 +118,7 @@ class Harness:
     store: SqlSkillStore
     service: SkillAuthorService
     git: FakeGit
+    scanner: FakeScanner
     session_factory: async_sessionmaker[AsyncSession]
     creation: SkillCreationConfig
 
@@ -167,7 +130,6 @@ class Harness:
 def harness_fixture(tmp_path: Path):
     creation = SkillCreationConfig(
         max_drafts_per_user=5,
-        max_pending_submissions_per_user=2,
         max_package_bytes=16_384,
         max_file_bytes=4_096,
         max_files=20,
@@ -182,8 +144,15 @@ def harness_fixture(tmp_path: Path):
         factory = async_sessionmaker(engine, expire_on_commit=False)
         store = SqlSkillStore(factory)
         git = FakeGit()
-        service = SkillAuthorService(store, git, FakeContent(), creation)  # type: ignore[arg-type]
-        return Harness(store, service, git, factory, creation), engine
+        scanner = FakeScanner()
+        service = SkillAuthorService(
+            store,
+            git,  # type: ignore[arg-type]
+            FakeContent(tmp_path / "content", git),  # type: ignore[arg-type]
+            creation,
+            scanner=scanner,
+        )
+        return Harness(store, service, git, scanner, factory, creation), engine
 
     built, engine = asyncio.run(_build())
     yield built
@@ -194,92 +163,60 @@ def skill_md(name: str, body: str = "Body\n") -> bytes:
     return (render_skill_md(name, "Does things") + "\n" + body).encode()
 
 
-async def _approve(
-    harness: Harness,
-    *,
-    submission,
-    public_name: str,
-    actor: str = "admin",
-):
-    public_commit = harness.git.publish(submission.submitted_commit, public_name)
-    return await harness.store.record_public_release(
-        submission=submission,
-        public_name=public_name,
-        git_repository="https://example.invalid/skills.git",
-        git_commit=public_commit,
-        skill_path=f"public/{public_name}/SKILL.md",
-        source_commit=submission.submitted_commit,
-        actor=actor,
-    )
-
-
-def test_create_draft_stages_initial_skill_md_without_commit(harness: Harness) -> None:
+def test_create_draft_stages_skill_md_without_commit(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
             owner_user_id="u1", name="pdf-tools", description="Does things"
         )
-        assert skill.owner_user_id == "u1"
         assert harness.git.save_calls == []
-
         files = await harness.service.list_files(owner_user_id="u1", skill_id=skill.id)
         assert [file.path for file in files] == ["SKILL.md"]
         assert all(isinstance(file, StagedFileInfo) for file in files)
         expected = render_skill_md("pdf-tools", "Does things").encode()
         assert files[0].sha256 == hashlib.sha256(expected).hexdigest()
 
-        async with harness.session_factory() as session:
-            row = await session.get(SkillDraftFileRow, (skill.id, "SKILL.md"))
-            assert row is not None and row.content == expected
-
     harness.run(scenario)
 
 
-def test_save_reuses_identical_version_and_bumps_changed_version(harness: Harness) -> None:
+def test_save_updates_name_and_description_from_skill_md(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
+            owner_user_id="u1", name="old-name", description="旧描述"
         )
-        v1 = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        assert v1.skill_version == "v1"
-        assert v1.draft_commit == await harness.git.head(v1.draft_ref or "")
-        assert v1.skill_path == f"users/u1/{skill.id}/SKILL.md"
-
-        same = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        assert same.id == v1.id
-        assert same.skill_version == "v1"
-        assert [item.id for item in await harness.service.list_versions(
-            owner_user_id="u1", skill_id=skill.id
-        )] == [v1.id]
-
         await harness.service.put_file(
             owner_user_id="u1",
             skill_id=skill.id,
             path="SKILL.md",
-            content=skill_md("pdf-tools", "Changed\n"),
+            content=(render_skill_md("daily-report", "整理日报") + "\n正文\n").encode(),
         )
-        v2 = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        assert v2.skill_version == "v2"
-        assert v2.id != v1.id
-        versions = await harness.service.list_versions(
-            owner_user_id="u1", skill_id=skill.id
-        )
-        assert [item.skill_version for item in versions] == ["v1", "v2"]
+
+        version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+
+        assert version.metadata["name"] == "daily-report"
+        assert version.metadata["description"] == "整理日报"
 
     harness.run(scenario)
 
 
-def test_save_writes_private_active_and_outbox(harness: Harness) -> None:
+def test_save_produces_an_inert_version(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
             owner_user_id="u1", name="pdf-tools", description="Does things"
         )
         version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        assert version.skill_version == "v1"
+        # Save commits the draft to Git but stays inert until activation.
+        assert version.draft_commit == harness.git.heads["refs/heads/myflow/drafts/u1"]
+        assert version.draft_ref == "refs/heads/myflow/drafts/u1"
+        assert version.skill_path == f"users/u1/{skill.id}/SKILL.md"
+        assert version.index_status == "unindexed"
+        assert len(harness.git.save_calls) == 1
+        assert await harness.service.active_version(
+            owner_user_id="u1", skill_id=skill.id
+        ) is None
 
         async with harness.session_factory() as session:
-            active = await session.get(SkillPrivateActiveRow, skill.id)
-            assert active is not None
-            assert active.owner_user_id == "u1"
-            assert active.version_id == version.id
+            assert await session.get(SkillPrivateActiveRow, skill.id) is None
             outbox = (
                 await session.scalars(
                     select(SkillIndexOutboxRow).where(
@@ -287,287 +224,221 @@ def test_save_writes_private_active_and_outbox(harness: Harness) -> None:
                     )
                 )
             ).all()
-            assert len(outbox) == 1
-            assert outbox[0].op == "upsert_active"
-            assert outbox[0].projection_key == f"private:u1:{skill.id}"
-            assert outbox[0].version_id == version.id
+            assert outbox == []
 
-    harness.run(scenario)
-
-
-def test_pending_submission_blocks_staging_and_save(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        await harness.service.submit(owner_user_id="u1", skill_id=skill.id)
-
-        with pytest.raises(SkillConflict):
-            await harness.service.put_file(
-                owner_user_id="u1",
-                skill_id=skill.id,
-                path="SKILL.md",
-                content=skill_md("pdf-tools", "x\n"),
-            )
-        with pytest.raises(SkillConflict):
-            await harness.service.delete_file(
-                owner_user_id="u1", skill_id=skill.id, path="SKILL.md"
-            )
-        with pytest.raises(SkillConflict):
-            await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-
-    harness.run(scenario)
-
-
-def test_submit_uses_the_saved_version_commit(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        await harness.service.put_file(
-            owner_user_id="u1",
-            skill_id=skill.id,
-            path="scripts/run.sh",
-            content=b"echo ok\n",
-            mode="executable",
-        )
-        version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        submission = await harness.service.submit(
-            owner_user_id="u1", skill_id=skill.id
-        )
-        assert submission.status == "pending"
-        assert submission.version_id == version.id
-        assert submission.submitted_commit == version.draft_commit
-        assert submission.owner_user_id == "u1"
-        assert await harness.store.pending_submission(skill.id) is not None
-
-    harness.run(scenario)
-
-
-def test_submit_rejects_changed_git_head(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        harness.git.rewrite_skill(version.draft_ref or "", skill_md("pdf-tools", "evil\n"))
-
-        with pytest.raises(SkillConflict):
-            await harness.service.submit(owner_user_id="u1", skill_id=skill.id)
-        assert await harness.store.pending_submission(skill.id) is None
-
-    harness.run(scenario)
-
-
-def test_submit_rejects_changed_attachment_at_git_head(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        await harness.service.put_file(
-            owner_user_id="u1",
-            skill_id=skill.id,
-            path="scripts/run.sh",
-            content=b"echo ok\n",
-            mode="executable",
-        )
-        version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        harness.git.rewrite_file(
-            version.draft_ref or "",
-            f"users/u1/{skill.id}/scripts/run.sh",
-            b"echo evil\n",
-            mode="executable",
-        )
-
-        with pytest.raises(SkillConflict):
-            await harness.service.submit(owner_user_id="u1", skill_id=skill.id)
-        assert await harness.store.pending_submission(skill.id) is None
-
-    harness.run(scenario)
-
-
-def test_withdraw_releases_the_pending_guard(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        await harness.service.submit(owner_user_id="u1", skill_id=skill.id)
-        withdrawn = await harness.service.withdraw(
-            owner_user_id="u1", skill_id=skill.id
-        )
-        assert withdrawn.status == "withdrawn"
-        assert await harness.store.pending_submission(skill.id) is None
+        same = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        assert same.id == version.id
         await harness.service.put_file(
             owner_user_id="u1",
             skill_id=skill.id,
             path="SKILL.md",
-            content=skill_md("pdf-tools", "again\n"),
+            content=skill_md("pdf-tools", "Changed"),
         )
+        v2 = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        assert v2.skill_version == "v2"
 
     harness.run(scenario)
 
 
-def test_delete_draft_keeps_public_release(harness: Harness) -> None:
+def test_scan_uses_the_saved_commit_and_persists_findings(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
             owner_user_id="u1", name="pdf-tools", description="Does things"
         )
-        await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        submission = await harness.service.submit(
+        version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        harness.scanner.outcome = SecurityScanOutcome(
+            status="completed",
+            is_safe=False,
+            max_severity="HIGH",
+            findings=(
+                {
+                    "rule_id": "R1",
+                    "title": "Bad",
+                    "severity": "HIGH",
+                    "category": "prompt_injection",
+                    "file_path": "SKILL.md",
+                    "line_number": 2,
+                    "remediation": "remove",
+                },
+            ),
+            scanner_version="2.3.2",
+            duration_ms=11,
+        )
+
+        scan = await harness.service.scan_security(
             owner_user_id="u1", skill_id=skill.id
         )
-        release = await _approve(
-            harness, submission=submission, public_name="pdf-tools"
+        assert scan.version_id == version.id
+        assert scan.is_safe is False
+        assert scan.max_severity == "HIGH"
+        assert scan.findings_count == 1
+        assert version.draft_commit in harness.scanner.calls[0].parts
+        assert harness.scanner.saw_skill_md == [True]
+        assert await harness.service.latest_scan(
+            owner_user_id="u1", skill_id=skill.id, version_id=version.id
+        ) == scan
+
+    harness.run(scenario)
+
+
+def test_scan_rejects_an_unrelated_version(harness: Harness) -> None:
+    async def scenario() -> None:
+        skill = await harness.service.create_draft(
+            owner_user_id="u1", name="pdf-tools", description="Does things"
         )
-
-        async with harness.session_factory() as session:
-            assert await session.get(SkillPrivateActiveRow, skill.id) is not None
-            assert await session.get(SkillPublicActiveRow, skill.id) is not None
-
-        await harness.service.delete_draft(owner_user_id="u1", skill_id=skill.id)
-        assert await harness.store.list_draft_files(skill.id) == []
-        with pytest.raises(SkillConflict):
-            await harness.service.list_files(owner_user_id="u1", skill_id=skill.id)
-        with pytest.raises(SkillConflict):
-            await harness.service.put_file(
-                owner_user_id="u1",
-                skill_id=skill.id,
-                path="SKILL.md",
-                content=skill_md("pdf-tools", "resurrected"),
+        version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        with pytest.raises(SkillConflict, match="latest"):
+            await harness.service.scan_security(
+                owner_user_id="u1", skill_id=skill.id, version_id="other"
             )
-        with pytest.raises(SkillConflict):
-            await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        async with harness.session_factory() as session:
-            assert await session.get(SkillPrivateActiveRow, skill.id) is None
-            assert await session.get(SkillPublicActiveRow, skill.id) is not None
-            assert await session.get(SkillReleaseRow, release.id) is not None
-            skill_row = await session.get(SkillRow, skill.id)
-            assert skill_row is not None and skill_row.deleted_at is not None
-        public = [
-            item
-            for item in await harness.store.visible_for_user("u1")
-            if item.skill.skill_id == skill.id
-        ]
-        assert [item.scope for item in public] == ["public"]
+        assert harness.scanner.calls == []
+        assert version.id
 
     harness.run(scenario)
 
 
-def test_delete_draft_enqueues_private_delete_outbox(harness: Harness) -> None:
+def test_activation_requires_a_passing_scan_then_points_the_active_pointer(harness: Harness) -> None:
+    async def scenario() -> None:
+        skill = await harness.service.create_draft(
+            owner_user_id="u1", name="pdf-tools", description="Does things"
+        )
+        version = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        assert len(harness.git.save_calls) == 1
+
+        with pytest.raises(SkillConflict, match="scan"):
+            await harness.service.activate(owner_user_id="u1", skill_id=skill.id)
+        assert len(harness.git.save_calls) == 1
+
+        harness.scanner.outcome = SecurityScanOutcome(
+            status="completed", is_safe=False, max_severity="CRITICAL"
+        )
+        await harness.service.scan_security(owner_user_id="u1", skill_id=skill.id)
+        with pytest.raises(SkillConflict, match="did not pass"):
+            await harness.service.activate(owner_user_id="u1", skill_id=skill.id)
+
+        harness.scanner.outcome = SecurityScanOutcome(
+            status="completed",
+            is_safe=True,
+            max_severity="SAFE",
+            scanner_version="2.3.2",
+        )
+        await harness.service.scan_security(owner_user_id="u1", skill_id=skill.id)
+        active = await harness.service.activate(owner_user_id="u1", skill_id=skill.id)
+        assert active.id == version.id
+        assert active.index_status == "pending"
+        assert active.draft_commit is not None
+        assert len(harness.git.save_calls) == 1
+        assert harness.git.save_calls[0][2][0].path == "SKILL.md"
+        assert await harness.service.active_version(
+            owner_user_id="u1", skill_id=skill.id
+        ) == active
+
+        async with harness.session_factory() as session:
+            event = await session.scalar(
+                select(SkillIndexOutboxRow).where(
+                    SkillIndexOutboxRow.projection_key == f"private:u1:{skill.id}"
+                )
+            )
+            assert event is not None and event.op == "upsert_active"
+
+    harness.run(scenario)
+
+
+def test_activation_without_a_projection_marks_index_disabled(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
             owner_user_id="u1", name="pdf-tools", description="Does things"
         )
         await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        submission = await harness.service.submit(
-            owner_user_id="u1", skill_id=skill.id
+        harness.scanner.outcome = SecurityScanOutcome(
+            status="completed", is_safe=True, max_severity="SAFE"
         )
-        release = await _approve(
-            harness, submission=submission, public_name="pdf-tools"
+        await harness.service.scan_security(owner_user_id="u1", skill_id=skill.id)
+
+        active = await harness.service.activate(
+            owner_user_id="u1", skill_id=skill.id, index_enabled=False
         )
 
-        await harness.service.delete_draft(owner_user_id="u1", skill_id=skill.id)
-
+        assert active.index_status == "disabled"
         async with harness.session_factory() as session:
-            assert await session.get(SkillPrivateActiveRow, skill.id) is None
-            assert await session.get(SkillPublicActiveRow, skill.id) is not None
-            assert await session.get(SkillReleaseRow, release.id) is not None
-            rows = (
-                await session.scalars(
-                    select(SkillDraftFileRow).where(
-                        SkillDraftFileRow.skill_id == skill.id
-                    )
-                )
-            ).all()
-            assert rows == []
-            delete_events = (
+            events = (
                 await session.scalars(
                     select(SkillIndexOutboxRow).where(
-                        SkillIndexOutboxRow.projection_key
-                        == f"private:u1:{skill.id}",
-                        SkillIndexOutboxRow.op == "delete_active",
+                        SkillIndexOutboxRow.skill_id == skill.id
                     )
                 )
             ).all()
-            assert len(delete_events) == 1
-            event = delete_events[0]
-            assert event.scope == "private"
-            assert event.owner_user_id == "u1"
-            assert event.skill_id == skill.id
-            assert event.version_id is None
-            assert event.payload_json == {}
-            audit = await session.scalar(
-                select(SkillAuditEventRow).where(
-                    SkillAuditEventRow.skill_id == skill.id,
-                    SkillAuditEventRow.action == "skill.delete",
-                )
-            )
-            assert audit is not None and audit.actor == "u1"
-
-        public = [
-            item
-            for item in await harness.store.visible_for_user("u1")
-            if item.skill.skill_id == skill.id
-        ]
-        assert [item.scope for item in public] == ["public"]
+            assert events == []
 
     harness.run(scenario)
 
 
-def test_open_draft_seeds_from_owned_public_release(harness: Harness) -> None:
+def test_saving_v2_keeps_v1_active_until_v2_is_scanned_and_activated(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
             owner_user_id="u1", name="pdf-tools", description="Does things"
         )
+        v1 = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        await harness.service.scan_security(owner_user_id="u1", skill_id=skill.id)
+        await harness.service.activate(owner_user_id="u1", skill_id=skill.id)
+
         await harness.service.put_file(
             owner_user_id="u1",
             skill_id=skill.id,
-            path="scripts/run.sh",
-            content=b"echo ok\n",
-            mode="executable",
+            path="SKILL.md",
+            content=skill_md("pdf-tools", "v2"),
         )
-        await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        submission = await harness.service.submit(
+        v2 = await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        assert v2.id != v1.id
+        active = await harness.service.active_version(
             owner_user_id="u1", skill_id=skill.id
         )
-        await _approve(harness, submission=submission, public_name="pdf-tools")
+        assert active is not None and active.id == v1.id
+
+        with pytest.raises(SkillConflict, match="scan"):
+            await harness.service.activate(owner_user_id="u1", skill_id=skill.id)
+
+        scan = await harness.service.scan_security(
+            owner_user_id="u1", skill_id=skill.id
+        )
+        assert scan.version_id == v2.id
+        activated = await harness.service.activate(owner_user_id="u1", skill_id=skill.id)
+        assert activated.id == v2.id
+
+    harness.run(scenario)
+
+
+def test_open_draft_returns_staging_and_does_not_seed_from_active_content(harness: Harness) -> None:
+    async def scenario() -> None:
+        skill = await harness.service.create_draft(
+            owner_user_id="u1", name="pdf-tools", description="Does things"
+        )
+        await harness.service.save(owner_user_id="u1", skill_id=skill.id)
         await harness.store.delete_all_draft_files(skill.id)
 
         files = await harness.service.open_draft(
             owner_user_id="u1", skill_id=skill.id
         )
-        assert [file.path for file in files] == ["SKILL.md", "scripts/run.sh"]
-        async with harness.session_factory() as session:
-            row = await session.get(SkillDraftFileRow, (skill.id, "scripts/run.sh"))
-            assert row is not None and row.content == b"echo ok\n"
+        assert files == []
 
     harness.run(scenario)
 
 
-def test_only_the_owner_can_touch_a_draft(harness: Harness) -> None:
+def test_only_the_owner_can_touch_a_skill(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
             owner_user_id="u1", name="pdf-tools", description="Does things"
         )
-        with pytest.raises(SkillConflict):
-            await harness.service.list_files(owner_user_id="u2", skill_id=skill.id)
-        with pytest.raises(SkillConflict):
-            await harness.service.open_draft(owner_user_id="u2", skill_id=skill.id)
-        with pytest.raises(SkillConflict):
-            await harness.service.list_versions(owner_user_id="u2", skill_id=skill.id)
-        with pytest.raises(SkillConflict):
-            await harness.service.put_file(
-                owner_user_id="u2",
-                skill_id=skill.id,
-                path="SKILL.md",
-                content=skill_md("pdf-tools"),
-            )
-        with pytest.raises(SkillConflict):
-            await harness.service.delete_draft(
-                owner_user_id="u2", skill_id=skill.id
-            )
+        for action in (
+            harness.service.list_files(owner_user_id="u2", skill_id=skill.id),
+            harness.service.open_draft(owner_user_id="u2", skill_id=skill.id),
+            harness.service.save(owner_user_id="u2", skill_id=skill.id),
+            harness.service.scan_security(owner_user_id="u2", skill_id=skill.id),
+            harness.service.activate(owner_user_id="u2", skill_id=skill.id),
+            harness.service.delete_draft(owner_user_id="u2", skill_id=skill.id),
+        ):
+            with pytest.raises(SkillConflict):
+                await action
         assert len(
             await harness.service.list_files(owner_user_id="u1", skill_id=skill.id)
         ) == 1
@@ -575,38 +446,14 @@ def test_only_the_owner_can_touch_a_draft(harness: Harness) -> None:
     harness.run(scenario)
 
 
-def test_create_draft_enforces_quota_and_public_name(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        submission = await harness.service.submit(
-            owner_user_id="u1", skill_id=skill.id
-        )
-        await _approve(harness, submission=submission, public_name="pdf-tools")
-
-        with pytest.raises(SkillConflict):
-            await harness.service.create_draft(
-                owner_user_id="u1", name="pdf-tools", description="collision"
-            )
-
-        harness.creation.max_drafts_per_user = 1
-        with pytest.raises(SkillConflict):
-            await harness.service.create_draft(
-                owner_user_id="u1", name="other-tools", description="quota"
-            )
-
-    harness.run(scenario)
-
-
-def test_create_draft_rejects_a_builtin_name(harness: Harness) -> None:
+def test_create_rejects_a_builtin_name(harness: Harness) -> None:
     service = SkillAuthorService(
         harness.store,
         harness.git,  # type: ignore[arg-type]
-        FakeContent(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
         harness.creation,
         reserved_names=lambda: frozenset({"demo"}),
+        scanner=harness.scanner,
     )
 
     async def scenario() -> None:
@@ -619,105 +466,104 @@ def test_create_draft_rejects_a_builtin_name(harness: Harness) -> None:
     harness.run(scenario)
 
 
-def test_put_file_enforces_package_limits_before_staging(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        with pytest.raises(InvalidSkillPackage):
-            await harness.service.put_file(
-                owner_user_id="u1",
-                skill_id=skill.id,
-                path="big.bin",
-                content=b"x" * (harness.creation.max_file_bytes + 1),
-                mode="binary",
-            )
-        assert [
-            file.path
-            for file in await harness.service.list_files(
-                owner_user_id="u1", skill_id=skill.id
-            )
-        ] == ["SKILL.md"]
-
-    harness.run(scenario)
-
-
-def test_git_failure_leaves_staging_and_versions_untouched(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        harness.git.fail_save = True
-        with pytest.raises(RuntimeError):
-            await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        assert await harness.service.list_versions(
-            owner_user_id="u1", skill_id=skill.id
-        ) == []
-        assert [
-            file.path
-            for file in await harness.service.list_files(
-                owner_user_id="u1", skill_id=skill.id
-            )
-        ] == ["SKILL.md"]
-
-    harness.run(scenario)
-
-
-def test_submit_enforces_pending_quota(harness: Harness) -> None:
-    async def scenario() -> None:
-        first = await harness.service.create_draft(
-            owner_user_id="u1", name="first-tools", description="Does things"
-        )
-        second = await harness.service.create_draft(
-            owner_user_id="u1", name="second-tools", description="Does things"
-        )
-        await harness.service.save(owner_user_id="u1", skill_id=first.id)
-        await harness.service.save(owner_user_id="u1", skill_id=second.id)
-        harness.creation.max_pending_submissions_per_user = 1
-        await harness.service.submit(owner_user_id="u1", skill_id=first.id)
-        with pytest.raises(SkillConflict):
-            await harness.service.submit(owner_user_id="u1", skill_id=second.id)
-
-    harness.run(scenario)
-
-
-def test_withdraw_requires_a_pending_submission(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        with pytest.raises(SkillConflict):
-            await harness.service.withdraw(owner_user_id="u1", skill_id=skill.id)
-
-    harness.run(scenario)
-
-
-def test_open_draft_without_public_release_returns_empty(harness: Harness) -> None:
-    async def scenario() -> None:
-        skill = await harness.service.create_draft(
-            owner_user_id="u1", name="pdf-tools", description="Does things"
-        )
-        await harness.store.delete_all_draft_files(skill.id)
-        assert await harness.service.open_draft(
-            owner_user_id="u1", skill_id=skill.id
-        ) == []
-
-    harness.run(scenario)
-
-
-def test_delete_draft_requires_no_pending_submission(harness: Harness) -> None:
+def test_failed_scan_result_is_stored_and_activation_stays_blocked(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
             owner_user_id="u1", name="pdf-tools", description="Does things"
         )
         await harness.service.save(owner_user_id="u1", skill_id=skill.id)
-        await harness.service.submit(owner_user_id="u1", skill_id=skill.id)
-        with pytest.raises(SkillConflict):
-            await harness.service.delete_draft(
-                owner_user_id="u1", skill_id=skill.id
+        harness.scanner.outcome = SecurityScanOutcome(
+            status="failed",
+            is_safe=False,
+            max_severity="SAFE",
+            scanner_version="2.3.2",
+            error="SkillScannerError: boom",
+        )
+        scan = await harness.service.scan_security(
+            owner_user_id="u1", skill_id=skill.id
+        )
+        assert scan.status == "failed"
+        assert scan.error == "SkillScannerError: boom"
+        with pytest.raises(SkillConflict, match="failed"):
+            await harness.service.activate(owner_user_id="u1", skill_id=skill.id)
+
+    harness.run(scenario)
+
+
+def test_import_extracted_skill_creates_an_unscanned_extracted_draft(
+    harness: Harness,
+) -> None:
+    async def scenario() -> None:
+        skill_md = render_skill_md("session-helper", "从会话提炼的技能")
+        record = await harness.service.import_extracted_skill(
+            owner_user_id="u1",
+            skill_md=skill_md,
+            source_uri="viking://user/u1/skills/session-helper",
+            source_task_id="task-1",
+        )
+
+        assert record.private_name == "session-helper"
+        assert record.source == "extracted"
+        assert record.source_uri == "viking://user/u1/skills/session-helper"
+        version = await harness.service.latest_version(
+            owner_user_id="u1", skill_id=record.id
+        )
+        assert version is not None
+        assert version.skill_version == "v1"
+        assert version.index_status == "unindexed"
+        assert await harness.service.latest_scan(
+            owner_user_id="u1", skill_id=record.id, version_id=version.id
+        ) is None
+        files = await harness.service.list_files(
+            owner_user_id="u1", skill_id=record.id
+        )
+        assert [file.path for file in files] == ["SKILL.md"]
+
+        # The same generated URI is idempotent.
+        again = await harness.service.import_extracted_skill(
+            owner_user_id="u1",
+            skill_md=skill_md,
+            source_uri="viking://user/u1/skills/session-helper",
+            source_task_id="task-1",
+        )
+        assert again.id == record.id
+        assert len(await harness.service.list_mine(owner_user_id="u1")) == 1
+
+    harness.run(scenario)
+
+
+def test_import_extracted_skill_avoids_manual_name_collisions(
+    harness: Harness,
+) -> None:
+    async def scenario() -> None:
+        manual = await harness.service.create_draft(
+            owner_user_id="u1", name="session-helper", description="manual"
+        )
+        record = await harness.service.import_extracted_skill(
+            owner_user_id="u1",
+            skill_md=render_skill_md("session-helper", "从会话提炼的技能"),
+            source_uri="viking://user/u1/skills/session-helper",
+        )
+
+        assert record.id != manual.id
+        assert record.private_name.startswith("session-helper-")
+        assert record.source == "extracted"
+        staged = await harness.service.read_file(
+            owner_user_id="u1", skill_id=record.id, path="SKILL.md"
+        )
+        assert staged is not None
+        assert parse_skill_text(staged.content.decode()).name == record.private_name
+
+    harness.run(scenario)
+
+
+def test_import_extracted_skill_rejects_malformed_skill_md(harness: Harness) -> None:
+    async def scenario() -> None:
+        with pytest.raises(InvalidSkillPackage):
+            await harness.service.import_extracted_skill(
+                owner_user_id="u1",
+                skill_md="not a skill",
+                source_uri="viking://user/u1/skills/bad",
             )
-        assert len(
-            await harness.service.list_files(owner_user_id="u1", skill_id=skill.id)
-        ) == 1
 
     harness.run(scenario)

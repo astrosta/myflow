@@ -1,10 +1,12 @@
-"""SQL repository for the Git-backed skill catalog.
+"""SQL repository for the user-isolated Git-backed skill catalog.
 
-Every public method opens exactly one short-lived session.  The three mutating
-calls that move an active pointer (record_saved_version, create_submission and
-record_public_release) write the state change, active pointer, audit event and
-projection outbox row in one transaction, so a worker can never observe a
-half-applied catalog change.
+Every public method opens exactly one short-lived session.  The lifecycle calls
+that create or move user-visible state write the state change, active pointer
+(when applicable), audit event and projection outbox row in one transaction, so
+a worker can never observe a half-applied catalog change.
+
+v2 has no submissions, releases or public active pointers.  Saving a version is
+deliberately inert: only activate_version makes a version runtime-visible.
 """
 
 from __future__ import annotations
@@ -17,18 +19,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from agentkit.skills.domain import (
     PackageManifest,
-    ReviewDetail,
-    ReviewItem,
+    SecurityScanRecord,
     SkillConflict,
     SkillRecord,
-    SkillReleaseRecord,
     SkillScope,
-    SkillSubmissionRecord,
     SkillVersionRecord,
     StagedFile,
     StagedFileInfo,
@@ -40,19 +39,13 @@ from agentkit.skills.store.model import (
     SkillDraftFileRow,
     SkillIndexOutboxRow,
     SkillPrivateActiveRow,
-    SkillPublicActiveRow,
-    SkillReleaseBatchRow,
-    SkillReleaseRow,
     SkillRow,
-    SkillSettingsRow,
-    SkillSubmissionRow,
+    SkillSecurityScanRow,
     SkillVersionRow,
 )
 from agentkit.skills.types import SecretRequirement, Skill, SkillCategory
 
 if TYPE_CHECKING:
-    # Task 10 owns the Milvus projection record.  Importing it only for type
-    # checking keeps this store usable before projection.py exists.
     from agentkit.skills.projection import ProjectionHit
 
 
@@ -74,6 +67,18 @@ class OutboxEvent:
     payload: dict[str, Any]
     attempts: int
 
+
+#: 允许写入 skill_versions.index_status 的取值。
+_INDEX_STATUSES = frozenset({"unindexed", "pending", "ready", "failed", "disabled"})
+#: 对账快路径只拾取这三种：ready 已就绪，disabled 是"本部署不建索引"。
+_REPAIRABLE_INDEX_STATUSES = ("pending", "failed", "unindexed")
+
+
+def _reset_index_repair(row: SkillVersionRow) -> None:
+    """Clear the repair backoff: the version is being projected again."""
+    row.index_attempts = 0
+    row.index_last_error = None
+    row.index_next_attempt_at = None
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -110,10 +115,13 @@ def _skill_record(row: SkillRow) -> SkillRecord:
         id=row.id,
         owner_user_id=row.owner_user_id,
         private_name=row.private_name,
-        public_name=row.public_name,
         created_at=_utc(row.created_at),  # type: ignore[arg-type]
         updated_at=_utc(row.updated_at),  # type: ignore[arg-type]
         deleted_at=_utc(row.deleted_at),
+        source=row.source,
+        source_uri=row.source_uri,
+        enabled=bool(row.enabled),
+        load_count=int(row.load_count or 0),
     )
 
 
@@ -134,50 +142,23 @@ def _version_record(row: SkillVersionRow) -> SkillVersionRecord:
     )
 
 
-def _submission_record(row: SkillSubmissionRow) -> SkillSubmissionRecord:
-    return SkillSubmissionRecord(
+def _scan_record(row: SkillSecurityScanRow) -> SecurityScanRecord:
+    return SecurityScanRecord(
         id=row.id,
         skill_id=row.skill_id,
         version_id=row.version_id,
-        submitted_commit=row.submitted_commit,
         owner_user_id=row.owner_user_id,
+        package_sha256=row.package_sha256,
         status=row.status,
-        submitted_at=_utc(row.submitted_at),  # type: ignore[arg-type]
-        reviewed_by=row.reviewed_by,
-        reviewed_at=_utc(row.reviewed_at),
-        reject_reason=row.reject_reason,
-        public_release_id=row.public_release_id,
-    )
-
-
-def _release_record(row: SkillReleaseRow) -> SkillReleaseRecord:
-    return SkillReleaseRecord(
-        id=row.id,
-        batch_id=row.batch_id,
-        version_id=row.version_id,
-        skill_id=row.skill_id,
-        skill_version=row.skill_version,
-        git_repository=row.git_repository,
-        git_commit=row.git_commit,
-        skill_path=row.skill_path,
-        public_name=row.public_name,
-        source_commit=row.source_commit,
-        approved_by=row.approved_by,
+        is_safe=bool(row.is_safe),
+        max_severity=row.max_severity,
+        findings_count=int(row.findings_count or 0),
+        findings=list(row.findings_json or []),
+        scanner=row.scanner,
+        scanner_version=row.scanner_version,
+        duration_ms=int(row.duration_ms or 0),
+        error=row.error,
         created_at=_utc(row.created_at),  # type: ignore[arg-type]
-    )
-
-
-def _review_item(
-    skill: SkillRow, version: SkillVersionRow, submission: SkillSubmissionRow
-) -> ReviewItem:
-    return ReviewItem(
-        submission_id=submission.id,
-        skill_id=skill.id,
-        name=skill.private_name,
-        version=version.skill_version,
-        owner_user_id=submission.owner_user_id,
-        submitted_at=_utc(submission.submitted_at),  # type: ignore[arg-type]
-        submitted_commit=submission.submitted_commit,
     )
 
 
@@ -201,19 +182,9 @@ def _required_secrets(metadata: dict[str, Any]) -> tuple[SecretRequirement, ...]
     return tuple(secrets)
 
 
-def _skill_for_visibility(
-    skill: SkillRow,
-    version: SkillVersionRow,
-    *,
-    scope: SkillScope,
-    enabled: bool,
-    release: SkillReleaseRow | None = None,
-) -> Skill:
+def _skill_for_visibility(skill: SkillRow, version: SkillVersionRow) -> Skill:
     metadata = dict(version.metadata_json or {})
-    if scope is SkillScope.PUBLIC:
-        name = str(skill.public_name or metadata.get("name") or skill.private_name)
-    else:
-        name = str(metadata.get("name") or skill.private_name)
+    name = str(metadata.get("name") or skill.private_name)
     return Skill(
         name=name,
         description=str(metadata.get("description") or ""),
@@ -223,37 +194,26 @@ def _skill_for_visibility(
         relative_path=Path(name),
         category=SkillCategory.CUSTOM,
         allowed_tools=_allowed_tools(metadata),
-        enabled=enabled,
+        enabled=bool(skill.enabled),
+        load_count=int(skill.load_count or 0),
         required_secrets=_required_secrets(metadata),
         secrets_autonomous=bool(metadata.get("secrets_autonomous", True)),
         argument_hint=metadata.get("argument_hint"),
         skill_id=skill.id,
-        scope=scope,
+        scope=SkillScope.PRIVATE,
         owner_user_id=skill.owner_user_id,
         version_id=version.id,
         skill_version=version.skill_version,
-        release_id=release.id if release is not None else None,
-        git_repository=release.git_repository if release is not None else None,
-        git_commit=release.git_commit if release is not None else version.draft_commit,
+        git_commit=version.draft_commit,
         repo_path=version.skill_path,
     )
 
 
-def _visible(
-    skill: SkillRow,
-    version: SkillVersionRow,
-    *,
-    scope: SkillScope,
-    enabled: bool,
-    release: SkillReleaseRow | None = None,
-) -> VisibleSkill:
+def _visible(skill: SkillRow, version: SkillVersionRow) -> VisibleSkill:
     return VisibleSkill(
-        skill=_skill_for_visibility(
-            skill, version, scope=scope, enabled=enabled, release=release
-        ),
-        scope=scope,
+        skill=_skill_for_visibility(skill, version),
+        scope=SkillScope.PRIVATE,
         version=_version_record(version),
-        release=_release_record(release) if release is not None else None,
     )
 
 
@@ -284,13 +244,12 @@ def _outbox_event(row: SkillIndexOutboxRow) -> OutboxEvent:
 def _projection_payload(
     version: SkillVersionRow,
     *,
-    enabled: bool,
-    name: str | None = None,
+    enabled: bool = True,
 ) -> dict[str, Any]:
     metadata = dict(version.metadata_json or {})
     return {
         "enabled": enabled,
-        "name": name or metadata.get("name") or version.skill_version,
+        "name": metadata.get("name") or version.skill_version,
         "description": metadata.get("description") or "",
         "skill_version": version.skill_version,
         "package_sha256": version.package_sha256,
@@ -298,8 +257,12 @@ def _projection_payload(
     }
 
 
+def _projection_key(owner_user_id: str, skill_id: str) -> str:
+    return f"private:{owner_user_id}:{skill_id}"
+
+
 class SqlSkillStore:
-    """Async SQL implementation of catalog identity and lifecycle state."""
+    """Async SQL implementation of user-private skill identity and lifecycle."""
 
     def __init__(self, session_factory) -> None:
         self._sf = session_factory
@@ -319,11 +282,7 @@ class SqlSkillStore:
             return int(value or 0)
 
     async def bump_catalog_epoch(self) -> int:
-        """原子递增目录代数并返回新值，多 worker 并发安全。
-
-        先 UPDATE 再 INSERT：并发首次插入时只有一个能提交，输掉的一方回滚后
-        重跑 UPDATE，因此不会丢增量，也不会把 epoch 退回 1。
-        """
+        """原子递增目录代数并返回新值，多 worker 并发安全。"""
         now = _now()
         async with self._sf() as session:
             result = await session.execute(
@@ -365,13 +324,102 @@ class SqlSkillStore:
     # identity and versions
     # ------------------------------------------------------------------
 
-    async def create_skill(self, *, owner_user_id: str, private_name: str) -> SkillRecord:
+    async def set_skill_enabled(
+        self,
+        *,
+        skill_id: str,
+        owner_user_id: str,
+        enabled: bool,
+        index_enabled: bool = True,
+    ) -> SkillRecord:
+        """Persist the user switch for an active skill and refresh its projection."""
+        now = _now()
+        async with self._sf() as session:
+            skill = await self._owned_skill(session, skill_id, owner_user_id)
+            active = await session.get(SkillPrivateActiveRow, skill_id)
+            if active is None:
+                raise SkillConflict("only active skills can be enabled or disabled")
+            skill.enabled = bool(enabled)
+            skill.updated_at = now
+            if index_enabled:
+                version = await session.get(SkillVersionRow, active.version_id)
+                if version is not None:
+                    version.index_status = "pending"
+                    # 重新入队：上次耗尽的退避不该继续挡住这条版本。
+                    _reset_index_repair(version)
+                    self._outbox_row(
+                        session,
+                        op="upsert_active",
+                        projection_key=_projection_key(owner_user_id, skill_id),
+                        scope=SkillScope.PRIVATE.value,
+                        owner_user_id=owner_user_id,
+                        skill_id=skill_id,
+                        version_id=version.id,
+                        payload=_projection_payload(version, enabled=bool(enabled)),
+                        now=now,
+                    )
+            self._audit_row(
+                session,
+                actor=owner_user_id,
+                action="skill.enabled",
+                skill_id=skill_id,
+                detail={"enabled": bool(enabled)},
+                now=now,
+            )
+            await self._commit(session, f"skill {skill_id!r} enabled state conflicts")
+            return _skill_record(skill)
+
+    async def increment_skill_load_count(self, skill_id: str) -> int:
+        """Increment and return one private skill's successful load counter."""
+        async with self._sf() as session:
+            result = await session.execute(
+                update(SkillRow)
+                .where(SkillRow.id == skill_id, SkillRow.deleted_at.is_(None))
+                .values(load_count=SkillRow.load_count + 1)
+                .returning(SkillRow.load_count)
+            )
+            value = result.scalar_one_or_none()
+            await self._commit(session, f"skill {skill_id!r} load count conflicts")
+            return int(value or 0)
+
+    async def list_skill_load_counts(self) -> list[tuple[str, str, int]]:
+        """Return (owner_user_id, skill_id, load_count) for Redis startup seeding."""
+        async with self._sf() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        SkillRow.owner_user_id,
+                        SkillRow.id,
+                        SkillRow.load_count,
+                    )
+                    .where(
+                        SkillRow.deleted_at.is_(None),
+                        SkillRow.load_count > 0,
+                    )
+                    .order_by(SkillRow.owner_user_id.asc(), SkillRow.id.asc())
+                )
+            ).all()
+            return [
+                (str(owner), str(skill_id), int(count or 0))
+                for owner, skill_id, count in rows
+            ]
+
+    async def create_skill(
+        self,
+        *,
+        owner_user_id: str,
+        private_name: str,
+        source: str = "manual",
+        source_uri: str | None = None,
+    ) -> SkillRecord:
         if not private_name or not private_name.strip():
             raise ValueError("private_name must not be blank")
         now = _now()
         row = SkillRow(
             owner_user_id=owner_user_id,
             private_name=private_name,
+            source=source,
+            source_uri=source_uri,
             created_at=now,
             updated_at=now,
         )
@@ -385,12 +433,6 @@ class SqlSkillStore:
     async def get_skill(
         self, skill_id: str, *, include_deleted: bool = False
     ) -> SkillRecord | None:
-        """读取技能记录；默认不含已软删的私有草稿。
-
-        发布状态（unpublish）和重新打开草稿必须以“记录是否仍存在”为准，
-        调用方显式传 include_deleted=True；编辑/保存等草稿级路径保持默认值，
-        已删除的草稿仍然不可写。
-        """
         conditions = [SkillRow.id == skill_id]
         if not include_deleted:
             conditions.append(SkillRow.deleted_at.is_(None))
@@ -401,7 +443,7 @@ class SqlSkillStore:
     async def revive_private_draft(
         self, *, skill_id: str, owner_user_id: str
     ) -> bool:
-        """清掉软删标记，让作者能重新编辑仍然发布的技能。"""
+        """Clear the soft-delete marker so an owner can reopen their skill."""
         async with self._sf() as session:
             row = await session.scalar(
                 select(SkillRow).where(
@@ -465,6 +507,11 @@ class SqlSkillStore:
         skill_path: str,
         extra_metadata: Mapping[str, Any] | None = None,
     ) -> SkillVersionRecord:
+        """Record an immutable Git-backed draft version.
+
+        Saving is deliberately inert: it never moves the active pointer or
+        enqueues indexing.  Only activate_version makes a version visible.
+        """
         now = _now()
         async with self._sf() as session:
             skill = await self._owned_skill(session, skill_id, owner_user_id)
@@ -495,26 +542,11 @@ class SqlSkillStore:
                     draft_ref=draft_ref,
                     draft_commit=draft_commit,
                     skill_path=skill_path,
-                    index_status="pending",
+                    index_status="unindexed",
                     created_at=now,
                 )
                 session.add(version)
                 await self._flush(session, f"skill {skill_id!r} version could not be allocated")
-
-            active = await session.get(SkillPrivateActiveRow, skill_id)
-            if active is None:
-                session.add(
-                    SkillPrivateActiveRow(
-                        skill_id=skill_id,
-                        owner_user_id=owner_user_id,
-                        version_id=version.id,
-                        updated_at=now,
-                    )
-                )
-            else:
-                active.owner_user_id = owner_user_id
-                active.version_id = version.id
-                active.updated_at = now
 
             self._audit_row(
                 session,
@@ -528,236 +560,11 @@ class SqlSkillStore:
                 },
                 now=now,
             )
-            self._outbox_row(
-                session,
-                op="upsert_active",
-                projection_key=f"private:{owner_user_id}:{skill_id}",
-                scope="private",
-                owner_user_id=owner_user_id,
-                skill_id=skill_id,
-                version_id=version.id,
-                payload=_projection_payload(version, enabled=True),
-                now=now,
-            )
             skill.updated_at = now
 
             record = _version_record(version)
             await self._commit(session, f"skill {skill_id!r} version could not be allocated")
             return record
-
-    # ------------------------------------------------------------------
-    # submissions and reviews
-    # ------------------------------------------------------------------
-
-    async def create_submission(
-        self,
-        *,
-        skill_id: str,
-        version: SkillVersionRecord,
-        owner_user_id: str,
-        submitted_commit: str,
-    ) -> SkillSubmissionRecord:
-        now = _now()
-        async with self._sf() as session:
-            skill = await self._owned_skill(session, skill_id, owner_user_id)
-            version_row = await session.get(SkillVersionRow, version.id)
-            if version_row is None or version_row.skill_id != skill_id:
-                raise SkillConflict(f"version {version.id!r} does not belong to skill {skill_id!r}")
-
-            pending = await session.scalar(
-                select(SkillSubmissionRow.id).where(
-                    SkillSubmissionRow.skill_id == skill_id,
-                    SkillSubmissionRow.status == "pending",
-                )
-            )
-            if pending is not None:
-                raise SkillConflict(f"skill {skill_id!r} already has a pending submission")
-
-            submission = SkillSubmissionRow(
-                skill_id=skill_id,
-                version_id=version_row.id,
-                submitted_commit=submitted_commit,
-                owner_user_id=owner_user_id,
-                status="pending",
-                submitted_at=now,
-                created_at=now,
-            )
-            session.add(submission)
-            await self._flush(session, f"skill {skill_id!r} already has a pending submission")
-
-            # Submitting does not create a new version, but keeping the private
-            # pointer explicit here makes the one-transaction contract obvious.
-            active = await session.get(SkillPrivateActiveRow, skill_id)
-            if active is None:
-                session.add(
-                    SkillPrivateActiveRow(
-                        skill_id=skill_id,
-                        owner_user_id=owner_user_id,
-                        version_id=version_row.id,
-                        updated_at=now,
-                    )
-                )
-            else:
-                active.owner_user_id = owner_user_id
-                active.version_id = version_row.id
-                active.updated_at = now
-
-            self._outbox_row(
-                session,
-                op="upsert_active",
-                projection_key=f"private:{owner_user_id}:{skill_id}",
-                scope="private",
-                owner_user_id=owner_user_id,
-                skill_id=skill_id,
-                version_id=version_row.id,
-                payload=_projection_payload(version_row, enabled=True),
-                now=now,
-            )
-            self._audit_row(
-                session,
-                actor=owner_user_id,
-                action="skill.submit",
-                skill_id=skill_id,
-                submission_id=submission.id,
-                detail={
-                    "version_id": version_row.id,
-                    "version": version_row.skill_version,
-                    "submitted_commit": submitted_commit,
-                },
-                now=now,
-            )
-            skill.updated_at = now
-
-            record = _submission_record(submission)
-            await self._commit(session, f"skill {skill_id!r} already has a pending submission")
-            return record
-
-    async def pending_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
-        async with self._sf() as session:
-            row = await session.scalar(
-                select(SkillSubmissionRow).where(
-                    SkillSubmissionRow.skill_id == skill_id,
-                    SkillSubmissionRow.status == "pending",
-                )
-            )
-            return _submission_record(row) if row is not None else None
-
-    async def latest_submission(self, skill_id: str) -> SkillSubmissionRecord | None:
-        """最近一次提交，不论状态；作者据此看到驳回/撤回，而不是退回草稿。"""
-
-        async with self._sf() as session:
-            row = await session.scalar(
-                select(SkillSubmissionRow)
-                .where(SkillSubmissionRow.skill_id == skill_id)
-                .order_by(
-                    SkillSubmissionRow.submitted_at.desc(),
-                    SkillSubmissionRow.id.desc(),
-                )
-                .limit(1)
-            )
-            return _submission_record(row) if row is not None else None
-
-    async def submission(self, submission_id: str) -> SkillSubmissionRecord | None:
-        async with self._sf() as session:
-            row = await session.get(SkillSubmissionRow, submission_id)
-            return _submission_record(row) if row is not None else None
-
-    async def set_submission_status(
-        self,
-        submission_id: str,
-        *,
-        status: str,
-        reviewed_by: str | None = None,
-        reject_reason: str | None = None,
-        public_release_id: str | None = None,
-    ) -> SkillSubmissionRecord:
-        now = _now()
-        async with self._sf() as session:
-            row = await session.get(SkillSubmissionRow, submission_id)
-            if row is None:
-                raise SkillConflict(f"submission {submission_id!r} does not exist")
-
-            row.status = status
-            if reviewed_by is not None:
-                row.reviewed_by = reviewed_by
-            if reject_reason is not None:
-                row.reject_reason = reject_reason
-            if public_release_id is not None:
-                row.public_release_id = public_release_id
-            if reviewed_by is not None or status != "pending":
-                row.reviewed_at = now
-
-            action = {
-                "approved": "skill.approve",
-                "rejected": "skill.reject",
-                "withdrawn": "skill.withdraw",
-            }.get(status, "skill.submit")
-            self._audit_row(
-                session,
-                actor=reviewed_by or row.owner_user_id,
-                action=action,
-                skill_id=row.skill_id,
-                submission_id=row.id,
-                release_id=row.public_release_id,
-                detail={
-                    "status": status,
-                    "reviewed_by": reviewed_by,
-                    "reject_reason": reject_reason,
-                },
-                now=now,
-            )
-            record = _submission_record(row)
-            await self._commit(session, f"submission {submission_id!r} could not be updated")
-            return record
-
-    async def list_pending_submissions(self, limit: int = 50) -> list[ReviewItem]:
-        async with self._sf() as session:
-            rows = (
-                await session.execute(
-                    select(SkillSubmissionRow, SkillVersionRow, SkillRow)
-                    .join(SkillVersionRow, SkillVersionRow.id == SkillSubmissionRow.version_id)
-                    .join(SkillRow, SkillRow.id == SkillSubmissionRow.skill_id)
-                    .where(SkillSubmissionRow.status == "pending")
-                    .order_by(
-                        SkillSubmissionRow.submitted_at.asc(),
-                        SkillSubmissionRow.id.asc(),
-                    )
-                    .limit(limit)
-                )
-            ).all()
-            return [
-                _review_item(skill, version, submission)
-                for submission, version, skill in rows
-            ]
-
-    async def review_detail(self, submission_id: str) -> ReviewDetail | None:
-        """Return the database-known review envelope.
-
-        Git-backed file contents are attached by the review service; this store
-        intentionally neither reads Git nor invents body content it does not
-        have.  The metadata snapshot and exact source commit are authoritative
-        here.
-        """
-        async with self._sf() as session:
-            row = (
-                await session.execute(
-                    select(SkillSubmissionRow, SkillVersionRow, SkillRow)
-                    .join(SkillVersionRow, SkillVersionRow.id == SkillSubmissionRow.version_id)
-                    .join(SkillRow, SkillRow.id == SkillSubmissionRow.skill_id)
-                    .where(SkillSubmissionRow.id == submission_id)
-                )
-            ).first()
-            if row is None:
-                return None
-            submission, version, skill = row
-            return ReviewDetail(
-                item=_review_item(skill, version, submission),
-                files=[],
-                skill_md="",
-                diff="",
-                metadata=dict(version.metadata_json or {}),
-                package_bytes=0,
-            )
 
     async def list_versions(self, skill_id: str) -> list[SkillVersionRecord]:
         async with self._sf() as session:
@@ -784,315 +591,358 @@ class SqlSkillStore:
             ).all()
             return [_version_record(row) for row in rows]
 
+    async def latest_version(self, skill_id: str) -> SkillVersionRecord | None:
+        async with self._sf() as session:
+            row = await session.scalar(
+                select(SkillVersionRow)
+                .where(SkillVersionRow.skill_id == skill_id)
+                .order_by(
+                    SkillVersionRow.version_seq.desc(),
+                    SkillVersionRow.id.desc(),
+                )
+                .limit(1)
+            )
+            return _version_record(row) if row is not None else None
+
+    async def get_version(
+        self, skill_id: str, version_id: str
+    ) -> SkillVersionRecord | None:
+        async with self._sf() as session:
+            row = await session.get(SkillVersionRow, version_id)
+            if row is None or row.skill_id != skill_id:
+                return None
+            return _version_record(row)
+
     async def set_version_index_status(self, version_id: str, status: str) -> None:
         """Update only the mutable projection status of one immutable version."""
-        if status not in {"pending", "ready", "failed"}:
+        if status not in _INDEX_STATUSES:
             raise ValueError(f"unsupported index status: {status!r}")
         async with self._sf() as session:
             row = await session.get(SkillVersionRow, version_id)
             if row is None:
                 return
             row.index_status = status
+            if status != "failed":
+                # 新一轮投影（生效/开关/成功）重新开始计数，旧退避不该拖住它。
+                _reset_index_repair(row)
             await self._commit(
                 session, f"skill version {version_id!r} index status conflicts"
             )
 
-    # ------------------------------------------------------------------
-    # public releases and active pointers
-    # ------------------------------------------------------------------
-
-    async def record_public_release(
+    async def list_index_repair_candidates(
         self,
         *,
-        submission: SkillSubmissionRecord,
-        public_name: str,
-        git_repository: str,
-        git_commit: str,
-        skill_path: str,
-        source_commit: str,
-        actor: str,
-    ) -> SkillReleaseRecord:
+        limit: int,
+        max_attempts: int,
+        now: datetime | None = None,
+    ) -> list[VisibleSkill]:
+        """Active versions whose projection is not ready and whose backoff elapsed.
+
+        This is the only query the periodic repair pass runs: index_status is the
+        authority for "should this version be in Milvus", so a healthy catalog costs
+        one indexed lookup and nothing else.  max_attempts keeps rows that keep
+        failing from starving the rest of the queue.
+        """
+        if limit <= 0:
+            return []
+        moment = now or _now()
+        async with self._sf() as session:
+            rows = (
+                await session.execute(
+                    select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
+                    .join(
+                        SkillVersionRow,
+                        SkillVersionRow.id == SkillPrivateActiveRow.version_id,
+                    )
+                    .join(SkillRow, SkillRow.id == SkillPrivateActiveRow.skill_id)
+                    .where(
+                        SkillRow.deleted_at.is_(None),
+                        SkillVersionRow.index_status.in_(_REPAIRABLE_INDEX_STATUSES),
+                        SkillVersionRow.index_attempts < int(max_attempts),
+                        or_(
+                            SkillVersionRow.index_next_attempt_at.is_(None),
+                            SkillVersionRow.index_next_attempt_at <= moment,
+                        ),
+                    )
+                    .order_by(
+                        SkillVersionRow.index_next_attempt_at.asc().nullsfirst(),
+                        SkillVersionRow.version_seq.asc(),
+                        SkillVersionRow.id.asc(),
+                    )
+                    .limit(int(limit))
+                )
+            ).all()
+        return [_visible(skill, version) for _active, version, skill in rows]
+
+    async def mark_version_indexed(self, version_id: str) -> None:
+        """The projection row is in Milvus: ready, and the backoff state is cleared."""
+        async with self._sf() as session:
+            row = await session.get(SkillVersionRow, version_id)
+            if row is None:
+                return
+            row.index_status = "ready"
+            _reset_index_repair(row)
+            await self._commit(
+                session, f"skill version {version_id!r} index status conflicts"
+            )
+
+    async def mark_version_index_failed(
+        self,
+        version_id: str,
+        *,
+        error: str,
+        max_attempts: int,
+        base_seconds: float = 60.0,
+        cap_seconds: float = 3600.0,
+        now: datetime | None = None,
+    ) -> int:
+        """Record one failed repair and schedule the next attempt. Returns attempts."""
+        moment = now or _now()
+        async with self._sf() as session:
+            row = await session.get(SkillVersionRow, version_id)
+            if row is None:
+                return 0
+            attempts = int(row.index_attempts or 0) + 1
+            row.index_status = "failed"
+            row.index_attempts = attempts
+            row.index_last_error = str(error or "")[:255]
+            if attempts >= int(max_attempts):
+                # 自动重试到此为止；运维处理或重新生效才会复活它。
+                row.index_next_attempt_at = None
+            else:
+                delay = min(
+                    float(cap_seconds),
+                    float(base_seconds) * 2 ** max(0, attempts - 1),
+                )
+                row.index_next_attempt_at = moment + timedelta(seconds=delay)
+            await self._commit(
+                session, f"skill version {version_id!r} index status conflicts"
+            )
+            return attempts
+
+    # ------------------------------------------------------------------
+    # security scans
+    # ------------------------------------------------------------------
+
+    async def record_security_scan(
+        self,
+        *,
+        skill_id: str,
+        owner_user_id: str,
+        version_id: str,
+        status: str,
+        is_safe: bool,
+        max_severity: str,
+        findings: Sequence[Mapping[str, Any]],
+        scanner: str,
+        scanner_version: str | None,
+        duration_ms: int,
+        error: str | None = None,
+    ) -> SecurityScanRecord:
+        """Persist one scan result bound to the immutable version content."""
+        if status not in {"completed", "failed"}:
+            raise ValueError(f"unsupported scan status: {status!r}")
+        normalized = [dict(item) for item in findings]
         now = _now()
         async with self._sf() as session:
-            submission_row = await session.get(SkillSubmissionRow, submission.id)
-            if submission_row is None:
-                raise SkillConflict(f"submission {submission.id!r} does not exist")
-            if submission_row.status != "pending":
-                raise SkillConflict(f"submission {submission.id!r} is not pending")
-
-            skill = await session.get(SkillRow, submission_row.skill_id)
-            version = await session.get(SkillVersionRow, submission_row.version_id)
-            if skill is None or version is None:
-                raise SkillConflict(f"submission {submission.id!r} has no catalog rows")
-            if skill.public_name is not None and skill.public_name != public_name:
+            skill = await self._owned_skill(session, skill_id, owner_user_id)
+            version = await session.get(SkillVersionRow, version_id)
+            if version is None or version.skill_id != skill_id:
                 raise SkillConflict(
-                    f"public name for skill {skill.id!r} is immutable: {skill.public_name!r}"
+                    f"version {version_id!r} does not belong to skill {skill_id!r}"
                 )
-            collision = await session.scalar(
-                select(SkillRow.id).where(
-                    SkillRow.public_name == public_name,
-                    SkillRow.id != skill.id,
-                )
-            )
-            if collision is not None:
-                raise SkillConflict(f"public name {public_name!r} is already in use")
-
-            batch = SkillReleaseBatchRow(
-                git_repository=git_repository,
-                git_commit=git_commit,
-                approved_by=actor,
-                created_at=now,
-                stats_json={"skills": 1},
-            )
-            session.add(batch)
-            await self._flush(session, "public release batch could not be recorded")
-
-            release = SkillReleaseRow(
-                batch_id=batch.id,
-                version_id=version.id,
-                skill_id=skill.id,
-                skill_version=version.skill_version,
-                git_repository=git_repository,
-                git_commit=git_commit,
-                skill_path=skill_path,
-                public_name=public_name,
-                source_commit=source_commit,
-                approved_by=actor,
+            row = SkillSecurityScanRow(
+                skill_id=skill_id,
+                version_id=version_id,
+                owner_user_id=owner_user_id,
+                package_sha256=version.package_sha256,
+                status=status,
+                is_safe=bool(is_safe),
+                max_severity=max_severity,
+                findings_count=len(normalized),
+                findings_json=normalized,
+                scanner=scanner,
+                scanner_version=scanner_version,
+                duration_ms=max(0, int(duration_ms)),
+                error=error,
                 created_at=now,
             )
-            session.add(release)
-            await self._flush(session, f"public release for skill {skill.id!r} conflicts")
-
-            skill.public_name = public_name
-            skill.updated_at = now
-
-            active = await session.get(SkillPublicActiveRow, skill.id)
-            if active is None:
-                session.add(
-                    SkillPublicActiveRow(
-                        skill_id=skill.id,
-                        release_id=release.id,
-                        activated_by=actor,
-                        updated_at=now,
-                    )
-                )
-            else:
-                active.release_id = release.id
-                active.activated_by = actor
-                active.updated_at = now
-
-            settings = await session.get(SkillSettingsRow, skill.id)
-            if settings is None:
-                session.add(
-                    SkillSettingsRow(
-                        skill_id=skill.id,
-                        enabled=True,
-                        updated_by=actor,
-                        updated_at=now,
-                    )
-                )
-            else:
-                settings.enabled = True
-                settings.updated_by = actor
-                settings.updated_at = now
-
-            self._outbox_row(
-                session,
-                op="upsert_active",
-                projection_key=f"public:{skill.id}",
-                scope="public",
-                owner_user_id=None,
-                skill_id=skill.id,
-                version_id=version.id,
-                payload=_projection_payload(version, enabled=True, name=public_name),
-                now=now,
-            )
+            session.add(row)
+            await self._flush(session, f"security scan for skill {skill_id!r} conflicts")
             self._audit_row(
                 session,
-                actor=actor,
-                action="skill.approve",
-                skill_id=skill.id,
-                submission_id=submission_row.id,
-                release_id=release.id,
+                actor=owner_user_id,
+                action="skill.scan",
+                skill_id=skill_id,
                 detail={
-                    "version_id": version.id,
-                    "version": version.skill_version,
-                    "public_name": public_name,
-                    "git_commit": git_commit,
-                    "source_commit": source_commit,
+                    "scan_id": row.id,
+                    "version_id": version_id,
+                    "status": status,
+                    "is_safe": bool(is_safe),
+                    "max_severity": max_severity,
+                    "findings_count": len(normalized),
                 },
                 now=now,
             )
-
-            submission_row.status = "approved"
-            submission_row.reviewed_by = actor
-            submission_row.reviewed_at = now
-            submission_row.public_release_id = release.id
-
-            record = _release_record(release)
-            await self._commit(session, f"public release for skill {skill.id!r} conflicts")
+            skill.updated_at = now
+            record = _scan_record(row)
+            await self._commit(session, f"security scan for skill {skill_id!r} conflicts")
             return record
 
-    async def set_public_active(self, skill_id: str, release_id: str, actor: str) -> None:
+    async def latest_security_scan(
+        self, skill_id: str, version_id: str | None = None
+    ) -> SecurityScanRecord | None:
+        async with self._sf() as session:
+            query = select(SkillSecurityScanRow).where(
+                SkillSecurityScanRow.skill_id == skill_id
+            )
+            if version_id is not None:
+                query = query.where(SkillSecurityScanRow.version_id == version_id)
+            row = await session.scalar(
+                query.order_by(
+                    SkillSecurityScanRow.created_at.desc(),
+                    SkillSecurityScanRow.id.desc(),
+                ).limit(1)
+            )
+            return _scan_record(row) if row is not None else None
+
+    async def list_security_scans(
+        self, skill_id: str, *, limit: int = 20
+    ) -> list[SecurityScanRecord]:
+        async with self._sf() as session:
+            rows = (
+                await session.scalars(
+                    select(SkillSecurityScanRow)
+                    .where(SkillSecurityScanRow.skill_id == skill_id)
+                    .order_by(
+                        SkillSecurityScanRow.created_at.desc(),
+                        SkillSecurityScanRow.id.desc(),
+                    )
+                    .limit(max(1, min(int(limit), 100)))
+                )
+            ).all()
+            return [_scan_record(row) for row in rows]
+
+    async def security_scan(self, scan_id: str) -> SecurityScanRecord | None:
+        async with self._sf() as session:
+            row = await session.get(SkillSecurityScanRow, scan_id)
+            return _scan_record(row) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # explicit activation
+    # ------------------------------------------------------------------
+
+    async def activate_version(
+        self,
+        *,
+        skill_id: str,
+        owner_user_id: str,
+        version_id: str,
+        scan_id: str,
+        actor: str,
+        index_enabled: bool = True,
+    ) -> SkillVersionRecord:
+        """Point the user's runtime at one scanned version and enqueue indexing.
+
+        The scan, version, owner, package hash and latest-version constraints are
+        re-checked inside this transaction.  The caller cannot activate a stale
+        scan or an older version that has since been superseded.
+        """
         now = _now()
         async with self._sf() as session:
-            skill = await session.get(SkillRow, skill_id)
-            release = await session.get(SkillReleaseRow, release_id)
-            if skill is None:
-                raise SkillConflict(f"skill {skill_id!r} does not exist")
-            if release is None or release.skill_id != skill_id:
+            skill = await self._owned_skill(session, skill_id, owner_user_id)
+            version = await session.get(SkillVersionRow, version_id)
+            if version is None or version.skill_id != skill_id:
                 raise SkillConflict(
-                    f"release {release_id!r} does not belong to skill {skill_id!r}"
+                    f"version {version_id!r} does not belong to skill {skill_id!r}"
                 )
-            version = await session.get(SkillVersionRow, release.version_id)
-            if version is None:
-                raise SkillConflict(f"release {release_id!r} has no version row")
+            latest_seq = await session.scalar(
+                select(func.max(SkillVersionRow.version_seq)).where(
+                    SkillVersionRow.skill_id == skill_id
+                )
+            )
+            if int(latest_seq or 0) != int(version.version_seq):
+                raise SkillConflict(
+                    f"version {version.skill_version!r} is not the latest saved version"
+                )
 
-            active = await session.get(SkillPublicActiveRow, skill_id)
+            scan = await session.get(SkillSecurityScanRow, scan_id)
+            if (
+                scan is None
+                or scan.skill_id != skill_id
+                or scan.version_id != version.id
+                or scan.owner_user_id != owner_user_id
+            ):
+                raise SkillConflict("security scan does not belong to this version")
+            if scan.status != "completed":
+                raise SkillConflict("security scan did not complete successfully")
+            if not scan.is_safe:
+                raise SkillConflict(
+                    "security scan did not pass; fix the findings and scan again"
+                )
+            if scan.package_sha256 != version.package_sha256:
+                raise SkillConflict("security scan was produced for different content")
+            active = await session.get(SkillPrivateActiveRow, skill_id)
             if active is None:
                 session.add(
-                    SkillPublicActiveRow(
+                    SkillPrivateActiveRow(
                         skill_id=skill_id,
-                        release_id=release_id,
-                        activated_by=actor,
+                        owner_user_id=owner_user_id,
+                        version_id=version.id,
                         updated_at=now,
                     )
                 )
             else:
-                active.release_id = release_id
-                active.activated_by = actor
+                active.owner_user_id = owner_user_id
+                active.version_id = version.id
                 active.updated_at = now
 
-            settings = await session.get(SkillSettingsRow, skill_id)
-            if settings is None:
-                settings = SkillSettingsRow(
+            version.index_status = "pending" if index_enabled else "disabled"
+            _reset_index_repair(version)
+            if index_enabled:
+                self._outbox_row(
+                    session,
+                    op="upsert_active",
+                    projection_key=_projection_key(owner_user_id, skill_id),
+                    scope=SkillScope.PRIVATE.value,
+                    owner_user_id=owner_user_id,
                     skill_id=skill_id,
-                    enabled=True,
-                    updated_by=actor,
-                    updated_at=now,
+                    version_id=version.id,
+                    payload=_projection_payload(version, enabled=bool(skill.enabled)),
+                    now=now,
                 )
-                session.add(settings)
-            enabled = settings.enabled
-
-            self._outbox_row(
-                session,
-                op="upsert_active",
-                projection_key=f"public:{skill_id}",
-                scope="public",
-                owner_user_id=None,
-                skill_id=skill_id,
-                version_id=release.version_id,
-                payload=_projection_payload(
-                    version, enabled=enabled, name=release.public_name
-                ),
-                now=now,
-            )
             self._audit_row(
                 session,
                 actor=actor,
                 action="skill.activate",
                 skill_id=skill_id,
-                release_id=release_id,
-                detail={"release_id": release_id, "version_id": release.version_id},
+                detail={
+                    "version_id": version.id,
+                    "version": version.skill_version,
+                    "scan_id": scan.id,
+                    "package_sha256": version.package_sha256,
+                },
                 now=now,
             )
             skill.updated_at = now
-            await self._commit(
-                session, f"public active pointer for skill {skill_id!r} conflicts"
-            )
+            record = _version_record(version)
+            await self._commit(session, f"skill {skill_id!r} activation conflicts")
+            return record
 
-    async def clear_public_active(self, skill_id: str) -> None:
-        now = _now()
+    async def private_active(self, skill_id: str) -> SkillVersionRecord | None:
         async with self._sf() as session:
-            skill = await session.get(SkillRow, skill_id)
-            if skill is None:
-                raise SkillConflict(f"skill {skill_id!r} does not exist")
-
-            active = await session.get(SkillPublicActiveRow, skill_id)
-            if active is not None:
-                await session.delete(active)
-
-            self._outbox_row(
-                session,
-                op="delete_active",
-                projection_key=f"public:{skill_id}",
-                scope="public",
-                owner_user_id=None,
-                skill_id=skill_id,
-                version_id=None,
-                payload={},
-                now=now,
-            )
-            self._audit_row(
-                session,
-                actor="system",
-                action="skill.unpublish",
-                skill_id=skill_id,
-                detail={},
-                now=now,
-            )
-            skill.updated_at = now
-            await self._commit(
-                session, f"public active pointer for skill {skill_id!r} conflicts"
-            )
-
-    async def set_global_enabled(self, skill_id: str, enabled: bool, actor: str) -> None:
-        now = _now()
-        async with self._sf() as session:
-            skill = await session.get(SkillRow, skill_id)
-            if skill is None:
-                raise SkillConflict(f"skill {skill_id!r} does not exist")
-
-            settings = await session.get(SkillSettingsRow, skill_id)
-            if settings is None:
-                settings = SkillSettingsRow(
-                    skill_id=skill_id,
-                    enabled=enabled,
-                    updated_by=actor,
-                    updated_at=now,
-                )
-                session.add(settings)
-            else:
-                settings.enabled = enabled
-                settings.updated_by = actor
-                settings.updated_at = now
-
-            active = await session.get(SkillPublicActiveRow, skill_id)
-            if active is not None:
-                release = await session.get(SkillReleaseRow, active.release_id)
-                version = (
-                    await session.get(SkillVersionRow, release.version_id)
-                    if release is not None
-                    else None
-                )
-                if release is None or version is None:
-                    raise SkillConflict(
-                        f"skill {skill_id!r} has a dangling public active pointer"
+            row = (
+                await session.execute(
+                    select(SkillVersionRow)
+                    .join(
+                        SkillPrivateActiveRow,
+                        SkillPrivateActiveRow.version_id == SkillVersionRow.id,
                     )
-                self._outbox_row(
-                    session,
-                    op="upsert_active",
-                    projection_key=f"public:{skill_id}",
-                    scope="public",
-                    owner_user_id=None,
-                    skill_id=skill_id,
-                    version_id=version.id,
-                    payload=_projection_payload(
-                        version, enabled=enabled, name=release.public_name
-                    ),
-                    now=now,
+                    .where(SkillPrivateActiveRow.skill_id == skill_id)
+                    .limit(1)
                 )
-
-            self._audit_row(
-                session,
-                actor=actor,
-                action="skill.enable" if enabled else "skill.disable",
-                skill_id=skill_id,
-                detail={"enabled": enabled},
-                now=now,
-            )
-            skill.updated_at = now
-            await self._commit(session, f"skill setting for {skill_id!r} conflicts")
+            ).first()
+            return _version_record(row[0]) if row is not None else None
 
     # ------------------------------------------------------------------
     # draft staging
@@ -1181,11 +1031,10 @@ class SqlSkillStore:
     async def delete_private_draft(
         self, *, skill_id: str, owner_user_id: str, actor: str
     ) -> bool:
-        """Delete one owner's private draft and queue its projection removal.
+        """Delete one owner's private skill and queue its projection removal.
 
-        A missing or foreign skill is reported as False rather than raising,
-        so callers cannot distinguish another owner's draft from an absent one.
-        Public release rows and the public active pointer are never touched.
+        Versions and scan history stay in PostgreSQL for audit; the owner,
+        active pointer and draft staging are removed from every runtime read.
         """
         now = _now()
         async with self._sf() as session:
@@ -1217,8 +1066,8 @@ class SqlSkillStore:
             self._outbox_row(
                 session,
                 op="delete_active",
-                projection_key=f"private:{owner_user_id}:{skill_id}",
-                scope="private",
+                projection_key=_projection_key(owner_user_id, skill_id),
+                scope=SkillScope.PRIVATE.value,
                 owner_user_id=owner_user_id,
                 skill_id=skill_id,
                 version_id=None,
@@ -1298,10 +1147,6 @@ class SqlSkillStore:
                 await self._commit(session, "projection outbox claim conflicts")
                 return events
 
-            # SQLite has no FOR UPDATE.  Select candidates and then claim them
-            # with a conditional UPDATE in the same transaction; a concurrent
-            # caller that lost the race gets no rows back and never duplicates
-            # an event.
             candidates = (
                 await session.scalars(
                     select(SkillIndexOutboxRow)
@@ -1367,8 +1212,6 @@ class SqlSkillStore:
         self, event_id: str, error: str, delay_seconds: int
     ) -> None:
         now = _now()
-        # A retry is always scheduled strictly in the future so an immediate
-        # claim cannot spin on the same failed event.
         next_attempt_at = now + timedelta(seconds=max(1, int(delay_seconds)))
         async with self._sf() as session:
             row = await session.get(SkillIndexOutboxRow, event_id)
@@ -1405,35 +1248,12 @@ class SqlSkillStore:
             return [_outbox_event(row) for row in rows]
 
     # ------------------------------------------------------------------
-    # visibility, projection confirmation, and audit
+    # visibility and projection confirmation
     # ------------------------------------------------------------------
 
     async def visible_for_user(self, user_id: str) -> list[VisibleSkill]:
         async with self._sf() as session:
-            public_rows = (
-                await session.execute(
-                    select(
-                        SkillReleaseRow,
-                        SkillVersionRow,
-                        SkillPublicActiveRow,
-                        SkillRow,
-                        SkillSettingsRow,
-                    )
-                    .join(SkillRow, SkillRow.id == SkillReleaseRow.skill_id)
-                    .join(SkillVersionRow, SkillVersionRow.id == SkillReleaseRow.version_id)
-                    .join(
-                        SkillPublicActiveRow,
-                        (SkillPublicActiveRow.skill_id == SkillRow.id)
-                        & (SkillPublicActiveRow.release_id == SkillReleaseRow.id),
-                    )
-                    .outerjoin(SkillSettingsRow, SkillSettingsRow.skill_id == SkillRow.id)
-                    .order_by(
-                        func.coalesce(SkillRow.public_name, SkillRow.private_name).asc(),
-                        SkillRow.id.asc(),
-                    )
-                )
-            ).all()
-            private_rows = (
+            rows = (
                 await session.execute(
                     select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
                     .join(
@@ -1443,62 +1263,19 @@ class SqlSkillStore:
                     .join(SkillRow, SkillRow.id == SkillPrivateActiveRow.skill_id)
                     .where(
                         SkillPrivateActiveRow.owner_user_id == user_id,
+                        SkillRow.owner_user_id == user_id,
                         SkillRow.deleted_at.is_(None),
+                        SkillRow.enabled.is_(True),
                     )
                     .order_by(SkillRow.private_name.asc(), SkillRow.id.asc())
                 )
             ).all()
-
-        visible = [
-            _visible(
-                skill,
-                version,
-                scope=SkillScope.PUBLIC,
-                enabled=bool(settings.enabled) if settings is not None else True,
-                release=release,
-            )
-            for release, version, _active, skill, settings in public_rows
-        ]
-        visible.extend(
-            _visible(skill, version, scope=SkillScope.PRIVATE, enabled=True)
-            for _active, version, skill in private_rows
-        )
-        return visible
+        return [_visible(skill, version) for _active, version, skill in rows]
 
     async def list_active_visible(self) -> list[VisibleSkill]:
-        """Return every public and private active pointer, regardless of owner.
-
-        The outbox reconciler and retention scan need the complete active set;
-        normal request-time visibility still goes through visible_for_user.
-        """
+        """Return every owner's active private skill for reconciliation."""
         async with self._sf() as session:
-            public_rows = (
-                await session.execute(
-                    select(
-                        SkillReleaseRow,
-                        SkillVersionRow,
-                        SkillPublicActiveRow,
-                        SkillRow,
-                        SkillSettingsRow,
-                    )
-                    .join(SkillRow, SkillRow.id == SkillReleaseRow.skill_id)
-                    .join(SkillVersionRow, SkillVersionRow.id == SkillReleaseRow.version_id)
-                    .join(
-                        SkillPublicActiveRow,
-                        (SkillPublicActiveRow.skill_id == SkillRow.id)
-                        & (SkillPublicActiveRow.release_id == SkillReleaseRow.id),
-                    )
-                    .outerjoin(SkillSettingsRow, SkillSettingsRow.skill_id == SkillRow.id)
-                    # 公共分支不看 skills.deleted_at：删除自己的私有草稿只删指针，
-                    # 已批准公共版本对所有用户都还在（§2.2）。是否在架由 skill_public_active 决定，
-                    # 下架（unpublish）会删掉那一行。记录级的过滤留在私有分支与按记录查的路径上。
-                    .order_by(
-                        func.coalesce(SkillRow.public_name, SkillRow.private_name).asc(),
-                        SkillRow.id.asc(),
-                    )
-                )
-            ).all()
-            private_rows = (
+            rows = (
                 await session.execute(
                     select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
                     .join(
@@ -1514,25 +1291,10 @@ class SqlSkillStore:
                     )
                 )
             ).all()
-
-        visible = [
-            _visible(
-                skill,
-                version,
-                scope=SkillScope.PUBLIC,
-                enabled=bool(settings.enabled) if settings is not None else True,
-                release=release,
-            )
-            for release, version, _active, skill, settings in public_rows
-        ]
-        visible.extend(
-            _visible(skill, version, scope=SkillScope.PRIVATE, enabled=True)
-            for _active, version, skill in private_rows
-        )
-        return visible
+        return [_visible(skill, version) for _active, version, skill in rows]
 
     async def all_active(self) -> list[VisibleSkill]:
-        """Snapshot refresh alias: every public and private active pointer."""
+        """Snapshot refresh alias: every owner's active private pointer."""
         return await self.list_active_visible()
 
     async def get_active_visible(
@@ -1543,210 +1305,77 @@ class SqlSkillStore:
         owner_user_id: str | None = None,
     ) -> VisibleSkill | None:
         """Re-read one projection target from the authoritative active pointer."""
-        scope_value = str(scope)
+        if str(scope) != SkillScope.PRIVATE.value or owner_user_id is None:
+            return None
         async with self._sf() as session:
-            if scope_value == SkillScope.PUBLIC.value:
-                row = (
-                    await session.execute(
-                        select(
-                            SkillReleaseRow,
-                            SkillVersionRow,
-                            SkillPublicActiveRow,
-                            SkillRow,
-                            SkillSettingsRow,
-                        )
-                        .join(SkillRow, SkillRow.id == SkillReleaseRow.skill_id)
-                        .join(
-                            SkillVersionRow,
-                            SkillVersionRow.id == SkillReleaseRow.version_id,
-                        )
-                        .join(
-                            SkillPublicActiveRow,
-                            (SkillPublicActiveRow.skill_id == SkillRow.id)
-                            & (SkillPublicActiveRow.release_id == SkillReleaseRow.id),
-                        )
-                        .outerjoin(
-                            SkillSettingsRow, SkillSettingsRow.skill_id == SkillRow.id
-                        )
-                        .where(SkillPublicActiveRow.skill_id == skill_id)
-                        # 这里刻意不筛 deleted_at：软删只删私有草稿指针，公共版本
-                        # 不受影响（§2.2）。筛掉会让删除草稿后的公共投影重读返回
-                        # None，outbox 据此把 Milvus 里的公共行删掉。公共可见性由
-                        # skill_public_active 决定（下架即删这一行）。
-                        .limit(1)
+            row = (
+                await session.execute(
+                    select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
+                    .join(
+                        SkillVersionRow,
+                        SkillVersionRow.id == SkillPrivateActiveRow.version_id,
                     )
-                ).first()
-                if row is None:
-                    return None
-                release, version, _active, skill, settings = row
-                return _visible(
-                    skill,
-                    version,
-                    scope=SkillScope.PUBLIC,
-                    enabled=bool(settings.enabled) if settings is not None else True,
-                    release=release,
-                )
-            if scope_value == SkillScope.PRIVATE.value:
-                if owner_user_id is None:
-                    return None
-                row = (
-                    await session.execute(
-                        select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
-                        .join(
-                            SkillVersionRow,
-                            SkillVersionRow.id == SkillPrivateActiveRow.version_id,
-                        )
-                        .join(SkillRow, SkillRow.id == SkillPrivateActiveRow.skill_id)
-                        .where(
-                            SkillPrivateActiveRow.skill_id == skill_id,
-                            SkillPrivateActiveRow.owner_user_id == owner_user_id,
-                            SkillRow.deleted_at.is_(None),
-                        )
-                        .limit(1)
-                    )
-                ).first()
-                if row is None:
-                    return None
-                _active, version, skill = row
-                return _visible(
-                    skill, version, scope=SkillScope.PRIVATE, enabled=True
-                )
-        raise ValueError(f"unsupported projection scope: {scope_value!r}")
-
-    async def private_skill_ids(self, user_id: str) -> tuple[str, ...]:
-        async with self._sf() as session:
-            rows = (
-                await session.scalars(
-                    select(SkillPrivateActiveRow.skill_id)
                     .join(SkillRow, SkillRow.id == SkillPrivateActiveRow.skill_id)
                     .where(
-                        SkillPrivateActiveRow.owner_user_id == user_id,
+                        SkillPrivateActiveRow.skill_id == skill_id,
+                        SkillPrivateActiveRow.owner_user_id == owner_user_id,
+                        SkillRow.owner_user_id == owner_user_id,
                         SkillRow.deleted_at.is_(None),
                     )
-                    .order_by(SkillPrivateActiveRow.skill_id.asc())
+                    .limit(1)
                 )
-            ).all()
-            return tuple(rows)
+            ).first()
+            if row is None:
+                return None
+            _active, version, skill = row
+            return _visible(skill, version)
 
     async def confirm_hits(
         self, user_id: str, hits: Sequence[ProjectionHit]
     ) -> list[VisibleSkill]:
-        """Confirm projection hits against authoritative active pointers.
+        """Confirm projection hits against the caller's active pointers.
 
-        This deliberately uses one join per visibility scope, never one query
-        per hit.  A private hit is accepted only when its owner is the caller
-        and its version matches the caller's current private active pointer.
+        A hit is accepted only when it says private, belongs to the caller and
+        names the version currently in the caller's active pointer.  One query
+        confirms the whole hit set.
         """
-        candidates = list(hits)
-        public_skill_ids = {
-            hit.skill_id
-            for hit in candidates
-            if str(getattr(hit, "scope", "")) == "public"
-        }
-        private_skill_ids = {
-            hit.skill_id
-            for hit in candidates
-            if str(getattr(hit, "scope", "")) == "private"
+        candidates = {
+            hit.skill_id: hit.version_id
+            for hit in hits
+            if str(getattr(hit, "scope", "")) == SkillScope.PRIVATE.value
             and getattr(hit, "owner_user_id", None) == user_id
         }
-
+        if not candidates:
+            return []
         async with self._sf() as session:
-            public_map: dict[
-                str,
-                tuple[SkillReleaseRow, SkillVersionRow, SkillRow, SkillSettingsRow | None],
-            ] = {}
-            if public_skill_ids:
-                rows = (
-                    await session.execute(
-                        select(
-                            SkillReleaseRow,
-                            SkillVersionRow,
-                            SkillPublicActiveRow,
-                            SkillRow,
-                            SkillSettingsRow,
-                        )
-                        .join(SkillRow, SkillRow.id == SkillReleaseRow.skill_id)
-                        .join(
-                            SkillVersionRow,
-                            SkillVersionRow.id == SkillReleaseRow.version_id,
-                        )
-                        .join(
-                            SkillPublicActiveRow,
-                            (SkillPublicActiveRow.skill_id == SkillRow.id)
-                            & (SkillPublicActiveRow.release_id == SkillReleaseRow.id),
-                        )
-                        .outerjoin(SkillSettingsRow, SkillSettingsRow.skill_id == SkillRow.id)
-                        .where(SkillPublicActiveRow.skill_id.in_(public_skill_ids))
+            rows = (
+                await session.execute(
+                    select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
+                    .join(
+                        SkillVersionRow,
+                        SkillVersionRow.id == SkillPrivateActiveRow.version_id,
                     )
-                ).all()
-                for release, version, _active, skill, settings in rows:
-                    public_map[skill.id] = (release, version, skill, settings)
-
-            private_map: dict[str, tuple[SkillVersionRow, SkillRow]] = {}
-            if private_skill_ids:
-                rows = (
-                    await session.execute(
-                        select(SkillPrivateActiveRow, SkillVersionRow, SkillRow)
-                        .join(
-                            SkillVersionRow,
-                            SkillVersionRow.id == SkillPrivateActiveRow.version_id,
-                        )
-                        .join(SkillRow, SkillRow.id == SkillPrivateActiveRow.skill_id)
-                        .where(
-                            SkillPrivateActiveRow.owner_user_id == user_id,
-                            SkillPrivateActiveRow.skill_id.in_(private_skill_ids),
-                            SkillRow.deleted_at.is_(None),
-                        )
+                    .join(SkillRow, SkillRow.id == SkillPrivateActiveRow.skill_id)
+                    .where(
+                        SkillPrivateActiveRow.owner_user_id == user_id,
+                        SkillPrivateActiveRow.skill_id.in_(candidates),
+                        SkillRow.owner_user_id == user_id,
+                        SkillRow.deleted_at.is_(None),
+                        SkillRow.enabled.is_(True),
                     )
-                ).all()
-                for _active, version, skill in rows:
-                    private_map[skill.id] = (version, skill)
-
+                )
+            ).all()
         confirmed: list[VisibleSkill] = []
-        seen: set[tuple[str, str, str]] = set()
-        for hit in candidates:
-            scope = str(getattr(hit, "scope", ""))
-            skill_id = hit.skill_id
-            version_id = hit.version_id
-            if scope == "public":
-                found = public_map.get(skill_id)
-                if found is None:
-                    continue
-                release, version, skill, settings = found
-                if version.id != version_id:
-                    continue
-                if settings is not None and not settings.enabled:
-                    continue
-                key = (scope, skill.id, version.id)
-                if key in seen:
-                    continue
-                seen.add(key)
-                confirmed.append(
-                    _visible(
-                        skill,
-                        version,
-                        scope=SkillScope.PUBLIC,
-                        enabled=True,
-                        release=release,
-                    )
-                )
-            elif scope == "private":
-                if getattr(hit, "owner_user_id", None) != user_id:
-                    continue
-                found = private_map.get(skill_id)
-                if found is None:
-                    continue
-                version, skill = found
-                if version.id != version_id:
-                    continue
-                key = (scope, skill.id, version.id)
-                if key in seen:
-                    continue
-                seen.add(key)
-                confirmed.append(
-                    _visible(skill, version, scope=SkillScope.PRIVATE, enabled=True)
-                )
+        for active, version, skill in rows:
+            if candidates.get(active.skill_id) != version.id:
+                continue
+            confirmed.append(_visible(skill, version))
+        confirmed.sort(key=lambda item: (item.skill.name, item.version.skill_id))
         return confirmed
+
+    # ------------------------------------------------------------------
+    # audit
+    # ------------------------------------------------------------------
 
     async def audit(
         self,
@@ -1754,9 +1383,7 @@ class SqlSkillStore:
         actor: str,
         action: str,
         skill_id: str | None = None,
-        submission_id: str | None = None,
-        release_id: str | None = None,
-        detail: dict | None = None,
+        detail: Mapping[str, Any] | None = None,
     ) -> None:
         async with self._sf() as session:
             self._audit_row(
@@ -1764,23 +1391,27 @@ class SqlSkillStore:
                 actor=actor,
                 action=action,
                 skill_id=skill_id,
-                submission_id=submission_id,
-                release_id=release_id,
-                detail=detail,
+                detail=dict(detail or {}),
                 now=_now(),
             )
-            await self._commit(session, "audit event could not be recorded")
+            await self._commit(session, "skill audit event could not be recorded")
 
     # ------------------------------------------------------------------
-    # transaction helpers
+    # internals
     # ------------------------------------------------------------------
 
-    async def _owned_skill(self, session, skill_id: str, owner_user_id: str) -> SkillRow:
-        skill = await session.get(SkillRow, skill_id)
-        if skill is None or skill.deleted_at is not None:
+    async def _owned_skill(
+        self, session, skill_id: str, owner_user_id: str
+    ) -> SkillRow:
+        skill = await session.scalar(
+            select(SkillRow).where(
+                SkillRow.id == skill_id,
+                SkillRow.owner_user_id == owner_user_id,
+                SkillRow.deleted_at.is_(None),
+            )
+        )
+        if skill is None:
             raise SkillConflict(f"skill {skill_id!r} does not exist")
-        if skill.owner_user_id != owner_user_id:
-            raise SkillConflict(f"skill {skill_id!r} is not owned by {owner_user_id!r}")
         return skill
 
     async def _flush(self, session, message: str) -> None:
@@ -1803,10 +1434,8 @@ class SqlSkillStore:
         *,
         actor: str,
         action: str,
-        skill_id: str | None = None,
-        submission_id: str | None = None,
-        release_id: str | None = None,
-        detail: dict | None = None,
+        skill_id: str | None,
+        detail: dict[str, Any],
         now: datetime,
     ) -> None:
         session.add(
@@ -1814,9 +1443,7 @@ class SqlSkillStore:
                 actor=actor,
                 action=action,
                 skill_id=skill_id,
-                submission_id=submission_id,
-                release_id=release_id,
-                detail_json=detail or {},
+                detail_json=detail,
                 created_at=now,
             )
         )
@@ -1831,9 +1458,13 @@ class SqlSkillStore:
         owner_user_id: str | None,
         skill_id: str,
         version_id: str | None,
-        payload: dict,
+        payload: dict[str, Any],
         now: datetime,
     ) -> None:
+        if op not in {"upsert_active", "delete_active"}:
+            raise ValueError(f"unsupported outbox operation: {op!r}")
+        if scope != SkillScope.PRIVATE.value:
+            raise ValueError("only private skill projections are supported")
         _validate_outbox_payload(payload)
         session.add(
             SkillIndexOutboxRow(

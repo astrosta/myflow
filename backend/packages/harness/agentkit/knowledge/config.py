@@ -249,6 +249,14 @@ class VectorStoreServiceConfig(BaseModel):
     token: str = Field(default="", repr=False)
     db_name: str = ""
 
+    @field_validator("token", "db_name", mode="before")
+    @classmethod
+    def _blank_means_unset(cls, value: object) -> object:
+        # config.yaml 里这两个键故意留空（无鉴权、默认库）。YAML 把空标量读成 null。
+        if value is None:
+            return ""
+        return value
+
 
 class MilvusConfig(VectorStoreServiceConfig):
     """One collection's schema and request policy on the shared Milvus service."""

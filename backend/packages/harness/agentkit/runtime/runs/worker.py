@@ -30,6 +30,7 @@ from agentkit.runtime.stream_bridge.base import StreamBridge
 from agentkit.runtime.stream_modes import to_langgraph_stream_modes
 from agentkit.runtime.task import spawn_detached
 from agentkit.runtime.user_context import AUTO
+from agentkit.observability import RunTrace, start_run_trace
 from agentkit.agents.leader_agent import unwrap_agent_graph
 from agentkit.agents.leader_agent.runtime_keys import CLIENT_IDENTITY_KEYS
 from agentkit.subagents.results import (
@@ -146,6 +147,15 @@ async def run_agent(
     usage = UsageCollector(run_manager, run_id)
     journal = _open_journal(ctx, record, usage_sink=usage)
     subagent_events = _open_subagent_events(ctx, record)
+    try:
+        trace = start_run_trace(record)
+    except Exception:  # noqa: BLE001 - observability must not break the run
+        logger.exception("Failed to start Langfuse trace; continuing untraced")
+        trace = RunTrace.disabled()
+    if trace.root_span_id and isinstance(ctx.run_config, dict):
+        run_context = ctx.run_config.setdefault("context", {})
+        if isinstance(run_context, dict):
+            run_context["trace_parent_span_id"] = trace.root_span_id
     deadline: asyncio.Timeout | None = None
     timeout_s: float | None = None
 
@@ -182,7 +192,9 @@ async def run_agent(
         timeout_s = ctx.app_config.runs.timeout_seconds if ctx.app_config is not None else None
         deadline = asyncio.timeout(timeout_s) #开始计时
         async with deadline:
-            await _stream_graph(bridge, record, ctx, graph, usage, journal, subagent_events) #每一帧都查abort
+            await _stream_graph(
+                bridge, record, ctx, graph, usage, journal, subagent_events, tracing=trace
+            ) #每一帧都查abort
         terminal, error = RunStatus.success, None
 
     except RunAborted:
@@ -224,10 +236,16 @@ async def run_agent(
             )
         finally:
             #无论收尾是否成功，流必须结束
-            await bridge.publish_end(run_id)
-            record.finalizing = False
-            run_manager.schedule_cleanup(run_id)
-            spawn_detached(bridge.cleanup(run_id, delay=STREAM_RETENTION_SECONDS))
+            try:
+                await bridge.publish_end(run_id)
+                record.finalizing = False
+                run_manager.schedule_cleanup(run_id)
+                spawn_detached(bridge.cleanup(run_id, delay=STREAM_RETENTION_SECONDS))
+            finally:
+                with suppress(Exception):
+                    await trace.aclose(
+                        status=getattr(terminal, "value", str(terminal)), error=error
+                    )
 
 
 def _call_agent_factory(
@@ -519,6 +537,7 @@ async def _stream_graph(
     usage: UsageCollector,
     journal: RunJournal | None,
     subagent_events: _SubagentEventBuffer | None = None,
+    tracing: Any | None = None,
 ) -> None:
     requested_modes = to_langgraph_stream_modes(ctx.stream_modes)
     # §14.3：子代理事件靠 custom 帧落库，所以 worker **总要**订 custom——但只把客户端要的
@@ -534,6 +553,9 @@ async def _stream_graph(
     callbacks = [*(ctx.run_config.get("callbacks") or ()), usage]
     if journal is not None:
         callbacks.append(journal)
+    handler = getattr(tracing, "handler", None)
+    if handler is not None:
+        callbacks.append(handler)
     config = {**ctx.run_config, "callbacks": callbacks}
     configurable = dict(config.get("configurable") or {})
     configurable.setdefault("thread_id", record.thread_id)

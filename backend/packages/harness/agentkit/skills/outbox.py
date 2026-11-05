@@ -5,15 +5,17 @@ worker re-reads the current active pointer and settings before embedding, so a
 stale event is marked done instead of overwriting a newer projection.  Milvus
 writes never happen while a PostgreSQL transaction is open.
 
-The active collection has one row per active public or private skill.  When
-several pending events target the same projection key, only the newest is
-processed; the older events are settled as no-ops.
+The active collection has one row per active private skill.  When several
+pending events target the same projection key, only the newest is processed;
+the older events are settled as no-ops.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass
 
 from agentkit.skills.content import SkillContentStore
 from agentkit.skills.domain import SkillScope, VisibleSkill
@@ -28,6 +30,36 @@ _MAX_ATTEMPTS = 5
 _MAX_RETRY_DELAY_SECONDS = 60
 _INDEX_READY = "ready"
 _INDEX_FAILED = "failed"
+#: 修复快路径的退避：坏行按指数退避，跨重启有效（状态在 PostgreSQL 里）。
+_DEFAULT_REPAIR_MAX_ATTEMPTS = 8
+_DEFAULT_RETRY_BASE_SECONDS = 60.0
+_DEFAULT_RETRY_CAP_SECONDS = 3600.0
+
+
+@dataclass(frozen=True, slots=True)
+class RepairStats:
+    """One bounded repair pass."""
+
+    scanned: int = 0
+    repaired: int = 0
+    failed: int = 0
+    truncated: bool = False
+    #: 另一个 worker 拿着 advisory lock：这一轮什么都没做。
+    skipped_due_to_lock: bool = False
+    seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class VerifyStats:
+    """One integrity sweep over the projection keys."""
+
+    keys_seen: int = 0
+    missing: int = 0
+    deleted: int = 0
+    truncated: bool = False
+    #: 另一个 worker 拿着 advisory lock：这一轮什么都没做。
+    skipped_due_to_lock: bool = False
+    seconds: float = 0.0
 
 
 def _scope_value(scope: SkillScope | str) -> str:
@@ -36,8 +68,6 @@ def _scope_value(scope: SkillScope | str) -> str:
 
 def _projection_key(source: VisibleSkill) -> str:
     skill_id = source.version.skill_id
-    if source.scope is SkillScope.PUBLIC:
-        return f"public:{skill_id}"
     owner = source.skill.owner_user_id
     if not owner:
         raise ValueError("private active skill has no owner")
@@ -54,14 +84,12 @@ def _source_for_retention(source: VisibleSkill) -> set[str]:
     """Return commits that must survive while this active row exists."""
     commits: set[str] = set()
     _remember_commit(commits, source.version.draft_commit)
-    if source.scope is SkillScope.PUBLIC and source.release is not None:
-        _remember_commit(commits, source.release.git_commit)
     return commits
 
 
 #: 投影文本的语义版本（设计 §7.2）。改格式、换模型或换维度都等于让全部存量
-#: 向量失效，必须配一次强制重建（POST /api/admin/skills/reindex）。
-PROJECTION_TEXT_VERSION = 2
+#: 向量失效，需要运维对 collection 做一次强制重建/对账。
+PROJECTION_TEXT_VERSION = 3
 
 
 def projection_text(name: str, description: str) -> str:
@@ -79,23 +107,10 @@ async def _projection_row(
     source: VisibleSkill,
 ) -> ProjectionRow:
     """Build one active row from a freshly read active pointer."""
-    scope = _scope_value(source.scope)
     version = source.version
-    if scope == SkillScope.PUBLIC.value:
-        release = source.release
-        if release is None:
-            raise ValueError("public active skill has no release")
-        commit = release.git_commit
-        path = release.skill_path
-        name = release.public_name
-        owner_user_id = None
-        enabled = bool(source.skill.enabled)
-    else:
-        commit = version.draft_commit
-        path = version.skill_path
-        name = source.skill.name
-        owner_user_id = source.skill.owner_user_id
-        enabled = True
+    commit = version.draft_commit
+    name = source.skill.name
+    owner_user_id = source.skill.owner_user_id
     if not commit:
         raise ValueError("active skill has no content commit")
 
@@ -109,12 +124,12 @@ async def _projection_row(
 
     return ProjectionRow(
         projection_key=_projection_key(source),
-        scope=scope,
+        scope=SkillScope.PRIVATE.value,
         owner_user_id=owner_user_id,
         skill_id=version.skill_id,
         version_id=version.id,
         skill_version=version.skill_version,
-        enabled=enabled,
+        enabled=bool(source.skill.enabled),
         name=name,
         description=source.skill.description,
         package_sha256=version.package_sha256,
@@ -130,12 +145,9 @@ def _matches_event(source: VisibleSkill | None, event: OutboxEvent) -> bool:
         return False
     if source.version.id != event.version_id:
         return False
-    enabled = (
-        bool(source.skill.enabled)
-        if _scope_value(source.scope) == SkillScope.PUBLIC.value
-        else True
-    )
-    return event.payload.get("enabled") is enabled
+    # The event only identifies the active version. The worker re-reads the
+    # current enabled switch, so a stale toggle event still converges.
+    return True
 
 
 async def _active_source(
@@ -179,14 +191,24 @@ class SkillIndexOutboxWorker:
         projection: SkillProjectionStore,
         *,
         poll_seconds: float = 2.0,
+        repair_max_attempts: int = _DEFAULT_REPAIR_MAX_ATTEMPTS,
+        retry_base_seconds: float = _DEFAULT_RETRY_BASE_SECONDS,
+        retry_cap_seconds: float = _DEFAULT_RETRY_CAP_SECONDS,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
+        if repair_max_attempts < 1:
+            raise ValueError("repair_max_attempts must be positive")
+        if retry_base_seconds <= 0 or retry_cap_seconds <= 0:
+            raise ValueError("retry delays must be positive")
         self._store = store
         self._content = content
         self._embedder = embedder
         self._projection = projection
         self._poll_seconds = float(poll_seconds)
+        self._max_attempts = int(repair_max_attempts)
+        self._retry_base_seconds = float(retry_base_seconds)
+        self._retry_cap_seconds = float(retry_cap_seconds)
         self._task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------
@@ -249,7 +271,7 @@ class SkillIndexOutboxWorker:
                     # The provider and the projection run outside every PG
                     # transaction; only the short status write follows.
                     await self._projection.upsert_active(row)
-                    await self._store.set_version_index_status(row.version_id, _INDEX_READY)
+                    await self._store.mark_version_indexed(row.version_id)
             else:
                 logger.warning(
                     "Skipping unknown outbox operation %s on event %s",
@@ -301,114 +323,150 @@ class SkillIndexOutboxWorker:
     # repair and retention
     # ------------------------------------------------------------------
 
-    async def reconcile(self, *, force: bool = False) -> int:
-        """Make the projection equal the current active pointers.
+    async def repair_missing(
+        self, *, budget_rows: int, budget_seconds: float
+    ) -> RepairStats:
+        """Repair active versions whose projection is not ready.
 
-        Existing projection keys are read first, then every current active row
-        is checked against them, and every key without a current pointer is
-        deleted.
-
-        Steady state must be cheap: re-embedding the whole catalog every tick
-        would cost real money for no benefit, so a row is left alone when its
-        key already exists **and** its version is already indexed.  A key that
-        disappeared from Milvus, or a version that never reached ``ready``
-        (a lost outbox event, an exhausted retry, a wiped collection), is
-        repaired.  ``force=True`` redoes every row, for operator repair after
-        editing the collection by hand.
+        index_status is the authority for "should this version be in Milvus", so a
+        healthy catalog costs one indexed query and nothing else.  Rows that keep
+        failing get a backoff (see the store) and stop consuming the budget, and
+        the whole pass is bounded by rows *and* time: recovering a wiped
+        collection then takes a few passes instead of one unbounded run.
         """
-        existing = await self._projection.list_projection_keys()
-        sources = await self._store.list_active_visible()
-        active_keys: set[str] = set()
-        present = set(existing)
-        touched = 0
-
-        for source in sources:
-            key = _projection_key(source)
-            active_keys.add(key)
-            if (
-                not force
-                and key in present
-                and source.version.index_status == _INDEX_READY
-            ):
-                continue
+        started = time.monotonic()
+        wanted = max(1, int(budget_rows))
+        # One extra row tells us "there is more to do" without a second query.
+        rows = await self._store.list_index_repair_candidates(
+            limit=wanted + 1, max_attempts=self._max_attempts
+        )
+        repaired = failed = attempted = 0
+        for source in rows[:wanted]:
+            if attempted and time.monotonic() - started >= max(0.0, budget_seconds):
+                break
+            attempted += 1
             try:
                 row = await _projection_row(self._embedder, source)
                 await self._projection.upsert_active(row)
-                await self._store.set_version_index_status(
-                    row.version_id, _INDEX_READY
-                )
-                touched += 1
+                await self._store.mark_version_indexed(source.version.id)
+                repaired += 1
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - repair the rest of the catalog
+            except Exception as exc:  # noqa: BLE001 - one bad row must not stop the rest
+                failed += 1
+                await self._store.mark_version_index_failed(
+                    source.version.id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    max_attempts=self._max_attempts,
+                    base_seconds=self._retry_base_seconds,
+                    cap_seconds=self._retry_cap_seconds,
+                )
                 logger.warning(
-                    "Reconcile failed for active key %s (%s)",
-                    key,
+                    "Repair failed for version %s (%s); backing off",
+                    source.version.id,
                     type(exc).__name__,
                 )
+        return RepairStats(
+            scanned=min(len(rows), wanted),
+            repaired=repaired,
+            failed=failed,
+            truncated=len(rows) > wanted,
+            seconds=time.monotonic() - started,
+        )
 
-        for key in dict.fromkeys(existing):
-            if key in active_keys:
+    async def verify_projection(
+        self, *, budget_rows: int, budget_seconds: float
+    ) -> VerifyStats:
+        """Detect silent loss: rows the catalog believes are indexed but are gone.
+
+        This is the only pass that reads Milvus keys, and it never embeds: a key
+        that disappeared is marked pending so the bounded repair pass rebuilds it.
+        A scan that hits the budget cannot prove absence, so the "missing" phase
+        only runs on a completed scan; orphan deletion is safe either way.
+        """
+        started = time.monotonic()
+        sources = await self._store.list_active_visible()
+        pending = await self._store.list_pending_outbox()
+        by_key = {_projection_key(source): source for source in sources}
+        keep = set(by_key) | {event.projection_key for event in pending}
+
+        keys, truncated = await self._projection.scan_projection_keys(
+            limit=max(1, int(budget_rows))
+        )
+        seen = set(keys)
+
+        deleted = 0
+        for key in keys:
+            if key in keep or key not in seen:
                 continue
+            seen.discard(key)
+            if time.monotonic() - started >= max(0.0, budget_seconds):
+                truncated = True
+                break
             await self._projection.delete_active(key)
-            touched += 1
-        return touched
+            deleted += 1
 
-    async def prune(
+        missing = 0
+        if not truncated:
+            for key, source in by_key.items():
+                if key in seen or source.version.index_status == "pending":
+                    continue
+                await self._store.set_version_index_status(source.version.id, "pending")
+                missing += 1
+        return VerifyStats(
+            keys_seen=len(keys),
+            missing=missing,
+            deleted=deleted,
+            truncated=truncated,
+            seconds=time.monotonic() - started,
+        )
+
+    async def forget_commits(
         self,
-        keep_versions_per_skill: int = 20,
+        skill_id: str,
         *,
+        keep_versions: int,
         min_age_seconds: float = 0.0,
     ) -> int:
-        """Delete unreferenced commit caches and projection rows only.
+        """Event-driven cache cleanup: drop one skill's unreferenced commits.
 
-        No PostgreSQL metadata is deleted.  The keep-set consists of the active
-        pointers, pending outbox targets, and the newest N versions per skill.
-        ``min_age_seconds`` protects caches that only just lost their last
-        reference (skills.retention.cache_ttl_days).
+        Only this skill's commits are candidates, so no directory walk and no
+        global comparison is needed.  The commit cache is a cache: anything still
+        needed is re-materialized from Git by SkillContentStore.ensure().
         """
-        keep = int(keep_versions_per_skill)
-        if keep < 1:
-            raise ValueError("keep_versions_per_skill must be positive")
-
-        versions = await self._store.list_all_versions()
-        active = await self._store.list_active_visible()
-        pending = await self._store.list_pending_outbox()
-        by_id = {version.id: version for version in versions}
-
-        keep_commits: set[str] = set()
-        active_keys: set[str] = set()
-        pending_keys: set[str] = set()
-
-        for source in active:
-            active_keys.add(_projection_key(source))
-            keep_commits.update(_source_for_retention(source))
-        for event in pending:
-            pending_keys.add(event.projection_key)
-            version = by_id.get(event.version_id) if event.version_id else None
-            if version is not None:
-                _remember_commit(keep_commits, version.draft_commit)
-
-        by_skill: dict[str, list] = {}
+        keep = max(0, int(keep_versions))
+        versions = await self._store.list_versions(skill_id)
+        if not versions:
+            return 0
+        protected: set[str] = set()
+        record = await self._store.get_skill(skill_id)
+        retired = record is None or record.deleted_at is not None
+        if keep and not retired:
+            # 保留最近 N 版：删除技能之后没有任何"回滚"可言，缓存可以一次收干净。
+            for version in versions[-keep:]:
+                _remember_commit(protected, version.draft_commit)
+        pending = [
+            event
+            for event in await self._store.list_pending_outbox()
+            if event.skill_id == skill_id
+        ]
+        pending_versions = {event.version_id for event in pending if event.version_id}
+        for source in await self._store.list_active_visible():
+            if source.version.skill_id == skill_id:
+                _remember_commit(protected, source.version.draft_commit)
         for version in versions:
-            by_skill.setdefault(version.skill_id, []).append(version)
-        for skill_versions in by_skill.values():
-            skill_versions.sort(key=lambda version: version.version_seq, reverse=True)
-            for version in skill_versions[:keep]:
-                _remember_commit(keep_commits, version.draft_commit)
-
-        removed = await self._content.prune(
-            keep_commits, min_age_seconds=min_age_seconds
+            if version.id in pending_versions:
+                _remember_commit(protected, version.draft_commit)
+        candidates = {
+            version.draft_commit
+            for version in versions
+            if version.draft_commit and version.draft_commit.lower() not in protected
+        }
+        if not candidates:
+            return 0
+        return await self._content.forget_commits(
+            candidates, min_age_seconds=min_age_seconds
         )
-        existing = await self._projection.list_projection_keys()
-        keep_keys = active_keys | pending_keys
-        for key in dict.fromkeys(existing):
-            if key in keep_keys:
-                continue
-            await self._projection.delete_active(key)
-            removed += 1
-        return removed
-
     # ------------------------------------------------------------------
     # background loop
     # ------------------------------------------------------------------

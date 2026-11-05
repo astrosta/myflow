@@ -1,5 +1,6 @@
 import copy
 import os
+import re
 from pathlib import Path
 from typing import Any, Self
 
@@ -20,6 +21,7 @@ from agentkit.config.knowledge_config import (
 from agentkit.config.llm_call_config import LlmCallConfig
 from agentkit.config.memory_config import MemoryConfig
 from agentkit.config.model_config import ModelConfig
+from agentkit.config.observability_config import ObservabilityConfig
 from agentkit.config.pii_config import PIIConfig
 from agentkit.config.reload_boundary import format_field_description
 from agentkit.config.run_events_config import RunEventsConfig
@@ -35,6 +37,7 @@ from agentkit.config.title_config import TitleConfig
 from agentkit.config.tool_config import ToolConfig
 from agentkit.subagents.config import INHERIT_MODEL
 
+_BRACED_ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 _SHARED_SERVICE_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
     "embedding": (
@@ -97,6 +100,10 @@ class AppConfig(BaseModel):
     runs: RunsConfig = Field(default_factory=RunsConfig)
     run_events: RunEventsConfig = Field(default_factory=RunEventsConfig)
     stream_bridge: StreamBridgeConfig = Field(default_factory=StreamBridgeConfig)
+    observability: ObservabilityConfig = Field(
+        default_factory=ObservabilityConfig,
+        description=format_field_description("observability.langfuse"),
+    )
     llm_call: LlmCallConfig = Field(default_factory=LlmCallConfig)
     title: TitleConfig = Field(default_factory=TitleConfig)
     summarization: SummarizationConfig = Field(default_factory=SummarizationConfig)
@@ -117,6 +124,22 @@ class AppConfig(BaseModel):
     @classmethod
     def resolve_env_variables(cls, config: Any) -> Any:
         if isinstance(config, str):
+            if "${" in config:
+                missing: list[str] = []
+
+                def replace(match: re.Match[str]) -> str:
+                    name = match.group(1)
+                    value = os.getenv(name)
+                    if value is None:
+                        missing.append(name)
+                        return match.group(0)
+                    return value
+
+                expanded = _BRACED_ENV.sub(replace, config)
+                if missing:
+                    names = ", ".join(f"${{{name}}}" for name in missing)
+                    raise ValueError(f"Environment variable {names} is not set")
+                return expanded
             if config.startswith("$"):
                 value = os.getenv(config[1:])
                 if value is None:

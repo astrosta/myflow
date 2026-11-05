@@ -25,7 +25,7 @@ def _runtime() -> ToolRuntime:
 def test_an_empty_skill_search_tells_the_model_to_stop(monkeypatch) -> None:
     import asyncio
 
-    from agentkit.tools.builtin import search_and_load_skills as module
+    from agentkit.tools.builtin import search_skills as module
 
     class _EmptyRegistry:
         def __init__(self, **_kwargs) -> None:
@@ -44,9 +44,9 @@ def test_an_empty_skill_search_tells_the_model_to_stop(monkeypatch) -> None:
     monkeypatch.setattr(module, "SkillRegistry", _EmptyRegistry)
 
     result = asyncio.run(
-        module.search_and_load_skills.ainvoke(
+        module.search_skills.ainvoke(
             {
-                "name": "search_and_load_skills",
+                "name": "search_skills",
                 "args": {
                     "task_query": "PostgreSQL 多租户 search_path 串库",
                     "domain_keywords": [],

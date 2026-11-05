@@ -202,13 +202,15 @@ export function ArtifactPanel({
         : { status: "loading" };
 
   if (!artifacts.length) {
-    // 没有产物时整个面板退化成一行说明，不要留一个空侧栏占着屏幕。
-    // 但"还没加载完"和"确实没有"是两件事——前者说"还没有产物"是在撒谎（§6.5）。
-    return (
-      <aside className={cn("px-4 py-3 text-xs text-neutral-400", className)} aria-label="产物">
-        {threadLoading ? "正在加载产物…" : "这一轮还没有产物。"}
-      </aside>
-    );
+    /**
+     * 没有产物就**什么都不画**。
+     *
+     * 这里曾经退化成一行"这一轮还没有产物。"（加载中是"正在加载产物…"），
+     * 结果是每个没有文件的会话右侧都杵着一条无用的空白——用户会问
+     * "这是什么，没有用就删掉"。历史还在加载时也无法断言"确实没有"，
+     * 更不该先写一句占位。面板只在有内容可看时出现。
+     */
+    return null;
   }
 
   if (!open) {

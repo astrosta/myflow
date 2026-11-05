@@ -47,6 +47,7 @@ from agentkit.agents.middlewares.assembly import build_subagent_runtime_middlewa
 from agentkit.agents.thread_state import ThreadState
 from agentkit.config import AppConfig
 from agentkit.models import create_chat_model
+from agentkit.observability import attach_callback_handler, start_subagent_trace
 from agentkit.sandbox.lease import release_sandbox_lease, subagent_lease_owner_id
 from agentkit.sandbox.security import safe_app_config
 from agentkit.subagents.capacity import AdmissionDenied, SubagentExecutionCapacity
@@ -436,20 +437,51 @@ class SubagentExecutor:
         config = attach_token_collector(
             config, self._make_token_collector(dispatch), inherited=parent_config
         )
-        async for chunk in agent.astream(
-            state,
-            config=config,
-            context=self._child_context(dispatch),
-            stream_mode="values",
-        ):
-            run.last_state = chunk
-            # §3.2 第 6 步：**先发布最新证据**，再看有没有人喊停。反过来的话，取消刚好卡在
-            # stream 边界时，lead 拿不到已经发生的工具输出。
-            self._capture_steps(run, dispatch.holder, chunk)
-            if dispatch.holder.cancel_event.is_set():
-                self._terminalize(dispatch, run, SubagentStatus.CANCELLED)
-                return
-        self._terminalize(dispatch, run, None)
+        subagent_trace = start_subagent_trace(
+            trace_id=dispatch.holder.trace_id or None,
+            parent_span_id=getattr(dispatch, "trace_parent_span_id", None),
+            name=dispatch.config.name,
+            execution_id=dispatch.holder.task_id,
+            tool_call_id=dispatch.holder.external_task_id,
+            user_id=dispatch.user_id,
+            thread_id=dispatch.thread_id,
+            model_name=dispatch.model_name,
+        )
+        if subagent_trace.handler is not None:
+            try:
+                config = attach_callback_handler(config, subagent_trace.handler)
+            except Exception:  # noqa: BLE001 - tracing must not fail the subagent
+                logger.warning("Failed to attach Langfuse handler to subagent", exc_info=True)
+        try:
+            async for chunk in agent.astream(
+                state,
+                config=config,
+                context=self._child_context(dispatch),
+                stream_mode="values",
+            ):
+                run.last_state = chunk
+                # §3.2 第 6 步：**先发布最新证据**，再看有没有人喊停。反过来的话，取消刚好卡在
+                # stream 边界时，lead 拿不到已经发生的工具输出。
+                self._capture_steps(run, dispatch.holder, chunk)
+                if dispatch.holder.cancel_event.is_set():
+                    self._terminalize(dispatch, run, SubagentStatus.CANCELLED)
+                    subagent_trace.finish(status="cancelled")
+                    return
+            self._terminalize(dispatch, run, None)
+            if dispatch.holder.status is SubagentStatus.COMPLETED:
+                subagent_trace.finish(status="success")
+            else:
+                subagent_trace.finish(
+                    status="error", error=dispatch.holder.error or "subagent failed"
+                )
+        except asyncio.CancelledError:
+            subagent_trace.finish(status="cancelled")
+            raise
+        except Exception as exc:
+            subagent_trace.finish(
+                status="error", error=f"{type(exc).__name__}: {exc}"
+            )
+            raise
 
     async def _finish(
         self, dispatch: SubagentDispatch, *, report_loop: asyncio.AbstractEventLoop | None

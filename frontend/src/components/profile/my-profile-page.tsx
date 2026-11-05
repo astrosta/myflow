@@ -50,7 +50,7 @@ function formatProfileValue(
 }
 
 function draftValueFromField(spec: ProfileFieldSpec, value: unknown): string {
-  if (Array.isArray(value)) return value.join(", ");
+  if (Array.isArray(value)) return value.join("、");
   if (value === null || value === undefined) return "";
   return String(value);
 }
@@ -68,7 +68,7 @@ export function draftFromProfile(
 
 function splitItems(raw: string): string[] {
   return raw
-    .split(/[,，]/)
+    .split(/[、,，]/)
     .map((item) => item.trim())
     .filter(Boolean);
 }
@@ -424,7 +424,7 @@ function ProfileField({
   const id = "profile-" + spec.path;
   const hint =
     spec.kind === "string_list"
-      ? `多个值用逗号分隔，最多 ${spec.max_items} 项`
+      ? `多个值用顿号分隔，最多 ${spec.max_items} 项`
       : spec.kind === "multi_choice"
         ? "可多选"
         : spec.description;

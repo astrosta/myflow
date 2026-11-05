@@ -1,149 +1,147 @@
-# 技能包 Git 发布、私有创作与审核设计
+# 用户隔离技能、安全扫描与生效设计
 
-> 状态：待评审（2026-10-23）
-> 本版取代初版中“管理员整仓发布”的模型。现在的主线是：
-> 普通用户创作私有技能 → 提交审核 → 管理员批准 → 成为公共技能。
-> 不在范围：MCP、知识库、技能市场、跨仓库合并。
+> 状态：已接受（v2，2026-11-02；2026-11-03 修订）
+> 2026-11-03 修订：技能启用开关落到数据库、移除私有技能 `skills_prefs.json`、
+> `search_and_load_skills` 拆成 `search_skills` / `load_skills`、Redis ZSET
+> 记录使用次数并驱动 system prompt top-10。
+> 本版取代 2026-10-23 版“私有创作 → 管理员审核 → 公共技能”的模型。
+> 新模型只有**用户私有技能**：不设管理员审批、不做公共技能发布、不允许跨用户可见。
+> 不在范围：技能市场、团队/组织共享、跨仓库合并、MCP 与知识库改造。
 
-## 1. 意图与问题
+## 1. 目标与非目标
 
-技能必须同时满足三件事：
+### 1.1 目标
 
-1. 技能包由 Git 管理，任何线上内容都能追溯到仓库、commit 和路径；
-2. 普通用户可以在应用内创建带 SKILL.md、scripts/、模板和示例的技能包，未审核时只有自己可用；
-3. 管理员审核某个具体版本后，该版本成为公共技能，所有用户可用。
+1. 每个登录用户创建、保存、扫描、启用和删除的技能只属于自己；其他用户即使知道
+   skill_id 也读不到正文、附件、版本、扫描结果或容器路径。
+2. 用户点击“保存”后得到的是**不可变 Git 草稿版本**：暂存内容 commit/push 到
+   该用户的草稿分支，并写入一行 `skill_versions`；保存不进入运行时、提示词索引
+   或向量索引。
+3. 用户点击“安全扫描”时，后台以 **Python 包 import 的方式**调用
+   `cisco-ai-skill-scanner`，同时运行**规则分析**和**默认模型的 LLM 语义分析**，
+   扫描该版本不可变的 Git commit 内容；扫描结论持久化到数据库并回显到编辑器。
+4. 用户点击“生效”后，只有当前最新已保存版本存在一次通过的扫描结果时，服务端才
+   把该版本设为用户的 active 版本：运行时快照立即可见，并向 outbox 写入索引事件，
+   由后台 worker 在 Milvus 的 `myflow_skills_active` collection 中构建/更新该用户的
+   向量行。
+5. 没有 active 版本，或用户关闭启用开关的技能，不进入 `<available_skills>`、
+   `search_skills` / `load_skills`、slash 技能或沙箱私有挂载。草稿仍可在“我的技能”中编辑。
+6. 技能发现拆成两段：`search_skills` 只返回 name / description / skill_id；
+   `load_skills` 按 skill_id 加载正文。前者只给 skill-finder，后者是系统内置工具。
+7. `load_skills` 同时累加使用次数；PostgreSQL 保存持久计数，Redis ZSET 保存每个用户
+   active 技能的使用排名，系统提示词超过 10 个私有技能时用 Redis 排名选择 top-10。
 
-现有实现只有“部署机上的目录 + 扫描 frontmatter”，没有所有者、审核、草稿或版本记录。
-新模型把技能分成两个可见域：
+### 1.2 非目标
 
-- **私有域**：作者的草稿和待审核版本，只对作者可见、可检索、可使用；
-- **公共域**：管理员批准过的版本，对所有登录用户可见、可检索、可使用。
+- 管理员审核、驳回、下架、发布、回滚、公共版本指针。
+- 用户之间的技能共享、克隆或引用。
+- 自动修复扫描发现；扫描只做检测，不执行技能脚本。
+- 二进制大文件、Git LFS、跨仓库依赖。
+- 扫描结果作为安全认证。扫描器是 best-effort 检测，无发现不代表绝对安全。
 
-Git 保存内容，PostgreSQL 保存所有权、版本、审核和激活指针，Milvus 保存可重建的向量投影。
-Milvus 只负责候选召回；任何命中都必须回到 PostgreSQL 按当前用户和版本确认。
+## 2. 可见性与状态机
 
-### 1.1 成功标准
+### 2.1 可见性
 
-1. 普通用户可以在应用内创建技能包，保存后立即成为自己的私有版本；其他用户看不到、搜不到、
-
-   读不到它的正文或附件。
-2. 作者点击提交后，管理员看到的是一个不可变的版本（固定 draft_commit），批准或驳回都
-
-   针对这个版本，不会因为作者继续编辑而审核到另一份内容。
-3. 批准后，该版本进入公共主线；所有用户都可以检索和使用，作者之后的编辑只产生新的
-
-   私有版本，不会自动改变公共版本。
-4. 每个公共版本都能回答：skill_id、skill_version、git_repository、git_commit、skill_path、
-
-   提交人、审核人、审核时间。
-5. 向量库中的私有版本不会泄漏给其他用户；即使 Milvus 出现旧记录或伪造记录，PostgreSQL
-
-   也会按用户和激活版本拒绝。
-6. 管理员驳回后，技能仍然是作者的私有技能；作者可以修改后重新提交。
-
-### 1.2 非目标（V1）
-
-- 多仓库合并、跨仓库依赖、技能市场分成。
-- 用户直接使用 Git 推送或合并；普通用户不接触 Git 凭据和分支。
-- 自动代码审查、恶意脚本沙箱扫描、签名校验。V1 的信任边界是“管理员人工审核”。
-- 二进制附件、Git LFS、超大模型文件。V1 允许文本脚本、模板、示例和小型资源文件。
-- 团队/组织级可见性。V1 只有 private 和 public 两个可见域。
-- 删除 Git 历史。公共发布历史和审核记录永久保留；只清理可重建的缓存和向量。
-
-## 2. 角色、可见性与生命周期
-
-### 2.1 角色
-
-| 角色 | 能力 |
+| 对象 | 可见范围 |
 |---|---|
-| user | 创建/编辑自己的草稿；保存、提交审核、撤回；检索和使用公共技能 + 自己的私有技能；管理个人偏好 |
-| admin | user 的全部能力；查看审核队列；批准/驳回；下架公共技能；回滚公共版本；全局启停 |
+| skills / skill_versions / skill_draft_files | 仅 owner_user_id 对应用户 |
+| skill_security_scans | 仅 owner_user_id 对应用户 |
+| skill_private_active | 仅 owner_user_id 对应用户 |
+| 内置技能 | 所有登录用户只读，不进入用户创作数据 |
 
-权限继续使用现有 require_scope：
+权限使用现有 scope：
 
-- skills:read：查看可见技能、使用检索；
-- skills:write：创建/编辑/提交自己的技能；
-- admin：审核、公共发布、下架、回滚、全局开关。
+- `skills:read`：列出/读取自己的技能、运行检索；
+- `skills:write`：创建、编辑、保存、扫描、生效、删除自己的技能；
+- 不再存在 `admin` 专属的技能审核权限。
 
-普通用户的创建能力可以由 skills.creation.enabled 关闭；关闭后只有 admin 能创建。
+对非所有者的读取统一返回 404 `skill_not_found`，不泄露技能是否存在。
 
-### 2.2 两个版本指针
+### 2.2 生命周期
 
-每个技能有两个独立指针：
+~~~text
+创建草稿（暂存表）
+   │ PUT draft/file、上传附件
+   ▼
+保存 ── Git commit ──▶ refs/heads/myflow/drafts/<user>
+   │                    + skill_versions(v1)（不可变版本）
+   │ 用户点击“安全扫描”
+   ▼
+skill_security_scans（绑定 version_id + package_sha256）
+   │
+   │ 用户点击“生效”
+   ▼
+校验最新版本 && 扫描通过
+   │
+   ├── skill_private_active = version
+   ├── outbox: upsert_active
+   └── runtime 快照刷新
+           │ worker
+           ▼
+      Milvus myflow_skills_active（private:<owner>:<skill_id>）
 
-- 私有指针：作者当前使用的最新私有版本；
-- 公共指针：管理员最后一次批准的公共版本。
-
-两者可以不同。典型时间线：
-
+保存 v2（扫描/生效前）
+   │
+   ├── active 仍指向 v1（v1 继续可用）
+   └── v2 是草稿；必须重新扫描并生效
 ~~~
-作者保存 v1           私有=v1，公共=无
-提交审核             私有=v1，公共=无，审核中=v1
-管理员批准           私有=v1，公共=v1
-作者继续编辑 v2      私有=v2，公共=v1
-作者提交 v2          私有=v2，公共=v1，审核中=v2
-管理员批准 v2        私有=v2，公共=v2
-~~~
 
-管理员批准后，作者如果只想使用公共版本，可以删除自己的私有草稿指针；
-但公共版本不受影响。
+状态值（API 对最新版本派生，不新增可变状态列）：
 
-### 2.3 审核状态
+- `draft`：没有已保存版本（仅有暂存文件）；
+- `unscanned`：已保存版本，但没有该版本的成功扫描；
+- `scan_failed`：最新扫描失败（发现 HIGH/CRITICAL，或扫描器执行失败）；
+- `scanned`：最新扫描通过，但尚未生效；
+- `active`：active 指针指向最新版本；
+- `builtin`：内置技能。
 
-单个提交记录的状态：
-
-- pending：已提交，等待审核；版本冻结，作者不能修改该版本；
-- approved：审核通过，已创建公共发布记录；
-- rejected：审核驳回；私有版本仍可用，作者可修改并重新提交；
-- withdrawn：作者主动撤回；可重新提交；
-- superseded：同一技能又提交了新版本，旧提交被取代（仅用于历史）。
-
-作者在 pending 期间调用保存会返回 409，必须先撤回。这样可以保证管理员看到的版本就是
-最终被批准的版本。
+“生效”只允许最新版本；一旦保存了 v2，v1 的扫描不能用于启用 v2。
 
 ## 3. 总体架构
 
-~~~
-普通用户工作台 / 管理员审核台
-   │ 创建、编辑、提交、批准
+~~~text
+浏览器“我的技能 / 编辑器”
+   │ 保存 / 扫描 / 生效
    ▼
 Gateway /api/skills/*
-   │ 暂存表 → 服务端 Git commit/push
-   ▼
-Git：用户草稿分支 + main 公共目录
    │
+   ├── SkillAuthorService：所有权、保存提交、安全扫描、生效
+   │        │
+   │        ├── Git：保存时 commit/push 到 refs/heads/myflow/drafts/<user-id>
+   │        ├── PostgreSQL：skills / skill_versions / 扫描 / active / outbox
+   │        └── cisco-ai-skill-scanner（import 调用）
    ▼
-PostgreSQL：skills / versions / submissions / releases / active / outbox
-   │ outbox 异步更新
+PostgreSQL
+  skills / skill_versions / skill_draft_files
+  skill_private_active / skill_security_scans / skill_index_outbox
+  skill_catalog_epoch / audit
+   │ outbox
    ▼
-Milvus active projection：公共技能一行 + 私有技能一行
-   │ 检索：scope/owner 过滤 + 向量匹配
+Milvus myflow_skills_active：每个 owner 的 active 技能一行
+   │ 检索时按 owner_user_id 过滤，并回 PostgreSQL 确认 active 指针
    ▼
-PostgreSQL 确认 → 合并去重（作者私有优先）→ Git 缓存正文
+提示词索引 / search_skills + load_skills / 私有沙箱挂载
 ~~~
 
 ### 3.1 不可破坏的约束
 
-- 普通用户创建的未审核内容绝不进入 main，也不进入公共目录。
-- 服务端是唯一写 Git 的一方；用户不持有 Git 凭据，不直接操作分支。
-- 审核针对不可变版本；管理员批准的不是“当前文件”，而是某个 submitted_commit。
-- 批准会把该版本完整复制到 main，公共内容不依赖作者草稿分支继续存在。
-- 向量库只保存可重建的投影；私有/公共可见性和审核状态只存在 PostgreSQL。
-- 私有正文、附件和容器路径只对所有者开放；管理员只为审核目的读取。
+- 服务端是唯一写 Git 的一方；用户不持有 Git 凭据，也不能提供 Git 参数。
+- **保存即写 Git**：每次保存都把暂存内容 commit/push 草稿分支，并记录一行不可变
+  `skill_versions`；保存不会自动激活。
+- **生效不写 Git**：生效只把已经保存、扫描通过的版本设为 active，不再产生 Git 操作。
+- 安全扫描只读取该版本不可变的 Git commit 缓存，不读取可变的编辑器暂存表。
+- 安全扫描结果是扫描那一刻的不可变快照；编辑/保存新版本后旧扫描不再适用于生效。
+- Git 不可达时保存失败，数据库不写版本行；暂存内容保留，用户可重试保存。
+- active 指针是唯一运行时可见性来源；没有 active 指针就没有索引、提示词和挂载。
+- Milvus 只是可重建投影：任何命中必须回到 PostgreSQL 按 owner 和 active 版本确认。
+- 技能容器路径只返回给所有者；不向其他用户暴露 host cache 路径。
 
-## 4. Git 拓扑与草稿存储
+## 4. Git 写入与不可变版本
 
-### 4.1 仓库和分支
+### 4.1 Git 分支（保存时写入）
 
-一个配置的技能仓库（V1 单仓库），由服务端读写：
-
-~~~
-main
-  public/<public_name>/SKILL.md
-  public/<public_name>/scripts/...
-  public/<public_name>/templates/...
-  public/<public_name>/examples/...
-
+~~~text
 refs/heads/myflow/drafts/<user-id>
   users/<user-id>/<skill_id>/SKILL.md
   users/<user-id>/<skill_id>/scripts/...
@@ -151,946 +149,534 @@ refs/heads/myflow/drafts/<user-id>
   users/<user-id>/<skill_id>/examples/...
 ~~~
 
-- 私有技能用内部 UUID skill_id 作为目录，避免作者改名/重名破坏路径。
-- 公共技能用 public_name 作为目录；public_name 全局唯一。
-- 草稿分支只由服务端写入，普通用户和浏览器看不到 Git 凭据。
-- 草稿分支可以包含同一用户的多个技能；每次保存只提交一个技能的目录变更。
+- 不再有 `main` 公共目录、`public/` 路径或公共发布 commit。
+- 每个用户一条草稿分支；技能目录使用内部 UUID，改名不影响路径。
+- 普通用户不接触 Git 凭据；只有 `SkillAuthorService.save` 会调用 Git。
+- 保存使用进程内锁；Git 操作不放在数据库事务里。
+- 保存步骤：读取暂存文件 → 校验路径/大小/文件数 → 临时工作区 commit/push →
+  写入 `skill_versions` 并记录 `draft_ref / draft_commit / skill_path`。
+- 相同 package_sha256 复用既有版本，不重复升版，也不重复产生 commit。
+- Git 失败时保存返回错误，数据库不写版本行；暂存表内容保留，用户可重试保存。
 
-### 4.2 服务端 Git 写入
+### 4.2 暂存表与不可变版本
 
-先明确两个位置：**已经保存但未审核的草稿包在 Git 草稿分支**；**尚未点击保存的编辑在
-PostgreSQL 的 skill_draft_files 暂存表**。后者只是编辑器缓冲区，不是技能版本，不进入
-检索、审核或公共发布。
-
-V1 使用系统 git CLI，通过受限参数和环境执行。编辑暂存和 Git 提交分成两层：
-
-- 未保存的编辑和附件上传写入 PostgreSQL 的 skill_draft_files 暂存表；
-这是编辑器缓冲区，不是技能版本，不参与检索、审核或公共发布；
-- 点击“保存”时，在 PostgreSQL advisory lock 下从远端拉取草稿分支，使用临时工作区
-物化暂存文件并提交；
-- 保存步骤：
-  1. 校验路径、文件类型、大小、数量和符号链接；
-  2. 解析 SKILL.md、计算 package_sha256 / skill_md_sha256；
-  3. 在临时工作区 git add + git commit，并 push 到远端草稿分支；
-  4. 写入 skill_versions 和 skill_private_active；
-  5. 写 skill_index_outbox（upsert private active）；worker 生成 embedding 并 upsert
-     Milvus active projection 后，私有版本可被检索。
-- 不在 worker 本地保存跨请求的用户工作区：每个 worker 都用临时工作区，保存前 fetch
-远端分支，保存后 push；这样多 worker 下不会因为请求落到不同实例而丢失未提交编辑。
-- Git 作者/提交者固定为 MyFlow 服务身份；commit message 可以带 user_id、skill_id、
-version，不写用户邮箱。
-- 禁止 Git hook、交互式认证和用户提供的命令参数；所有路径由服务端生成。
-- 保存按 skill 加锁（进程内锁 + PostgreSQL advisory lock）；公共批准按公共分支锁。
-- 未保存编辑在暂存表中持久化；已保存版本在 Git 中。服务重启不会丢掉暂存内容。
-
-### 4.3 附件和包边界
-
-- 一个技能是 users/// 整个目录；SKILL.md 是入口。
-- scripts/、templates/、examples/ 随包提交，服务端不执行任何脚本。
-- 拒绝符号链接、硬链接、设备文件、绝对路径、.. 路径和目录逃逸。
-- V1 默认限制：单包 5 MiB、单文件 1 MiB、最多 200 个文件；文本/脚本允许，二进制只允许
-小型资源文件。限制由配置覆盖。
-- 审核页必须展示完整文件列表和 diff；脚本内容属于人工审核范围。
-
-### 4.4 审核通过后的公共 commit
-
-管理员批准时：
-
-1. 从草稿分支读取被批准的 submitted_commit 和 skill_path；
-2. 重新校验 submitted_commit 的包 hash、frontmatter、文件边界和 public_name 冲突；
-3. 在 main 上创建权威的批准 commit，把技能目录复制到 public//，并 push 到远端；
-4. 记录 source_commit=submitted_commit、git_commit=main commit、skill_path=public 路径；
-5. 公共版本不依赖草稿分支，作者删除草稿也不影响公共技能。
-
-批准 commit 只包含被批准的一个技能（V1 一次审核一个技能；批次表允许未来合并多个）。
-
-### 4.5 运行时缓存与沙箱
-
--  是节点本地缓存，不要求共享文件系统；每个 worker 可从 PG + Git 重建；
-- /commits///：从 Git 导出的不可变内容，校验 hash；
-- /active/public/：公共激活树的只读副本；
-- /active/users//：该用户私有激活树的只读副本；
-- 公共技能挂到 /mnt/skills/public，私有技能挂到 /mnt/skills/private；
-- /mnt/skills/private 必须是按 sandbox/用户挂载的，不允许进程级静态挂载给所有用户；
-- 如果某个 sandbox provider 不支持按用户挂载，则私有技能不提供容器路径，只通过
-search_and_load_skills / slash 注入正文；不能退化成全局可读目录。
+- 未点击保存的编辑写在 `skill_draft_files`，只是编辑器缓冲区。
+- 点击保存时把暂存文件提交为 Git commit，并写入一行不可变的 `skill_versions`。
+- 保存后暂存表保留为当前工作副本，用于继续编辑；它不是运行时内容。
+- 扫描从版本的 Git commit 缓存物化到临时目录；暂存表不进入扫描或 prompt。
+- 删除技能时删除暂存文件、active 指针并写 `delete_active` outbox；版本和扫描历史
+  保留用于审计，除非运维显式清理。
 
 ## 5. 数据模型
 
-新增十一张表。所有时间使用 UTC。
-
 ### 5.1 skills
-
-技能身份。名字可以改，skill_id 不变。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| id | String(64) PK | 内部 UUID，API 的 skill_id |
-| owner_user_id | String(64) | 创建者/所有者 |
-| private_name | String(128) | 作者当前名字；同一 owner 内唯一 |
-| public_name | String(128) nullable | 首次批准时确定；全局唯一，批准后不可随意改 |
-| created_at / updated_at | DateTime(tz) | 创建/更新时间 |
-| deleted_at | DateTime(tz) nullable | 私有草稿软删除；不删除公共历史 |
+| id | String(64) PK | 内部 UUID |
+| owner_user_id | String(64) | 所有者，所有查询强制过滤 |
+| private_name | String(128) | 同一 owner 内唯一 |
+| enabled | Boolean | 用户开关，创建时默认 true；仅 active 技能可切换 |
+| load_count | Integer | `load_skills` 成功加载次数；内置技能不计数 |
+| created_at / updated_at | DateTime(tz) | 时间 |
+| deleted_at | DateTime(tz) nullable | 软删除 |
 
-约束：
-
-- UNIQUE(owner_user_id, private_name) WHERE deleted_at IS NULL；
-- UNIQUE(public_name) WHERE public_name IS NOT NULL；
-- public_name 为空表示还没有公共版本；一旦批准就保留，即使之后下架也不释放名字。
+约束：`UNIQUE(owner_user_id, private_name) WHERE deleted_at IS NULL`。
+不再有 `public_name`，不占用全局名字空间。
 
 ### 5.2 skill_versions
 
-技能内容的不可变版本，版本号由发布系统生成。
+内容不可变版本。保存即创建 Git commit 与版本行，但不会自动激活。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| id | String(64) PK | version_id；active projection 的版本字段 |
+| id | String(64) PK | version_id |
 | skill_id | String(64) FK | 所属技能 |
-| skill_version | String(32) | 发布系统生成 v1、v2… |
+| skill_version | String(32) | v1、v2… |
 | version_seq | Integer | 每个 skill 单调递增 |
-| package_sha256 | String(64) | 整个技能目录的 hash；版本去重 |
-| skill_md_sha256 | String(64) | SKILL.md hash；embedding 与校验 |
-| metadata_json | JSON | frontmatter 元数据快照 |
-| draft_ref | String(255) nullable | 草稿分支 ref；bootstrap 公共技能可为空 |
-| draft_commit | String(40) nullable | 首次保存该内容的草稿 commit；bootstrap 可为空 |
-| skill_path | String(1024) | 草稿分支内 SKILL.md 路径；bootstrap 为 main 路径 |
-| index_status | String(16) | pending / ready / failed |
-| created_at | DateTime(tz) | 版本创建时间 |
-
-约束：
-
-- UNIQUE(skill_id, skill_version)；
-- UNIQUE(skill_id, package_sha256)：同一内容不重复升版；
-- 版本行不可更新内容；index_status 可以变化。
-
-注意：skill_version 是每个技能内部递增的编号，不同技能可以同时是 v1。全局唯一定位
-一律用 version_id；skill_version 必须和 skill_id 一起使用。
-
-版本生成：
-
-1. 保存时对技能目录计算 package_sha256：按 POSIX 相对路径排序，包含文件字节和可执行位，
-
-   排除临时文件和系统垃圾；
-2. 若相同 hash 已存在，复用原 skill_version；版本被重新激活时重新 embedding 并
-   upsert active projection，不假设历史向量仍然存在；
-3. 否则取该 skill 最大 version_seq + 1，生成 v{n}；
-4. 版本只增不改；内容错误只能保存新版本。
-
-复用版本时，提交审核使用**本次提交时的草稿分支 HEAD**，而不是版本最早保存时的
-旧 commit；这样即使版本记录是旧的，审核和批准仍然落在包含该内容的当前 commit 上。
-
-### 5.3 skill_submissions
-
-一次提交审核。
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| id | String(64) PK | 提交 ID |
-| skill_id | String(64) FK | 技能 |
-| version_id | String(64) FK | 被审核的不可变版本 |
-| submitted_commit | String(40) | 提交那一刻的草稿分支 HEAD；审核/批准的源 commit |
-| owner_user_id | String(64) | 提交人 |
-| status | String(16) | pending / approved / rejected / withdrawn / superseded |
-| submitted_at | DateTime(tz) | 提交时间 |
-| reviewed_by | String(64) nullable | 审核人 |
-| reviewed_at | DateTime(tz) nullable | 审核时间 |
-| reject_reason | Text nullable | 驳回理由 |
-| public_release_id | String(64) nullable | 批准后生成的公共发布记录 |
-| created_at | DateTime(tz) | 创建时间 |
-
-约束：
-
-- 部分唯一索引：一个 skill 同时最多一个 pending submission；
-- 一个 version 可以有多条历史 submission，但只有一条 approved 可以指向公共 release。
-
-### 5.4 skill_release_batches
-
-一次公共批准产生的仓库 commit 批次。
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| id | String(64) PK | 批次 ID |
-| git_repository | String(512) | 规范化仓库 URL |
-| git_commit | String(40) | main 上的批准 commit |
-| approved_by | String(64) | 管理员 |
+| package_sha256 / skill_md_sha256 | String(64) | 包与入口 hash |
+| metadata_json | JSON | frontmatter 快照 |
+| draft_ref / draft_commit | String nullable | 保存时写入的 Git 分支与 commit |
+| skill_path | String(1024) | 保存时写入的 Git 内 SKILL.md 路径 |
+| index_status | String(16) | unindexed / pending / ready / failed |
 | created_at | DateTime(tz) | 时间 |
-| stats_json | JSON | 文件数、大小、耗时 |
 
-V1 一次审核一个技能；批次表和 release 表的形状允许未来批量批准。
+约束：`UNIQUE(skill_id, skill_version)`、`UNIQUE(skill_id, package_sha256)`。
+版本内容不可更新；`draft_ref / draft_commit / skill_path` 在保存时写入，
+`index_status` 是投影状态。
 
-### 5.5 skill_releases
+### 5.3 skill_private_active
 
-公共发布记录。需求要求的五个字段在这里。
-
-| 字段             | 类型                  | 说明                                  |
-| -------------- | ------------------- | ----------------------------------- |
-| id             | String(64) PK       | 发布记录 ID                             |
-| batch_id       | String(64) FK       | 批次                                  |
-| version_id     | String(64) FK       | 内容版本                                |
-| skill_id       | String(64)          | 技能 UUID                             |
-| skill_version  | String(32)          | 版本号                                 |
-| git_repository | String(512)         | 仓库 URL                              |
-| git_commit     | String(40)          | main 批准 commit                      |
-| skill_path     | String(1024)        | public//SKILL.md                    |
-| public_name    | String(128)         | 批准时的公共名字                            |
-| source_commit  | String(40) nullable | 审核时的 submitted_commit；bootstrap 可为空 |
-| approved_by    | String(64)          | 管理员                                 |
-| created_at     | DateTime(tz)        | 发布时间                                |
-
-约束：
-
-- UNIQUE(batch_id, skill_id)；
-- 索引：(skill_id, created_at)、git_commit、skill_version；
-- 发布记录不可变；回滚只改激活指针，不改 release。
-
-### 5.6 skill_public_active 与 skill_private_active
-
-公共激活指针：
+每个技能最多一个 active 版本，仅在用户点击生效且扫描通过后写入。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | skill_id | String(64) PK | 技能 |
-| release_id | String(64) FK | 当前公共 release |
-| activated_by | String(64) | 管理员 |
+| owner_user_id | String(64) | 冗余过滤字段 |
+| version_id | String(64) FK | 当前 active 版本 |
 | updated_at | DateTime(tz) | 时间 |
 
-私有激活指针：
+### 5.4 skill_security_scans
+
+一次安全扫描的不可变结果。每次点击扫描新增一行，不做覆盖。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| skill_id | String(64) PK | 技能 |
-| owner_user_id | String(64) | 所有者，冗余用于过滤 |
-| version_id | String(64) FK | 当前私有版本 |
-| updated_at | DateTime(tz) | 时间 |
-
-没有公共激活行 = 该技能当前不是公共技能；没有私有激活行 = 作者当前没有私有可用版本。
-管理员下架只删公共指针；作者删除草稿只删私有指针。
-
-### 5.7 skill_settings 与 skill_audit_events
-
-skill_settings：公共技能的全局开关。
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| skill_id | String(64) PK | 公共技能 |
-| enabled | Boolean | 全局启用 |
-| updated_by | String(64) | 管理员 |
-| updated_at | DateTime(tz) | 时间 |
-
-私有技能不受全局开关影响；作者自己的个人偏好仍然生效。
-
-skill_audit_events：append-only 管理/审核审计。
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| id | String(64) PK | 事件 ID |
-| actor | String(64) | 操作人 |
-| action | String(32) | skill.create / skill.save / skill.submit / skill.withdraw / skill.approve / skill.reject / skill.unpublish / skill.activate / skill.enable / skill.disable / skill.delete |
-| skill_id | String(64) nullable | 技能 |
-| submission_id | String(64) nullable | 提交 |
-| release_id | String(64) nullable | 公共发布 |
-| detail_json | JSON | 版本、commit、变更前后值、驳回理由摘要 |
+| id | String(64) PK | 扫描 ID |
+| skill_id | String(64) FK | 技能 |
+| version_id | String(64) FK | 被扫描版本 |
+| owner_user_id | String(64) | 扫描发起人/所有者 |
+| package_sha256 | String(64) | 扫描时版本包 hash，防止张冠李戴 |
+| status | String(16) | completed / failed |
+| is_safe | Boolean | 扫描器结论；failed 时为 false |
+| max_severity | String(16) | SAFE/INFO/LOW/MEDIUM/HIGH/CRITICAL |
+| findings_count | Integer | 发现数量 |
+| findings_json | JSON | 脱敏后的发现列表（规则、严重度、文件、行号、标题、建议） |
+| scanner | String(64) | `cisco-ai-skill-scanner` |
+| scanner_version | String(64) nullable | import 到的包版本 |
+| duration_ms | Integer | 扫描耗时 |
+| error | Text nullable | 扫描器异常的脱敏摘要，绝不存技能正文 |
 | created_at | DateTime(tz) | 时间 |
 
-草稿保存的完整内容历史在 Git；审计表记录生命周期动作。普通用户的个人偏好不进入审计表。
+索引：`(skill_id, created_at)`、`(version_id, created_at)`。
 
-### 5.8 skill_draft_files
+### 5.5 skill_draft_files / skill_index_outbox / skill_audit_events / skill_catalog_epoch
 
-未保存的编辑暂存。它不是技能版本，也不进入 Git、向量库或审核接口。
+- `skill_draft_files` 保持现有形状：`(skill_id, path)` 主键、内容字节、hash、大小、mode。
+- outbox 只保留 private 投影：`projection_key = private:<owner>:<skill_id>`，
+  op 仍是 `upsert_active` / `delete_active`。
+- 审计动作改为：`skill.create / skill.save / skill.scan / skill.upload / skill.activate /
+  skill.delete / skill.index_reindex`。不再有 submit/approve/reject/unpublish。
+- `skill_catalog_epoch` 保留，用于多 worker 快照失效。
 
-| 字段 | 类型 | 说明 |
+## 6. 安全扫描
+
+### 6.1 调用方式
+
+服务层新增 `SkillSecurityScanner` 协议和 `CiscoSkillScanner` 适配器。适配器在
+**真正扫描时**懒 import，避免网关启动就加载 YARA/Go CEL：
+
+~~~python
+from skill_scanner import scan_skill as cisco_scan_skill
+from skill_scanner.core.analyzer_factory import build_analyzers
+from skill_scanner.core.scan_policy import ScanPolicy
+
+analyzers = build_analyzers(
+    ScanPolicy.default(),
+    use_llm=True,
+    llm_model=default_model.model,
+    llm_api_key=default_model.api_key,
+    llm_base_url=default_model.base_url,
+    llm_provider="openai-compatible",
+)
+result = cisco_scan_skill(skill_directory, analyzers=analyzers)
+data = result.to_dict()
+~~~
+
+- 包依赖：`cisco-ai-skill-scanner`（PyPI），import 名是 `skill_scanner`。
+- 放在 agentkit 的 `skills` extra 中；未安装时扫描接口返回 503
+  `skill_scanner_unavailable`，技能编辑/保存仍可用。
+- 一次扫描**同时启用规则分析和 LLM 语义分析**：规则包含 static / bytecode /
+  pipeline / correlation，LLM 由扫描器的 `LLMAnalyzer` 执行。
+- LLM 使用部署默认模型：`agents.default_model`（未配置时取 `models[0]`），复用该
+  模型条目的 `model / base_url / api_key`；myflow 的默认模型走 OpenAI 兼容路由，
+  `use` 明确是 Anthropic / Ollama 时映射到扫描器对应 provider。
+- 没有默认模型时不静默降级为纯规则扫描：扫描接口返回 503，提示先配置
+  `agents.default_model`。
+- LLM 分析器没有运行（`analyzers_used` 不含 `llm_analyzer`）或自身报错时，整次扫描
+  记为 `failed`，不接受“只有规则通过”的结论。
+- 扫描包含对模型提供方的网络调用（会发送该版本的技能内容）；它仍是同步阻塞工作，
+  放在 `asyncio.to_thread`，不阻塞事件循环，也不执行技能中的任何脚本。
+- 扫描目标目录由 `SkillContentStore` 从版本的不可变 Git commit 物化到
+  `tempfile.TemporaryDirectory`：逐文件校验 `path`、写入字节和可执行位，扫描结束立即删除。
+- 扫描前校验版本存在、属于该用户、`package_sha256` 与数据库一致、`draft_commit`
+  存在；扫描器接收到的目录只包含该版本的不可变内容。
+
+### 6.2 结果归一化
+
+- 保存扫描器返回的 `is_safe`、`max_severity`、`findings_count` 和
+  `findings`；每条 finding 只保留 `rule_id/title/severity/category/file_path/
+  line_number/remediation`，不保存扫描器可能附带的完整文件内容或密钥。
+- `is_safe` 由扫描器定义（无 HIGH/CRITICAL 发现）决定；“生效”默认要求 `is_safe`。
+- 扫描器抛异常、import 失败或 LLM 阶段失败：
+  - import 失败 / 没有默认模型：不写扫描行，返回 503；
+  - 扫描执行失败：写 `status=failed` 的扫描行，前端展示错误，允许用户重试；
+  - LLM 分析器未运行或报错：同样写 `status=failed`，不能只凭规则结果判定通过。
+- 每次扫描都针对最新已保存版本；HTTP 接口不接受版本参数，服务层也拒绝非最新版本。
+
+### 6.3 生效门禁
+
+`POST /api/skills/{skill_id}/activate`：
+
+1. 校验 owner、技能未删除；
+2. 取最新已保存版本；请求中的 version_id 必须等于它；
+3. 取该版本最新一次扫描；必须 `status=completed && is_safe=true`；
+4. 在同一 PG 事务中重新校验扫描行、版本包 hash、active 指针和 Git commit，写
+   `skill_private_active`、outbox upsert、审计；
+5. 路由刷新进程级快照；worker 在 Milvus 构建/更新该用户的向量行；
+6. 返回 active 版本和 `index_status`。若投影未配置，`indexed=null` 且
+   `index_status=pending`，但运行时快照仍立即生效。
+
+生效不写 Git：commit/push 已在保存阶段完成。扫描未通过或版本不是最新时返回 409，
+不改变 active 指针。
+
+扫描通过但用户尚未点击生效：不进入运行时。
+
+## 7. HTTP API
+
+### 7.1 作者接口
+
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| skill_id | String(64) FK | 技能 |
-| path | String(1024) | 相对技能目录的 POSIX 路径 |
-| content | LargeBinary | 文件字节；文本/脚本/小型资源 |
-| sha256 | String(64) | 内容 hash |
-| size_bytes | Integer | 文件大小 |
-| mode | String(16) | text / binary |
-| updated_at | DateTime(tz) | 最后编辑时间 |
-
-约束：
-
-- PRIMARY KEY(skill_id, path)；
-- 只允许 owner 通过作者接口读写；admin 审核读取的是已保存版本，不读暂存表；
-- 保存时把暂存表物化到临时 Git 工作区；保存成功后暂存表保留为当前工作副本；
-- 暂存表也计入每用户配额；删除草稿时一起删除；
-- 暂存表只存在私有内容，日志和审核接口不输出其正文。
-
-### 5.9 skill_index_outbox
-
-Milvus active projection 的可靠更新队列。它和业务状态变更写在同一个 PostgreSQL 事务里。
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| id | String(64) PK | 事件 ID |
-| op | String(16) | upsert_active / delete_active |
-| projection_key | String(255) | public:<skill_id> 或 private:<owner_id>:<skill_id> |
-| scope | String(16) | public / private |
-| owner_user_id | String(64) nullable | 私有行所有者；公共行为空 |
-| skill_id | String(64) | 技能 |
-| version_id | String(64) nullable | 要投影的版本；delete 时可为空 |
-| payload_json | JSON | enabled、name、description、hash 等非正文元数据 |
-| status | String(16) | pending / running / done / failed |
-| attempts | Integer | 重试次数 |
-| next_attempt_at | DateTime(tz) | 下次重试 |
-| last_error | Text nullable | 脱敏错误 |
-| created_at / updated_at | DateTime(tz) | 时间 |
-
-- 发布、批准、下架、回滚、全局开关、私有保存/删除都在同一 PG 事务里写 outbox；
-- worker 幂等 upsert/delete Milvus；失败指数退避；
-- 同一 projection_key 的多个 pending 事件由 worker 合并为最新状态；worker 应用事件前
-  重新读取 PG 当前 active/settings，事件里的 version_id/enabled 已过期就跳过，避免旧
-  outbox 覆盖新状态；
-- 启动和每日对账扫描 PG active 指针，补齐缺失行、删除孤儿行；
-- PG 仍是权威；Milvus 落后时检索可能短暂少结果，但不会返回未确认内容。
-
-### 5.10 与旧 JSON 状态的关系
-
-- extensions_config.json 继续服务 MCP；skills 段在新目录启用后不再读取；
-- 全局技能开关迁移到 skill_settings，按公共 skill_id 建键；
-- skills_prefs.json 继续保存个人偏好，但键从“技能名”改为内部 skill_id，避免私有/公共重名；
-- 一次性脚本 scripts/migrate_skill_state.py 负责按旧名字找到对应公共 skill_id 并导入开关；
-脚本可重复执行，不在启动时偷偷写库；
-- 旧公共技能通过管理员 bootstrap 导入，给予 admin 所有者和已批准状态；
-- 切换后生产运行时**只认 Git 目录**，不再合并本地 skills/ 扫描；source=filesystem 仅用于
-测试/本地调试，不是生产回退；
-- 启动不要求 Git 在线：已有 PG 激活记录 + 本地 commit 缓存即可服务；只有保存/批准/缓存
-重建需要访问远端；Git 不可达时新写入失败，已有技能不受影响。
-
-## 6. 创建、保存、提交与审核
-
-### 6.1 创建草稿
-
-1. 用户在“我的技能”点击新建，填写 private_name 和 description；
-2. 服务端创建 skills 行（owner=当前用户）；
-3. 生成初始 SKILL.md，写入 skill_draft_files 暂存表；
-4. 不立即创建版本；用户保存时才 commit 到 Git。
-5. private_name 不能与其他技能已占用的 public_name 冲突（同一 skill 除外），否则创建/改名失败。
-
-### 6.2 编辑和保存
-
-- 编辑器支持 SKILL.md 正文、文件树、文本文件、附件上传和删除；
-- 所有编辑先写 skill_draft_files 暂存表，点击保存时执行 §4.2 的 Git commit；
-- 保存成功后：生成/复用 version，写 skill_versions，更新 skill_private_active，
-  并在同一事务里写 private active 的 outbox；
-- worker 完成 embedding 和 active projection upsert 后，私有版本才进入向量检索；
-  prompt/slash/容器读取不依赖向量，可立即使用；
-- 如果保存时存在 pending submission，返回 409；作者必须先撤回。
-
-### 6.3 提交审核
-
-1. 作者点击提交；服务端检查包合法、没有 pending submission；
-2. 读取草稿分支 HEAD，校验该 commit 的包 hash 等于 version.package_sha256；
-3. 创建 skill_submissions（pending），记录 version_id 和 submitted_commit=HEAD；
-4. 私有版本仍对作者可用；
-5. 管理员审核页看到的是固定 version + submitted_commit，不是作者暂存表；
-6. 向量索引未就绪不阻止提交：正文仍可通过 prompt/slash 使用，active projection 完成后
-   检索自动可见；返回结果里带 index_warning。
-
-### 6.4 管理员审核
-
-审核页展示：
-
-- 作者、技能名、版本、submitted_commit、source_commit；
-- 与当前公共版本的 diff；
-- SKILL.md 全文、frontmatter、allowed-tools、required-secrets；
-- scripts/、templates/、examples/ 的文件列表和内容；
-- 包大小、文件数、hash。
-
-批准：
-
-1. 校验提交仍是 pending，submitted_commit 的包 hash 与版本一致；
-2. 检查 public_name 冲突；冲突返回 409，要求作者改名后重新提交；
-3. 按 §4.4 从 submitted_commit 创建 main 批准 commit；
-4. 在 PostgreSQL 事务中写 release、public_active、settings 默认 enabled=true，并写
-   public active 的 outbox（upsert）；
-5. 提交置 approved，写审计；
-6. 刷新公共快照和该用户的私有快照；worker 完成公共 active projection 后，所有用户
-   的向量检索可见。
-
-驳回：
-
-- 写 rejected、reviewed_by、reject_reason；
-- 不改变私有激活指针，作者可编辑后重新提交；
-- 审计留痕。
-
-### 6.5 修改已批准技能
-
-- 作者保存新版本 v2 后，私有指针指向 v2，公共指针仍是 v1；
-- 其他用户继续使用 v1；
-- 作者提交 v2，管理员批准后公共指针切到 v2；
-- 公共 v1 的 release 记录和 Git commit 永久保留。
-- V1 不提供公共改名：public_name 在首次批准后固定，作者修改 private_name 只影响私有
-版本，不影响公共路径；必须改公共名时由管理员下架后作为新技能重新发布。
-
-### 6.6 下架和回滚
-
-- 管理员下架：删除 skill_public_active，保留 release 和 public_name，并写 public active
-  的 outbox（delete）；对**下一次 run / 下一次检索**生效；当前 run 已经注入上下文的
-  正文无法回收，这是所有上下文注入的共同限制，不假装能撤回；
-- 管理员回滚：把 skill_public_active 指向历史 release，并写 public active 的 outbox
-  （upsert；worker 必要时重新 embedding）；不改 Git、不改 release；同样对下一次 run 生效；
-- 下架/回滚后，作者私有指针不受影响；
-- 重新批准时，公共指针切到新 release。
-
-### 6.7 管理员创建
-
-管理员拥有 skills:write，可以创建私有草稿；管理员可以审核自己的提交（self_approved=true
-记录在审计中），也可以由另一个管理员审核。V1 不允许绕过审核直接写公共指针。
-
-## 7. 向量索引与检索
-
-### 7.1 Active Projection
-
-Milvus collection 默认名 myflow_skills_active。它**不是全量版本索引**，而是当前激活
-状态的物化视图：
-
-- 每个公共 active 技能一行；
-- 每个用户每个私有 active 技能一行。
-
-这样检索过滤器只需要 scope/owner，不需要把上千个 version_id 拼进 IN。
-
-| 字段 | 类型 | 用途 |
-|---|---|---|
-| pk | VARCHAR | public:<skill_id> 或 private:<owner_id>:<skill_id> |
-| scope | VARCHAR | public / private |
-| owner_user_id | VARCHAR | 私有行所有者；公共行为空串 |
-| skill_id | VARCHAR | 确认/去重 |
-| version_id | VARCHAR | 指向版本 |
-| skill_version | VARCHAR | 调试/确认 |
-| enabled | BOOL | 公共全局开关；私有行恒为 true |
-| name | VARCHAR | 调试 |
-| description | VARCHAR | 调试 |
-| package_sha256 | VARCHAR | 重建校验 |
-| skill_md_sha256 | VARCHAR | 内容校验 |
-| embedding | FLOAT_VECTOR | 向量 |
-| embedding_model | VARCHAR | 模型漂移 |
-| embedding_dimensions | INT | 维度 |
-| updated_at | INT64 | 投影更新时间 |
-
-- 版本历史不常驻向量库；历史版本只在 Git + PostgreSQL。回滚或重新激活旧版本时，
-  重新 embedding 后 upsert 对应的 active 行。
-- 同一个 version_id 可以同时出现在 public 行和作者的 private 行；pk 是 projection key，
-  不是 version_id。
-- scope/owner_user_id/enabled 是可变的投影字段。这是为了避免大 IN 列表刻意接受的
-  折中：PostgreSQL 仍是权威，outbox 负责更新，检索后仍要 PG 确认。
-- 不存正文和附件。
-- scope、owner_user_id、enabled 建 scalar index；公共/私有两条过滤路径不依赖大 IN。
-- consistency_level 默认 Strong；outbox 写入成功后，跨 worker 的检索应尽快看到。
-- 维度或模型变化走全量重建 active projection。
-
-### 7.2 Embedding 文本
-
-~~~
-{name}
-{description}
-~~~
-
-只有**作者手写的元数据**参与 embedding，正文不参与。理由：
-
-- 元数据是作者对“这个技能处理什么任务”的摘要，正是语义入口；
-- 正文每次改动都会变，嵌正文等于每次保存都重新 embedding 一次，成本高且噪声大；
-- 正文可能超出 embedding 的 max_input_tokens，超限时整条索引失败
-  （index_status=failed）而不是截断；嵌元数据从结构上消除了这条失败路径。
-
-正文不进向量，进的是另外两段：BM25 词法召回（§7.4 步骤 5）读正文，精排（§7.4
-步骤 7）也读正文。归纳成一句：**语义召回靠元数据，字面召回与终排靠正文。**
-
-代价是召回天花板取决于 description 的质量。因此创建/编辑界面必须把“适用任务 +
-关键工具/库名/报错词”写进描述引导里；系统提示词索引展示的同样是 name + description，
-两处口径因此一致。
-
-附件不进入 embedding，也不进入召回；它们只在正文里被引用。正文的用量由两个预算
-分别约束：max_body_chars 管“装载进上下文”，max_document_chars 管“送进精排”。
-
-> 改这一段的语义（换成嵌正文、改前缀格式、换模型）等于让全部存量向量失效，必须配
-> 一次强制重建，见 §7.6。
-
-### 7.3 可见性和冲突规则
-
-对当前用户，可见集合由两路组成：
-
-- 公共：scope=public、enabled=true 的 active 行；
-- 私有：scope=private、owner_user_id=当前用户的 active 行。
-
-同一个 skill_id 可能同时有公共行和作者的私有行。**作者侧私有版本优先**：
-
-- 作者有私有 active 版本时，公共分支直接排除该 skill_id，结果只保留私有；
-- 私有 active 版本存在但投影暂时缺失/失效时，该技能在作者检索里暂不出现，
-  outbox/对账修复后恢复；不自动回退公共版本；
-- 其他用户看不到该私有行，只看到公共行。
-
-这样即使用户更新后的私有版本和公共版本 embedding 高度相似，也只会返回一个技能，
-不会出现“同一技能两个版本同时命中”的冲突。作者侧**无条件私有优先**：不考虑两边
-分数谁高，只要私有版本有效就保留私有；不提供本次检索切换到公共版本的参数。
-作者要使用公共版本，删除私有草稿即可。
-
-个人偏好、agent 白名单、全局 enabled 仍由 PostgreSQL 最终确认；Milvus 的 enabled 字段
-只是减少候选。
-
-### 7.4 检索顺序
-
-三阶段漏斗：**稠密召回（元数据向量）→ 稀疏召回（正文 BM25）→ 精排（正文**
-**cross-encoder）**。每一段都只做自己最擅长的事，越贵越靠后。
-
-1. 生成 query embedding（只生成一次），查询文本是模型的 task_query；
-2. 从当前用户快照读取私有 active 的 skill_id 集合（数量受草稿配额限制，通常很小；
-   不需要额外 DB 查询）；
-3. **稠密召回**：Milvus **一次 search**，过滤表达式：
-   ~~~
-   (scope == "public" and enabled == true and skill_id not in [...私有 skill_id...])
-   or (scope == "private" and owner_user_id == 当前用户)
-   ~~~
-   limit = candidate_k；私有集合为空时只保留公共分支。
-4. 对命中批量回 PostgreSQL（一条 JOIN，不做 N+1），逐条确认：
-   - 公共：skill_public_active 指向的 release.version_id 命中，且 settings.enabled=true；
-   - 私有：skill_private_active.owner_user_id=当前用户且 version_id 命中；
-   - 版本 hash、skill_id、skill_version 一致；
-   - 个人偏好、agent 白名单通过；
-   丢弃失效命中。Milvus 只是候选来源，确认之后才存在“技能”，这一步不能省。
-5. **稀疏召回**：对同一份 PG 可见集合做本地 BM25（正文 + name + description），
-   得分来自 keyword 通道配置。正文从 Git 缓存读，按 (commit, path) 做进程内 LRU，
-   避免每次检索都 O(可见技能数) 次磁盘读；读不出正文的候选丢弃并记 warning。
-6. **合并**：按 skill_id 防御性去重（私有优先，无条件），再对两路各自的名次做 RRF
-   融合（rrf_k）。融合分数只用于排序，不改变可见性；min_score 作用在融合分数上。
-7. **精排**：对融合后的前 candidate_k 个候选，用正文（截断到 max_document_chars）
-   送 cross-encoder rerank，得到终排。精排只重排**已去重**的集合，因此不可能把作者
-   的公共副本排到自己的私有副本前面。
-8. 取 top_k，按 max_body_chars / max_context_chars 预算装载正文；
-9. 返回 skill_id、name、scope、skill_version、version_id、git_commit、skill_path、
-   release_id（公共）、score、命中的通道和 warning。
-
-代价与取舍：BM25 要覆盖正文就必须读到正文，这是这条链上唯一随目录规模增长的开销
-（步骤 5 的 LRU 是它的对冲）；精排是每次检索一次网络往返（约 2×候选数 × 4k 字符），
-换来的是“只往上下文里装 top_k 个正文”时的命中率。两者都比“装错技能、走错流程”便宜。
-
-这里仍然只有一次 Milvus search，query embedding 也只生成一次。私有分支用
-`owner_user_id == 当前用户` 过滤；公共分支用 `skill_id not in [我的私有 skill_id]`
-把作者自己的公共版本排除掉，所以同一技能不会同时出现两个版本。
-
-`not in` 列表是“当前用户私有 active 的 skill_id”，不是 version_id；它受草稿配额限制，
-通常只有几十个，不会形成大集合。无条件私有优先意味着：私有版本在投影中有效时，
-作者不会通过检索回退到公共版本；要使用公共版本，删除私有草稿即可。
-
-去重仍然保留为防御措施：如果 Milvus 出现重复/过期行，PG 确认后再按 skill_id 收敛。
-
-### 7.5 降级
-
-- 精排不可用（超时/5xx/协议错误）：跳过步骤 7，直接用融合顺序，返回 rerank_unavailable
-  并记 warning；精排永远不阻断检索，也不改变可见性；
-- 向量通道不可用（embedding 或 Milvus）：跳过步骤 1/3/4，只用 BM25 对 PG 可见集合排序，
-  返回 lexical_fallback 和 vector_unavailable，并按同一套私有优先规则去重；
-  因为 BM25 读的是正文，这条路仍然能命中“报错原文/库名”类查询；
-- BM25 通道异常（正文读不出）：只用向量分数排序，返回 lexical_unavailable；
-  全部通道都不可用时 fail-safe：返回空结果和原因，不返回未排序的候选；
-- PostgreSQL 不可用：fail-closed，不返回任何未确认的命中；
-- 内容缓存丢失：从 Git mirror 按 commit 重导出；失败则丢弃该条；
-- active projection 缺失/过期：outbox 重试和对账任务修复；修复前检索可能少结果，
-  prompt/slash 仍可用；
-- 个人偏好关闭的公共技能可能占用候选名额；candidate_k 允许过采样，确认阶段丢弃；
-- 所有降级显式返回，不静默隐藏。
-
-### 7.6 投影文本版本与强制重建
-
-投影行是**派生数据**，唯一让它失效的方式是重新 embedding。因此 embedding 文本的
-语义变更（§7.2 的格式、模型、维度）必须视为一次数据迁移，而不是一次代码改动。
-
-- 代码里维护一个 PROJECTION_TEXT_VERSION；它与某个 active 版本的“已索引文本版本”
-  不一致时，该行的可检索性是未知的；
-- 下面三种情况都会让存量向量失去意义：改嵌入文本、换 embedding 模型、换维度。
-  三者都必须走**全量重建**，不能依赖 outbox（outbox 只处理新的状态变更）；
-- 对账任务在稳态下会跳过“key 在 Milvus 且版本 ready”的行（这是为了不每十分钟
-  重嵌整个目录），所以**只改代码不会自愈**：必须显式触发重建；
-- 提供管理员入口 POST /api/admin/skills/reindex（skills:write + 审计），语义是
-  reconcile(force=True)：重建全部 active 行、删除多余 key、把版本 index_status 置回
-  ready；返回修复/删除计数。运维在换模型或换文本格式后调用一次即可；
-- 重建期间检索仍然可用：旧向量与新向量在 collection 里共存，Milvus 只是候选来源，
-  最终仍由 PG 确认；重建完成后旧行被覆盖或删除。
-
-## 8. 运行时快照与沙箱隔离
-
-### 8.1 按用户快照
-
-中间件和系统提示词是同步路径。SkillCatalogService 为每个用户构建不可变快照：
-
-- 快照包含公共可见技能 + 该用户自己的私有技能；
-- 一次 run 使用同一快照，保证索引、策略、激活一致；
-- 保存、提交、批准、下架、回滚、全局开关后按 epoch 失效；
-- 多 worker 通过 PG catalog_epoch 和短轮询/reload 刷新；
-- 检索工具不依赖快照，每次按 PG 现查。
-
-### 8.2 Skill 运行时字段
-
-增加：
-
-~~~
-skill_id
-scope: private | public
-owner_user_id
-skill_version
-version_id
-release_id (public only)
-git_repository
-git_commit
-skill_path
-container_file
-~~~
-
-保留 name/description/category/allowed_tools/required_secrets，让 middleware、slash、
-DurableContext 和 tool policy 继续用路径协议。
-
-### 8.3 容器路径
-
-公共技能：
-
-~~~
-/mnt/skills/public/<public_name>/SKILL.md
-~~~
-
-私有技能：
-
-~~~
-/mnt/skills/private/<private_name>/SKILL.md
-~~~
-
-- 私有路径在容器里不带 user_id；同一个字符串在每个用户的 sandbox 中映射到不同主机目录；
-- 只有所有者的 sandbox 挂载私有目录；
-- 提示词索引分别说明 public/private 两个根；
-- slash 同名时私有优先；公共技能仍可被 search_and_load_skills 显式命中；
-- 如果 sandbox provider 无法按用户挂载私有目录，私有 skill 不写 container_file，
-只通过工具/slash 注入正文，绝不做全局只读挂载。
-
-### 8.4 激活树
-
-- 公共激活树按公共 release 生成，全进程共享；
-- 私有激活树按用户生成，内容是该作者当前私有版本的只读副本；
-- 内容来自 commit 缓存，按技能目录原子替换；
-- 激活树是缓存，不是权威；短暂落后不影响检索确认。
-
-## 9. HTTP API
-
-### 9.1 作者
-
-| Method | Path | 权限 | 说明 |
+| GET | /api/skills/mine | 当前用户全部技能（含草稿、active、扫描摘要） |
+| POST | /api/skills | 创建草稿 |
+| POST | /api/skills/{id}/draft/open | 打开/恢复暂存 |
+| GET | /api/skills/{id}/draft | 技能 + 文件树 + 最新版本 + 最新扫描 |
+| GET/PUT/POST/DELETE | /api/skills/{id}/draft/file(s) | 暂存文件读写/上传/删除 |
+| POST | /api/skills/{id}/draft/save | Git commit + 不可变版本，不生效 |
+| GET | /api/skills/{id}/versions | 版本历史 |
+| POST | /api/skills/{id}/scan | 扫描最新已保存版本（Git commit 快照） |
+| GET | /api/skills/{id}/scans | 扫描历史（最多 N 条） |
+| POST | /api/skills/{id}/activate | 校验扫描 → 生效并写索引 outbox |
+| DELETE | /api/skills/{id} | 删除私有技能（含 active 和索引删除事件） |
+
+不再提供 `/submit`、`/withdraw` 或任何 `/api/admin/skills/*` 审核接口。
+
+### 7.2 目录接口
+
+- `GET /api/skills`：内置技能 + 当前用户 active 技能，不再返回其他用户技能，
+  不再支持 `scope=public`。
+- `PUT /api/skills/{id}/preference`：更新 `skills.enabled`；只允许 active 技能，
+  未知/非 active 返回 404/409；变更写快照刷新与投影 outbox。
+- `POST /api/skills/reload`：admin 运维刷新可保留，但与审核/发布无关。
+- 移除全局技能开关 PATCH：没有公共技能，也就不存在全局开关。
+
+### 7.3 响应字段
+
+`SkillListItem` 增加：
+
+- `status`：draft / unscanned / scan_failed / scanned / active / builtin；
+- `latest_scan`：扫描摘要（可为空）；
+- `active_version_id`、`active`：当前运行时版本；
+- `can_activate`、`activation_blocked_reason`：前端按钮可用性；
+- `index_status`：active 版本的投影状态；
+- `enabled`：用户启用开关（默认 true）；`load_count` 只在内部/调试需要时返回，
+  UI 不依赖它做操作。
+
+## 8. 前端
+
+### 8.1 “我的技能”页
+
+- 只请求 `/api/skills/mine` 和内置技能；删除公共目录区、审核入口、编辑公共技能入口。
+- 每行显示：名称、私有标签、生命周期徽标（草稿/待扫描/扫描未通过/已扫描/已生效）、
+  最新扫描摘要、编辑按钮。
+- 已生效行额外显示启用开关；关闭后显示“不参与技能检索”，开关调用 preference API
+  并刷新列表。草稿/扫描中的行不显示开关。
+- 空态文案改为“保存后先做安全扫描，扫描通过再点击生效”。
+
+### 8.2 编辑器
+
+- 文件树/正文/上传/删除/保存保持现有交互。
+- 保存写入 Git 并产生不可变版本；成功后提示“已保存草稿”。
+- 保存后状态为草稿/待扫描，按钮组变为：保存、安全扫描、生效、删除。
+- “安全扫描”调用扫描接口；显示：时间、耗时、扫描器版本、最高严重度、发现数、
+  finding 列表（文件、行号、规则、严重度、建议）。
+- “生效”仅在 `can_activate` 时可用；失败显示 `activation_blocked_reason`。
+- “生效”成功提示包含“已生效”；保存阶段 Git 失败时如实展示错误，暂存内容保留。
+- 生效后显示 active 版本和 index_status；保存新版本后旧 active 仍保留，页面同时
+  展示“已生效版本”和“当前草稿版本”。
+- 删除审核相关文案、驳回原因、撤回按钮和 pending 状态。
+
+### 8.3 移除的页面
+
+- `/workspace/admin/skills` 审核台；
+- review-queue / review-detail 组件及测试；
+- 侧栏“审核”入口和 `reviewActive` 属性。
+
+## 9. 运行时、检索与沙箱
+
+- `SkillSnapshot` 只包含 `private_by_owner`；`visible_for(user)` 只返回该用户的
+  active 且 `enabled=true` 的技能，再应用 `available_skills`。
+- `build_skills_section` 只渲染 `/mnt/skills/private/<name>` 与内置根，不再有
+  public 根；私有行带 `skill_id` 和容器 `path`。
+- `SkillSearchService` 只查 owner 的 active、enabled 技能：
+  Milvus 过滤 `scope == "private" and enabled == true and owner_user_id == "<user>"`，
+  PostgreSQL 用 active 指针和 `skills.enabled` 二次确认；不再有 public 回退。
+- outbox worker 只处理 `private:<owner>:<skill_id>`；投影 collection 名保持
+  `myflow_skills_active`，单行仍带 `owner_user_id` / `enabled` 以便过滤和审计。
+- 沙箱只做按用户私有挂载 `/mnt/skills/private -> active/users/<user>`；
+  不支持按用户挂载的 provider 不提供容器路径，只通过提示词/检索注入正文。
+- slash 激活、prompt、active context 全部只从调用者自己的 active、enabled 集合取。
+- 私有技能的用户开关只来自 `skills.enabled`；`skills_prefs.json` 不再参与 Git
+  私有技能的 prompt、slash、search 或目录响应。
+
+## 10. 迁移与清理
+
+- 旧库的 `skill_submissions / skill_releases / skill_release_batches /
+  skill_public_active / skill_settings` 以及 `skills.public_name` 不再被读取。
+- 迁移 `0011_user_isolated_skills`：
+  1. 新建 `skill_security_scans`；
+  2. 丢弃上述公共/审核表；PostgreSQL 上同时丢弃 `skills.public_name`，SQLite
+     为了不重建被外键引用的 `skills` 表而保留这个不再映射/写入的可空旧列；
+  3. 保留现有 `skills / skill_versions / skill_draft_files /
+     skill_private_active / skill_index_outbox / skill_audit_events` 数据；
+  4. 把旧的私有 active 指针保留为可用技能，删除尚未生效的公共指针。
+- 删除 `bootstrap_public_skills.py`、审核相关脚本和前端审核页面。
+- 启动时不再读取 public release 或 settings；Milvus 里旧 public 行由 outbox 对账
+  或运维 reindex 清掉。
+- 新增 `0013_skill_enabled`：`skills.enabled` 默认 true；旧私有技能迁移后默认启用。
+- 新增 `0014_skill_load_count`：`skills.load_count` 默认 0；供 Redis 启动回填和
+  无 Redis 时的 prompt 兜底排序。
+- 删除/停止写入 Git 私有技能的 `skills_prefs.json`；legacy filesystem 调试路径的
+  文件兼容代码单独标注，不属于本设计的私有技能链路。
+
+## 11. 验收标准
+
+1. 保存时 commit/push Git 成功并写入不可变版本行；Git 不可达或 push 失败时保存
+   返回错误，数据库不写版本行，暂存内容保留，页面如实展示失败原因。
+2. 用户 A 创建并保存技能后，用户 B 的 `/api/skills/mine`、`/api/skills`、
+   搜索、slash 和沙箱路径都看不到该技能。
+3. 保存后技能不出现在 `<available_skills>`，也没有 Milvus 行，状态为 unscanned；
+   Git 草稿分支已经产生新 commit。
+4. 点击安全扫描后，后端确实 import `skill_scanner`，扫描该版本不可变的 Git commit
+   内容，扫描结果写入 `skill_security_scans`，接口回显 findings。
+5. 未扫描、扫描失败或扫描不属于最新版本时，生效返回 409，不改变 active 指针。
+6. 扫描通过并点击生效后：active 指针更新、快照刷新、outbox 产生
+   `private:<owner>:<skill_id>` upsert，worker 调用 Milvus upsert。
+7. Git 不可达时保存失败且不写版本行；恢复后重试保存成功并产生新版本。
+8. 保存 v2 后 active 仍为 v1；v1 继续可检索，v2 必须重新扫描和生效。
+9. 删除技能后 active 指针和 Milvus 行被删除，其他用户/检索不再返回。
+10. 不存在任何管理员审批或公共技能路由、页面、表写入路径。
+11. 新技能默认 `enabled=true`；只有 active 技能可以切换开关；关闭后它仍出现在
+    所有者管理列表，但不出现在 prompt、slash、检索候选或 Milvus 可检索行中。
+12. Milvus 投影行与检索过滤都带 `enabled`；开关变更经过 outbox 收敛，版本
+    `index_status` 在切换后进入 pending，worker/对账最终恢复 ready。
+13. `search_skills` 只返回 `skill_id / name / description`，不返回正文；它是
+    skill-finder 的专属工具。`load_skills` 是系统内置工具，按 skill_id 返回正文。
+14. 每次成功 `load_skills` 同时增加 PostgreSQL `skills.load_count` 与 Redis
+    per-user ZSET；两者不要求同一事务，失败独立记录且不影响正文加载。
+15. 私有技能超过 10 个时，system prompt 的 `<available_skills>` 用 Redis ZSET
+    排名选择 top-10；Redis 冷启动/不可用时退回 PostgreSQL 计数，再退回稳定名称序。
+
+## 12. 2026-11-03 修订：工具拆分与使用次数
+
+### 12.1 工具拆分
+
+| 工具 | 归属 | 输入 | 输出 |
 |---|---|---|---|
-| GET | /api/skills | skills:read | 可见技能 = 公共 + 自己的私有 |
-| GET | /api/skills/mine | skills:read | 我的私有技能和公共状态 |
-| POST | /api/skills | skills:write | 创建私有草稿 |
-| GET | /api/skills/{skill_id}/draft | skills:write | 读取自己的暂存草稿 |
-| GET | /api/skills/{skill_id}/draft/tree | skills:write | 暂存文件树 |
-| GET | /api/skills/{skill_id}/draft/file?path=... | skills:write | 读暂存文件 |
-| PUT | /api/skills/{skill_id}/draft/file | skills:write | 写文本文件到暂存表 |
-| POST | /api/skills/{skill_id}/draft/files | skills:write | 上传附件到暂存表 |
-| DELETE | /api/skills/{skill_id}/draft/file?path=... | skills:write | 删除文件 |
-| POST | /api/skills/{skill_id}/draft/save | skills:write | 校验并提交到 Git，生成版本 |
-| POST | /api/skills/{skill_id}/submit | skills:write | 提交审核 |
-| POST | /api/skills/{skill_id}/withdraw | skills:write | 撤回 pending 提交 |
-| DELETE | /api/skills/{skill_id} | skills:write | 删除私有草稿；pending 时 409，需先撤回；公共版本不受影响 |
-| GET | /api/skills/{skill_id}/versions | 所有者或 admin | 版本历史 |
-| PUT | /api/skills/{skill_id}/preference | skills:read | 个人开关（JSON，按 skill_id） |
+| `search_skills` | 仅 `skill-finder` 子代理 | `task_query` / `domain_keywords` | `[{skill_id, name, description}]`，不含正文 |
+| `load_skills` | 系统内置工具，lead 和普通 agent 始终可用 | `skill_id` | `{"skill": {skill_id, name, description, scope, path, body}, "message"}` |
 
-### 9.2 管理员审核
+- `search_skills` 只做召回和元数据返回；不读取正文到返回体，不增加使用次数。
+- `load_skills` 按 owner + active + enabled 校验后读取 SKILL.md 正文（frontmatter
+  已剥离，元数据由字段返回），再计入使用次数。正文不截断；它是“加载即激活”的入口。
+- `skill-finder` 的系统提示词和 description 改为：用 `search_skills` 找候选，
+  交回 `skill_id / name / description / 匹配理由`；正文由 lead 调 `load_skills`，
+  不再让子代理 read_file 或搬运正文。
+- `load_skills` 进入 `ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES` 和 durable-context
+  的 loader 工具集合；`search_skills` 不进 always-available，由 skill-finder 认领。
+- prompt 私有技能行增加 `id=<skill_id>` 与 `path=<container_file>`，lead 可以直接
+  用 id 调 `load_skills`，不需要再解析路径。
+- 内置技能不进入 `search_skills` / `load_skills`；内置发现仍走索引、read_file 或 slash。
+- legacy filesystem source 的 `skill_id` 用技能名充当；不计入数据库/Redis 使用次数。
 
-| Method | Path | 权限 | 说明 |
-|---|---|---|---|
-| GET | /api/admin/skills/reviews | admin | 审核队列，按提交时间 |
-| GET | /api/admin/skills/reviews/{submission_id} | admin | 详情、diff、文件列表 |
-| POST | /api/admin/skills/reviews/{submission_id}/approve | admin | 批准并创建公共 release |
-| POST | /api/admin/skills/reviews/{submission_id}/reject | admin | 驳回，写理由 |
-| POST | /api/admin/skills/{skill_id}/unpublish | admin | 下架公共技能 |
-| POST | /api/admin/skills/{skill_id}/activate | admin | 回滚到历史公共 release |
-| PATCH | /api/skills/{skill_id} | admin | 全局启停 |
-| POST | /api/skills/reload | admin | 刷新本进程快照 |
+### 12.2 PostgreSQL 使用次数
 
-### 9.3 响应形状
+- `skills.load_count`：Integer，默认 0，只对非内置、非软删除技能计数。
+- `load_skills` 成功返回正文后调用 store 的原子自增；失败只记日志，不阻断加载。
+- 启动回填、Redis 丢失恢复都从这张表读取，不另建队列表。
 
-技能列表项至少包含：
+### 12.3 Redis ZSET
 
-- skill_id、name、scope、description；
-- skill_version、version_id、git_commit、skill_path；
-- owner_user_id（只对本人/admin 返回）、enabled、global_enabled（admin）；
-- review_status（本人/admin）；
-- container_file（私有技能只对所有者返回）。
+- key：`<skills.usage.key_prefix>:<user_id>`，默认
+  `myflow:skills:usage:<user_id>`。
+- member：internal `skill_id`；score：非负整数使用次数。
+- `load_skills`：先/后独立执行 `ZINCRBY` 与 DB 自增；没有跨系统事务，任一失败
+  只记录并继续。Redis 成功后刷新本进程的 top-K 缓存。
+- 启动：`SkillRuntime.start()` 调度一个异步任务，从
+  `skills.load_count > 0` 的行读出 `(owner_user_id, skill_id, load_count)`（技能表规模
+  有限，一次读完即可），按用户分组用 `ZADD ... GT` 写入 Redis，避免把 Redis 中更新的
+  计数降回去；随后为这些用户预热 top-K 缓存。启动流程不等待它完成。
+- 刷新：后台按 `skills.usage.refresh_seconds` 从 Redis 重读已知用户的 top-K，
+  让多 worker 的 prompt 缓存最终一致。
+- Redis 不可用：记 warning，`load_skills` 仍读正文并尝试写 DB；prompt 使用 DB
+  `load_count` 兜底，不因为缓存不可用而隐藏技能。
 
-审核详情包含版本、commit、文件树、diff、frontmatter、allowed-tools、required-secrets、
-作者、提交时间。
+### 12.4 Prompt top-10
 
-## 10. 前端工作台
+- 私有 active + enabled 技能总数 ≤ 10：全部渲染。
+- 超过 10：优先按 Redis ZSET 的 top-10 skill_id 选择；返回不足 10 个（冷启动、
+  已删除、已关闭）时用 DB `load_count` + 稳定名称序补齐。
+- 内置技能始终保留，不占私有技能 top-10 名额，也不写入使用次数。
+- prompt builder 是同步路径，不能直接 await Redis；它读取由 `SkillUsageService`
+  从 Redis 水合的进程内 top-K 缓存。缓存冷/不可用时按 DB 计数兜底。缓存 key 包含
+  选中的技能身份，不包含易变的原始计数文本。
 
-### 10.1 我的技能
-
-- 列表：私有/公共、审核中/已驳回/已通过、最后版本、更新时间；
-- 新建：名字、描述、初始 SKILL.md；
-- 编辑器：Markdown 正文、文件树、文本文件编辑、附件上传/删除、预览；
-- 操作：保存（生成版本）、提交审核、撤回、删除私有草稿；
-- 状态：未保存、保存中、索引中、可检索、审核中、已驳回、已通过。
-
-### 10.2 管理审核台
-
-- 待审核列表：作者、技能、版本、提交时间；
-- 详情：diff 当前公共版本、文件树、脚本内容、frontmatter、allowed-tools、
-required-secrets、包大小；
-- 批准：检查 public_name 冲突，创建公共 commit；
-- 驳回：必填理由；
-- 公共技能管理：下架、回滚、全局开关。
-
-### 10.3 可见技能页
-
-现有技能设置页改为显示公共技能 + 本人私有技能；私有项标记“私有”，公共项按现有
-全局/个人开关显示。
-
-## 11. 配置
+### 12.5 配置
 
 ~~~yaml
 skills:
-  creation:
+  usage:
     enabled: true
-    max_drafts_per_user: 20
-    max_pending_submissions_per_user: 5
-    max_package_bytes: 5242880
-    max_file_bytes: 1048576
-    max_files: 200
+    redis_url: $REDIS_URL      # 留空则退回 DB 计数模式
+    key_prefix: myflow:skills:usage
+    prompt_top_k: 10
+    refresh_seconds: 30
+~~~
 
-  git:
-    repository: "git@github.com:org/myflow-skills.git"
-    public_branch: main
-    draft_ref_prefix: "refs/heads/myflow/drafts"
-    cache_dir: ".myflow/skills"
-    ssh_key_path: "$SKILLS_GIT_SSH_KEY_PATH"
-    known_hosts_path: "$SKILLS_GIT_KNOWN_HOSTS"
-    command_timeout_seconds: 120
+Redis 客户端由 gateway lifespan 持有并按 runtime 关闭；不把 Redis URL 或连接对象
+暴露给前端。加载次数累加不是强一致事务：Redis 排名、DB 持久化和 prompt 缓存之间的
+短暂偏差是设计允许的，最终由启动回填 + 周期刷新 + DB 兜底收敛。
 
-  review:
-    require_admin: true
-    allow_self_approval: true
+## 13. 2026-11-04 修订：投影 collection 的自愈
 
+### 13.1 事故形态
+
+`myflow_skills_active` 存在但没有向量索引时，`load_collection` 返回 700
+`index not found`，异常被包成 `ProjectionUnavailable`。旧实现把"集合存在"当成
+"集合可用"：已存在的分支只调用一次 load 就去写向量，于是
+
+1. 首次创建走 `create_collection(..., index_params=...)`，索引那一步失败（或 load
+   与索引可见性抢跑）时集合已经落库，却没有任何向量索引；
+2. 之后的每次重试都命中"已存在 → 只 load"，必然以同样的 700 失败；
+3. 该 outbox 事件按退避重试到上限后被判为终止，版本 `index_status` 停在
+   `failed`，技能版本永远没有进向量索引；
+4. 只删集合不解决问题：下一次重试会再建出一个没有索引的集合，复现同一条失败路径。
+
+### 13.2 不变式
+
+任何一次写/查之前，"可用集合" = **存在** ∧ **schema 维度匹配** ∧ **embedding 向量
+索引存在** ∧ **已 load**。集合存在不再是可用的充分条件。
+
+### 13.3 修复规则
+
+1. **已存在的集合先自检再 load**：`describe_collection` 校验 embedding 维度；
+   再用 `list_indexes` / `describe_index` 确认 embedding 上真的有索引。
+   缺失就补建（embedding 索引 + `scope` / `owner_user_id` / `enabled`
+   的 INVERTED 标量索引），再 load。
+2. **load 抛 700 时补建索引并重试一次**：覆盖"索引刚建好还不可见"和"集合被手工
+   动过"两种情况；第二次仍失败就按普通失败处理，交给 outbox 退避。
+3. **新建不留半成品**：`create_collection` 只建 schema（不再把 `index_params`
+   塞进创建调用），随后显式 `create_index` → `load`。创建链路任何一步失败都丢弃
+   刚建出来的集合（`drop_collection`，尽力而为），避免"没有索引的幽灵集合"。
+4. **补建索引前先 release**：Milvus 不允许给已 load 的集合建索引；release 失败
+   （通常本来就没 load）按正常情况处理。并发 worker 撞到"index already exist"
+   视为成功，不报错。
+5. **健康集合不重建索引**：`describe_index` 显示 embedding 索引存在时只 load，
+   不产生额外写操作；索引类型/参数不匹配（例如换过 index_type）不在自愈范围内，
+   需要运维重建 collection。
+
+### 13.4 已经卡住的版本怎么恢复
+
+- 索引补齐后，下一次 `SkillIndexOutboxWorker.reconcile()` 会因为
+  `index_status != ready`（或投影 key 缺失）重新 embedding 并 upsert，把版本带回
+  `ready`；不需要人工 reindex，也不需要删集合。
+- 已经耗尽重试的 outbox 事件不会被"复活"——事件只是提示，权威来源是 active 指针
+  加 `index_status`。
+- 首轮对账用 `min(reconciliation_interval, 30s)` 的延迟，而不是先等一整个周期：
+  部署重启后约 30 秒就会把 `index_status != ready` 的版本修回来，之后的轮次仍按
+  `skills.index.reconciliation_interval_minutes`（默认 10 分钟）运行。
+- 运维动作：部署新代码并重启网关即可，集合不需要手工删除，也不需要人工 reindex；
+  在首轮对账之前，任何一次写/查同样会先把索引补上（自愈在投影内部，不依赖对账）。
+
+
+## 14. 2026-11-04 修订：对账规模化
+
+技能数、版本数、worker 数任一变大，§13 那套“每轮全量比对”就会先撑不住：一轮
+`list_all_versions()` + 一次全量 Milvus 主键 query（`limit=16384`，超出即截断）
++ 一次本地目录 walk，按 10 分钟节奏空转。本节把对账拆成**快路径 + 低频巡查**，
+并把提交缓存的清理改成事件驱动。
+
+### 14.1 权威信号
+
+- PostgreSQL 的 `skill_versions.index_status` 是“这一版该不该在 Milvus 里”的权威标记：
+  成功 upsert 之后写 `ready`，失败写 `failed`。
+- Milvus 主键集合只用来发现**静默丢失**（集合被清空、被手工动过）：低频事件，
+  不该占用 10 分钟节奏。
+- 因此**每轮只处理 `index_status != ready` 的行，不扫 Milvus**。
+
+### 14.2 快路径（默认 10 分钟）
+
+1. 一条索引查询取出到期需要修复的 active 版本：`index_status IN
+   ('pending', 'failed', 'unindexed')` 且 `index_next_attempt_at IS NULL OR
+   index_next_attempt_at <= now()`，按 `index_next_attempt_at`（NULL 优先）、
+   `version_seq` 排序。
+2. 逐行 embedding + upsert；**写前复核 active 指针**（语义不变），成功后写 `ready`，
+   并把 `index_attempts / index_last_error / index_next_attempt_at` 清零。
+3. 失败写 `failed`，记 `index_attempts += 1`、`index_last_error`（截断）、
+   `index_next_attempt_at = now + min(60s * 2^(attempts-1), 1h)`。坏行不会每轮吃满
+   预算，也不会饿死后面的行。
+4. **预算**：每轮最多 `repair_budget_rows`（默认 500）行、`repair_budget_seconds`
+   （默认 180 秒），先到为准；没修完的下一轮继续。本轮不做批量 embedding，
+   所以“集合被清空”后的重建是每行一次 provider 调用：5000 行约 2–3 轮；预算调小
+   会显著拉长恢复时间，配置时要注意这一条。
+5. `index_attempts` 超过 `repair_max_attempts`（默认 8）后不再自动重试，留 `failed`
+   等管理端重新生效或运维处理。
+
+### 14.3 完整性巡查（默认 60 分钟，首轮 5 分钟内）
+
+1. `SkillProjectionStore.iter_projection_keys()`：用 `query_iterator(batch_size=1000)`
+   流式读主键，**不再有 16384 截断**。
+2. 把 active 指针按 `private:<owner>:<skill_id>` 建索引；“active 有、Milvus 没有”的
+   key 只把对应版本标回 `pending`，交给快路径带预算修复（巡查自己不做 embedding）。
+3. Milvus 有、active 与 pending outbox 都没有的 key → 删除（孤儿行）。
+4. 同样受 `verify_budget_rows / verify_budget_seconds` 约束，可中断。
+5. 首轮延迟 `min(interval, 300s)`：集合被清空这类静默丢失不该等一整小时才发现。
+
+### 14.4 分布式锁（每轮互斥，不是选主）
+
+- 快路径与巡查各自跑在 `pg_try_advisory_lock` 下，key 由
+  `sha256("skill-index-reconcile:<collection>")` / `"...:verify:<collection>"` 取前 8
+  字节转 int64。抢不到就跳过本轮（`skipped_due_to_lock`），不排队。
+- 复用 `skills/author.py::_skill_lock` 的写法：专用连接（`bind.connect()`）、抢到后
+  `commit()` 结束隐式事务、`finally` 显式 `pg_advisory_unlock`。不要用
+  `pg_advisory_xact_lock`：那会把整轮（含 embedding 与 Milvus 写）包进一个 PG 事务，
+  违反“Milvus 写不发生在 PG 事务里”的既有约束。
+- 非 PostgreSQL（SQLite 测试、本地调试）直接放行，不起锁。
+- 配置 `skills.index.maintenance_lock`（默认 true）；单 worker 部署也只是一次多余 RPC。
+
+### 14.5 提交缓存：事件驱动清理
+
+- **删除周期性 `prune()`**：它每轮做全量集合比对（全表版本 + 全量 Milvus 主键 +
+  目录 walk），收益只是磁盘上界，不值得占对账节奏。
+- 缓存缺失不是错误：`SkillContentStore.ensure()` 本来就是“本地没有就从 Git 物化”，
+  `read_text` / `read_bytes` 都会走到它。提交缓存只是缓存，删掉不影响正确性。
+- 清理时机改成事件驱动：保存新版本、删除技能时，只对该技能计算保留集（active、
+  pending outbox、最近 `retention.keep_versions_per_skill` 版），把不在保留集、且比
+  `retention.cache_ttl_days` 更旧的提交目录删掉。只处理该技能名下的提交，绝不做
+  全目录扫描，也不会误删别的技能的缓存。
+- Milvus 孤儿行不再由周期性 prune 负责：删除技能已有 `delete_active` 事件，残余
+  孤儿交给 §14.3 的巡查处理。
+
+### 14.6 配置
+
+~~~yaml
+skills:
   index:
-    outbox_poll_seconds: 2          # worker 轮询间隔
-    catalog_poll_seconds: 5         # 跨 worker epoch 轮询；0 = 单 worker
-    reconciliation_interval_minutes: 10   # 对账 + 清理周期
-
-  search:
-    enabled: true
-    candidate_k: 20                 # 每路召回交给融合的候选数，也是精排上限
-    top_k: 3
-    rrf_k: 60                       # 向量名次与 BM25 名次的融合常数
-    min_score: null                 # 作用在融合分数上；null = 不过滤
-    max_body_chars: 6000            # 装载进上下文的单个正文预算
-    max_context_chars: 12000
-    keyword:                        # 稀疏通道：读正文，本地 BM25
-      enabled: true
-      bm25_k1: 1.2
-      bm25_b: 0.75
-      keyword_weight: 2.0
-      name_weight: 3.0
-    embedding:                      # 稠密通道：只嵌 name + description（§7.2）
-      enabled: true
-      base_url: "$EMBEDDING_BASE_URL"
-      path: /embeddings
-      api_key: "$EMBEDDING_API_KEY"
-      model: Qwen/Qwen3-Embedding-8B
-      dimensions: 4096
-    vector_store:
-      provider: milvus
-      uri: "$MILVUS_URI"
-      token: "$MILVUS_TOKEN"
-      collection: myflow_skills_active
-      metric_type: COSINE
-      index_type: AUTOINDEX
-      consistency_level: Strong
-    rerank:                         # 终排：读正文的 cross-encoder
-      enabled: false                # 打开时 base_url 与 model 必填
-      protocol: cohere              # cohere | tei
-      base_url: "$RERANK_BASE_URL"
-      path: /rerank
-      api_key: "$RERANK_API_KEY"
-      model: Qwen/Qwen3-Reranker-8B
-      max_document_chars: 4000      # 送进精排的单个正文上限
-      timeout_seconds: 30
-      max_retries: 1
-
+    outbox_poll_seconds: 2
+    catalog_poll_seconds: 5
+    reconciliation_interval_minutes: 10   # 快路径
+    maintenance_lock: true                # pg_try_advisory_lock 每轮互斥
+    repair_budget_rows: 500
+    repair_budget_seconds: 180
+    repair_max_attempts: 8
+    verify_interval_minutes: 60           # 完整性巡查
+    verify_budget_rows: 5000
+    verify_budget_seconds: 300
   retention:
     keep_versions_per_skill: 20
     cache_ttl_days: 30
 ~~~
 
-- search.enabled=true 时 embedding.base_url 和 vector_store.uri 必填；关掉向量后
-  检索仍有 BM25 通道（只依赖 PG + Git 缓存，不需要任何外部服务）；
-- keyword.enabled=false 且 embedding.enabled=false 时 search 退化为“没有任何召回通道”，
-  启动时直接报配置错误；
-- rerank.enabled=true 时 base_url 与 model 必填；精排失败只回退融合顺序；
-- git.write 需要服务端可写部署密钥；普通用户永远拿不到该密钥；
-- 创建/审核默认开启；关闭 creation 后只有 admin 能创建；
-- 代码中没有任何默认服务地址。
+### 14.7 迁移
 
-## 12. 安全、审计与配额
+- `0015_skill_index_repair`：`skill_versions` 新增 `index_attempts INTEGER NOT NULL
+  DEFAULT 0`、`index_last_error VARCHAR(255) NULL`、`index_next_attempt_at TIMESTAMP
+  WITH TIME ZONE NULL`，并为 `index_status` 建索引（快路径与运维查询共用）。
+- 旧行 `index_attempts=0`、`index_next_attempt_at=NULL`，迁移后即可被快路径拾取。
 
-### 12.1 私有隔离
+### 14.8 本轮不做的部分
 
-- PostgreSQL：所有作者接口按 owner_user_id 过滤；admin 只能通过审核接口读取待审内容；
-- Git：草稿分支只由服务端访问；管理员/运维通过审核页读取；
-- Milvus：私有 active 行带有 owner_user_id，检索只查当前用户 owner 的 scope=private 行；
-  命中后再次按 owner_user_id 确认；其他用户无法构造请求拿到私有版本；
-- Sandbox：私有目录按用户挂载；不支持按用户挂载时不暴露 container_file；
-- 暂存表只允许 owner 读写；审核只读已提交版本；日志、错误、审计不记录私有正文和附件内容。
-
-### 12.2 不可信内容
-
-- 服务端绝不执行用户脚本；只在审核页展示；
-- 只允许常规文件，拒绝符号链接、硬链接、设备文件、路径逃逸；
-- 限制包大小、文件数、单文件大小、文件名长度和扩展名；
-- 审核是公共技能的信任边界；审核页必须看到脚本和附件，不能只看 SKILL.md；
-- 公共技能正文仍然作为不可信数据注入，沿用当前的提示注入防护。
-
-### 12.3 审计和配额
-
-- 审计：创建、保存、提交、撤回、批准、驳回、下架、回滚、全局开关、删除；
-- 草稿保存的完整内容历史由 Git commit 记录；
-- 配额：每用户草稿数、待审数、总字节、文件数；超限返回 429/422；
-- 失败信息脱敏，不泄漏其他用户内容。
-
-## 13. 失败恢复与保留
-
-- 保存时 Git commit 成功、PG 写入失败：留下未引用的草稿 commit，不激活；重试可复用；
-- Git 失败：不创建版本，暂存表保留未提交内容；
-- active projection 写入失败：版本仍可被作者通过 slash/read 使用，但不能被检索；
-  index_status=failed/outbox 重试，管理端可见；提交/批准不被阻断，公共技能通过
-  prompt/slash 可用，检索在 outbox/对账恢复后自动加入；
-- search.enabled=false：不要求 active projection，提交/批准仍可用；技能靠
-  prompt/slash/read；
-- 复用旧版本但 active 行已被清理/替换：重新激活时重新 embedding 并 upsert，不依赖
-  旧向量；
-- 嵌入文本/模型/维度变化：视为数据迁移，必须调 POST /api/admin/skills/reindex 触发
-  全量重建（§7.6）；对账在稳态会跳过健康行，因此不会自愈；
-- 批准时 Git commit 成功、PG 失败：公共 commit 成为未引用对象，不改变 public_active；
-管理员可重试，重试检测同一 source_commit 并复用；
-- PG 不可用：所有技能操作 fail-closed；
-- Milvus 不可用：检索降级到 BM25，公共/私有可见性仍由 PG 决定；
-- 多 worker：保存按 skill advisory lock；批准按公共分支锁；Git 保存前 fetch 远端分支、
-保存后 push；没有跨请求的本地工作区；启动时只清理自己能确认失联的暂存任务/批次；
-- 保留：skills、versions、submissions、releases、audit 永久保留；公共 main 历史永久；
-  Milvus 只保留 active projection 行，不保留历史版本向量；commit 内容缓存保留 active、
-  待审和最近 N 个版本（默认 20）；旧版本回滚时从 Git 重新 embedding；
-- 草稿分支历史由 Git 保留；用户删除草稿时删除暂存表和私有指针，不重写 Git 历史；
-skills.deleted_at 只隐藏私有草稿，公共 release 和 public_active 不受影响。
-
-## 14. 测试计划
-
-### 14.1 单元
-
-- 版本生成：相同内容复用版本；内容/附件变化升版；路径排序稳定；
-- 包校验：重名、坏 frontmatter、路径逃逸、符号链接、超大文件、空包；
-- 审核状态机：pending 不可编辑、撤回、驳回、重新提交、批准；
-- 私有/公共指针分离：批准后编辑不改变公共版本；
-- 可见集合：公共 + 自己的私有；私有优先；他人私有不可见；
-- 检索确认：伪造/过期/他人私有 version_id 被拒绝；
-- 一次 Milvus OR 检索：公共分支排除本人私有 skill_id，私有分支按 owner 过滤；
-  同一 skill_id 不会返回公共/私有两条；作者侧无条件私有优先；
-- active projection 的 scope/owner/enabled 过滤器不超过简单表达式；
-- 公共与私有版本 embedding 高相似时仍只返回一个技能；
-- embedding 文本只由 name + description 组成，正文变化不触发重新 embedding；
-- 融合：两路名次按 rrf_k 合成，min_score 作用在融合分数上；私有去重发生在融合与
-  精排之前，精排无法把公共副本排到作者私有副本之前；
-- 精排：文档按 max_document_chars 截断；精排失败回退融合顺序并带 warning；
-- 降级矩阵：向量不可用 → 纯 BM25；BM25 不可用 → 纯向量；两者都不可用 → 空结果 + 原因；
-- 重建：reconcile(force=True) 会重写健康行；不 force 时健康行不重新 embedding。
-
-### 14.2 集成
-
-- 临时 Git 仓库：创建草稿、写暂存表、保存 commit、附件、提交、批准复制到 main；
-- 多 worker 保存：不同实例都能读取暂存表，保存时 fetch/push 不丢提交；
-- 批准 commit 与 source_commit 的关系；作者删除草稿后公共版本仍可读；
-- 发布 v1、作者编辑 v2：公共 v1 不变，作者搜索优先 v2；批准 v2 后公共切换；
-- 管理员驳回后作者仍可用私有版本；
-- 管理员下架/回滚后可见性变化；
-- active projection 重建、outbox 重试/对账、缓存删除、索引失败恢复；
-- 换投影文本版本后：重建前检索可能命中旧向量、重建后与 PG 一致；管理员 reindex 接口
-  返回修复/删除计数并记审计；
-- 精排按正文提高“正文里出现报错原文”的命中名次（用固定分数替身断言，不依赖真模型）；
-- 多用户隔离：A 无法通过 API/检索/文件路径读到 B 的私有包；
-- 权限：普通用户不能审核/下架/全局开关；admin 可以；
-- 版本复用但 active projection 被清理/索引失败时，提交/批准仍可用，outbox 重建后
-  检索恢复；
-- search 关闭时作者/管理员流程仍可用；
-- 下架/回滚对下一次 run 生效，当前 run 不被假装撤回；
-- public_name 首次批准后不可变，作者改 private_name 不影响公共路径。
-
-### 14.3 安全
-
-- Git 命令注入、分支名注入、文件路径注入；
-- 符号链接、硬链接、设备文件、tar/zip 炸弹；
-- 附件类型/大小/数量限制；
-- 私有内容不出现在其他用户的 prompt、检索结果、sandbox；
-- 审核页只对 admin 开放；
-- 凭据不出现在日志、API、数据库。
-
-## 15. 实施顺序
-
-1. **数据模型**：skills / versions / submissions / releases / active / settings / audit，
-
-   Alembic 迁移，内部 UUID 与名字约束；
-2. **Git 服务端写入**：bare mirror、临时 worktree、fetch/push、保存 commit、附件校验、
-
-   暂存表与分支锁；
-3. **作者 API/UI**：创建、文件树、编辑、保存、提交、撤回、版本历史；
-4. **审核 API/UI**：队列、diff、批准/驳回、公共 main commit、审计；
-5. **向量投影**：active projection collection、outbox worker、私有/公共 active 行、
-   回滚重嵌入、对账/reindex；
-6. **检索**：PG 可见集合 → Milvus → PG 批量确认 → Git 正文；
-7. **运行时**：按用户快照、提示词索引、slash、私有挂载、公共挂载；
-8. **迁移与测试**：旧 JSON 开关、bootstrap 导入、并发/安全/端到端测试。
-
-## 16. Builder calls
-
-1. skill_id 使用内部 UUID；private_name 按 owner 唯一；public_name 全局唯一。
-2. 首次批准时 public_name 取 private_name；冲突则批准 409，要求作者改名后重新提交。
-3. 一个用户一个草稿分支，技能路径用 skill_id；每次保存生成一个 commit/version。
-4. 编辑先写 PostgreSQL 的 skill_draft_files 暂存表；点击保存才 commit 到 Git；
-
-   未保存内容不是技能版本，也不参与检索/审核。
-5. 审核针对不可变 version + draft_commit；pending 期间禁止编辑，必须先撤回。
-6. 批准复制完整技能目录到 main，公共 release 的 git_commit 是 main 批准 commit；
-
-   source_commit 保留草稿 commit。
-7. 私有版本也进入 active projection；可见性由 scope/owner 过滤 + PostgreSQL 确认控制。
-8. active projection 每个公共/私有技能只保留一行，不保留历史版本向量；回滚时重新
-   embedding；同一版本可同时有 public/private 两行，按 skill_id 去重。
-9. 公共和私有同名时作者侧私有优先；公共技能仍可被工具检索。
-10. 管理员可以审核自己的提交（allow_self_approval=true），审计记录 self_approved。
-11. 管理员下架/回滚只改公共指针，不删除 release 或 Git 历史。
-12. V1 单仓库；草稿分支和 main 在同一仓库；普通用户没有 Git 凭据。
-13. 私有 sandbox 路径按用户挂载；provider 不支持时不暴露容器的私有路径。
-14. 旧公共技能通过显式 bootstrap 导入为 admin 所有、已批准；不自动扫描旧目录。
-15. 保留策略：元数据/公共历史永久；Milvus 只保留 active 行；内容缓存保留 active、
-    待审和最近 20 个版本。
-16. 个人偏好按 skill_id 存 JSON；全局开关按公共 skill_id 存 PostgreSQL。
-17. Milvus 默认 Strong consistency；PG 确认使用一条批量 JOIN，不做 N+1。
-18. 暂存表用 PG 而不是本地工作区，保证多 worker 下未保存编辑不丢；保存前 fetch、
-
-    保存后 push 远端草稿分支。
-19. 管理员审核只读已提交的 version/submitted_commit，不读 skill_draft_files 暂存表。
-20. private_name 不得与其他技能已占用的 public_name 冲突（同一 skill 除外）。
-21. 提交记录保存 submitted_commit（提交时草稿 HEAD）；审核/批准用它，而不是版本最早的
-    draft_commit；重新激活版本时重新 embedding 并 upsert active projection。
-22. 向量索引不是提交/批准的硬门槛；search 关闭或索引失败时，技能仍靠 prompt/slash/read
-
-    可用，检索恢复后自动加入。
-23. 生产只认 Git 目录，不合并本地 skills/ 扫描；source=filesystem 仅用于测试/本地调试。
-24. public_name 首次批准后固定；V1 不提供公共改名，改名需下架后作为新技能重新发布。
-25. 下架/回滚对下一次 run/检索生效；当前 run 已注入正文无法撤回，不承诺强撤稿。
-26. 检索只发一次 Milvus search：公共分支排除本人私有 skill_id，私有分支按 owner 过滤；
-    作者侧无条件私有优先，不考虑分数高低，也不提供 scope 切换参数；不拼大 version_id IN。
-27. outbox 与业务状态同事务写入，worker 幂等更新 Milvus；对账任务修复缺失/孤儿行。
-
-## 17. 备选方案与取舍
-
-| 方案 | 放弃原因 |
-|---|---|
-| 每个用户一个独立 Git 仓库 | 隔离更强，但管理员审核、公共合并、部署凭据和仓库数量都成倍复杂；V1 用单仓库 + 用户分支 |
-| 未审核内容只放数据库/对象存储，批准后才进 Git | 草稿版本、附件和 diff 会分裂成两套存储；Git 的提交历史和审核追溯更有价值 |
-| 批准时只切换可见性，不复制到 main | 公共技能依赖用户草稿分支，作者删除分支/改历史会破坏公共内容；复制到 main 才能形成不可变公共目录 |
-| 管理员整仓发布 tag | 与普通用户逐技能创作/审核冲突；V1 改为按版本的审核批准 |
-| 只索引公共技能，私有草稿只用 slash/read | 不满足“未审核草稿也要被作者检索和使用”的要求 |
-
-**结论**：采用“单仓库 + 用户草稿分支 + main 公共目录 + PostgreSQL 审核/激活账本 +
-Milvus active projection + outbox”的方案。
+- **批量 embedding**：每行一次 provider 调用；预算足够大时恢复时间可接受。
+- **指标设施**：不引入 Prometheus/OTel；每轮写一条 INFO 汇总
+  （`scanned / repaired / failed / deleted / seconds / skipped_due_to_lock`）。

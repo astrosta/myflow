@@ -167,8 +167,6 @@ def test_admin_only_routes(config_path, monkeypatch):
         ("patch", "/api/mcp/config", {"name": "github", "enabled": False}),
         ("post", "/api/mcp/cache/reset", None),
         ("post", "/api/skills/reload", None),
-        ("patch", "/api/skills/foo", {"enabled": False}),
-        ("get", "/api/skills?scope=global", None),
     ]
 
     for method, url, body in calls:
@@ -177,10 +175,10 @@ def test_admin_only_routes(config_path, monkeypatch):
         assert response.json()["code"] == "permission_denied"
 
 
-def test_reload_is_declared_before_the_skill_id_route(config_path, monkeypatch):
+def test_reload_is_declared_before_the_parameterized_skill_route(config_path, monkeypatch):
     paths = [route.path for route in skills.router.routes]
 
-    assert paths.index("/skills/reload") < paths.index("/skills/{skill_id}")
+    assert paths.index("/skills/reload") < paths.index("/skills/{skill_id}/preference")
     response = _client(monkeypatch).post("/api/skills/reload")
 
     assert response.status_code == 200
@@ -225,41 +223,13 @@ def test_personal_preference_needs_the_enabled_field(config_path, monkeypatch):
     assert response.json()["code"] == "invalid_request"
 
 
-def test_an_unknown_skill_is_404_on_both_switches(config_path, monkeypatch):
-    client = _client(monkeypatch, ADMIN, user_id="alice")
+def test_an_unknown_skill_preference_is_404(config_path, monkeypatch):
+    client = _client(monkeypatch, SKILLS_READ, user_id="alice")
 
-    global_patch = client.patch("/api/skills/ghost", json={"enabled": False})
-    client.identity.as_(SKILLS_READ, user_id="alice")
     preference = client.put("/api/skills/ghost/preference", json={"enabled": False})
 
-    assert global_patch.status_code == 404
-    assert global_patch.json()["code"] == "skill_not_found"
     assert preference.status_code == 404
     assert preference.json()["code"] == "skill_not_found"
-
-
-def test_scope_global_shows_the_global_value_to_admins(config_path, monkeypatch):
-    _write_skill(Path(config_path).parent, "foo")
-    admin = _client(monkeypatch, ADMIN | SKILLS_READ, user_id="alice")
-
-    admin.patch("/api/skills/foo", json={"enabled": False})
-
-    effective = admin.get("/api/skills").json()["skills"][0]
-    global_view = admin.get("/api/skills?scope=global").json()["skills"][0]
-    assert effective["enabled"] is False and effective["global_enabled"] is None
-    assert global_view["global_enabled"] is False
-    assert _disk(config_path)["skills"] == {"foo": {"enabled": False}}
-
-
-def test_the_global_switch_does_not_touch_mcp_servers(config_path, monkeypatch):
-    _write_skill(Path(config_path).parent, "foo")
-
-    response = _client(monkeypatch).patch("/api/skills/foo", json={"enabled": False})
-
-    assert response.status_code == 200
-    disk = _disk(config_path)
-    assert set(disk["mcpServers"]) == {"github"}
-    assert disk["mcpInterceptors"] == ["ops.Interceptor"]
 
 
 def test_get_masks_every_secret(config_path, monkeypatch):
@@ -317,7 +287,9 @@ def test_cache_reset_reports_this_worker_only(config_path, monkeypatch):
 
 
 def test_an_illegal_skill_name_is_422(config_path, monkeypatch):
-    response = _client(monkeypatch).patch("/api/skills/bad%20name", json={"enabled": False})
+    response = _client(monkeypatch, SKILLS_READ).put(
+        "/api/skills/bad%20name/preference", json={"enabled": False}
+    )
 
     assert response.status_code == 422
     assert response.json()["code"] == "invalid_request"

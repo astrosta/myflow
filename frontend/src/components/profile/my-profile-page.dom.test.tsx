@@ -213,8 +213,9 @@ describe("我的画像：全字段表单", () => {
     fireEvent.change(screen.getByLabelText("语言偏好"), { target: { value: "en" } });
     fireEvent.change(screen.getByLabelText("偏好语气"), { target: { value: "direct" } });
     fireEvent.click(screen.getByLabelText("要点"));
+    expect(screen.getByText("多个值用顿号分隔，最多 20 项")).toBeTruthy();
     fireEvent.change(screen.getByLabelText("常用工具"), {
-      target: { value: "FastAPI, Postgres" },
+      target: { value: "FastAPI、Postgres" },
     });
     fireEvent.click(screen.getByRole("button", { name: "保存修改" }));
 

@@ -6,6 +6,7 @@ package-initialization cycle between MemoryConfig and the memory package.
 
 from agentkit.config.openviking_memory import (
     DEFAULT_MEMORY_TYPES,
+    DEFAULT_SESSION_MEMORY_TYPES,
     CaptureConfig,
     CaptureStreamConfig,
     OpenVikingMemoryConfig,
@@ -13,6 +14,7 @@ from agentkit.config.openviking_memory import (
     ProfileSuggesterConfig,
     RetentionConfig,
     SessionPolicyConfig,
+    SessionSkillsConfig,
     idle_only_auto_commit_policy,
 )
 
@@ -20,10 +22,12 @@ __all__ = [
     "CaptureConfig",
     "CaptureStreamConfig",
     "DEFAULT_MEMORY_TYPES",
+    "DEFAULT_SESSION_MEMORY_TYPES",
     "OpenVikingMemoryConfig",
     "PersonalizationConfig",
     "ProfileSuggesterConfig",
     "RetentionConfig",
     "SessionPolicyConfig",
+    "SessionSkillsConfig",
     "idle_only_auto_commit_policy",
 ]

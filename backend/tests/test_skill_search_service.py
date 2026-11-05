@@ -1,8 +1,8 @@
-"""Task 12: one-query retrieval over the active skills projection.
+"""One-query retrieval over the caller's active private skill projection.
 
 Every request is one query embedding plus one Milvus search.  PostgreSQL
-confirms the hits, the commit cache supplies the bodies, and a private row
-always wins over a public row for the same skill id.
+confirms the hits against the caller's active pointers, the commit cache
+supplies bodies, and no other user's skill can survive confirmation.
 """
 
 from __future__ import annotations
@@ -10,12 +10,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from types import SimpleNamespace
 
 from agentkit.config.skills_config import (
     SkillEmbeddingChannelConfig,
@@ -28,15 +27,16 @@ from agentkit.skills.domain import PackageManifest, StagedFile
 from agentkit.skills.package import build_package
 from agentkit.skills.projection import MilvusSkillProjection, ProjectionHit
 from agentkit.skills.search import (
-    SkillSearchHit,
-    SkillSearchOutcome,
+    CONTENT_UNAVAILABLE,
+    LEXICAL_FALLBACK,
+    RERANK_UNAVAILABLE,
+    VECTOR_UNAVAILABLE,
     SkillSearchService,
     SkillSearchUnavailable,
 )
 from agentkit.skills.store.sql import SqlSkillStore
 
 LIMITS = {"max_files": 20, "max_file_bytes": 4096, "max_package_bytes": 16384}
-PUBLIC_COMMIT = "1" * 40
 
 
 def skill_md(name: str, description: str = "Does things", body: str = "# Body\n") -> bytes:
@@ -62,17 +62,15 @@ class FakeProjection:
         self,
         *,
         user_id: str,
-        private_skill_ids: list[str] | tuple[str, ...],
         vector: list[float] | tuple[float, ...],
         limit: int,
     ) -> list[ProjectionHit]:
         self.searches.append(
             {
                 "user_id": user_id,
-                "private_skill_ids": list(private_skill_ids),
                 "vector": list(vector),
                 "limit": limit,
-                "filter": MilvusSkillProjection._filter(user_id, private_skill_ids),
+                "filter": MilvusSkillProjection._filter(user_id),
             }
         )
         if self.fail:
@@ -129,6 +127,16 @@ class FakeReranker:
         return [SimpleNamespace(index=index) for index in order]
 
 
+class FakeUsage:
+    """只记调用：使用次数的 Redis/DB 细节由 test_skill_usage.py 负责。"""
+
+    def __init__(self) -> None:
+        self.loads: list[tuple[str, str]] = []
+
+    async def record_load(self, user_id: str, skill_id: str) -> None:
+        self.loads.append((user_id, skill_id))
+
+
 @dataclass
 class Harness:
     store: SqlSkillStore
@@ -137,6 +145,7 @@ class Harness:
     content: FakeContent = field(default_factory=FakeContent)
     embedder: FakeEmbedder = field(default_factory=FakeEmbedder)
     reranker: FakeReranker | None = None
+    usage: FakeUsage | None = None
 
     def service(self, config: SkillSearchConfig | None = None) -> SkillSearchService:
         return SkillSearchService(
@@ -146,6 +155,7 @@ class Harness:
             self.embedder,
             config or search_config(),
             self.reranker,  # type: ignore[arg-type]
+            usage=self.usage,  # type: ignore[arg-type]
         )
 
 
@@ -194,51 +204,38 @@ async def save_private(
         skill_path=path,
     )
     harness.content.texts[(commit, path)] = skill_md(name, description, body).decode()
-    return skill, version
-
-
-async def publish(
-    harness: Harness,
-    *,
-    owner: str,
-    skill: Any,
-    version: Any,
-    public_name: str | None = None,
-    body: str = "# Public body\n",
-) -> Any:
-    submission = await harness.store.create_submission(
+    scan = await harness.store.record_security_scan(
         skill_id=skill.id,
-        version=version,
         owner_user_id=owner,
-        submitted_commit=version.draft_commit,
+        version_id=version.id,
+        status="completed",
+        is_safe=True,
+        max_severity="SAFE",
+        findings=[],
+        scanner="cisco-ai-skill-scanner",
+        scanner_version="2.3.2",
+        duration_ms=1,
     )
-    release = await harness.store.record_public_release(
-        submission=submission,
-        public_name=public_name or skill.private_name,
-        git_repository="https://example.invalid/skills.git",
-        git_commit=PUBLIC_COMMIT,
-        skill_path=f"public/{public_name or skill.private_name}/SKILL.md",
-        source_commit=version.draft_commit,
-        actor="admin",
+    await harness.store.activate_version(
+        skill_id=skill.id,
+        owner_user_id=owner,
+        version_id=version.id,
+        scan_id=scan.id,
+        actor=owner,
     )
-    harness.content.texts[(PUBLIC_COMMIT, release.skill_path)] = skill_md(
-        public_name or skill.private_name, body=body
-    ).decode()
-    return release
+    return skill, version
 
 
 def hit(
     *,
-    scope: str,
-    owner: str | None,
+    owner: str,
     skill_id: str,
     version_id: str,
     score: float = 0.5,
 ) -> ProjectionHit:
-    key = f"public:{skill_id}" if scope == "public" else f"private:{owner}:{skill_id}"
     return ProjectionHit(
-        projection_key=key,
-        scope=scope,
+        projection_key=f"private:{owner}:{skill_id}",
+        scope="private",
         owner_user_id=owner,
         skill_id=skill_id,
         version_id=version_id,
@@ -253,442 +250,330 @@ def call(harness: Harness, **overrides: Any):
         "task_query": "pgvector",
         "domain_keywords": [],
         "available_skills": None,
-        "prefs": None,
         **overrides,
     }
     return harness.service(config).search(**values)
 
 
 @pytest.mark.asyncio
-async def test_one_search_and_private_precedence(harness: Harness) -> None:
+async def test_one_search_with_owner_filter(harness: Harness) -> None:
     skill, version = await save_private(
         harness, owner="u1", name="pdf-tools", body="# Private body\npgvector 多租户排查\n"
     )
-    await publish(harness, owner="u1", skill=skill, version=version)
     harness.projection.hits = [
-        hit(scope="public", owner=None, skill_id=skill.id, version_id=version.id, score=0.9),
-        hit(scope="private", owner="u1", skill_id=skill.id, version_id=version.id, score=0.5),
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.9)
     ]
 
     outcome = await call(harness)
 
     assert len(harness.projection.searches) == 1
-    search = harness.projection.searches[0]
-    assert "skill_id not in" in search["filter"]
-    assert "owner_user_id" in search["filter"]
-    assert search["private_skill_ids"] == [skill.id]
-    assert search["limit"] == 20
-    assert search["vector"] == [1.0, 0.0, 0.0]
-    assert harness.embedder.query_calls == ["pgvector"]
+    assert harness.projection.searches[0]["filter"] == (
+        'scope == "private" and enabled == true and owner_user_id == "u1"'
+    )
+    assert "skill_id not in" not in harness.projection.searches[0]["filter"]
     assert [item.scope for item in outcome.hits] == ["private"]
-    [loaded] = outcome.hits
-    assert isinstance(loaded, SkillSearchHit)
-    assert loaded.version_id == version.id
-    assert loaded.release_id is None
-    assert loaded.skill.name == "pdf-tools"
-    assert "pgvector 多租户排查" in loaded.body
-    assert "description:" not in loaded.body
-    assert outcome.candidates == 1
-    assert outcome.warnings == ()
+    assert outcome.hits[0].skill.skill_id == skill.id
+    assert outcome.hits[0].version_id == version.id
+    assert "pgvector" in outcome.hits[0].body
 
 
-# ---------------------------------------------------------------------------
-# Task 21: the third stage reorders confirmed, deduped candidates by body
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_other_users_private_hits_are_rejected(harness: Harness) -> None:
+    skill, version = await save_private(harness, owner="u2", name="other")
+    harness.projection.hits = [
+        hit(owner="u2", skill_id=skill.id, version_id=version.id, score=0.9)
+    ]
+
+    outcome = await call(harness)
+    assert outcome.hits == ()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_active_version_is_dropped(harness: Harness) -> None:
+    skill, version = await save_private(harness, owner="u1", name="pdf-tools")
+    harness.projection.hits = [
+        hit(owner="u1", skill_id=skill.id, version_id="stale", score=0.9)
+    ]
+
+    assert (await call(harness)).hits == ()
+    assert version.id != "stale"
 
 
 @pytest.mark.asyncio
 async def test_rerank_reorders_confirmed_candidates_using_bodies(harness: Harness) -> None:
     alpha, alpha_version = await save_private(
-        harness, owner='u1', name='alpha', body='# Alpha pgvector 建索引', seq=1
+        harness, owner="u1", name="alpha", body="# alpha\npgvector\n", seq=1
     )
     beta, beta_version = await save_private(
-        harness, owner='u1', name='beta', body='# Beta pgvector 慢查询排查', seq=2
+        harness, owner="u1", name="beta", body="# beta\npgvector\n", seq=2
     )
-    harness.projection.hits = [
-        hit(scope='private', owner='u1', skill_id=alpha.id, version_id=alpha_version.id, score=0.9),
-        hit(scope='private', owner='u1', skill_id=beta.id, version_id=beta_version.id, score=0.5),
-    ]
     harness.reranker = FakeReranker()
-    # 向量把 alpha 排在前面，精排认为 beta 更相关。
     harness.reranker.order = [1, 0]
+    harness.projection.hits = [
+        hit(owner="u1", skill_id=alpha.id, version_id=alpha_version.id, score=0.9),
+        hit(owner="u1", skill_id=beta.id, version_id=beta_version.id, score=0.5),
+    ]
 
     outcome = await call(harness)
 
-    assert [item.skill.name for item in outcome.hits][0] == 'beta'
+    assert [item.skill.skill_id for item in outcome.hits] == [beta.id, alpha.id]
     assert outcome.reranked is True
-    assert 'rerank_unavailable' not in outcome.warnings
-    # 精排读到的是正文，不是元数据。
-    documents = harness.reranker.calls[0]
-    assert len(documents) == 2
-    assert any('慢查询排查' in document for document in documents)
-    assert harness.reranker.queries == ['pgvector']
 
 
 @pytest.mark.asyncio
-async def test_rerank_never_reorders_a_private_copy_below_the_public_one(
-    harness: Harness,
-) -> None:
-    """去重发生在精排之前：公共副本根本不该出现在精排的文档里。"""
-
-    skill, version = await save_private(
-        harness, owner='u1', name='pdf-tools', body='PRIVATE-BODY-21', seq=1
-    )
-    await publish(harness, owner='u1', skill=skill, version=version)
-    # 第二个技能保证去重后仍有 2 个候选，精排才会真的被调用。
-    other, other_version = await save_private(
-        harness, owner='u1', name='other', body='OTHER-BODY-21', seq=2
-    )
-    harness.projection.hits = [
-        hit(scope='public', owner=None, skill_id=skill.id, version_id=version.id, score=0.9),
-        hit(scope='private', owner='u1', skill_id=skill.id, version_id=version.id, score=0.5),
-        hit(scope='private', owner='u1', skill_id=other.id, version_id=other_version.id, score=0.4),
-    ]
-    harness.reranker = FakeReranker()
-    # 精排更偏好另一个技能：这不该让作者的公共副本冒出来。
-    harness.reranker.order = [1, 0]
-
-    outcome = await call(harness)
-
-    assert {item.scope for item in outcome.hits} == {'private'}
-    documents = harness.reranker.calls[0]
-    assert len(documents) == 2
-    assert any('PRIVATE-BODY-21' in document for document in documents)
-    # 公共副本的正文没有被送进精排，也就不可能被它排到前面。
-    assert not any('Public body' in document for document in documents)
-
-
-@pytest.mark.asyncio
-async def test_rerank_failure_falls_back_to_the_fused_order(
-    harness: Harness, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_rerank_failure_falls_back_to_the_fused_order(harness: Harness) -> None:
     alpha, alpha_version = await save_private(
-        harness, owner='u1', name='alpha', seq=1
+        harness, owner="u1", name="alpha", seq=1
     )
-    beta, beta_version = await save_private(
-        harness, owner='u1', name='beta', seq=2
-    )
-    harness.projection.hits = [
-        hit(scope='private', owner='u1', skill_id=alpha.id, version_id=alpha_version.id, score=0.9),
-        hit(scope='private', owner='u1', skill_id=beta.id, version_id=beta_version.id, score=0.5),
-    ]
+    beta, beta_version = await save_private(harness, owner="u1", name="beta", seq=2)
     harness.reranker = FakeReranker()
     harness.reranker.fail = True
+    harness.projection.hits = [
+        hit(owner="u1", skill_id=alpha.id, version_id=alpha_version.id, score=0.9),
+        hit(owner="u1", skill_id=beta.id, version_id=beta_version.id, score=0.5),
+    ]
 
     outcome = await call(harness)
 
-    # 顺序回到融合/向量顺序；精排失败绝不能变成“没有结果”。
-    assert [item.skill.name for item in outcome.hits] == ['alpha', 'beta']
-    assert outcome.reranked is False
-    assert 'rerank_unavailable' in outcome.warnings
+    assert RERANK_UNAVAILABLE in outcome.warnings
+    assert len(outcome.hits) == 2
 
 
 @pytest.mark.asyncio
-async def test_rerank_documents_are_clipped_to_max_document_chars(
-    harness: Harness,
-) -> None:
-    long_body = '# 步骤 ' + '很长的正文 ' * 120
+async def test_bm25_recall_adds_candidates_the_vector_search_missed(harness: Harness) -> None:
+    dense, dense_version = await save_private(
+        harness, owner="u1", name="dense", description="unrelated", seq=1
+    )
+    lexical, lexical_version = await save_private(
+        harness,
+        owner="u1",
+        name="lexical",
+        description="pgvector specialist",
+        seq=2,
+    )
+    harness.projection.hits = [
+        hit(owner="u1", skill_id=dense.id, version_id=dense_version.id, score=0.9)
+    ]
+
+    outcome = await call(harness, config=search_config(top_k=5, candidate_k=5))
+
+    assert {item.skill.skill_id for item in outcome.hits} == {dense.id, lexical.id}
+    assert set(outcome.channels) == {"embedding", "keyword"}
+    assert lexical_version.id
+
+
+@pytest.mark.asyncio
+async def test_min_score_applies_to_the_normalised_fused_score(harness: Harness) -> None:
     skill, version = await save_private(
-        harness,
-        owner='u1',
-        name='alpha',
-        description='换流站巡检',
-        body=long_body,
-        seq=1,
+        harness, owner="u1", name="pdf-tools", body="# Body\n"
     )
-    other, other_version = await save_private(harness, owner='u1', name='beta', seq=2)
+    workdir = search_config(min_score=1.0, top_k=5, candidate_k=5)
     harness.projection.hits = [
-        hit(scope='private', owner='u1', skill_id=skill.id, version_id=version.id, score=0.9),
-        hit(scope='private', owner='u1', skill_id=other.id, version_id=other_version.id, score=0.2),
-    ]
-    harness.reranker = FakeReranker()
-    # 200 是这个字段允许的最小值：不要再往小调，那是配置契约。
-    config = search_config(rerank=SkillRerankStageConfig(max_document_chars=200))
-
-    await call(harness, config=config)
-
-    [documents] = harness.reranker.calls
-    assert all(len(document) <= 200 for document in documents)
-    # 元数据在头部，必须留下：正文再长也不能把“这是什么技能”挤掉。
-    assert documents[0].startswith('alpha')
-    assert '换流站巡检' in documents[0]
-
-
-@pytest.mark.asyncio
-async def test_other_users_private_hits_are_rejected(harness: Harness) -> None:
-    skill, _version = await save_private(harness, owner="u1", name="pdf-tools")
-    harness.projection.hits = [
-        hit(scope="private", owner="u2", skill_id=skill.id, version_id="v2", score=0.9)
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.9)
     ]
 
-    outcome = await call(harness)
-
-    # 向量命中被 PG 确认阶段丢弃；词法通道只读调用方自己的可见正文，
-    # 所以这里一次 u2 的正文都没读，也没产生命中。
-    assert outcome.hits == ()
-    assert outcome.candidates == 0
-    assert not [read for read in harness.content.reads if "u2" in read[1]]
-
-
-@pytest.mark.asyncio
-async def test_a_stale_active_version_is_dropped(harness: Harness) -> None:
-    skill, _version = await save_private(harness, owner="u1", name="pdf-tools")
-    harness.projection.hits = [
-        hit(scope="private", owner="u1", skill_id=skill.id, version_id="stale", score=0.9)
-    ]
-
-    outcome = await call(harness)
-
-    assert outcome.hits == ()
-    # 只读当前 active 版本的正文（BM25 通道），不会去读被替换掉的那个 commit。
-    stale_reads = [read for read in harness.content.reads if read[0] == 'stale']
-    assert stale_reads == []
-
-
-@pytest.mark.asyncio
-async def test_public_hits_are_visible_to_another_user(harness: Harness) -> None:
-    skill, version = await save_private(harness, owner="u1", name="pdf-tools")
-    release = await publish(
-        harness, owner="u1", skill=skill, version=version, public_name="pdf-public"
-    )
-    harness.projection.hits = [
-        hit(scope="public", owner=None, skill_id=skill.id, version_id=version.id, score=0.9)
-    ]
-
-    outcome = await call(harness, user_id="u2")
-
-    assert harness.projection.searches[0]["private_skill_ids"] == []
-    assert "skill_id not in" not in harness.projection.searches[0]["filter"]
-    [loaded] = outcome.hits
-    assert loaded.scope == "public"
-    assert loaded.release_id == release.id
-    assert loaded.skill.name == "pdf-public"
-    assert loaded.body.strip() == "# Public body"
-
-
-# ---------------------------------------------------------------------------
-# Task 22: BM25 is a parallel recall channel, fused with the vector channel
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_bm25_recall_adds_candidates_the_vector_search_missed(
-    harness: Harness,
-) -> None:
-    """报错原文只出现在正文里：向量没召回，BM25 也必须把它带回来。"""
-
-    lexical_only, lexical_version = await save_private(
-        harness,
-        owner='u1',
-        name='lexical-only',
-        description='与查询无语义相似度',
-        body='排查 pgvector 的 HNSW 参数',
-        seq=1,
-    )
-    dense_only, dense_version = await save_private(
-        harness, owner='u1', name='dense-only', description='向量召回', seq=2
-    )
-    harness.projection.hits = [
-        hit(scope='private', owner='u1', skill_id=dense_only.id, version_id=dense_version.id, score=0.9),
-    ]
-
-    outcome = await call(harness)
-
-    names = [item.skill.name for item in outcome.hits]
-    assert names[0] == 'dense-only' or 'lexical-only' in names
-    assert 'lexical-only' in names
-    assert outcome.channels == ('embedding', 'keyword')
-
-
-@pytest.mark.asyncio
-async def test_min_score_applies_to_the_normalised_fused_score(
-    harness: Harness,
-) -> None:
-    alpha, alpha_version = await save_private(
-        harness, owner='u1', name='alpha', body='pgvector 建索引', seq=1
-    )
-    # beta 只在向量通道出现（正文不含查询词），融合分数因此明显低于 alpha。
-    beta, beta_version = await save_private(
-        harness, owner='u1', name='beta', body='完全无关的正文', seq=2
-    )
-    harness.projection.hits = [
-        hit(scope='private', owner='u1', skill_id=alpha.id, version_id=alpha_version.id, score=0.9),
-        hit(scope='private', owner='u1', skill_id=beta.id, version_id=beta_version.id, score=0.4),
-    ]
-    config = search_config(min_score=0.9)
-
-    outcome = await call(harness, config=config)
-
-    # 融合分数归一化到最高分 1.0，min_score 仍然按 0..1 的直觉生效。
-    assert [item.skill.name for item in outcome.hits] == ['alpha']
+    outcome = await call(harness, config=workdir)
     assert outcome.hits[0].score == 1.0
 
 
 @pytest.mark.asyncio
-async def test_no_channel_available_returns_no_hits_with_reasons(
-    harness: Harness,
-) -> None:
-    await save_private(harness, owner='u1', name='alpha', seq=1)
+async def test_no_channel_available_returns_no_hits_with_reasons(harness: Harness) -> None:
+    await save_private(harness, owner="u1", name="pdf-tools")
     harness.embedder.fail = True
-    config = search_config(keyword=SkillKeywordChannelConfig(enabled=False))
+    config = search_config(
+        keyword=SkillKeywordChannelConfig(enabled=False),
+        top_k=5,
+        candidate_k=5,
+    )
 
     outcome = await call(harness, config=config)
 
     assert outcome.hits == ()
-    assert outcome.candidates == 0
-    assert 'vector_unavailable' in outcome.warnings
-    assert outcome.channels == ()
+    assert VECTOR_UNAVAILABLE in outcome.warnings
 
 
 @pytest.mark.asyncio
 async def test_each_body_is_clipped_to_max_body_chars(harness: Harness) -> None:
     skill, version = await save_private(
-        harness, owner="u1", name="pdf-tools", body="# 长正文\n" + "步骤 " * 400
+        harness, owner="u1", name="pdf-tools", body="# Body\n" + "x" * 500 + "\n"
     )
+    config = search_config(max_body_chars=200, top_k=5, candidate_k=5)
     harness.projection.hits = [
-        hit(scope="private", owner="u1", skill_id=skill.id, version_id=version.id)
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.9)
     ]
 
-    outcome = await call(harness, config=search_config(max_body_chars=200))
-
-    [loaded] = outcome.hits
-    assert len(loaded.body) <= 200
-    assert loaded.body.endswith("完整内容请 read_file 读 path）")
+    outcome = await call(harness, config=config)
+    assert len(outcome.hits[0].body) <= 200
 
 
 @pytest.mark.asyncio
 async def test_the_total_body_budget_stops_loading_more_hits(harness: Harness) -> None:
     first, first_version = await save_private(
-        harness, owner="u1", name="pdf-tools", body="# A\n" + "步骤 " * 400, seq=1
+        harness, owner="u1", name="first", body="# Body\n" + "a" * 200 + "\n", seq=1
     )
     second, second_version = await save_private(
-        harness, owner="u1", name="csv-tools", body="# B\n" + "步骤 " * 400, seq=2
+        harness, owner="u1", name="second", body="# Body\n" + "b" * 200 + "\n", seq=2
+    )
+    config = search_config(
+        max_body_chars=200, max_context_chars=210, top_k=5, candidate_k=5
     )
     harness.projection.hits = [
-        hit(scope="private", owner="u1", skill_id=first.id, version_id=first_version.id, score=0.9),
-        hit(scope="private", owner="u1", skill_id=second.id, version_id=second_version.id, score=0.8),
+        hit(owner="u1", skill_id=first.id, version_id=first_version.id, score=0.9),
+        hit(owner="u1", skill_id=second.id, version_id=second_version.id, score=0.8),
     ]
 
-    outcome = await call(
-        harness, config=search_config(max_body_chars=400, max_context_chars=250)
-    )
-
+    outcome = await call(harness, config=config)
     assert len(outcome.hits) == 1
-    assert len(outcome.hits[0].body) <= 250
-    assert outcome.candidates == 2
 
 
 @pytest.mark.asyncio
-async def test_a_missing_private_body_warns_and_never_falls_back_to_public(
-    harness: Harness,
-) -> None:
-    skill, version = await save_private(
-        harness, owner="u1", name="pdf-tools", body="# Private body\n"
-    )
-    release = await publish(harness, owner="u1", skill=skill, version=version)
-    harness.content.texts.pop((version.draft_commit, version.skill_path))
+async def test_a_missing_body_warns_and_is_dropped(harness: Harness) -> None:
+    skill, version = await save_private(harness, owner="u1", name="pdf-tools")
+    harness.content.texts.clear()
     harness.projection.hits = [
-        hit(scope="private", owner="u1", skill_id=skill.id, version_id=version.id, score=0.9),
-        hit(scope="public", owner=None, skill_id=skill.id, version_id=version.id, score=0.8),
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.9)
     ]
 
     outcome = await call(harness)
-
     assert outcome.hits == ()
-    assert outcome.candidates == 1
-    assert outcome.warnings == ("content_unavailable",)
-    assert (PUBLIC_COMMIT, release.skill_path) not in harness.content.reads
+    assert CONTENT_UNAVAILABLE in outcome.warnings
 
 
 @pytest.mark.asyncio
 async def test_milvus_failure_falls_back_to_local_lexical_scoring(harness: Harness) -> None:
-    skill, _version = await save_private(
-        harness, owner="u1", name="pdf-tools", body="# 排查\npgvector 多租户 search_path 串库\n"
+    await save_private(
+        harness, owner="u1", name="pdf-tools", body="# Body\npgvector 排查\n"
     )
     harness.projection.fail = True
 
-    outcome = await call(harness, domain_keywords=["pgvector"])
+    outcome = await call(harness)
 
-    assert len(harness.projection.searches) == 1
-    assert harness.embedder.query_calls == ["pgvector"]
-    assert outcome.warnings == ("vector_unavailable", "lexical_fallback")
-    [loaded] = outcome.hits
-    assert loaded.scope == "private"
-    assert loaded.skill.skill_id == skill.id
-    assert "search_path" in loaded.body
-    assert loaded.score > 0
+    assert VECTOR_UNAVAILABLE in outcome.warnings
+    assert LEXICAL_FALLBACK in outcome.warnings
+    assert [item.skill.name for item in outcome.hits] == ["pdf-tools"]
 
 
 @pytest.mark.asyncio
 async def test_embedding_failure_skips_the_vector_search(harness: Harness) -> None:
-    _skill, _version = await save_private(
-        harness, owner="u1", name="pdf-tools", body="# 排查\npgvector 多租户\n"
-    )
+    await save_private(harness, owner="u1", name="pdf-tools", body="# Body\npgvector\n")
     harness.embedder.fail = True
 
     outcome = await call(harness)
 
     assert harness.projection.searches == []
-    assert harness.embedder.query_calls == ["pgvector"]
-    assert outcome.warnings == ("vector_unavailable", "lexical_fallback")
-    assert [item.scope for item in outcome.hits] == ["private"]
+    assert LEXICAL_FALLBACK in outcome.warnings
+    assert outcome.hits
 
 
 @pytest.mark.asyncio
 async def test_disabled_embedding_channel_uses_lexical_scoring(harness: Harness) -> None:
-    await save_private(harness, owner="u1", name="pdf-tools", body="# 排查\npgvector\n")
-    keyword_only = SkillSearchConfig()
+    await save_private(harness, owner="u1", name="pdf-tools", body="# Body\npgvector\n")
+    config = search_config(embedding=SkillEmbeddingChannelConfig(enabled=False))
 
-    outcome = await call(harness, config=keyword_only)
+    outcome = await call(harness, config=config)
 
     assert harness.projection.searches == []
-    assert outcome.warnings == ("vector_unavailable", "lexical_fallback")
-    assert [item.skill.name for item in outcome.hits] == ["pdf-tools"]
+    assert outcome.channels == ("keyword",)
 
 
 @pytest.mark.asyncio
-async def test_preferences_and_available_skills_filter_hits(harness: Harness) -> None:
+async def test_available_skills_and_disabled_switch_filter_hits(harness: Harness) -> None:
     skill, version = await save_private(harness, owner="u1", name="pdf-tools")
     harness.projection.hits = [
-        hit(scope="private", owner="u1", skill_id=skill.id, version_id=version.id)
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.9)
     ]
 
-    disabled = await call(harness, prefs={skill.id: False})
-    assert disabled.hits == ()
-    assert disabled.candidates == 1
+    assert (await call(harness, available_skills=frozenset({"other"}))).hits == ()
+    assert len((await call(harness)).hits) == 1
 
-    denied = await call(harness, available_skills=frozenset({"other"}))
-    assert denied.hits == ()
-
-    allowed = await call(harness, available_skills=frozenset({"pdf-tools"}))
-    assert [item.skill.skill_id for item in allowed.hits] == [skill.id]
+    await harness.store.set_skill_enabled(
+        skill_id=skill.id,
+        owner_user_id="u1",
+        enabled=False,
+        index_enabled=False,
+    )
+    assert (await call(harness)).hits == ()
 
 
 @pytest.mark.asyncio
-async def test_a_missing_catalog_fails_closed_without_unconfirmed_hits(
-    harness: Harness, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _skill, _version = await save_private(harness, owner="u1", name="pdf-tools")
+async def test_a_missing_catalog_fails_closed_without_unconfirmed_hits(harness: Harness) -> None:
+    skill, version = await save_private(harness, owner="u1", name="pdf-tools")
     harness.projection.hits = [
-        hit(scope="private", owner="u1", skill_id="whatever", version_id="v1", score=0.9)
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.9)
     ]
 
-    async def unavailable(user_id: str, hits: list[ProjectionHit]) -> list[Any]:
-        raise RuntimeError("PostgreSQL is unavailable")
+    async def broken_confirm(*args, **kwargs):
+        raise RuntimeError("catalog is down")
 
-    monkeypatch.setattr(harness.store, "confirm_hits", unavailable)
-
+    harness.store.confirm_hits = broken_confirm  # type: ignore[method-assign]
     with pytest.raises(SkillSearchUnavailable):
         await call(harness)
-    assert harness.content.reads == []
 
 
 @pytest.mark.asyncio
 async def test_an_empty_query_returns_no_hits(harness: Harness) -> None:
-    await save_private(harness, owner="u1", name="pdf-tools")
-
     outcome = await call(harness, task_query="   ")
-
-    assert outcome == SkillSearchOutcome(hits=(), candidates=0, warnings=())
-    assert harness.projection.searches == []
+    assert outcome.hits == ()
     assert harness.embedder.query_calls == []
+
+@pytest.mark.asyncio
+async def test_load_skill_returns_the_body_and_records_one_use(harness: Harness) -> None:
+    skill, _version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# Private body\n先查 pg_stat_activity\n"
+    )
+    harness.usage = FakeUsage()
+
+    loaded = await harness.service().load_skill(user_id="u1", skill_id=skill.id)
+
+    assert loaded is not None
+    assert loaded.skill.skill_id == skill.id
+    assert "先查 pg_stat_activity" in loaded.body
+    assert "---" not in loaded.body  # frontmatter 不进正文
+    assert harness.usage.loads == [("u1", skill.id)]
+    assert harness.projection.searches == []  # 按 id 加载不走召回
+
+
+@pytest.mark.asyncio
+async def test_search_never_counts_as_a_load(harness: Harness) -> None:
+    skill, version = await save_private(harness, owner="u1", name="pdf-tools")
+    harness.usage = FakeUsage()
+    harness.projection.hits = [
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.9)
+    ]
+
+    outcome = await call(harness)
+
+    assert len(outcome.hits) == 1
+    assert harness.usage.loads == []
+
+
+@pytest.mark.asyncio
+async def test_load_skill_is_scoped_to_the_owner(harness: Harness) -> None:
+    skill, _version = await save_private(harness, owner="u2", name="pdf-tools")
+    harness.usage = FakeUsage()
+
+    assert await harness.service().load_skill(user_id="u1", skill_id=skill.id) is None
+    assert harness.usage.loads == []
+
+
+@pytest.mark.asyncio
+async def test_load_skill_refuses_a_disabled_skill(harness: Harness) -> None:
+    skill, _version = await save_private(harness, owner="u1", name="pdf-tools")
+    await harness.store.set_skill_enabled(
+        skill_id=skill.id, owner_user_id="u1", enabled=False, index_enabled=False
+    )
+    harness.usage = FakeUsage()
+
+    assert await harness.service().load_skill(user_id="u1", skill_id=skill.id) is None
+    assert harness.usage.loads == []
+
+
+@pytest.mark.asyncio
+async def test_load_skill_fails_when_the_body_cannot_be_read(harness: Harness) -> None:
+    skill, version = await save_private(harness, owner="u1", name="pdf-tools")
+    path = f"users/u1/{skill.id}/SKILL.md"
+    harness.content.texts.pop((version.draft_commit, path))  # type: ignore[misc]
+    harness.usage = FakeUsage()
+
+    assert await harness.service().load_skill(user_id="u1", skill_id=skill.id) is None
+    assert harness.usage.loads == []

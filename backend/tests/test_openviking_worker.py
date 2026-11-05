@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.memory.openviking.adapter import MemoryMessageAdapter
-from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig
+from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig, SessionSkillsConfig
 from agentkit.agents.memory.openviking.contracts import CapturedMessage
 from agentkit.agents.memory.openviking.session import SessionManager
 from agentkit.agents.memory.openviking.store import CaptureDedupStore, MemorySyncStore
@@ -24,6 +24,11 @@ class FakeSessionClient:
         self.config = config
         self.sessions: dict[str, dict] = {}
         self.appended: list[dict] = []
+        self.commits: list[str] = []
+        self.events: list[tuple[str, str]] = []
+        self.commit_task_id: str | None = None
+        self.tasks: dict[str, dict] = {}
+        self.skill_texts: dict[str, str] = {}
 
     def seed(self, session_id: str) -> None:
         self.sessions[session_id] = {
@@ -55,7 +60,33 @@ class FakeSessionClient:
 
     async def batch_add_messages(self, session_id: str, messages: list[dict]) -> dict:
         self.appended.extend(messages)
+        self.events.append(("append", session_id))
         return {"messages": [{"id": "ov-1"}]}
+
+    async def commit_session(
+        self, session_id: str, *, keep_recent_count: int = 0
+    ) -> dict:
+        self.commits.append(session_id)
+        self.events.append(("commit", session_id))
+        result = {"session_id": session_id}
+        if self.commit_task_id is not None:
+            result["task_id"] = self.commit_task_id
+        return result
+
+    async def get_task(self, task_id: str) -> dict | None:
+        return self.tasks.get(task_id)
+
+    async def read(self, uri: str) -> str:
+        return self.skill_texts[uri]
+
+
+class RecordingSkillImporter:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def import_skills(self, **kwargs):
+        self.calls.append(kwargs)
+        return []
 
 
 @pytest_asyncio.fixture
@@ -201,6 +232,104 @@ async def test_buffered_messages_append_only_after_turn_end(stack) -> None:
     assert len(client.appended) == 1
     assert human.stream_id in stream.acked
     assert control.stream_id in stream.acked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["EXPLICIT_REMEMBER", "USER_CORRECTION"])
+async def test_turn_signal_commits_after_the_current_turn_is_appended(stack, signal: str) -> None:
+    client, _sync_store, _dedup, sessions, _stream, publisher, worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    human = await publisher.publish_human(
+        ref, "r1", HumanMessage(content="请记住我喜欢 pytest"), sequence=0
+    )
+
+    assert await worker.handle(human) == "buffered"
+    control = await publisher.publish_turn_end(ref, "r1", signals=(signal,))
+    assert await worker.handle(control) == "flushed"
+
+    assert len(client.appended) == 1
+    assert client.commits == [ref.ov_session_id]
+    assert [event[0] for event in client.events] == ["append", "commit"]
+
+
+@pytest.mark.asyncio
+async def test_turn_without_a_signal_does_not_commit(stack) -> None:
+    client, _sync_store, _dedup, sessions, _stream, publisher, worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    human = await publisher.publish_human(
+        ref, "r1", HumanMessage(content="我住杭州"), sequence=0
+    )
+
+    assert await worker.handle(human) == "buffered"
+    control = await publisher.publish_turn_end(ref, "r1")
+
+    assert await worker.handle(control) == "flushed"
+    assert len(client.appended) == 1
+    assert client.commits == []
+
+
+@pytest.mark.asyncio
+async def test_commit_task_result_imports_session_skills_after_commit(stack) -> None:
+    client, sync_store, dedup, sessions, stream, publisher, _worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    client.commit_task_id = "task-1"
+    client.tasks["task-1"] = {
+        "status": "completed",
+        "result": {
+            "session_skill_uris": [
+                "viking://user/u_hash/skills/session-helper",
+            ]
+        },
+    }
+    importer = RecordingSkillImporter()
+    worker = TurnCaptureWorker(
+        MemoryMessageAdapter(),
+        stream,
+        dedup,
+        sessions,
+        sync_store,
+        session_skills=SessionSkillsConfig(
+            poll_interval_seconds=0.001,
+            task_timeout_seconds=1,
+        ),
+        session_skill_importer=importer,
+    )
+    human = await publisher.publish_human(
+        ref, "r1", HumanMessage(content="以后都按这个格式回答"), sequence=0
+    )
+
+    assert await worker.handle(human) == "buffered"
+    control = await publisher.publish_turn_end(ref, "r1", signals=("EXPLICIT_REMEMBER",))
+    assert await worker.handle(control) == "flushed"
+
+    assert importer.calls == [
+        {
+            "owner_user_id": "u1",
+            "ov_user": ref.ov_user,
+            "task_id": "task-1",
+            "skill_uris": ["viking://user/u_hash/skills/session-helper"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_detects_a_signal_when_turn_end_has_none(stack) -> None:
+    client, _sync_store, _dedup, sessions, _stream, publisher, worker = stack
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    human = await publisher.publish_human(
+        ref, "r1", HumanMessage(content="不对，应该是周三"), sequence=0
+    )
+
+    assert await worker.handle(human) == "buffered"
+    control = await publisher.publish_turn_end(ref, "r1")
+
+    assert await worker.handle(control) == "flushed"
+    assert len(client.appended) == 1
+    assert client.commits == [ref.ov_session_id]
 
 
 @pytest.mark.asyncio

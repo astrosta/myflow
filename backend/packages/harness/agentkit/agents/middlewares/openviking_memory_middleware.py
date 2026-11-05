@@ -13,18 +13,21 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, MutableMapping
+from dataclasses import replace
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agentkit.agents.memory.openviking.contracts import TurnDecision
+from agentkit.agents.memory.openviking.signals import CommitSignalDetector
 from agentkit.runtime.run_finalizers import (
     register_run_finalizer,
     unregister_run_finalizer,
 )
 
 logger = logging.getLogger(__name__)
+
 
 class OpenVikingMemoryMiddleware(AgentMiddleware):
     def __init__(
@@ -33,11 +36,13 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        detector: CommitSignalDetector | None = None,
     ) -> None:
         super().__init__()
         self._facade = facade
         self._user_id = user_id
         self._agent_name = agent_name
+        self._detector = detector or CommitSignalDetector()
         self._seen: set[tuple[str, int | str]] = set()
         self._ended_turns: set[str] = set()
         self._registered_turns: set[str] = set()
@@ -56,11 +61,13 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         message = _latest_user(state.get("messages") or [])
         if message is None:
             return None
+        user_text = _text(message.content) or ""
         decision = self._facade.decide_capture(
-            _text(message.content) or "",
+            user_text,
             has_attachments=bool(state.get("uploaded_files")),
         )
         _put(context, "capture_decision", decision)
+        _put(context, "capture_user_text", user_text)
         if decision.disposition != "capture":
             return None
         self._register_finalizer(context, decision)
@@ -119,6 +126,10 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         decision = context.get("capture_decision")
         if not isinstance(decision, TurnDecision):
             return
+        decision = _with_explicit_marker(context, decision)
+        if decision.disposition == "capture":
+            decision = await self._detect_decision(context, state, decision)
+            _put(context, "capture_decision", decision)
         turn_id = _turn_id(context)
         await self._finish_turn(context, turn_id, decision, "success")
 
@@ -132,10 +143,49 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         self._registered_turns.add(key)
 
         async def finalize(status: str) -> None:
-            await self._finish_turn(context, turn_id, decision, status)
+            current = context.get("capture_decision")
+            resolved = (
+                _with_explicit_marker(context, current)
+                if isinstance(current, TurnDecision)
+                else _with_explicit_marker(context, decision)
+            )
+            await self._finish_turn(context, turn_id, resolved, status)
 
         self._finalizer_callbacks[turn_id] = finalize
         register_run_finalizer(turn_id, finalize)
+
+    async def _detect_decision(
+        self,
+        context: MutableMapping[str, Any],
+        state: dict[str, Any],
+        decision: TurnDecision,
+    ) -> TurnDecision:
+        """Add signals once, preserving any signal already on the decision."""
+
+        if decision.signals:
+            return decision
+        messages = state.get("messages") or []
+        user = _latest_user(messages)
+        assistant = _latest_ai(messages)
+        has_tool_error, has_recovery = _tool_evidence(messages)
+        user_text = (
+            _text(user.content) if user is not None else _text(context.get("capture_user_text"))
+        )
+        try:
+            return await self._detector.detect_decision(
+                decision,
+                user_text=user_text,
+                assistant_text=_text(assistant.content) if assistant is not None else "",
+                has_tool_error=has_tool_error,
+                has_recovery=has_recovery,
+                run_status="success",
+            )
+        except Exception:
+            logger.warning(
+                "OpenViking commit-signal detection failed; continuing",
+                exc_info=True,
+            )
+            return decision
 
     async def _finish_turn(
         self,
@@ -147,10 +197,14 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         key = f"{context.get('thread_id') or ''}:{turn_id}"
         if key in self._ended_turns:
             return
-        if decision.disposition != "capture":
+        if decision.disposition != "capture" and not decision.signals:
             return
         try:
             ref = await self._capture_ref(context)
+            # Every CAPTURE turn needs its turn_end so the worker flushes the
+            # buffered messages. A SKIP turn only needs it when it carries a
+            # signal (for example SESSION_END). Commit itself belongs to the
+            # worker, after it has appended the current turn.
             await self._facade.publish_turn_end(
                 ref,
                 turn_id,
@@ -243,6 +297,40 @@ def _put(context: MutableMapping[str, Any], key: str, value: Any) -> None:
         context[key] = value
     except TypeError:
         pass
+
+
+def _with_explicit_marker(
+    context: MutableMapping[str, Any], decision: TurnDecision
+) -> TurnDecision:
+    """Merge the marker set by the built-in explicit-memory tool."""
+
+    if not context.get("memory_explicit_remember"):
+        return decision
+    if "EXPLICIT_REMEMBER" in decision.signals:
+        return decision
+    return replace(
+        decision,
+        signals=("EXPLICIT_REMEMBER", *decision.signals),
+        reason=decision.reason or "explicit_remember_tool",
+    )
+
+
+def _tool_evidence(messages: list[Any]) -> tuple[bool, bool]:
+    """Bounded tool success/failure summary for the detector (no raw output)."""
+
+    seen_error = False
+    recovered = False
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        kwargs = getattr(message, "additional_kwargs", None) or {}
+        meta = kwargs.get("myflow_tool_meta")
+        status = meta.get("status") if isinstance(meta, dict) else None
+        if status == "error":
+            seen_error = True
+        elif status == "success" and seen_error:
+            recovered = True
+    return seen_error, recovered
 
 
 def _turn_id(context: MutableMapping[str, Any]) -> str:

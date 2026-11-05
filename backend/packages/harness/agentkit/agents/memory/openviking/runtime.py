@@ -31,6 +31,7 @@ from agentkit.agents.memory.openviking.stream import (
 )
 from agentkit.agents.memory.openviking.tools import make_openviking_memory_tools
 from agentkit.agents.memory.openviking.worker import TurnCaptureWorker, WorkerSupervisor
+from agentkit.skills.session_import import SessionSkillImporter
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,7 @@ class OpenVikingMemoryRuntime:
         *,
         redis: Any = None,
         seed_path: str | None = None,
+        skill_author: Any = None,
     ) -> "OpenVikingMemoryRuntime":
         if not config.enabled:
             raise RuntimeError("memory.openviking.enabled must be true to build the runtime")
@@ -134,6 +136,15 @@ class OpenVikingMemoryRuntime:
         else:
             stream = InMemoryCaptureStream()
         publisher = MemoryMessagePublisher(stream)
+        skill_importer = (
+            SessionSkillImporter(
+                skill_author,
+                sessions,
+                max_skills_per_task=config.session_skills.max_skills_per_task,
+            )
+            if skill_author is not None and config.session_skills.enabled
+            else None
+        )
         worker = TurnCaptureWorker(
             MemoryMessageAdapter(),
             stream,
@@ -144,6 +155,8 @@ class OpenVikingMemoryRuntime:
             missing_turn_end_timeout_seconds=(
                 config.capture.missing_turn_end_timeout_seconds
             ),
+            session_skills=config.session_skills,
+            session_skill_importer=skill_importer,
         )
         supervisor = WorkerSupervisor(
             stream,

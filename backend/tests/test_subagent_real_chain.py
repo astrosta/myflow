@@ -29,7 +29,7 @@ from fakes.task_tool_harness import FakeRuntime, make_tool
 ROUNDS_ALLOWED_BY_PROMPT = {
     "knowledge-researcher": ("knowledge_search", 3),
     "memory-researcher": ("memory_search", 5),
-    "skill-finder": ("search_and_load_skills", 1),
+    "skill-finder": ("search_skills", 1),
     "general-purpose": ("read_file", 10),
     "bash": ("bash", 10),
 }

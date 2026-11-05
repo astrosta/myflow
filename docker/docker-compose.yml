@@ -1,0 +1,350 @@
+# MyFlow 基础服务。端口和账号对齐仓库根目录的 config.yaml / .env：
+#   postgres     127.0.0.1:5432         postgres/postgres   库名 myflow
+#                database.url / checkpointer / run_events
+#   redis        127.0.0.1:6379         用户 myflow / 密码 123456
+#                REDIS_URL：stream_bridge、skills.usage、openviking capture、sandbox lease
+#   milvus       127.0.0.1:19530        无鉴权（VECTOR_STORE_URI）
+#                etcd、minio 只给 Milvus standalone，不对外
+#   openviking   127.0.0.1:1933         配置只来自挂载的 ov.conf
+#   gitea ssh    127.0.0.1:2222         SKILLS_GIT_REPOSITORY
+#   opensandbox  127.0.0.1:8080         sandbox.opensandbox.domain，无 API key
+#   langfuse     ${MYFLOW_HOST}:3050    唯一对局域网开放的端口（容器内 3000）
+#                宿主机地址只在仓库根 .env 的 MYFLOW_HOST。其余端口只绑 127.0.0.1
+#                账号与 S3/Redis/ClickHouse 口令在 langfuse/env.example
+#
+# Langfuse 复用上面的 postgres（库 postgres）和 redis（用户 myflow）。
+# 它的 MinIO、ClickHouse 独立，不碰 Milvus 那套 etcd/minio。
+# 不在这里：DeepSeek、SiliconFlow embedding/rerank、MinerU 云端。
+# 在 docker/ 目录启动：docker compose --env-file ../.env up -d
+
+name: myflow-deps
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: myflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: myflow
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d myflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: myflow-redis
+    restart: unless-stopped
+    # REDIS_URL=redis://myflow:123456@127.0.0.1:6379/0
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      # BullMQ 不能淘汰正在排队的任务。
+      - --maxmemory-policy
+      - noeviction
+      - --user
+      - default
+      - off
+      - --user
+      - myflow
+      - on
+      - ">123456"
+      - "~*"
+      - "&*"
+      - "+@all"
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--user", "myflow", "-a", "123456", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    container_name: myflow-etcd
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: myflow-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /minio_data --console-address ":9001"
+    # 只给同网络的 Milvus 用，不映射到宿主机。
+    volumes:
+      - minio_data:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus:
+    image: milvusdb/milvus:v2.6.25
+    container_name: myflow-milvus
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_REGION: us-east-1
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 5
+
+  openviking:
+    image: ghcr.io/volcengine/openviking:latest
+    container_name: openviking
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1933:1933"
+    volumes:
+      # 只挂配置文件。数据目录由 ov.conf 的 storage.workspace 决定。
+      - ./ov.conf:/app/.openviking/ov.conf:ro
+      - openviking_data:/app/.openviking/data
+    healthcheck:
+      test: ["CMD", "openviking-entrypoint", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  gitea:
+    image: gitea/gitea:1.24
+    container_name: myflow-gitea
+    restart: unless-stopped
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__database__DB_TYPE: sqlite3
+      # SSH 克隆地址对齐 SKILLS_GIT_REPOSITORY=ssh://git@127.0.0.1:2222/...
+      GITEA__server__ROOT_URL: http://127.0.0.1:3001/
+      GITEA__server__SSH_DOMAIN: 127.0.0.1
+      GITEA__server__SSH_PORT: "2222"
+      GITEA__server__SSH_LISTEN_PORT: "22"
+      GITEA__server__START_SSH_SERVER: "true"
+    ports:
+      - "127.0.0.1:3001:3000"
+      - "127.0.0.1:2222:22"
+    volumes:
+      - gitea_data:/data
+
+  # 沙箱镜像必须在宿主 Docker 里。OpenSandbox 挂了 docker.sock，本地没有时会在创建沙箱时现拉。
+  # 这些服务只负责把镜像拉下来，进程立刻退出；opensandbox 等它们成功后再启动。
+  sandbox-image-python:
+    image: python:3.12
+    restart: "no"
+    entrypoint: ["/bin/true"]
+    network_mode: none
+
+  sandbox-image-execd:
+    image: opensandbox/execd:v1.1.0
+    restart: "no"
+    entrypoint: ["/bin/true"]
+    network_mode: none
+
+  sandbox-image-code-interpreter:
+    image: opensandbox/code-interpreter:v1.1.0
+    restart: "no"
+    entrypoint: ["/bin/true"]
+    network_mode: none
+
+  opensandbox:
+    image: opensandbox/server:release-1.2.0
+    container_name: myflow-opensandbox
+    restart: unless-stopped
+    depends_on:
+      sandbox-image-python:
+        condition: service_completed_successfully
+      sandbox-image-execd:
+        condition: service_completed_successfully
+      sandbox-image-code-interpreter:
+        condition: service_completed_successfully
+    environment:
+      SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
+      # config.yaml 的 api_key 为空；非交互启动必须显式确认。
+      OPENSANDBOX_INSECURE_SERVER: "YES"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # 对齐 sandbox.opensandbox.domain。控制面只对本机开放。
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./opensandbox.toml:/etc/opensandbox/config.toml:ro
+      - opensandbox_data:/var/lib/opensandbox
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Langfuse v4。env_file 里的变量优先于镜像默认值；下面的 environment
+  # 只补服务发现地址，避免和 env.example 里的口令互相覆盖。
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    container_name: myflow-langfuse-worker
+    restart: unless-stopped
+    env_file:
+      - ./langfuse/env.example
+    depends_on: &langfuse-depends-on
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3030:3030"
+    environment: &langfuse-env
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      CLICKHOUSE_CLUSTER_NAME: default
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: langfuse
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: exports/
+      LANGFUSE_S3_BATCH_EXPORT_REGION: auto
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: http://127.0.0.1:9090
+      NEXTAUTH_URL: http://${MYFLOW_HOST:?set MYFLOW_HOST in the repo root .env}:3050
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+      TELEMETRY_ENABLED: "true"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    container_name: myflow-langfuse-web
+    restart: unless-stopped
+    env_file:
+      - ./langfuse/env.example
+    depends_on: *langfuse-depends-on
+    ports:
+      # 唯一发布到所有网卡的端口，对齐 NEXTAUTH_URL。
+      - "3050:3000"
+    environment:
+      <<: *langfuse-env
+      # 浏览器直传只走本机 MinIO，不对外。
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://127.0.0.1:9090
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:26.3.62.3
+    container_name: myflow-clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    env_file:
+      - ./langfuse/env.example
+    environment:
+      CLICKHOUSE_DB: default
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9094:9000"
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio
+    container_name: myflow-langfuse-minio
+    restart: unless-stopped
+    entrypoint: sh
+    # 启动前建好 langfuse 桶。与 Milvus 的 minio 服务分开。
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    env_file:
+      - ./langfuse/env.example
+    ports:
+      # 浏览器直传只给本机，不对外。
+      - "127.0.0.1:9090:9000"
+      - "127.0.0.1:9093:9001"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  postgres_data:
+  redis_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  openviking_data:
+  gitea_data:
+  opensandbox_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
