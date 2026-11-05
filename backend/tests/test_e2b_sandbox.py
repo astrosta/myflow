@@ -1,44 +1,55 @@
-"""CubeSandbox commands and file I/O contract tests.
+"""E2BSandbox commands, file I/O, and lazy skill upload contract tests.
 
-The E2B file API exposes native text and bytes modes. Binary downloads use
-``files.read(format="bytes")``; the fake SDK implements the same mode so these
-tests exercise the production path.
+The E2B file API exposes native text and bytes modes.  There is no host mount:
+the fake filesystem is the sandbox filesystem, and skill sources are uploaded on
+first read.
 """
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from agentkit.sandbox.cube.mounts import MountEntry
-from agentkit.sandbox.cube.sandbox import CubeSandbox
+from agentkit.sandbox.e2b.sandbox import E2BSandbox
+from agentkit.sandbox.e2b.sync import SkillSource, SyncLimits
 from agentkit.sandbox.exceptions import (
     SandboxNotFoundError,
     SandboxRuntimeError,
     SandboxTimeoutError,
 )
-from fakes.cube_sdk import FakeCommandResult, FakeCommands, FakeFiles, FakeSdkSandbox
+from agentkit.sandbox.security import PathMapping
+from fakes.e2b_sdk import FakeCommandResult, FakeCommands, FakeFiles, FakeSdkSandbox
 
 _USER_DATA = "/mnt/user-data"
+_SKILLS = "/mnt/skills"
 _PRIVATE_SKILLS = "/mnt/skills/private"
 
 
-def _sandbox(tmp_path, *, on_dead=None) -> CubeSandbox:
-    sdk = FakeSdkSandbox(
-        files=FakeFiles({_USER_DATA: tmp_path / "user-data"}),
-        commands=FakeCommands(),
-    )
-    mounts = [MountEntry(_USER_DATA, str(tmp_path / "user-data"), False)]
-    return CubeSandbox(
+def _sandbox(
+    tmp_path,
+    *,
+    on_dead=None,
+    skill_sources=(),
+    sync_limits: SyncLimits | None = None,
+) -> E2BSandbox:
+    sdk = FakeSdkSandbox(files=FakeFiles(), commands=FakeCommands())
+    mappings = [PathMapping(_USER_DATA, str(tmp_path / "user-data"), False)]
+    if skill_sources:
+        mappings.append(PathMapping(_SKILLS, str(tmp_path / "skills"), True))
+    return E2BSandbox(
         sdk,
-        sandbox_id="cube:s1",
-        mounts=mounts,
+        sandbox_id="e2b:s1",
+        path_mappings=mappings,
+        skill_sources=skill_sources,
+        sync_limits=sync_limits,
         command_timeout=600,
         on_dead=on_dead,
     )
 
 
 class _ApiError(Exception):
-    """Stand-in for cubesandbox.ApiError carrying an HTTP status."""
+    """Stand-in for an E2B API error carrying an HTTP status."""
 
     def __init__(self, status_code: int) -> None:
         super().__init__(f"HTTP {status_code}")
@@ -57,22 +68,13 @@ def _boom() -> None:
     raise RuntimeError("the on_dead callback exploded")
 
 
-def _namespaced_sandbox(tmp_path) -> CubeSandbox:
-    (tmp_path / "private").mkdir(parents=True, exist_ok=True)
-    sdk = FakeSdkSandbox(
-        files=FakeFiles(
-            {
-                _USER_DATA: tmp_path / "user-data",
-                _PRIVATE_SKILLS: tmp_path / "private",
-            }
-        ),
-        commands=FakeCommands(),
-    )
-    mounts = [
-        MountEntry(_USER_DATA, str(tmp_path / "user-data"), False),
-        MountEntry(_PRIVATE_SKILLS, str(tmp_path / "private"), True),
+def _namespaced_sandbox(tmp_path) -> E2BSandbox:
+    sdk = FakeSdkSandbox(files=FakeFiles(), commands=FakeCommands())
+    mappings = [
+        PathMapping(_USER_DATA, str(tmp_path / "user-data"), False),
+        PathMapping(_PRIVATE_SKILLS, str(tmp_path / "private"), True),
     ]
-    return CubeSandbox(sdk, sandbox_id="cube:s1", mounts=mounts)
+    return E2BSandbox(sdk, sandbox_id="e2b:s1", path_mappings=mappings)
 
 
 def test_execute_command_returns_stdout_and_exit_code(tmp_path) -> None:
@@ -128,20 +130,15 @@ def test_command_maps_timeout_and_gone_and_auth(tmp_path) -> None:
     with pytest.raises(SandboxTimeoutError):
         sandbox.execute_command("sleep 5")
 
-    class ApiError(Exception):
-        def __init__(self, status_code: int) -> None:
-            super().__init__(f"HTTP {status_code}")
-            self.status_code = status_code
-
     def raise_404(cmd, **kw):
-        raise ApiError(404)
+        raise _ApiError(404)
 
     sandbox._sdk.commands.handler = raise_404
     with pytest.raises(SandboxNotFoundError):
         sandbox.execute_command("true")
 
     def raise_auth(cmd, **kw):
-        raise ApiError(403)
+        raise _ApiError(403)
 
     sandbox._sdk.commands.handler = raise_auth
     with pytest.raises(SandboxRuntimeError):
@@ -158,7 +155,7 @@ def test_command_gone_marks_the_handle_dead_once(tmp_path, status) -> None:
         with pytest.raises(SandboxNotFoundError):
             sandbox.execute_command("true")
 
-    assert dead == ["cube:s1"]
+    assert dead == ["e2b:s1"]
 
 
 def test_command_failures_that_are_not_gone_leave_the_handle_alive(tmp_path) -> None:
@@ -206,7 +203,7 @@ def test_command_masks_host_paths(tmp_path) -> None:
 def test_path_mappings_and_persistent_shell(tmp_path) -> None:
     sandbox = _namespaced_sandbox(tmp_path)
     assert sandbox.persistent_shell_sessions is False
-    assert sandbox.id == "cube:s1"
+    assert sandbox.id == "e2b:s1"
     mappings = [
         (mapping.container_path, mapping.local_path, mapping.read_only)
         for mapping in sandbox.path_mappings
@@ -266,14 +263,14 @@ def test_read_file_large_range_uses_sed(tmp_path) -> None:
 def test_write_file_creates_parent(tmp_path) -> None:
     sandbox = _sandbox(tmp_path)
     sandbox.write_file("/mnt/user-data/workspace/sub/a.txt", "x")
-    assert (tmp_path / "user-data" / "workspace" / "sub" / "a.txt").read_text() == "x"
+    assert sandbox.read_file("/mnt/user-data/workspace/sub/a.txt") == "x"
     assert any("mkdir -p" in call["cmd"] for call in sandbox._sdk.commands.calls)
 
 
 def test_write_file_append_creates_a_missing_file(tmp_path) -> None:
     sandbox = _sandbox(tmp_path)
     sandbox.write_file("/mnt/user-data/workspace/new.txt", "first\n", append=True)
-    assert (tmp_path / "user-data" / "workspace" / "new.txt").read_text() == "first\n"
+    assert sandbox.read_file("/mnt/user-data/workspace/new.txt") == "first\n"
 
 
 def test_read_file_truncates_a_huge_file(tmp_path) -> None:
@@ -288,7 +285,7 @@ def test_write_file_append_reads_then_writes(tmp_path) -> None:
     sandbox = _sandbox(tmp_path)
     sandbox.write_file("/mnt/user-data/workspace/a.txt", "one\n")
     sandbox.write_file("/mnt/user-data/workspace/a.txt", "two\n", append=True)
-    assert (tmp_path / "user-data" / "workspace" / "a.txt").read_text() == "one\ntwo\n"
+    assert sandbox.read_file("/mnt/user-data/workspace/a.txt") == "one\ntwo\n"
 
 
 def test_download_and_update_bytes(tmp_path) -> None:
@@ -315,7 +312,7 @@ def test_download_file_uses_native_e2b_bytes_mode(tmp_path) -> None:
 
 
 def test_read_bytes_refuses_an_oversized_artifact_before_transfer(tmp_path) -> None:
-    from agentkit.sandbox.cube.files import read_bytes
+    from agentkit.sandbox.e2b.files import read_bytes
 
     sandbox = _sandbox(tmp_path)
     sandbox.update_file("/mnt/user-data/workspace/big.bin", b"0123456789")
@@ -348,7 +345,7 @@ def test_download_file_missing_is_oserror(tmp_path) -> None:
 
 def test_download_file_rejects_a_directory(tmp_path) -> None:
     sandbox = _sandbox(tmp_path)
-    (tmp_path / "user-data" / "workspace").mkdir(parents=True, exist_ok=True)
+    sandbox._sdk.files.make_dir("/mnt/user-data/workspace")
     with pytest.raises(OSError):
         sandbox.download_file("/mnt/user-data/workspace")
 
@@ -364,9 +361,126 @@ def test_file_tools_reject_escape_and_read_only(tmp_path) -> None:
     with pytest.raises(PermissionError):
         sandbox.update_file(f"{_PRIVATE_SKILLS}/a.bin", b"x")
 
-    (tmp_path / "private" / "a.txt").write_text("shared", encoding="utf-8")
-    assert sandbox.read_file(f"{_PRIVATE_SKILLS}/a.txt") == "shared"
-    assert sandbox.download_file(f"{_PRIVATE_SKILLS}/a.txt") == b"shared"
+
+# -- lazy skill upload ----------------------------------------------------
+
+
+def _skill_tree(tmp_path):
+    root = tmp_path / "skills"
+    (root / "private" / "demo").mkdir(parents=True)
+    (root / "private" / "demo" / "SKILL.md").write_text("skill body\n", encoding="utf-8")
+    (root / "private" / "demo" / "notes.md").write_text("notes\n", encoding="utf-8")
+    return root
+
+
+def test_read_file_uploads_one_skill_file_on_demand(tmp_path) -> None:
+    root = _skill_tree(tmp_path)
+    sandbox = _sandbox(
+        tmp_path,
+        skill_sources=(SkillSource(root, _SKILLS),),
+    )
+
+    assert sandbox.read_file("/mnt/skills/private/demo/SKILL.md").strip() == "skill body"
+    assert "/mnt/skills/private/demo/SKILL.md" in sandbox._sdk.files.writes
+    # The neighbouring file stays out of the sandbox.
+    assert "/mnt/skills/private/demo/notes.md" not in sandbox._sdk.files.writes
+
+
+def test_a_second_read_uses_the_uploaded_copy(tmp_path) -> None:
+    root = _skill_tree(tmp_path)
+    sandbox = _sandbox(
+        tmp_path,
+        skill_sources=(SkillSource(root, _SKILLS),),
+    )
+
+    sandbox.read_file("/mnt/skills/private/demo/SKILL.md")
+    sandbox.read_file("/mnt/skills/private/demo/SKILL.md")
+
+    assert sandbox._sdk.files.writes.count("/mnt/skills/private/demo/SKILL.md") == 1
+
+
+def test_list_dir_uploads_the_queried_subtree_once(tmp_path) -> None:
+    root = _skill_tree(tmp_path)
+    sandbox = _sandbox(
+        tmp_path,
+        skill_sources=(SkillSource(root, _SKILLS),),
+    )
+
+    lines = sandbox.list_dir("/mnt/skills/private/demo")
+    assert lines == ["├── notes.md", "└── SKILL.md"]
+    assert "/mnt/skills/private/demo/notes.md" in sandbox._sdk.files.writes
+    assert "/mnt/skills/private/demo/SKILL.md" in sandbox._sdk.files.writes
+
+    writes = list(sandbox._sdk.files.writes)
+    sandbox.list_dir("/mnt/skills/private/demo")
+    assert sandbox._sdk.files.writes == writes
+
+
+def test_glob_uploads_the_subtree_before_running_the_helper(tmp_path) -> None:
+    root = _skill_tree(tmp_path)
+    sandbox = _sandbox(
+        tmp_path,
+        skill_sources=(SkillSource(root, _SKILLS),),
+    )
+    sandbox._sdk.commands.handler = lambda cmd, **kw: FakeCommandResult(
+        json.dumps({"matches": ["/mnt/skills/private/demo/SKILL.md"], "truncated": False})
+    )
+
+    matches, truncated = sandbox.glob("/mnt/skills/private/demo", "**/*.md")
+    assert matches == ["/mnt/skills/private/demo/SKILL.md"]
+    assert truncated is False
+    assert "/mnt/skills/private/demo/SKILL.md" in sandbox._sdk.files.writes
+    assert "/mnt/skills/private/demo/notes.md" in sandbox._sdk.files.writes
+
+
+def test_grep_uploads_the_subtree_before_running_the_helper(tmp_path) -> None:
+    root = _skill_tree(tmp_path)
+    sandbox = _sandbox(
+        tmp_path,
+        skill_sources=(SkillSource(root, _SKILLS),),
+    )
+    sandbox._sdk.commands.handler = lambda cmd, **kw: FakeCommandResult(
+        json.dumps(
+            {
+                "matches": [
+                    {
+                        "path": "/mnt/skills/private/demo/SKILL.md",
+                        "line_number": 1,
+                        "line": "skill body",
+                    }
+                ],
+                "truncated": False,
+            }
+        )
+    )
+
+    matches, _ = sandbox.grep("/mnt/skills/private/demo", "skill", literal=True)
+    assert matches[0].line == "skill body"
+    assert "/mnt/skills/private/demo/SKILL.md" in sandbox._sdk.files.writes
+
+
+def test_oversized_skill_tree_is_an_explicit_error(tmp_path) -> None:
+    root = _skill_tree(tmp_path)
+    sandbox = _sandbox(
+        tmp_path,
+        skill_sources=(SkillSource(root, _SKILLS),),
+        sync_limits=SyncLimits(max_tree_bytes=4, max_file_bytes=1024),
+    )
+
+    with pytest.raises(OSError, match="cannot upload skills on demand"):
+        sandbox.list_dir("/mnt/skills/private/demo")
+
+
+def test_oversized_skill_file_is_an_explicit_error(tmp_path) -> None:
+    root = _skill_tree(tmp_path)
+    sandbox = _sandbox(
+        tmp_path,
+        skill_sources=(SkillSource(root, _SKILLS),),
+        sync_limits=SyncLimits(max_file_bytes=4, max_tree_bytes=1024),
+    )
+
+    with pytest.raises(OSError, match="cannot upload skills on demand"):
+        sandbox.read_file("/mnt/skills/private/demo/SKILL.md")
 
 
 # -- E2B lifecycle errors --------------------------------------------------
@@ -402,7 +516,7 @@ def test_command_maps_an_e2b_gone_type_to_not_found(tmp_path) -> None:
     with pytest.raises(SandboxNotFoundError):
         sandbox.execute_command("true")
 
-    assert dead == ["cube:s1"]
+    assert dead == ["e2b:s1"]
 
 
 def test_a_file_read_of_a_gone_sandbox_drops_the_handle(tmp_path) -> None:
@@ -415,7 +529,7 @@ def test_a_file_read_of_a_gone_sandbox_drops_the_handle(tmp_path) -> None:
 
     # The Sandbox file contract stays OSError-shaped for the tool layer.
     assert not isinstance(exc_info.value, FileNotFoundError)
-    assert dead == ["cube:s1"]
+    assert dead == ["e2b:s1"]
 
 
 def test_a_missing_file_type_keeps_the_handle_alive(tmp_path) -> None:

@@ -18,7 +18,7 @@ STARTUP_ONLY_FIELDS: dict[str,str] = {
     "stream_bridge.backend": "create_stream_bridge() 在 lifespan 里构造一次；换后端要重建单例",
     "observability.langfuse": "Langfuse client / exporter 线程在 lifespan 里构造一次；换地址或开关要重启进程",
     "sandbox.use": "get_sandbox_provider() 首次调用时按 use 创建单例；重载后的 AppConfig 不会重建它",
-    "sandbox.cube": "CubeSandbox provider 与 lease 在首次获取时按配置构造；重载后的 AppConfig 不会重建它们",
+    "sandbox.e2b": "E2B provider 与 lease 在首次获取时按配置构造；重载后的 AppConfig 不会重建它们",
     "sandbox.opensandbox": "OpenSandbox provider 与 lease 在首次获取时按配置构造；镜像、sandbox 与服务端地址都绑在这个单例上",
     "sandbox.run_code": "run_code 工具的默认语言与墙钟在工具装配时读取；改了要重启才能作用到已缓存的 provider",
     "skills.container_path": "它被编译进系统提示词的技能索引和沙箱 mount；换路径要重建沙箱视图",

@@ -1,21 +1,23 @@
-"""CubeSandbox.run_code: the snippet goes through the shell channel."""
+"""E2BSandbox.run_code: the snippet goes through the shell channel."""
 
 from __future__ import annotations
 
-from agentkit.sandbox.cube.mounts import MountEntry
-from agentkit.sandbox.cube.sandbox import CubeSandbox
-from fakes.cube_sdk import FakeCommandResult, FakeCommands, FakeFiles, FakeSdkSandbox
+from agentkit.sandbox.e2b.sandbox import E2BSandbox
+from agentkit.sandbox.security import PathMapping
+from fakes.e2b_sdk import FakeCommandResult, FakeCommands, FakeFiles, FakeSdkSandbox
 
 _USER_DATA = "/mnt/user-data"
 
 
-def _sandbox(tmp_path) -> CubeSandbox:
-    sdk = FakeSdkSandbox(
-        files=FakeFiles({_USER_DATA: tmp_path / "user-data"}),
-        commands=FakeCommands(),
+def _sandbox(tmp_path) -> E2BSandbox:
+    sdk = FakeSdkSandbox(files=FakeFiles(), commands=FakeCommands())
+    mappings = [PathMapping(_USER_DATA, str(tmp_path / "user-data"), False)]
+    return E2BSandbox(
+        sdk,
+        sandbox_id="e2b:s1",
+        path_mappings=mappings,
+        command_timeout=600,
     )
-    mounts = [MountEntry(_USER_DATA, str(tmp_path / "user-data"), False)]
-    return CubeSandbox(sdk, sandbox_id="cube:s1", mounts=mounts, command_timeout=600)
 
 
 def test_run_code_writes_runs_and_removes_the_snippet(tmp_path) -> None:
@@ -30,8 +32,6 @@ def test_run_code_writes_runs_and_removes_the_snippet(tmp_path) -> None:
     assert ".py" in run
     # The commands are wrapped by the output cap, so match on containment.
     assert any("rm -f -- " in cmd for cmd in commands)
-    written = tmp_path / "user-data" / "workspace" / ".myflow-run"
-    assert written.is_dir()  # the fake command handler does not really delete
 
 
 def test_run_code_declares_support(tmp_path) -> None:

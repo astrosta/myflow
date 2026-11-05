@@ -101,11 +101,11 @@ def test_start_sandbox_provider_propagates_a_failed_check(monkeypatch) -> None:
     """A failed startup check aborts startup: no half-initialized provider is kept."""
     class Exploding(FakeProvider):
         def startup_check(self) -> None:
-            raise RuntimeError("cube unreachable")
+            raise RuntimeError("e2b unreachable")
 
     monkeypatch.setattr(runtime, "get_sandbox_provider", lambda: Exploding())
 
-    with pytest.raises(RuntimeError, match="cube unreachable"):
+    with pytest.raises(RuntimeError, match="e2b unreachable"):
         runtime.start_sandbox_provider()
 
 

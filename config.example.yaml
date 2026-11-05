@@ -216,63 +216,69 @@ observability:
 sandbox:
   # provider 三选一（不写 = local）。切 provider 只改这一行 + 展开对应的段：
   #   agentkit.sandbox.local:LocalSandboxProvider         进程内路径映射，不是隔离边界
-  #   agentkit.sandbox.cube:CubeSandboxProvider          需要 cube 段 + CubeMaster/Cubelet
+  #   agentkit.sandbox.e2b:E2BSandboxProvider            需要 e2b 段 + E2B 兼容控制面（无宿主挂载）
   #   agentkit.sandbox.opensandbox:OpenSandboxProvider   需要 opensandbox 段 + opensandbox-server
   use: agentkit.sandbox.local:LocalSandboxProvider
-  # 只对 local 生效：local 下默认不暴露 bash 工具。换成 cube/opensandbox 时这个开关被忽略
-  # （隔离来自 MicroVM/容器，bash 工具始终可用），不要在隔离环境里指望它关掉 bash。
+  # 只对 local 生效：local 下默认不暴露 bash 工具。换成 e2b/opensandbox 时这个开关被忽略
+  # （隔离来自沙箱/容器，bash 工具始终可用），不要在隔离环境里指望它关掉 bash。
   allow_host_bash: false
-  # 所有 provider 共用：单条命令的墙钟超时（秒）。cube 用作服务端 hard timeout，
+  # 所有 provider 共用：单条命令的墙钟超时（秒）。e2b 作为 SDK 命令超时，
   # opensandbox 用作 RunCommandOpts.timeout，local 用作子进程超时。
   bash_command_timeout: 600
-  # 所有 provider 共用：额外挂载 {container_path, local_path, read_only}。
-  # cube/opensandbox 会把它并进宿主挂载并计入 mounts_hash；local 直接加映射。
+  # 额外挂载 {container_path, local_path, read_only}。
+  # opensandbox 并进宿主挂载；local 直接加映射；e2b 不读宿主目录，忽略这一项。
   mounts: []
   # run_code 工具（跑一段代码，一次调用拿输出）。默认关闭：关着模型看不见这个工具。
   #   local      只有 allow_host_bash 为 true 才放行（等于在宿主上跑模型代码）
-  #   cube       走沙箱 shell（模板自带 python3）
+  #   e2b        走沙箱 shell（模板自带 python3）
   #   opensandbox 配了 opensandbox.run_code 就走 Code Interpreter，否则走 shell
   run_code:
     enabled: false
     default_language: python
     timeout_seconds: 120
 
-  # CubeSandbox（宿主挂载，Linux 同机部署）。默认保持注释：本地 provider 不需要这一节。
-  # 取消注释前先装依赖：cd backend && uv sync --extra cube（= agentkit[cube,redis]），
-  # 否则 sandbox.use 指向 Cube 会因缺 e2b/redis 拒绝启动。
-  # sandbox.cube 整段是 startup-only：改完要重启 Gateway。
-  # cube:
+  # E2B（无宿主挂载，显式同步）。默认保持注释：本地 provider 不需要这一节。
+  # 取消注释前先装依赖：cd backend && uv sync --extra e2b（= agentkit[e2b,redis]），
+  # 否则 sandbox.use 指向 E2B 会因缺 e2b/redis 拒绝启动。
+  # sandbox.e2b 整段是 startup-only：改完要重启 Gateway。
+  #
+  # 协议里没有 bind mount：acquire 上传宿主 uploads/，release 下载 outputs/；
+  # 技能文件在 read_file / list_dir / glob / grep 命中时按需上传，不预传整棵树。
+  # e2b:
   #   api_url: $E2B_API_URL             # 控制面地址；不依赖 SDK 默认的 127.0.0.1:3000
   #   api_key: ""                       # 留空时由 e2b SDK 读 E2B_API_KEY；无鉴权保持空
-  #   template_id: $E2B_TEMPLATE_ID     # 必填；模板要预建 /mnt/user-data 与 /mnt/skills
+  #   template_id: $E2B_TEMPLATE_ID     # 必填；模板要自带 mkdir/cat/python3/grep/find/sed
   #   sandbox_domain: cube.app          # 数据面 <port>-<sandbox-id>.<domain> 必须可解析（wildcard DNS）
   #
-  #   # 生命周期：pause 保持 MicroVM 热，宿主文件不受影响；kill 每次重建。
+  #   # 生命周期：pause 保持沙箱热；kill 每次重建。release 前会先下载 outputs/。
   #   timeout_seconds: 1800             # 空闲 TTL，显式给值，不依赖集群默认
   #   on_timeout: pause                 # kill | pause
   #   auto_resume: true
-  #   release_action: pause             # kill | pause；shutdown() 始终 kill
+  #   release_action: pause             # kill | pause；shutdown() 会先下载 outputs 再 kill
   #   acquire_timeout_seconds: 120      # 等 Redis per-thread 锁的上限
   #   request_timeout_seconds: 30       # 控制面 HTTP 超时，不是命令超时
-  #   startup_healthcheck: true         # 启动时 Cube health + Redis PING，失败即拒绝启动
+  #   startup_healthcheck: true         # 启动时控制面 health + Redis PING，失败即拒绝启动
   #
   #   # 网络
   #   allow_internet_access: true
   #   allow_public_traffic: false
-  #   sandbox_user: root                # V1 默认 root；非 root 要先验证 UID/GID/umask
+  #   sandbox_user: root                # 默认 root；非 root 要先验证 UID/GID 与模板工具
   #   network:
   #     deny_out:
   #       - 169.254.169.254/32
   #
-  #   # 宿主挂载：Gateway 与 Cubelet 在同一台 Linux 主机，看到同一个项目根。
-  #   # 两项都省略时都取 project_root()（MYFLOW_PROJECT_ROOT 或工作目录）；
-  #   # host_root 必须落在 CubeMaster 的 allowed_host_mount_prefixes 里（默认只允许 /data/shared/）。
-  #   host_mount:
-  #     local_root: /opt/myflow          # Gateway 进程看到的根，要覆盖 .myflow 与 skills/
-  #     host_root: /opt/myflow           # Cubelet 看到的同一个根；同机可省略
-  #     allowed_prefix: /opt/myflow      # 只作记录；真正的白名单在 CubeMaster
+  #   # 显式同步：替代宿主挂载。单文件超限跳过并 warning，整树超限放弃并 warning。
+  #   sync:
+  #     enabled: true
+  #     upload_uploads: true            # acquire 上传宿主 uploads/
+  #     upload_workspace: false         # 默认不回放上一轮工作区
+  #     upload_skills: true             # 允许技能按需上传（不是预传整棵树）
+  #     download_outputs: true          # release 下载沙箱 outputs/
+  #     download_workspace: false       # 默认不把工作区回写到宿主
+  #     max_file_bytes: 33554432        # 32 MiB
+  #     max_tree_bytes: 268435456       # 256 MiB
   #
-  #   # V1 必填：多 worker 的 per-thread 锁。Redis 不可达时启动失败。
+  #   # 必填：多 worker 的 per-thread 锁。Redis 不可达时启动失败。
   #   lease:
   #     redis_url: $REDIS_URL
   #     ttl_seconds: 30
@@ -315,13 +321,13 @@ sandbox:
   #   env:
   #     TZ: Asia/Shanghai
   #
-  #   # 宿主挂载：与 cube 段同形状。local_root 是 Gateway 视角，
+  #   # 宿主挂载（E2B provider 没有这一概念）。local_root 是 Gateway 视角，
   #   # host_root 是**服务端宿主**视角（卷源按它翻译）。
   #   host_mount:
   #     local_root: /opt/myflow
   #     host_root: /opt/myflow
   #
-  #   # 必填：与 cube 共用同一个 per-thread Redis 锁。Redis 不可达时启动失败。
+  #   # 必填：与 E2B 共用同一个 per-thread Redis 锁。Redis 不可达时启动失败。
   #   lease:
   #     redis_url: $REDIS_URL
   #     ttl_seconds: 30

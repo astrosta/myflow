@@ -1,4 +1,4 @@
-"""CubeSandbox per-thread Redis lock (Task 4)."""
+"""E2BSandbox per-thread Redis lock (Task 4)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import time
 import fakeredis
 import pytest
 
-from agentkit.sandbox.cube.locks import LockLease, LockNotAcquiredError, RedisThreadLock
+from agentkit.sandbox.e2b.locks import LockLease, LockNotAcquiredError, RedisThreadLock
 
 
 def _lock(client=None) -> RedisThreadLock:

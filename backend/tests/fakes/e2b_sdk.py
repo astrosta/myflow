@@ -1,15 +1,17 @@
-"""In-memory CubeSandbox SDK fake shared by Cube adapter tests.
+"""In-memory E2B SDK fake shared by the E2B adapter tests.
 
-The fake mirrors the narrow SDK surface used by CubeSandbox and
-CubeSandboxProvider. A root map can bind a container mount (for example
-/mnt/user-data) to a real host directory, which lets provider canary tests
-exercise actual host reads and writes without a Cube cluster.
+The fake mirrors the narrow SDK surface used by E2BSandbox and
+E2BSandboxProvider.  It is a pure in-memory filesystem: there is no host root
+map, because the production provider has no host mount.  Provider tests that
+need host files create them under a real Paths directory and let explicit sync
+move the bytes across.
 """
 
 from __future__ import annotations
 
 import posixpath
-import shutil
+import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -19,7 +21,7 @@ FILE_TYPE_DIRECTORY = "FILE_TYPE_DIRECTORY"
 
 
 class FilesystemNotFoundError(OSError):
-    """Stand-in for cubesandbox.FilesystemNotFoundError."""
+    """Stand-in for e2b.FilesystemNotFoundError."""
 
     def __init__(self, message: str, status_code: int | None = 404) -> None:
         super().__init__(message)
@@ -34,19 +36,9 @@ class FakeCommandResult:
 
 
 class FakeFiles:
-    """A small file API over an optional host root plus in-memory paths."""
+    """A small in-memory file API."""
 
-    def __init__(self, root_map: dict[str, Path] | None = None) -> None:
-        roots = root_map or {}
-        self.root_map = {
-            self._normalize(container): Path(host).resolve()
-            for container, host in roots.items()
-        }
-        self._mounts = sorted(
-            self.root_map.items(),
-            key=lambda item: len(item[0]),
-            reverse=True,
-        )
+    def __init__(self) -> None:
         self._virtual_files: dict[str, bytes] = {}
         self._virtual_dirs: set[str] = {"/"}
         self.writes: list[str] = []
@@ -84,12 +76,6 @@ class FakeFiles:
         normalized = self._normalize(path)
         payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
         self.writes.append(normalized)
-        host = self._host_path(normalized)
-        if host is not None:
-            host.parent.mkdir(parents=True, exist_ok=True)
-            host.write_bytes(payload)
-            return
-
         self._virtual_files[normalized] = payload
         self._virtual_dirs.discard(normalized)
         parent = PurePosixPath(normalized).parent
@@ -119,15 +105,6 @@ class FakeFiles:
     ) -> list[dict[str, Any]]:
         del user, kwargs
         normalized = self._normalize(path)
-        host = self._host_path(normalized)
-        if host is not None:
-            if not host.exists():
-                raise FilesystemNotFoundError(f"no such file or directory: {path}")
-            if not host.is_dir():
-                raise NotADirectoryError(path)
-            children = sorted(host.iterdir(), key=lambda child: child.name.casefold())
-            return [self._host_entry(child) for child in children]
-
         if not self._virtual_is_dir(normalized):
             if self._virtual_exists(normalized):
                 raise NotADirectoryError(path)
@@ -143,12 +120,6 @@ class FakeFiles:
     ) -> dict[str, Any]:
         del user, kwargs
         normalized = self._normalize(path)
-        host = self._host_path(normalized)
-        if host is not None:
-            if not host.exists():
-                raise FilesystemNotFoundError(f"no such file or directory: {path}")
-            return self._host_entry(host)
-
         if normalized in self._virtual_files:
             return {
                 "name": PurePosixPath(normalized).name,
@@ -185,11 +156,6 @@ class FakeFiles:
     ) -> dict[str, Any]:
         del user, kwargs
         normalized = self._normalize(path)
-        host = self._host_path(normalized)
-        if host is not None:
-            host.mkdir(parents=True, exist_ok=True)
-            return self._host_entry(host)
-
         if normalized in self._virtual_files:
             raise FileExistsError(path)
         self._virtual_dirs.add(normalized)
@@ -208,16 +174,6 @@ class FakeFiles:
     ) -> None:
         del user, kwargs
         normalized = self._normalize(path)
-        host = self._host_path(normalized)
-        if host is not None:
-            if not host.exists():
-                raise FilesystemNotFoundError(f"no such file or directory: {path}")
-            if host.is_dir():
-                shutil.rmtree(host)
-            else:
-                host.unlink()
-            return
-
         if normalized in self._virtual_files:
             del self._virtual_files[normalized]
             return
@@ -239,51 +195,18 @@ class FakeFiles:
         *,
         user: str | None = None,
     ) -> dict[str, Any]:
+        del user
         old = self._normalize(old_path)
         new = self._normalize(new_path)
-        old_host = self._host_path(old)
-        new_host = self._host_path(new)
-        if old_host is not None and new_host is not None:
-            if not old_host.exists():
-                raise FilesystemNotFoundError(f"no such file or directory: {old_path}")
-            new_host.parent.mkdir(parents=True, exist_ok=True)
-            old_host.rename(new_host)
-            return self._host_entry(new_host)
-        return self._rename_virtual(old, new)
-
-    def _rename_virtual(self, old: str, new: str) -> dict[str, Any]:
         if old not in self._virtual_files:
             raise FilesystemNotFoundError(f"no such file or directory: {old}")
-        data = self._virtual_files.pop(old)
-        self.write(new, data)
+        self.write(new, self._virtual_files.pop(old))
         return self.stat(new)
 
     def _read_bytes(self, path: str) -> bytes:
-        host = self._host_path(path)
-        if host is not None:
-            try:
-                return host.read_bytes()
-            except FileNotFoundError as exc:
-                raise FilesystemNotFoundError(
-                    f"no such file or directory: {path}"
-                ) from exc
-            except IsADirectoryError as exc:
-                raise NotADirectoryError(path) from exc
         if path in self._virtual_files:
             return self._virtual_files[path]
         raise FilesystemNotFoundError(f"no such file or directory: {path}")
-
-    def _host_entry(self, path: Path) -> dict[str, Any]:
-        try:
-            is_dir = path.is_dir()
-            size = 0 if is_dir else path.stat().st_size
-        except OSError as exc:
-            raise FilesystemNotFoundError(f"no such file or directory: {path}") from exc
-        return {
-            "name": path.name or "/",
-            "type": FILE_TYPE_DIRECTORY if is_dir else FILE_TYPE_FILE,
-            "size": str(size),
-        }
 
     def _virtual_entries(self, path: str) -> list[dict[str, Any]]:
         prefix = self._prefix(path)
@@ -321,17 +244,6 @@ class FakeFiles:
         return any(key.startswith(prefix) for key in self._virtual_files) or any(
             key.startswith(prefix) for key in self._virtual_dirs if key != path
         )
-
-    def _host_path(self, path: str) -> Path | None:
-        for container, root in self._mounts:
-            if path == container or path.startswith(f"{container}/"):
-                relative = path[len(container):].lstrip("/")
-                parts = PurePosixPath(relative).parts if relative else ()
-                candidate = root.joinpath(*parts).resolve()
-                if candidate != root and not candidate.is_relative_to(root):
-                    raise PermissionError(f"path escapes fake mount root: {path}")
-                return candidate
-        return None
 
     @staticmethod
     def _prefix(path: str) -> str:
@@ -444,8 +356,7 @@ class FakeSdkSandbox:
 class FakeSdkFactory:
     """Fake control plane used by provider lifecycle tests."""
 
-    def __init__(self, root_map: dict[str, Path] | None = None) -> None:
-        self.root_map = dict(root_map or {})
+    def __init__(self) -> None:
         self.created: list[FakeSdkSandbox] = []
         self.connected: list[str] = []
         self.connected_sandboxes: list[FakeSdkSandbox] = []
@@ -478,9 +389,11 @@ class FakeSdkFactory:
         sandbox_id = f"s{self._next_id}"
         self._next_id += 1
         self.calls.append({"op": "create", "metadata": dict(metadata)})
+        files = FakeFiles()
         sandbox = FakeSdkSandbox(
             sandbox_id,
-            files=FakeFiles(self.root_map),
+            files=files,
+            commands=FakeCommands(handler=_default_shell(files)),
             metadata=metadata,
             factory=self,
             template=template,
@@ -504,9 +417,11 @@ class FakeSdkFactory:
             None,
         )
         metadata = dict(row.get("metadata", {})) if row is not None else {}
+        files = FakeFiles()
         sandbox = FakeSdkSandbox(
             sandbox_id,
-            files=FakeFiles(self.root_map),
+            files=files,
+            commands=FakeCommands(handler=_default_shell(files)),
             metadata=metadata,
             factory=self,
         )
@@ -538,6 +453,84 @@ class FakeSdkFactory:
             if row.get("sandboxID") == sandbox.sandbox_id:
                 row["killed"] = True
                 return
+
+
+def _default_shell(files: FakeFiles) -> Callable[..., FakeCommandResult]:
+    """A tiny shell for provider-level tests.
+
+    It implements only the commands the provider canary and directory setup use:
+    mkdir -p, cat, rm -f, rmdir.  A test that needs different command behavior
+    replaces commands.handler explicitly.
+    """
+
+    def run(cmd: str, **kwargs: Any) -> FakeCommandResult:
+        del kwargs
+        for line in cmd.splitlines():
+            if "mkdir -p" in line:
+                _run_mkdir(files, line)
+            elif re.search(r"\bcat\s", line):
+                result = _run_cat(files, line)
+                if result is not None:
+                    return result
+            elif "rm -f" in line:
+                _run_rm(files, line)
+            elif "rmdir" in line:
+                _run_rmdir(files, line)
+        return FakeCommandResult()
+
+    return run
+
+
+def _shell_args(line: str, marker: str) -> list[str]:
+    index = line.find(marker)
+    if index < 0:
+        return []
+    tail = line[index + len(marker):]
+    try:
+        return shlex.split(tail, comments=False, posix=True)
+    except ValueError:
+        return []
+
+
+def _run_mkdir(files: FakeFiles, line: str) -> None:
+    for path in _shell_args(line, "mkdir -p"):
+        if path.startswith("-"):
+            continue
+        try:
+            files.make_dir(path)
+        except Exception:
+            pass
+
+
+def _run_cat(files: FakeFiles, line: str) -> FakeCommandResult | None:
+    for path in _shell_args(line, "cat"):
+        if path.startswith("-"):
+            continue
+        try:
+            return FakeCommandResult(files.read(path))
+        except Exception as exc:
+            return FakeCommandResult("", str(exc), 1)
+    return None
+
+
+def _run_rm(files: FakeFiles, line: str) -> None:
+    for path in _shell_args(line, "rm -f"):
+        if path.startswith("-"):
+            continue
+        try:
+            files.remove(path)
+        except Exception:
+            pass
+
+
+def _run_rmdir(files: FakeFiles, line: str) -> None:
+    for path in _shell_args(line, "rmdir"):
+        if path.startswith("-"):
+            continue
+        try:
+            files.remove(path)
+        except Exception:
+            pass
 
 
 __all__ = [

@@ -32,9 +32,9 @@ skills = [
 redis = [
     "agentkit[redis]",
 ]
-# CubeSandbox provider 需要控制面 SDK 与 Redis lease。
-cube = [
-    "agentkit[cube,redis]",
+# E2B provider 需要 E2B 协议 SDK 与 Redis lease。
+e2b = [
+    "agentkit[e2b,redis]",
 ]
 # OpenSandbox provider 需要 OpenSandbox SDK 与 Redis lease。
 opensandbox = [

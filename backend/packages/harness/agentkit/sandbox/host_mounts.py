@@ -1,10 +1,9 @@
 """Plan host bind mounts for one user/thread, provider-neutral.
 
-Two providers share this planning code: CubeSandbox (bind mounts declared in
-sandbox metadata) and the AIO Docker provider (docker --mount). Both run the
-sandbox on a host that must see the Gateway's project root, possibly under a
-different path: local_root is what the Gateway process sees, host_root is what
-the sandbox runtime sees (Cubelet's namespace, or the Docker daemon's).
+The OpenSandbox provider uses this planning code: it runs containers on a host
+that must see the Gateway's project root, possibly under a different path.
+local_root is what the Gateway process sees, host_root is what the sandbox
+runtime sees (the Docker/Kubernetes node's namespace).
 
 Every source is resolved before it is translated. A source that escapes
 local_root through '..' or a symlink is rejected instead of becoming a
@@ -67,11 +66,10 @@ class MountEntry:
     read_only: bool = False
 
     def as_payload(self) -> dict[str, object]:
-        """CubeSandbox's camelCase host-mount wire shape.
+        """A stable payload shape consumed only by mounts_hash.
 
-        The AIO provider only uses this through mounts_hash. Keeping one stable
-        shape means a fingerprint is comparable across providers and across a
-        config change that swaps one provider for the other.
+        The camelCase keys are historical; the payload never reaches a
+        provider wire protocol, it only keeps fingerprints stable.
         """
         return {
             "hostPath": self.host_path,
@@ -129,7 +127,7 @@ def build_host_mounts(
     paths: Paths | None = None,
     field_prefix: str = _DEFAULT_FIELD_PREFIX,
 ) -> tuple[MountEntry, ...]:
-    """Build the complete host-mount list for one user/thread.
+    """Build the complete host-mount list for one OpenSandbox user/thread.
 
     Thread data is created before the list is returned. The git private-skill
     tree is created empty if the catalog has not materialized it yet; the builtin
@@ -218,7 +216,7 @@ def build_host_mounts(
 
 
 def mounts_hash(mounts: Sequence[MountEntry]) -> str:
-    """Stable SHA-256 fingerprint of the host-mount list (16 hex chars)."""
+    """Stable SHA-256 fingerprint of an OpenSandbox host-mount list."""
 
     payloads = sorted(
         json.dumps(entry.as_payload(), sort_keys=True, separators=(",", ":"))

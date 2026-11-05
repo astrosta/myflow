@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agentkit.sandbox.cube.client import (
+from agentkit.sandbox.e2b.client import (
     E2BFactory,
     SandboxGoneError,
     error_status,
@@ -51,7 +51,7 @@ def _create(factory: E2BFactory):
 
 
 def test_client_module_does_not_import_e2b_at_import_time() -> None:
-    import agentkit.sandbox.cube.client as client_module
+    import agentkit.sandbox.e2b.client as client_module
 
     assert "e2b" not in vars(client_module)
 

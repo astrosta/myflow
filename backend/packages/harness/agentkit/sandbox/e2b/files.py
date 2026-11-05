@@ -1,4 +1,4 @@
-"""File helpers for CubeSandbox.
+"""File helpers for E2BSandbox.
 
 Text and bytes both go through the E2B file API. E2B's
 ``Filesystem.read`` supports ``format="text" | "bytes" | "stream"``, so
@@ -23,7 +23,7 @@ import shlex
 import weakref
 from typing import Any
 
-from agentkit.sandbox.cube.client import (
+from agentkit.sandbox.e2b.client import (
     SandboxGoneError,
     SdkSandbox,
     error_status,
@@ -47,7 +47,7 @@ SEARCH_HELPER_PATH = "/tmp/.myflow/search.py"
 # instead of the 600s command budget.
 _SEARCH_TIMEOUT_SECONDS = 120.0
 # Handles whose helper is already installed. Keyed by handle, not by
-# CubeSandbox: two sandboxes over one handle must not upload it twice.
+# E2BSandbox: two sandboxes over one handle must not upload it twice.
 _PREPARED_SEARCH_HELPERS: weakref.WeakSet[Any] = weakref.WeakSet()
 _AUTH_STATUS_CODES = frozenset({401, 403})
 _TIMEOUT_TYPE_NAMES = frozenset(
@@ -494,7 +494,7 @@ def _map_list_error(
     status = error_status(exc)
     if status in _AUTH_STATUS_CODES:
         return SandboxRuntimeError(
-            "CubeSandbox rejected the file request; check sandbox.cube.api_key"
+            "E2BSandbox rejected the file request; check sandbox.e2b.api_key"
         )
     if is_missing_path_error(exc):
         return FileNotFoundError(f"{path}: no such file or directory")
@@ -621,7 +621,7 @@ def _map_file_error(exc: BaseException, path: str, *, action: str) -> Exception:
     status = error_status(exc)
     if status in _AUTH_STATUS_CODES:
         return SandboxRuntimeError(
-            "CubeSandbox rejected the file request; check sandbox.cube.api_key"
+            "E2BSandbox rejected the file request; check sandbox.e2b.api_key"
         )
     # A path request reads a bare not-found as a missing path; E2B names the
     # sandbox-gone cases explicitly, so those are still reported as gone.

@@ -1,7 +1,7 @@
-"""CubeSandbox per-thread lease lock.
+"""E2BSandbox per-thread lease lock.
 
 The implementation lives in agentkit.sandbox.redis_lock because the AIO Docker
-provider serializes the same way. This module keeps the CubeSandbox import path
+provider serializes the same way. This module keeps the E2BSandbox import path
 stable.
 """
 

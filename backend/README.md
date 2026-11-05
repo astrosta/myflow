@@ -62,67 +62,79 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
 
 沙箱段见 `config.yaml` 的 `sandbox`。本机 Local provider 默认不开宿主 bash；可信环境可设 `allow_host_bash: true`。
 
-### CubeSandbox 宿主挂载（Linux 同机部署）
+### E2B（无宿主挂载，显式同步）
 
-默认仍是本地 provider。要在 CubeSandbox MicroVM 里跑工具，把 `sandbox.use` 切成
-`agentkit.sandbox.cube:CubeSandboxProvider`，并启用 `sandbox.cube`（`config.example.yaml`
-里有整段注释模板）。这是**宿主挂载**，不是第二套工作区：CubeSandbox 通过 bind mount 看到同一份
-`.myflow/users/{user_id}/threads/{thread_id}/user-data`；上传和产物的 `thread_files.py`
-链路完全不变，`/mnt/user-data/uploads`、`/mnt/user-data/outputs` 就是宿主上那两个目录。
+默认仍是本地 provider。要在 E2B 兼容沙箱里跑工具，把 `sandbox.use` 切成
+`agentkit.sandbox.e2b:E2BSandboxProvider`，并启用 `sandbox.e2b`（`config.example.yaml`
+里有整段注释模板）。E2B 协议没有 bind mount：**沙箱文件系统是权威**，宿主与沙箱之间只通过
+文件 API 显式同步。
 
-前置条件（缺一条都会在启动或第一次 acquire 失败）：
+一次完整的往返：
 
-1. **Gateway 与 Cubelet 在同一台 Linux 主机**，看到同一个项目根。`host_mount.local_root` 和
-   `host_mount.host_root` 默认都取 `project_root()`（`MYFLOW_PROJECT_ROOT` 或 Gateway 的工作目录），
-   同机部署时两项都可以省略。这个根必须同时覆盖 `.myflow`（thread 数据 + Git 技能缓存）和
-   `skills/`（内置技能），所以默认是整个项目根，不是一个单独的数据盘目录。
-2. CubeMaster 的 `allowed_host_mount_prefixes` 必须包含这个项目根。CubeMaster 默认只允许
-   `/data/shared/`；创建时报 `hostPath ... is not within an allowed mount prefix` 就是这里没配。
-3. 模板已预创建 `/mnt/user-data` 和 `/mnt/skills` 下的技能路径
-   （`skills.container_path` 默认 `/mnt/skills`），并提供 `bash`、`python3`、`grep`、
-   `find`、`sed`（文本工具调它们；二进制读写走 E2B 文件 API，不需要 `dd`/`base64`）。
-   建议模板 umask `0022`。`workspace`、`uploads`、
-   `outputs` 三个子目录由宿主线程目录提供，每次 acquire 前创建。
-4. Gateway 进程对项目根有读写权限，沙箱内（默认 `sandbox_user: root`）写出的文件必须能被
-   Gateway 读和删。每次 acquire 的 canary 就在验证这一点：宿主机写 token → 沙箱读，
-   沙箱写 token → 宿主机读，探针放在 `workspace/.myflow-canary/`，成功后删除。
-   失败会 kill 新沙箱并报 `host mount canary failed`，先查 `host_mount`、模板 umask 和目录权限。
-5. 装依赖：`cd backend && uv sync --extra cube`（backend 的 `cube` extra = `agentkit[cube,redis]`，
-   提供 E2B 官方 Python SDK `e2b>=2.62,<3` 和 `redis>=5`）。如果直接装 harness 的 extras，
-   `agentkit[cube]` 不够：per-thread 锁在 `redis` extra 里，必须 `agentkit[cube,redis]`。
-6. Redis 从 Gateway 可达，`sandbox.cube.lease.redis_url`（生产用 `$REDIS_URL`）指向它；
+1. **acquire**：在沙箱里 `mkdir -p /mnt/user-data/{workspace,uploads,outputs}`，然后把宿主
+   `.myflow/users/{user_id}/threads/{thread_id}/user-data/uploads/` 整棵树上传到
+   `/mnt/user-data/uploads/`。上传失败会让整次 acquire 失败，并 kill 新建的沙箱，不会带着
+   半份文件继续跑。
+2. **技能按需上传**：不预传整棵技能树。`read_file` 命中 `/mnt/skills` 下的文件时只上传那一个；
+   `list_dir` / `glob` / `grep` 命中时上传这次查询的子树，之后同一棵子树不再重复传。技能路径
+   仍然是只读挂载语义，由路径守卫保证，不依赖宿主目录共享。
+3. **release**：把 `/mnt/user-data/outputs/` 下载回宿主同名目录，覆盖同名文件、保留仅宿主存在
+   的文件。下载失败只 warning，不会因为一份产物丢掉一个还在用的沙箱。`workspace/` 默认不传
+   也不回写；需要"下一轮接着干上轮工作区"时把 `sync.upload_workspace` /
+   `sync.download_workspace` 打开。
+
+`thread_files.py` 完全不变：前端按虚拟路径上传/读产物，宿主 `uploads/`、`outputs/` 仍是唯一
+访问点，差别只是 `outputs/` 的内容由 release 时的下载写进来。
+
+前置条件：
+
+1. 一个 E2B 兼容控制面（E2B Cloud、自建 envd，或 CubeSandbox），以及一个模板。模板不需要
+   预建 `/mnt/user-data` 的 bind 源，但要自带 `mkdir`、`cat`、`python3`、`grep`、`find`、`sed`
+   （目录初始化、canary、文本工具与 search helper 用）。
+2. 装依赖：`cd backend && uv sync --extra e2b`（backend 的 `e2b` extra =
+   `agentkit[e2b,redis]`，提供 E2B 官方 Python SDK `e2b>=2.62,<3` 和 `redis>=5`）。如果直接装
+   harness 的 extras，`agentkit[e2b]` 不够：per-thread 锁在 `redis` extra 里，必须
+   `agentkit[e2b,redis]`。
+3. Redis 从 Gateway 可达，`sandbox.e2b.lease.redis_url`（生产用 `$REDIS_URL`）指向它；
    多 worker 必须共用同一个实例/DB。启动时 Redis `PING` 失败直接拒绝启动；运行中续租失败会把
    handle 标成 dead，不会带着失效的锁继续写。
-7. **数据面域名可解析**：E2B 官方 SDK 按 `<port>-<sandbox_id>.<sandbox_domain>` 访问 envd，
+4. **数据面域名可解析**：E2B 官方 SDK 按 `<port>-<sandbox_id>.<sandbox_domain>` 访问 envd，
    所以 Gateway 必须能解析 `*.cube.app`（或你在 `sandbox_domain` 配的域名，需要 wildcard DNS）。
-   这是从 `cubesandbox` SDK 迁到 E2B 协议后唯一的部署新增项：旧 SDK 的
-   `CUBE_PROXY_NODE_IP` 逐请求 IP 覆盖在 E2B 协议里没有对应字段。
+   反向代理 / 网关本身也必须允许数据面地址。
 
 配置要点：
 
-- `sandbox.use`、整个 `sandbox.cube`、`sandbox.mounts`、`skills.container_path`、
-  `skills.builtin.*`、`skills.git.cache_dir`、`skills.source` 都是 **startup-only**，改完重启。
-- `release_action` 默认 `pause`：`after_agent` 每轮跑完都会释放，kill 会变成"每条用户消息
-  冷启动一个 MicroVM"。pause 保留内存和进程状态，下一轮 `connect()` 自动恢复，宿主文件仍在。
-  `shutdown()` 始终 kill。
+- `sandbox.use`、整个 `sandbox.e2b`、`skills.container_path`、`skills.builtin.*`、
+  `skills.git.cache_dir`、`skills.source` 都是 **startup-only**，改完重启。
+- `release_action` 默认 `pause`：`after_agent` 每轮跑完都会下载 outputs 再释放，kill 会变成
+  "每条用户消息冷启动一个沙箱"。pause 保留内存和进程状态，下一轮 `connect()` 自动恢复。
+  `shutdown()` 会先下载 outputs 再 kill。
 - `on_timeout` 默认 `pause`，`auto_resume: true`：空闲到 `timeout_seconds` 暂停，下次请求自动恢复。
-  集群配额紧张时可以把 `on_timeout` / `release_action` 改成 `kill`，宿主数据不受影响。
+  配额紧张时可以把 `on_timeout` / `release_action` 改成 `kill`；宿主文件仍由显式同步保证。
+- `sync` 是同步开关与上下限：`upload_uploads` / `download_outputs` 默认开，`upload_workspace` /
+  `download_workspace` 默认关；`max_file_bytes`（默认 32 MiB）超限的文件跳过并 warning，
+  `max_tree_bytes`（默认 256 MiB）超限的树直接放弃并 warning，绝不截断。
 - `allow_public_traffic: false` 让 CubeProxy 拒绝未带 traffic token 的公网请求；e2b SDK 会自动带。
 - `api_key` 留空时由 e2b SDK 读 `E2B_API_KEY`，`api_url` / `template_id` 建议直接用
   `$E2B_API_URL` / `$E2B_TEMPLATE_ID`，与 SDK 自己的环境变量保持一致。
-- 宿主挂载清单（`/mnt/user-data` 读写，技能树只读）和 mount hash 写进沙箱 metadata。
-  配置或技能路径变了，下一次 acquire 会发现 hash 不一致并重建旧沙箱，不会带着过期挂载继续跑。
+- 沙箱 metadata 只有 `myflow.version` / `myflow.user` / `myflow.thread` / `myflow.instance`，
+  不再写 `host-mount` 或 `mounts_hash`。发现只按 user/thread 匹配；旧 `cube:` sandbox_id 在
+  `get()` 里是内存 miss，runtime 会重新 acquire。
+- acquire 的 canary 是**三方一致**：`files.write` 写 token → `files.read` 读回 → 容器内
+  `cat` 看同一份文件，证明文件 API 与容器视图没有分叉。探针放在
+  `/mnt/user-data/workspace/.myflow-canary/`，成功后删除；失败会 kill 新沙箱。
+- `sandbox.mounts` 只对 local / opensandbox 生效；E2B provider 不读宿主目录。
 
 **回滚**：把 `sandbox.use` 改回 `agentkit.sandbox.local:LocalSandboxProvider`，重启 Gateway 即可。
-不需要数据库迁移，也不需要移动宿主文件：local 与 cube 共用同一份 `user-data` 和技能树。
-旧 checkpoint 里的 `cube:` sandbox_id 在回滚后 `get()` 返回 `None`，runtime 会重新 acquire
-本地沙箱；反过来从 local 切到 cube 也一样。
+不需要数据库迁移，也不需要移动宿主文件：local 与 E2B 共用同一份 `user-data` 和技能树。旧
+`e2b:` sandbox_id 在回滚后 `get()` 返回 `None`，runtime 会重新 acquire 本地沙箱；反过来从 local
+切到 E2B 也一样。
 
 ### OpenSandbox（容器隔离）
 
 在容器里跑工具：`sandbox.use: agentkit.sandbox.opensandbox:OpenSandboxProvider`，启用
 `sandbox.opensandbox`（`config.example.yaml` 里有整段注释模板）。容器里看到的
-`/mnt/user-data` 还是同一个宿主线程目录，上传与产物链路不变，所以和 local / cube 之间切换
+`/mnt/user-data` 还是同一个宿主线程目录，上传与产物链路不变，所以和 local 之间切换
 不需要迁数据。
 
 **容器由 `opensandbox-server` 托管**，Gateway 不再驱动 docker：少了一整套端口发布、
@@ -141,7 +153,7 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
    我们只用命令与文件 API（`grep` 走 shell）。
 4. 宿主挂载：`host_mount.local_root` 是 Gateway 进程看到的根（要覆盖 `.myflow` 与
    `skills/`），`host_mount.host_root` 是**服务端宿主**看到的同一个根（卷源按它翻译）。
-5. Redis 必填：`sandbox.opensandbox.lease.redis_url`，与 cube 共用同一个 per-thread 锁；
+5. Redis 必填：`sandbox.opensandbox.lease.redis_url`，与 E2B 共用同一个 per-thread 锁；
    不可达时启动失败。
 
 生命周期：
@@ -160,13 +172,13 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
 | provider | 走哪条路 |
 |---|---|
 | `opensandbox` | 配了 `opensandbox.run_code` 就走 **Code Interpreter**（镜像 + entrypoint 换成官方 code-interpreter，能返回表达式结果，支持 python/javascript/typescript/bash/java/go）；没配就走 shell 通道 |
-| `cube` | shell 通道（模板自带 `python3`），支持 python/javascript/bash |
+| `e2b` | shell 通道（模板自带 `python3`），支持 python/javascript/bash |
 | `local` | shell 通道，但要求 `allow_host_bash: true`：这就是在宿主上跑模型代码，与 bash 工具同一个信任前提 |
 
 shell 通道会把片段写到 `/mnt/user-data/workspace/.myflow-run/`、跑完即删；typescript/java/go
 在 shell 通道下会明确报"需要 code interpreter"，不会猜着跑。
 
-**回滚**：`sandbox.use` 改回 local 或 cube 并重启即可；旧的 `osb:` sandbox_id 在
+**回滚**：`sandbox.use` 改回 local 或 E2B 并重启即可；旧的 `osb:` sandbox_id 在
 `get()` 里是内存 miss，runtime 会重新 acquire；残留沙箱交给服务端的 TTL 或 `osb` CLI。
 
 ### 模型与推理等级（输入框里的两个选择）
@@ -663,20 +675,20 @@ collection 没有这些字段，关键词通道会报 `keyword_search_unavailabl
 uv run python -m pytest backend/tests
 ```
 
-CubeSandbox 的真集群用例默认跳过，只在 Linux 宿主上显式开启（会创建真实 MicroVM 和宿主挂载，
-不要指向共享生产 Cube）：
+E2B 的真集群用例默认跳过，只在 Linux 宿主上显式开启（会创建真实沙箱，不要指向共享生产环境）：
 
 ```bash
 cd backend
-CUBE_INTEGRATION=1 \
-E2B_API_URL=http://<cube-api> \
+E2B_INTEGRATION=1 \
+E2B_API_URL=http://<e2b-api> \
 E2B_TEMPLATE_ID=<template-id> \
 REDIS_URL=redis://127.0.0.1:6379/0 \
-uv run pytest tests/test_cube_integration.py -v
+uv run pytest tests/test_e2b_integration.py -v
 ```
 
-有鉴权时再加 `E2B_API_KEY`；数据面域名不是 `cube.app` 时加 `E2B_DOMAIN`。用例跑真实 provider 的 acquire → `echo`/python3 →
-`/mnt/user-data/workspace` 双向读写 → canary → pause/release → 重新 acquire。
+有鉴权时再加 `E2B_API_KEY`；数据面域名不是 `cube.app` 时加 `E2B_DOMAIN`。用例跑真实 provider 的 acquire →
+uploads 上传 → `echo`/python3 → 沙箱内写 `/mnt/user-data/outputs` → release 下载 → pause/release → 重新 acquire，
+并覆盖一次按需技能读取。
 
 OpenSandbox 的真用例同样默认跳过（会创建并 kill 真实沙箱，需要一个在跑的服务端）：
 

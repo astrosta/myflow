@@ -1,13 +1,13 @@
-"""CubeSandbox: the ``Sandbox`` contract over one SDK sandbox handle.
+"""E2BSandbox: the Sandbox contract over one E2B SDK sandbox handle.
 
-Commands run through ``sdk.commands.run`` with a fresh shell, so
-``persistent_shell_sessions`` is explicitly ``False``. Output is bounded by a
-``head -c`` wrapper and the per-call timeout is always explicit, because the
-SDK client's transport timeout is meant for control-plane calls, not 600s work.
+Commands run through sdk.commands.run with a fresh shell, so
+persistent_shell_sessions is explicitly False.  Output is bounded by a head -c
+wrapper and the per-call timeout is always explicit, because the SDK client's
+transport timeout is meant for control-plane calls, not 600s work.
 
-File paths are remote POSIX paths: every one is checked with
-``assert_virtual_path`` against the mount list before it reaches the SDK. The
-MicroVM, not this path table, is the isolation boundary for commands.
+File paths are remote POSIX paths checked against a static virtual mount table.
+There is no host mount: the sandbox filesystem is authoritative, and skill
+sources are uploaded lazily by LazySkillUploader when a tool first reads them.
 """
 
 from __future__ import annotations
@@ -17,13 +17,13 @@ import logging
 import threading
 from collections.abc import Callable, Iterator, Sequence
 
-from agentkit.sandbox.cube.client import (
+from agentkit.sandbox.e2b.client import (
     SandboxGoneError,
     SdkSandbox,
     error_status,
     is_gone_error,
 )
-from agentkit.sandbox.cube.files import (
+from agentkit.sandbox.e2b.files import (
     command_exit_code,
     command_stdout,
     glob_paths,
@@ -35,7 +35,7 @@ from agentkit.sandbox.cube.files import (
     write_bytes,
     write_text,
 )
-from agentkit.sandbox.cube.mounts import MountEntry
+from agentkit.sandbox.e2b.sync import LazySkillUploader, SkillSource, SyncLimits
 from agentkit.sandbox.exceptions import (
     SandboxError,
     SandboxNotFoundError,
@@ -58,13 +58,13 @@ _AUTH_STATUS_CODES = frozenset({401, 403})
 logger = logging.getLogger(__name__)
 
 
-class CubeSandbox(Sandbox):
-    """One CubeSandbox MicroVM behind the ``Sandbox`` interface."""
+class E2BSandbox(Sandbox):
+    """One E2B sandbox behind the Sandbox interface."""
 
-    #: Every ``execute_command`` starts a new shell; exports and cwd do not persist.
+    #: Every execute_command starts a new shell; exports and cwd do not persist.
     persistent_shell_sessions: bool | None = False
 
-    #: The Cube template ships python3, so a snippet can run through the shell.
+    #: The E2B template ships python3, so a snippet can run through the shell.
     supports_run_code: bool = True
 
     def __init__(
@@ -72,7 +72,9 @@ class CubeSandbox(Sandbox):
         sdk: SdkSandbox,
         *,
         sandbox_id: str,
-        mounts: Sequence[MountEntry],
+        path_mappings: Sequence[PathMapping],
+        skill_sources: Sequence[SkillSource] = (),
+        sync_limits: SyncLimits | None = None,
         sandbox_user: str = "root",
         command_timeout: float = _DEFAULT_COMMAND_TIMEOUT,
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
@@ -86,21 +88,23 @@ class CubeSandbox(Sandbox):
         self.sandbox_user = sandbox_user
         self.command_timeout = command_timeout
         self.max_output_bytes = max_output_bytes
-        self._mounts = tuple(mounts)
+        # The static table is the whole path guard. local_path is only used by
+        # mask_host_paths to redact host roots from tool output.
+        self.path_mappings: list[PathMapping] = list(path_mappings)
         self._virtual_mounts = [
-            VirtualMount(container_path=entry.container_path, read_only=entry.read_only)
-            for entry in self._mounts
+            VirtualMount(container_path=mapping.container_path, read_only=mapping.read_only)
+            for mapping in self.path_mappings
         ]
-        # ``mask_host_paths`` only redacts tool output and errors; it never decides
-        # what a path is allowed to reach.
-        self.path_mappings: list[PathMapping] = [
-            PathMapping(
-                container_path=entry.container_path,
-                local_path=entry.host_path,
-                read_only=entry.read_only,
+        self._skills = (
+            LazySkillUploader(
+                sdk,
+                sources=skill_sources,
+                limits=sync_limits or SyncLimits(),
+                user=sandbox_user,
             )
-            for entry in self._mounts
-        ]
+            if skill_sources
+            else None
+        )
 
     # -- commands ---------------------------------------------------------
 
@@ -149,6 +153,7 @@ class CubeSandbox(Sandbox):
     ) -> str:
         normalized = self._assert_path(path)
         with self._file_errors(normalized, "read"):
+            self._ensure_skill_file(normalized)
             return read_text(
                 self._sdk,
                 normalized,
@@ -172,6 +177,7 @@ class CubeSandbox(Sandbox):
     def download_file(self, path: str) -> bytes:
         normalized = self._assert_path(path)
         with self._file_errors(normalized, "read"):
+            self._ensure_skill_file(normalized)
             return read_bytes(self._sdk, normalized, user=self.sandbox_user)
 
     def update_file(self, path: str, content: bytes) -> None:
@@ -185,6 +191,7 @@ class CubeSandbox(Sandbox):
     def list_dir(self, path: str, max_depth: int = 2) -> list[str]:
         normalized = self._assert_path(path)
         with self._file_errors(normalized, "list"):
+            self._ensure_skill_tree(normalized)
             return list_tree(
                 self._sdk, normalized, user=self.sandbox_user, max_depth=max_depth
             )
@@ -199,6 +206,7 @@ class CubeSandbox(Sandbox):
     ) -> tuple[list[str], bool]:
         normalized = self._assert_path(path)
         with self._file_errors(normalized, "search"):
+            self._ensure_skill_tree(normalized)
             return glob_paths(
                 self._sdk,
                 normalized,
@@ -220,6 +228,7 @@ class CubeSandbox(Sandbox):
     ) -> tuple[list[GrepMatch], bool]:
         normalized = self._assert_path(path)
         with self._file_errors(normalized, "search"):
+            self._ensure_skill_tree(normalized)
             return grep_paths(
                 self._sdk,
                 normalized,
@@ -232,6 +241,14 @@ class CubeSandbox(Sandbox):
             )
 
     # -- helpers ----------------------------------------------------------
+
+    def _ensure_skill_file(self, path: str) -> None:
+        if self._skills is not None:
+            self._skills.ensure_file(path)
+
+    def _ensure_skill_tree(self, path: str) -> None:
+        if self._skills is not None:
+            self._skills.ensure_tree(path)
 
     def _notify_dead(self) -> None:
         """Report that the remote sandbox is gone, at most once per handle.
@@ -251,7 +268,7 @@ class CubeSandbox(Sandbox):
             self._on_dead()
         except Exception:
             logger.warning(
-                "CubeSandbox %s on_dead callback failed; the handle is still dead",
+                "E2BSandbox %s on_dead callback failed; the handle is still dead",
                 self.id,
                 exc_info=True,
             )
@@ -291,13 +308,12 @@ class CubeSandbox(Sandbox):
 
 
 def _wrap_command(command: str, max_output_bytes: int) -> str:
-    """Bound stdout and report the command's own status, not ``head``'s.
+    """Bound stdout and report the command's own status, not head's.
 
-    The body sits in a brace group so ``2>&1`` covers the whole command. Then
-    ``pipefail`` plus ``PIPESTATUS[0]`` keep ``head``'s early close from hiding a
-    real failure. The ``:-$?`` fallback covers a shell that does not report
-    ``PIPESTATUS``: with ``pipefail`` on, the pipeline's own status carries the
-    same exit code.
+    The body sits in a brace group so 2>&1 covers the whole command. Then
+    pipefail plus PIPESTATUS[0] keep head's early close from hiding a real
+    failure. The :-$? fallback covers a shell that does not report PIPESTATUS:
+    with pipefail on, the pipeline's own status carries the same exit code.
     """
 
     return (
@@ -319,7 +335,7 @@ def _map_command_error(
         return exc
     if isinstance(exc, SandboxGoneError) or is_gone_error(exc):
         return SandboxNotFoundError(
-            f"CubeSandbox {sandbox_id} no longer exists; acquire a new sandbox",
+            f"E2BSandbox {sandbox_id} no longer exists; acquire a new sandbox",
             sandbox_id=sandbox_id,
         )
     status = error_status(exc)
@@ -327,9 +343,9 @@ def _map_command_error(
         return SandboxTimeoutError(f"Command timed out after {timeout:g}s")
     if status in _AUTH_STATUS_CODES:
         return SandboxRuntimeError(
-            "CubeSandbox rejected the command credentials; check sandbox.cube.api_key"
+            "E2BSandbox rejected the command credentials; check sandbox.e2b.api_key"
         )
-    return SandboxRuntimeError(f"CubeSandbox command failed: {exc}")
+    return SandboxRuntimeError(f"E2BSandbox command failed: {exc}")
 
 
 def _as_text(value: object) -> str:
@@ -340,4 +356,4 @@ def _as_text(value: object) -> str:
     return str(value)
 
 
-__all__ = ["CubeSandbox"]
+__all__ = ["E2BSandbox"]

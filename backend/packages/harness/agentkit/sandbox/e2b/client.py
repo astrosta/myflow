@@ -1,12 +1,12 @@
-"""E2B protocol boundary for CubeSandbox.
+"""E2B protocol boundary for E2BSandbox.
 
 The official E2B Python SDK is optional. It is imported only inside the methods
 that need it, so a local-only deployment can import the sandbox package without
-installing agentkit[cube].
+installing agentkit[e2b].
 
-The Protocols here are the narrow surface CubeSandboxProvider and CubeSandbox
+The Protocols here are the narrow surface E2BSandboxProvider and E2BSandbox
 depend on. The adapters below translate E2B objects and exceptions into that
-surface; the fake in tests/fakes/cube_sdk.py implements the same surface.
+surface; the fake in tests/fakes/e2b_sdk.py implements the same surface.
 """
 
 from __future__ import annotations

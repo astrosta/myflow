@@ -1,7 +1,7 @@
-"""CubeSandbox tree listing and search contract tests.
+"""E2BSandbox tree listing and search contract tests.
 
-``list_dir`` renders the same glyphs as the local provider from ``sdk.files.list``.
-``glob`` / ``grep`` delegate to one Python helper dropped into the sandbox, which
+list_dir renders the same glyphs as the local provider from sdk.files.list.
+glob / grep delegate to one Python helper dropped into the sandbox, which
 rejects escaping patterns and caps results before serializing. These tests drive
 the fake command handler for the JSON contract, and run the helper source itself
 on the host for its own path and truncation rules.
@@ -18,26 +18,23 @@ from pathlib import Path
 
 import pytest
 
-from agentkit.sandbox.cube import files as cube_files
-from agentkit.sandbox.cube.mounts import MountEntry
-from agentkit.sandbox.cube.sandbox import CubeSandbox
-from fakes.cube_sdk import FakeCommandResult, FakeCommands, FakeFiles, FakeSdkSandbox
+from agentkit.sandbox.e2b import files as e2b_files
+from agentkit.sandbox.e2b.sandbox import E2BSandbox
+from agentkit.sandbox.security import PathMapping
+from fakes.e2b_sdk import FakeCommandResult, FakeCommands, FakeFiles, FakeSdkSandbox
 
 _USER_DATA = "/mnt/user-data"
 _WORKSPACE = "/mnt/user-data/workspace"
 _HELPER = "/tmp/.myflow/search.py"
 
 
-def _sandbox(tmp_path: Path, *, read_only: bool = False) -> CubeSandbox:
-    sdk = FakeSdkSandbox(
-        files=FakeFiles({_USER_DATA: tmp_path / "user-data"}),
-        commands=FakeCommands(),
-    )
-    mounts = [MountEntry(_USER_DATA, str(tmp_path / "user-data"), read_only)]
-    return CubeSandbox(sdk, sandbox_id="cube:s1", mounts=mounts)
+def _sandbox(tmp_path: Path, *, read_only: bool = False) -> E2BSandbox:
+    sdk = FakeSdkSandbox(files=FakeFiles(), commands=FakeCommands())
+    mappings = [PathMapping(_USER_DATA, str(tmp_path / "user-data"), read_only)]
+    return E2BSandbox(sdk, sandbox_id="e2b:s1", path_mappings=mappings)
 
 
-def _reply(sandbox: CubeSandbox, payload: dict) -> None:
+def _reply(sandbox: E2BSandbox, payload: dict) -> None:
     """Make every command return one helper JSON payload."""
 
     sandbox._sdk.commands.handler = lambda cmd, **kw: FakeCommandResult(
@@ -45,7 +42,7 @@ def _reply(sandbox: CubeSandbox, payload: dict) -> None:
     )
 
 
-def _helper_command(sandbox: CubeSandbox) -> str:
+def _helper_command(sandbox: E2BSandbox) -> str:
     commands = [call["cmd"] for call in sandbox._sdk.commands.calls]
     helpers = [cmd for cmd in commands if cmd.startswith("python3 ")]
     assert len(helpers) == 1
@@ -78,7 +75,7 @@ def test_list_dir_on_a_file_is_not_a_directory(tmp_path: Path) -> None:
 
 def test_list_dir_empty_directory_returns_no_lines(tmp_path: Path) -> None:
     sandbox = _sandbox(tmp_path)
-    (tmp_path / "user-data" / "workspace").mkdir(parents=True)
+    sandbox._sdk.files.make_dir(_WORKSPACE)
     assert sandbox.list_dir(_WORKSPACE) == []
 
 
@@ -109,9 +106,7 @@ def test_list_dir_rejects_an_unusable_entry(tmp_path: Path) -> None:
 
 def test_list_dir_lists_a_read_only_mount(tmp_path: Path) -> None:
     sandbox = _sandbox(tmp_path, read_only=True)
-    workspace = tmp_path / "user-data" / "workspace"
-    workspace.mkdir(parents=True)
-    (workspace / "a.txt").write_text("x", encoding="utf-8")
+    sandbox._sdk.files.write(f"{_WORKSPACE}/a.txt", "x")
     assert sandbox.list_dir(_WORKSPACE) == ["└── a.txt"]
 
 
@@ -218,7 +213,7 @@ def test_search_helper_is_written_once(tmp_path: Path) -> None:
     sandbox.glob(_WORKSPACE, "*.py")
     sandbox.glob(_WORKSPACE, "*.py")
     assert sandbox._sdk.files.writes.count(_HELPER) == 1
-    assert cube_files.SEARCH_HELPER_PATH == _HELPER
+    assert e2b_files.SEARCH_HELPER_PATH == _HELPER
 
 
 # -- the helper script itself ---------------------------------------------
@@ -226,7 +221,7 @@ def test_search_helper_is_written_once(tmp_path: Path) -> None:
 
 def _run_helper(tmp_path: Path, payload: dict) -> dict:
     script = tmp_path / "search.py"
-    script.write_text(cube_files.SEARCH_HELPER, encoding="utf-8")
+    script.write_text(e2b_files.SEARCH_HELPER, encoding="utf-8")
     encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
     completed = subprocess.run(
         [sys.executable, str(script), encoded],

@@ -35,12 +35,7 @@ class SandboxLeaseConfig(BaseModel):
     ttl_seconds: int = 30
 
 
-# The CubeSandbox sections predate the shared models; keep their names importable.
-CubeSandboxHostMountConfig = HostMountConfig
-CubeSandboxLeaseConfig = SandboxLeaseConfig
-
-
-class CubeSandboxNetworkConfig(BaseModel):
+class E2BSandboxNetworkConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     allow_out: list[str] = Field(default_factory=list)
@@ -48,11 +43,34 @@ class CubeSandboxNetworkConfig(BaseModel):
     rules: dict | None = None
 
 
-class CubeSandboxConfig(BaseModel):
+class E2BSandboxSyncConfig(BaseModel):
+    """Explicit host<->sandbox file sync; the E2B protocol has no host mounts.
+
+    Acquire uploads the host uploads/ tree, release downloads outputs/. Skill
+    files are uploaded lazily when a tool first reads them, so upload_skills
+    only turns that source on; it never bulk-copies the tree.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    upload_uploads: bool = True
+    upload_workspace: bool = False
+    upload_skills: bool = True
+    download_outputs: bool = True
+    download_workspace: bool = False
+    max_file_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
+    max_tree_bytes: int = Field(default=256 * 1024 * 1024, gt=0)
+
+
+class E2BSandboxConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     api_url: str = "http://127.0.0.1:3000"
-    api_key: str = Field(default="", description="Leave empty to read E2B_API_KEY / CUBE_API_KEY; redact in logs and errors")
+    api_key: str = Field(
+        default="",
+        description="Leave empty to read E2B_API_KEY; redact in logs and errors",
+    )
     template_id: str
     sandbox_domain: str = "cube.app"
     timeout_seconds: int = 1800
@@ -65,9 +83,9 @@ class CubeSandboxConfig(BaseModel):
     allow_internet_access: bool = True
     allow_public_traffic: bool = False
     sandbox_user: str = "root"
-    network: CubeSandboxNetworkConfig = Field(default_factory=CubeSandboxNetworkConfig)
-    host_mount: CubeSandboxHostMountConfig
-    lease: CubeSandboxLeaseConfig
+    network: E2BSandboxNetworkConfig = Field(default_factory=E2BSandboxNetworkConfig)
+    lease: SandboxLeaseConfig
+    sync: E2BSandboxSyncConfig = Field(default_factory=E2BSandboxSyncConfig)
     max_cached_threads: int = 64
 
 
@@ -209,11 +227,11 @@ class SandboxConfig(BaseModel):
             field_doc="run_code tool: expose it, pick the default language and the wall clock.",
         ),
     )
-    cube: CubeSandboxConfig | None = Field(
+    e2b: E2BSandboxConfig | None = Field(
         default=None,
         description=format_field_description(
-            "sandbox.cube",
-            field_doc="CubeSandbox control-plane, host mount, and lease settings.",
+            "sandbox.e2b",
+            field_doc="E2B control-plane, explicit file sync, and lease settings.",
         ),
     )
     opensandbox: OpenSandboxConfig | None = Field(
@@ -227,10 +245,9 @@ class SandboxConfig(BaseModel):
 
 __all__ = [
     "DEFAULT_OPENSANDBOX_IMAGE",
-    "CubeSandboxConfig",
-    "CubeSandboxHostMountConfig",
-    "CubeSandboxLeaseConfig",
-    "CubeSandboxNetworkConfig",
+    "E2BSandboxConfig",
+    "E2BSandboxNetworkConfig",
+    "E2BSandboxSyncConfig",
     "HostMountConfig",
     "OpenSandboxConfig",
     "OpenSandboxRunCodeConfig",
