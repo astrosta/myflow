@@ -75,6 +75,8 @@ def test_defaults() -> None:
     assert parsed.max_cached_threads == 64
     assert parsed.discover_existing is True
     assert parsed.startup_healthcheck is True
+    assert parsed.prewarm is True
+    assert parsed.prewarm_max_concurrent == 1
     assert parsed.orphan_policy == "report"
     assert parsed.orphan_ttl_seconds == 86400
 

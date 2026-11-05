@@ -23,7 +23,13 @@ from agentkit.sandbox.exceptions import (
     SandboxNotFoundError,
     SandboxRuntimeError,
 )
-from agentkit.sandbox.lease import lease_owner_from_context, shield_sandbox_work
+from agentkit.sandbox.lease import (
+    current_sandbox_lease,
+    get_sandbox_lease_manager,
+    lead_lease_owner_id,
+    lease_owner_from_context,
+    shield_sandbox_work,
+)
 from agentkit.sandbox.sandbox import Sandbox
 from agentkit.sandbox.sandbox_provider import (
     SandboxProvider,
@@ -101,6 +107,22 @@ def _remember(runtime: ToolRuntime, sandbox_id: str) -> None:
         runtime.context["sandbox_id"] = sandbox_id
 
 
+def _retain_lease(runtime: ToolRuntime, sandbox_id: str) -> None:
+    """Lazy tool acquisition must register the execution lease exactly like
+    the eager middleware path; otherwise after_agent cannot release it."""
+
+    context = runtime.context if isinstance(runtime.context, dict) else {}
+    execution_owner = lease_owner_from_context(context)
+    owner_id = execution_owner or lead_lease_owner_id(_resolve_runtime_thread_id(runtime))
+    if owner_id is None:
+        return
+    get_sandbox_lease_manager().retain(
+        owner_id,
+        client=current_sandbox_lease(sandbox_id),
+        releasing=execution_owner is None,
+    )
+
+
 def ensure_sandbox_initialized(runtime: ToolRuntime | None = None) -> Sandbox:
     if runtime is None or runtime.state is None:
         raise SandboxRuntimeError("Tool runtime not available")
@@ -127,6 +149,7 @@ def ensure_sandbox_initialized(runtime: ToolRuntime | None = None) -> Sandbox:
         raise SandboxNotFoundError("Sandbox not found after acquisition", sandbox_id=sandbox_id)
 
     _remember(runtime, sandbox_id)
+    _retain_lease(runtime, sandbox_id)
     return sandbox
 
 
@@ -157,6 +180,7 @@ async def ensure_sandbox_initialized_async(runtime: ToolRuntime | None = None) -
         raise SandboxNotFoundError("Sandbox not found after acquisition", sandbox_id=sandbox_id)
 
     _remember(runtime, sandbox_id)
+    _retain_lease(runtime, sandbox_id)
     return sandbox
 
 

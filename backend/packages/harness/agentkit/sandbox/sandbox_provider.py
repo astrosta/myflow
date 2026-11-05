@@ -20,6 +20,16 @@ _provider_lock = threading.Lock()
 class SandboxProvider(ABC):
     uses_thread_data_mounts: bool = False
 
+    @property
+    def prewarm_enabled(self) -> bool:
+        """Whether this provider wants a speculative acquire before the model call."""
+
+        return False
+
+    @property
+    def prewarm_max_concurrent(self) -> int:
+        return 1
+
     @abstractmethod
     def acquire(self, thread_id: str | None = None, *, user_id: str | None = None) -> str: ...
 

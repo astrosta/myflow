@@ -177,6 +177,12 @@ Gateway 在宿主机上解析不到它，表现为请求发不出去（`pre_send
 
 - `release_action` 默认 `keep`：每轮结束只放租约，沙箱留给 TTL（`timeout_seconds`）
   回收，下一轮 `connect` 接回同一个沙箱；改成 `destroy` 则每轮 `kill`。
+- `prewarm`（默认开）把 acquire 从 `before_agent` 移到后台：只有最新用户消息带
+  代码块、路径、命令或 traceback 等工具信号时才预取，模型首 token 与容器启动并行。
+  首个沙箱工具仍走正常的 lazy acquire，通过 provider 的 per-thread 锁复用同一个
+  acquire 结果；纯文本轮不会创建沙箱。预取没被工具用到时，收尾会等这次 acquire
+  结束后再按 `release_action` 释放/保留（只影响 run 结束，不影响首 token）；
+  `prewarm_max_concurrent` 限制每进程并发预取，满额时该轮退回工具惰性 acquire。
 - `reset()` 不动远端；`shutdown()` kill 本进程持有的沙箱；LRU 驱逐只丢 handle。
 - acquire 会用 `get_info()` 复核缓存：TTL 到期或被外部 kill 了就重建。
 - 挂载或技能路径变了（metadata 里 `myflow.mounts_hash` 不一致）会 kill 后重建。

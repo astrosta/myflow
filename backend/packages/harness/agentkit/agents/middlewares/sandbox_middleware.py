@@ -25,6 +25,11 @@ from agentkit.sandbox.lease import (
     lead_lease_owner_id,
     lease_owner_from_context,
 )
+from agentkit.sandbox.prewarm import (
+    close_sandbox_prewarm,
+    close_sandbox_prewarm_async,
+    start_sandbox_prewarm,
+)
 from agentkit.sandbox.runtime import (
     reset_authorization_checked,
     runtime_user_bucket,
@@ -33,11 +38,13 @@ from agentkit.sandbox.sandbox_provider import get_sandbox_provider
 
 
 class SandboxMiddleware(AgentMiddleware):
-    """Warm the sandbox before the agent and release it after the graph finishes.
+    """Acquire the thread sandbox around one agent execution and release it after.
 
-    A single tool must not release: siblings in the same step still need the sandbox.
-    M8 又加了一条：**单个执行**也不能释放——兄弟子代理还在跑（§11）。
-    ``ensure_sandbox_initialized`` remains the lazy fallback for runs that skipped warmup.
+    OpenSandbox can opt into a speculative background acquire; eager providers
+    still acquire here. Either way a single tool must not release: siblings in
+    the same step still need the sandbox. M8 又加了一条：**单个执行**也不能释放——
+    兄弟子代理还在跑（§11）。``ensure_sandbox_initialized`` remains the lazy
+    acquisition path used by tools.
     """
 
     def before_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
@@ -124,7 +131,14 @@ def _acquire(state: Any, runtime: Runtime, *, async_acquire: bool) -> dict[str, 
     thread_id = _thread_id(runtime)
     if thread_id is None:
         return None
-    sandbox_id = get_sandbox_provider().acquire(thread_id, user_id=_user_id(runtime))
+    provider = get_sandbox_provider()
+    if getattr(provider, "prewarm_enabled", False):
+        # Optional speculative acquire: submit it and return immediately so the
+        # model can produce its first token. The first sandbox-backed tool waits
+        # on the provider's per-thread lock and reuses the result.
+        start_sandbox_prewarm(state, runtime, provider=provider)
+        return None
+    sandbox_id = provider.acquire(thread_id, user_id=_user_id(runtime))
     _stamp(runtime, sandbox_id)
     _retain_lease(runtime, sandbox_id)
     return {"sandbox": {"sandbox_id": sandbox_id}}
@@ -139,7 +153,12 @@ async def _acquire_async(state: Any, runtime: Runtime) -> dict[str, Any] | None:
     thread_id = _thread_id(runtime)
     if thread_id is None:
         return None
-    sandbox_id = await get_sandbox_provider().acquire_async(thread_id, user_id=_user_id(runtime))
+    provider = get_sandbox_provider()
+    if getattr(provider, "prewarm_enabled", False):
+        # Do not await: the worker overlaps sandbox creation with model time.
+        start_sandbox_prewarm(state, runtime, provider=provider)
+        return None
+    sandbox_id = await provider.acquire_async(thread_id, user_id=_user_id(runtime))
     _stamp(runtime, sandbox_id)
     _retain_lease(runtime, sandbox_id)
     return {"sandbox": {"sandbox_id": sandbox_id}}
@@ -152,6 +171,7 @@ def _stamp(runtime: Runtime, sandbox_id: str) -> None:
 
 
 def _release(state: Any, runtime: Runtime) -> None:
+    close_sandbox_prewarm(state, runtime)
     sandbox_id = _sandbox_id(state, runtime)
     if sandbox_id:
         _release_lease(runtime, sandbox_id)
@@ -159,6 +179,7 @@ def _release(state: Any, runtime: Runtime) -> None:
 
 async def _release_async(state: Any, runtime: Runtime) -> None:
     """``aafter_agent`` 只有一个 await 时机：等 provider 的异步 release 结束。"""
+    await close_sandbox_prewarm_async(state, runtime)
     sandbox_id = _sandbox_id(state, runtime)
     if sandbox_id:
         await _release_lease_async(runtime, sandbox_id)

@@ -207,6 +207,19 @@ class OpenSandboxConfig(BaseModel):
     max_cached_threads: int = Field(default=64, ge=1)
     discover_existing: bool = True
     startup_healthcheck: bool = True
+    prewarm: bool = Field(
+        default=True,
+        description=(
+            "Speculatively acquire the thread sandbox while the model is "
+            "generating, so the first model token never waits for container "
+            "startup. Tools still acquire lazily and fall back on failure."
+        ),
+    )
+    prewarm_max_concurrent: int = Field(
+        default=1,
+        ge=1,
+        description="Maximum in-flight speculative acquisitions per Gateway process.",
+    )
     host_mount: HostMountConfig
     lease: SandboxLeaseConfig
     orphan_policy: Literal["report", "remove"] = "report"

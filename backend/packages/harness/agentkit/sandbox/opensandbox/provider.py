@@ -83,6 +83,14 @@ class OpenSandboxProvider(SandboxProvider):
     uses_thread_data_mounts = True
     supports_agent_skill_isolation = True
 
+    @property
+    def prewarm_enabled(self) -> bool:
+        return bool(self._osb.prewarm)
+
+    @property
+    def prewarm_max_concurrent(self) -> int:
+        return max(1, int(self._osb.prewarm_max_concurrent))
+
     def __init__(
         self,
         *,
