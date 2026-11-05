@@ -7,7 +7,8 @@ import type { ThreadSummary } from "@/core/types";
 import { Sidebar } from "./sidebar";
 
 /**
- * 侧栏版面：品牌行 → 新对话 → 知识库 → **最近对话**（历史会话挂在它下面）。
+ * 侧栏版面：品牌行 → 新对话 → 功能导航 → **最近对话**（历史会话挂在它下面）。
+ * 功能导航顺序：我的画像 → 记忆管理 → 技能中心 → 知识库。
  *
  * `next/link` 在 vitest 里没有路由上下文，这里替换成一个普通 `<a>`：
  * 这条测试要断言的是**结构和文案**，不是 Next 的路由行为。
@@ -75,6 +76,25 @@ describe("侧栏的最近对话栏", () => {
     expect(memory.getAttribute("href")).toBe("/workspace/memory");
     expect(memory.getAttribute("aria-current")).toBe("page");
     expect(view.getByRole("link", { name: /我的画像/ }).getAttribute("aria-current")).toBeNull();
+  });
+
+  it("功能导航按我的画像、记忆管理、技能中心、知识库排列", () => {
+    const view = render(<Sidebar threads={[]} />);
+    const nav = view.getByRole("navigation", { name: "功能导航" });
+    const links = Array.from(nav.querySelectorAll("a"));
+
+    expect(links.map((link) => link.textContent?.trim())).toEqual([
+      "我的画像",
+      "记忆管理",
+      "技能中心",
+      "知识库",
+    ]);
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([
+      "/workspace/profile",
+      "/workspace/memory",
+      "/workspace/skills",
+      "/workspace/knowledge",
+    ]);
   });
 
   it("当前会话高亮：aria-current 只挂在它自己身上", () => {

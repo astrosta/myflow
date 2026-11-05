@@ -11,7 +11,8 @@ import { cn, formatTimestamp } from "@/lib/utils";
  * 侧栏不自己取数，是因为"列表怎么来的"（分页、失效、乐观插入）属于
  * 服务端状态，应该由 TanStack Query 在容器里管；这里只负责画出来。
  *
- * 版面从上到下：品牌行 → 新对话 → 知识库 → **最近对话**（历史会话）。
+ * 版面从上到下：品牌行 → 新对话 → 功能导航 → **最近对话**（历史会话）。
+ * 功能导航固定为：我的画像 → 记忆管理 → 技能中心 → 知识库。
  * 历史会话挂在一个带标题的分区下面，而不是直接铺在导航里——它和上面两个
  * 是不同性质的东西：上面是"去哪"，下面是"回过哪"，中间没有分隔就读成一串
  * 同级的按钮。标题始终渲染（空列表也一样），免得列表加载完再冒出一行字、
@@ -21,10 +22,10 @@ const NEW_CHAT_CLASS =
   "flex h-9 w-full items-center justify-center rounded-md border border-neutral-300 bg-white text-xs font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900";
 
 /**
- * 导航项（知识库 / 技能 / 审核）共用一套形制。
+ * 导航项（我的画像 / 记忆管理 / 技能中心 / 知识库 / 审核）共用一套形制。
  *
- * 三个入口是同一类东西——"去哪"，形状就得一致；各写一份 class 的话，
- * 加第三个入口时高亮态迟早会跟上两个不一样。
+ * 这些入口是同一类东西——"去哪"，形状就得一致；各写一份 class 的话，
+ * 新增入口时高亮态迟早会跟已有入口不一样。
  */
 function navItemClass(active: boolean): string {
   return cn(
@@ -119,22 +120,6 @@ export function Sidebar({
 
       <nav aria-label="功能导航" className="space-y-1 px-3 pb-3">
         <Link
-          aria-current={knowledgeActive ? "page" : undefined}
-          className={navItemClass(knowledgeActive)}
-          href="/workspace/knowledge"
-        >
-          <BookOpenIcon className="shrink-0" size={15} />
-          知识库
-        </Link>
-        <Link
-          aria-current={skillsActive ? "page" : undefined}
-          className={navItemClass(skillsActive)}
-          href="/workspace/skills"
-        >
-          <ToolIcon className="shrink-0" size={15} />
-          技能
-        </Link>
-        <Link
           aria-current={profileActive ? "page" : undefined}
           className={navItemClass(profileActive)}
           href="/workspace/profile"
@@ -149,6 +134,22 @@ export function Sidebar({
         >
           <MemoryIcon className="shrink-0" size={15} />
           记忆管理
+        </Link>
+        <Link
+          aria-current={skillsActive ? "page" : undefined}
+          className={navItemClass(skillsActive)}
+          href="/workspace/skills"
+        >
+          <ToolIcon className="shrink-0" size={15} />
+          技能中心
+        </Link>
+        <Link
+          aria-current={knowledgeActive ? "page" : undefined}
+          className={navItemClass(knowledgeActive)}
+          href="/workspace/knowledge"
+        >
+          <BookOpenIcon className="shrink-0" size={15} />
+          知识库
         </Link>
         {/**
          * 「审核」只对管理员画出来：普通用户看不到这个链接。
