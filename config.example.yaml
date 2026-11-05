@@ -135,14 +135,24 @@ memory:
     user_id_salt: ""          # 生产用 $MYFLOW_MEMORY_ID_SALT（至少 32 字符；true 时必填）
     required: false
     # Session 只用 idle-only auto-commit；0 表示关闭 token/message 阈值。
-    # memory_policy.memory_types 固定只启用 8 类自动记忆，显式排除
-    # profile / identity / soul（它们是 OpenViking 内置类型）。
+    # 记忆查询与管理页支持 7 类：preferences / entities / events / cases /
+    # trajectories / experiences / tools。session skills 是独立链路，不是记忆类型：
+    # OpenViking 在 commit task 完成后返回 session_skill_uris，MyFlow 把它们导入
+    # Git 技能目录，标记为「提炼」并停在待扫描，等用户在前端扫描/生效。
+    # 创建 session 固定使用 DEFAULT_SESSION_MEMORY_TYPES（6 类）。
     capture_stream:
       redis_url: ""            # 生产用 $MYFLOW_REDIS_URL
       shard_count: 64
       claim_idle_ms: 60000
     capture:
       missing_turn_end_timeout_seconds: 86400
+    # Session Commit 后台任务的 skills 导入：等待任务结束后读取
+    # session_skill_uris，按技能目录逐个生成「提炼 · 待扫描」草稿。
+    session_skills:
+      enabled: true
+      poll_interval_seconds: 2
+      task_timeout_seconds: 180
+      max_skills_per_task: 20
 
 
 # ------------------------------------------------------------
@@ -176,6 +186,30 @@ stream_bridge:
   health_check_interval_seconds: 30
   max_connections: 32
   read_block_seconds: 5            # XREAD BLOCK 的上限；心跳按本地计时，不靠它
+
+# ------------------------------------------------------------
+# Langfuse 可观测性。远程实例已安装，这里只做客户端接入。
+# 整段 startup-only：client/exporter 在 lifespan 里构造一次，改了要重启。
+# 默认关闭；关闭时不 import langfuse，也不发任何网络请求。
+# 启用前先装依赖：cd backend && uv sync --extra observability
+# ------------------------------------------------------------
+observability:
+  langfuse:
+    enabled: false
+    base_url: ""                  # 启用时写 $LANGFUSE_BASE_URL，根地址不要带 /api/public
+    public_key: ""                # 启用时写 $LANGFUSE_PUBLIC_KEY
+    secret_key: ""                # 启用时写 $LANGFUSE_SECRET_KEY
+    project_id: ""                # 可选：只用于生成 trace 深链
+    environment: development      # 小写字母/数字/-/_，不超过 40 字符
+    release: ""                   # 可选：部署版本；留空则由 SDK 读取 release 环境
+    sample_rate: 1.0              # 0.0–1.0；head sampling，错误 trace 也可能被采样掉
+    timeout_seconds: 5            # 导出 HTTP 超时
+    capture_content: redacted     # redacted | metadata_only | full
+    user_id_mode: hashed          # hashed | raw | none
+    user_id_salt: ""              # hashed 时必填，至少 16 字符；不要复用 JWT secret
+    trace_subagents: true         # 是否给隔离子代理建子 trace/span
+    flush_on_run_end: false       # 默认不在请求路径同步 flush
+    required: false               # true 时初始化失败会阻止启动；默认降级为 no-op
 
 # 本地沙箱是路径映射，不是隔离。宿主 bash 默认关闭。
 # sandbox.use 是 startup-only：改了要重启。
@@ -228,6 +262,55 @@ sandbox:
   #
   #   max_cached_threads: 64             # 进程内缓存上限；驱逐只丢 handle，不 pause/kill 远端
 
+  # AIO Sandbox（Docker 容器隔离）。默认保持注释：本地 provider 不需要这一节。
+  # 取消注释前先装依赖：cd backend && uv sync --extra aio（= agentkit[aio,redis]），
+  # 并确认部署机有可用的 docker CLI 与 daemon。sandbox.aio 整段是 startup-only。
+  #
+  # 两种部署形态（publish_host / connect_host 留 auto 时按下面的规则自动判断，
+  # 判断不出来会拒绝启动，不会静默退化成 0.0.0.0）：
+  #   Gateway 在宿主上        → 两端都 127.0.0.1
+  #   Gateway 在容器里(DooD)  → 两端都是 Docker 网桥网关 IP（如 172.17.0.1），
+  #                             同时要把 /var/run/docker.sock 挂进 Gateway 容器，
+  #                             且 host_mount.host_root 写 daemon 视角的路径。
+  # aio:
+  #   image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0
+  #   pull_policy: missing              # missing | always（always = 每次启动先 pull）
+  #   container_name_prefix: myflow-aio
+  #   port: 8080                        # 容器内 AIO server 端口
+  #   publish_host: auto                # auto | 127.0.0.1 | 0.0.0.0 | <ip>
+  #   connect_host: auto                # auto | 127.0.0.1 | host.docker.internal | <ip>
+  #   ready_timeout_seconds: 60         # 容器起到 /v1/sandbox 返回 200 的上限
+  #   request_timeout_seconds: 30       # AIO HTTP 客户端超时，不是命令超时
+  #   acquire_timeout_seconds: 120      # 等 Redis per-thread 锁的上限
+  #   release_action: stop              # stop | remove；stop 让下一轮热恢复
+  #   max_cached_threads: 64            # 进程内缓存上限；驱逐只 stop，不 rm
+  #   discover_existing: true           # 进程重启后按 labels 捡回自己的容器
+  #   startup_healthcheck: true         # 启动时校验 docker / 拓扑 / 挂载 / Redis
+  #
+  #   # 容器级 env；不要放 secret（docker inspect 能看到）。请求级 token 走工具调用的 env。
+  #   env:
+  #     TZ: Asia/Shanghai
+  #   network:
+  #     mode: bridge                    # bridge | none
+  #     name: null                      # 已有网络名；空 = 默认 bridge
+  #   resources:
+  #     cpus: 2
+  #     memory: 2g
+  #     pids_limit: 512
+  #
+  #   # 宿主挂载：与 cube 段同形状。local_root 是 Gateway 视角，host_root 是 daemon 视角。
+  #   host_mount:
+  #     local_root: /opt/myflow
+  #     host_root: /opt/myflow           # DooD 时必须写成宿主上看得到的路径
+  #
+  #   # 必填：与 cube 共用同一个 per-thread Redis 锁。Redis 不可达时启动失败。
+  #   lease:
+  #     redis_url: $REDIS_URL
+  #     ttl_seconds: 30
+  #
+  #   orphan_policy: report             # report | remove；remove 需配合 orphan_ttl_seconds
+  #   orphan_ttl_seconds: 86400
+
 # ------------------------------------------------------------
 # M8 子代理委派。整段热重载。
 # 两个上限别合成一个：max_total_per_run 管"一次 run 累计派几个"（防止长 run 每个
@@ -274,17 +357,15 @@ subagent_runtime:
 # plugins:         # M10  startup-only，且会导致代码被 import
 
 # ------------------------------------------------------------
-# 技能：宿主上的 skills/public 与 skills/custom，挂进沙箱的 container_path。
+# 技能：用户私有技能写入 Git/PostgreSQL，内置技能随进程发布；沙箱根目录是 container_path。
 # 模型看到的是系统提示词尾部的 <available_skills> 索引（每技能一行，描述截断）；
 # 正文一律按需：要么 read_file 读 SKILL.md，要么 search_and_load_skills 按意图检索加载。
 # 没有"全量注入"模式开关（M7 §3.5）。
-# 全局启用开关在 PostgreSQL 的 skill_settings（git 来源），个人偏好仍在 skills_prefs.json；
-# 旧部署用 backend.scripts.migrate_skill_state 迁移（名字 → skill_id）。
+# 个人偏好仍在 skills_prefs.json。技能保存后是草稿，必须安全扫描通过并点击生效才进入运行时与向量索引。
 # ------------------------------------------------------------
 skills:
-  # git：生产目录（Git 是唯一内容源，PostgreSQL 拥有身份/版本/审核/发布指针）。
-  # filesystem：仅测试/迁移时扫描本地 skills/ 目录。旧部署用
-  # `python -m backend.scripts.migrate_skill_state` 迁移开关与个人偏好。
+  # git：生产目录（Git 是唯一内容源，PostgreSQL 拥有身份/版本/扫描/active 指针）。
+  # filesystem：仅测试/本地调试时扫描本地 skills/ 目录，不提供用户创作。
   source: git                 # startup-only：切换来源要重启
 
   # 内置技能：随项目发布、只读，不进 Git/数据库；每个子目录一个技能（builtin/<name>/SKILL.md）。
@@ -293,11 +374,10 @@ skills:
     enabled: true
     path: skills/builtin
 
-  # 私有草稿的配额与包边界（普通用户创作；admin 也受同一套限制）。
+  # 私有技能的配额与包边界。
   creation:
-    enabled: true             # 关掉后只有 admin 能创建技能
+    enabled: true             # 关掉后任何人都不能创建技能
     max_drafts_per_user: 20
-    max_pending_submissions_per_user: 5
     max_package_bytes: 5242880    # 单个技能包（所有文件之和）
     max_file_bytes: 1048576       # 单个技能文件
     max_files: 200
@@ -305,16 +385,10 @@ skills:
   # 服务端技能仓库。凭据只在这里；普通用户永远拿不到。
   git:
     repository: $SKILLS_GIT_REPOSITORY   # 代码里没有默认仓库地址
-    public_branch: main
     draft_ref_prefix: "refs/heads/myflow/drafts"
     cache_dir: .myflow/skills
     ssh_key: ""  # base64 编码的 SSH 私钥内容；生产用 $SKILLS_GIT_SSH_KEY
     command_timeout_seconds: 120
-
-  # 公共发布必须走人工审核；管理员可以批准自己的提交。
-  review:
-    require_admin: true
-    allow_self_approval: true
 
   # Milvus active projection 的 outbox、对账与清理节奏。
   # outbox：状态变更在同一个 PG 事务里插一行“意图”，worker 异步把它变成 Milvus 的
@@ -323,11 +397,25 @@ skills:
   #   被清空这类漂移；稳态下已经索引好的行不会被重新 embedding。
   # 清理：同一轮里删掉没人引用的提交缓存，受 retention.cache_ttl_days 安全期保护。
   index:
-    outbox_poll_seconds: 2                 # worker 轮询：保存后最慢多久能被向量召回
+    outbox_poll_seconds: 2                 # worker 轮询：生效后最慢多久能被向量召回
     catalog_poll_seconds: 5                # 跨 worker catalog epoch 轮询；0 = 单 worker 不同步
-    reconciliation_interval_minutes: 10    # 对账 + 清理的周期（分钟）
+    reconciliation_interval_minutes: 10    # 修复快路径周期：只修 index_status != ready
+    maintenance_lock: true                 # 多 worker 每轮互斥（pg_try_advisory_lock）
+    repair_budget_rows: 500                # 每轮最多修多少版本（超出的下一轮继续）
+    repair_budget_seconds: 180             # 每轮墙钟上限，和行数预算先到为准
+    repair_max_attempts: 8                 # 同一版本连续失败多少次后停止重试
+    verify_interval_minutes: 60            # 完整性巡查：流式扫描 Milvus 主键；0 = 关闭
+    verify_budget_rows: 5000               # 巡查每轮最多读多少主键
+    verify_budget_seconds: 300             # 巡查每轮墙钟上限
 
-  # 可重建缓存的保留策略；元数据与公共历史永久保留。
+  # 每个用户的技能使用次数：Redis ZSET 只做 top-K 排序，PostgreSQL load_count 持久化。
+  usage:
+    enabled: true
+    redis_url: $REDIS_URL           # 留空则退回 PostgreSQL load_count
+    key_prefix: myflow:skills:usage # key = <prefix>:<user_id>
+    prompt_top_k: 10                # 私有技能超过 N 个时，system prompt 只列前 N 个
+    refresh_seconds: 30             # 多 worker 的 top-K 缓存刷新间隔；0 = 关闭
+  # 可重建缓存的保留策略；数据库元数据与扫描历史永久保留。
   retention:
     keep_versions_per_skill: 20
     cache_ttl_days: 30
@@ -376,7 +464,7 @@ skills:
       collection: myflow_skills_active
       metric_type: COSINE
       index_type: AUTOINDEX
-      consistency_level: Strong   # 审核通过后马上要能检索到，不用 Session 的最终一致
+      consistency_level: Strong   # 点击生效后马上要能检索到，不用 Session 的最终一致
       flush: true
       timeout_seconds: 30
 

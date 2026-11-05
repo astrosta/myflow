@@ -118,6 +118,48 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
 旧 checkpoint 里的 `cube:` sandbox_id 在回滚后 `get()` 返回 `None`，runtime 会重新 acquire
 本地沙箱；反过来从 local 切到 cube 也一样。
 
+### AIO Sandbox（Docker 容器隔离）
+
+在 Docker 容器里跑工具：`sandbox.use: agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker`，
+启用 `sandbox.aio`（`config.example.yaml` 里有整段注释模板）。容器里看到的
+`/mnt/user-data` 还是同一个宿主线程目录，上传与产物链路不变，所以和 local / cube 之间
+切换不需要迁数据。
+
+前置条件：
+
+1. 部署机有可用的 `docker` CLI 与 daemon（provider 直接调 CLI，不引入 docker Python SDK）。
+2. 装依赖：`cd backend && uv sync --extra aio`（= `agentkit[aio,redis]`）。
+3. 镜像从官方仓库拉，默认 `all-in-one-sandbox:1.11.0`。**不要用 `latest`**：上游说这个
+   浮动 tag 可能仍停在 1.0.0.x 线，那条线没有 `/v1/bash/exec`（没有 per-command env 注入、
+   没有服务端 hard timeout），provider 会在第一次执行命令时直接报错要求升级镜像。
+4. 宿主挂载：`host_mount.local_root` 是 Gateway 进程看到的根（要覆盖 `.myflow` 与
+   `skills/`），`host_mount.host_root` 是 Docker daemon 看到的同一个根；同机时写一个即可。
+5. Redis 必填：`sandbox.aio.lease.redis_url`，与 cube 共用同一个 per-thread 锁；不可达时启动失败。
+
+**两种部署形态**（`publish_host` / `connect_host` 留 `auto` 时自动判断）：
+
+| 形态 | publish / connect | 额外要求 |
+|---|---|---|
+| Gateway 在宿主上 | 两端都 `127.0.0.1` | 无 |
+| Gateway 在容器里（DooD） | 两端都是 Docker 网桥网关 IP（如 `172.17.0.1`） | 挂载 `/var/run/docker.sock`；`host_mount.host_root` 写宿主视角路径 |
+
+自动判断在容器里推不出网关时会**拒绝启动**并提示显式配置，不会静默绑到 `0.0.0.0`
+（那等于把容器的 root shell 端口暴露到整台宿主）。Docker Desktop 之类的环境直接写死两端更稳。
+
+生命周期：
+
+- `release_action` 默认 `stop`：每轮结束后停容器，下一轮 `docker start` 热恢复，
+  容器 id 不变；改成 `remove` 则每轮冷启动。
+- `reset()` 不动容器；`shutdown()` 删除本进程持有的容器；LRU 驱逐只 `stop`。
+- acquire 会先用 `docker inspect` 复核缓存里的容器：被外部删掉就重建，被停掉就重启。
+- 挂载或技能路径变了（`mounts_hash` 不一致）会重建容器，不会带着过期挂载继续跑。
+- 上次进程崩溃留下的容器：`orphan_policy: report`（默认）只在启动日志里列出，
+  手动清理 `docker rm -f $(docker ps -aq --filter label=myflow.provider=aio)`；
+  改成 `remove` 会在启动时删掉超过 `orphan_ttl_seconds` 的孤儿。
+
+**回滚**：`sandbox.use` 改回 local 或 cube 并重启即可；旧的 `aio:` sandbox_id 在
+`get()` 里是内存 miss，runtime 会重新 acquire。残留容器用上面那条 `docker rm -f` 清理。
+
 ### 模型与推理等级（输入框里的两个选择）
 
 **列表来自厂商**：`GET /api/models` 会带着 `models[].api_key` 去调每个 provider 的
@@ -170,7 +212,7 @@ models:
 | `GET /api/memory/profile/schema` | 全部受支持字段的元数据，前端按它渲染全字段表单 |
 | `PATCH /api/memory/profile` | 部分更新；`null` 删除字段；列表整列表替换；etag CAS |
 | `GET/POST /api/memory/profile/suggestions` `/onboarding` | 画像建议与引导 |
-| `GET /api/memory/items/types` | 记忆管理支持的六类记忆与中文名 |
+| `GET /api/memory/items/types` | 记忆管理支持的七类记忆与中文名（不含 skills） |
 | `GET /api/memory/items` | 按类型列记忆摘要（OpenViking 过滤型 `find`，不落库） |
 | `GET /api/memory/items/detail` / `content` | 详情目录（`.overview.md`）与记忆正文（`read`） |
 | `PUT /api/memory/items/content` / `DELETE /api/memory/items` | 编辑/删除具体记忆（`write` / `rm`，sidecar 只读） |
@@ -205,6 +247,35 @@ checkpoint 或日志；进程重启后旧 handle 不可解析，工具必须 fai
 只有"项目根下搜不到"才算没配扩展。所有读-改-写走 `agentkit.config.update_extensions_config()`：
 进程内 `threading.Lock` + 跨进程文件咨询锁 + 原子写，技能路由和 MCP 路由共用同一把锁。
 
+### Langfuse 可观测性（远程自建）
+
+Langfuse 已在远程机器上运行；MyFlow 只做客户端接入，不管理 Langfuse 的 ClickHouse/Postgres/Redis/MinIO。
+整段 `observability.langfuse` 是 **startup-only**，改完后重启 Gateway。
+
+1. 装可选依赖：`cd backend && uv sync --extra observability`。
+2. 在 `.env` 写 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`、`LANGFUSE_USER_ID_SALT`；`base_url` 只写根地址，不要带 `/api/public`。
+3. 把 `config.yaml` 的 `observability.langfuse.enabled` 改为 true，密钥写 `$LANGFUSE_...` 形式。
+4. 重启 Gateway，发一条会触发工具的 workspace 消息；Langfuse 中 trace id 应与响应头 `X-Trace-Id` 相同。
+
+默认 `capture_content: redacted`：导出前用 `mask_otel_spans` 把字面 PII 和 `[[PII:...]]` handle 替换为
+`[REDACTED]`。更严格的环境改 `metadata_only`，只保留模型、耗时、token 和错误类型。Langfuse 故障、
+未安装 SDK、远程不可达都不会让 run 失败；需要启动即失败时设 `required: true`。
+
+```yaml
+observability:
+  langfuse:
+    enabled: true
+    base_url: $LANGFUSE_BASE_URL
+    public_key: $LANGFUSE_PUBLIC_KEY
+    secret_key: $LANGFUSE_SECRET_KEY
+    capture_content: redacted
+    user_id_mode: hashed
+    user_id_salt: $LANGFUSE_USER_ID_SALT
+```
+
+回滚：`enabled: false` 并重启。服务端 trace 保留期/采样由远程 Langfuse 管理；`sample_rate` 是 head sampling，
+降采样会同时丢掉一部分错误 trace。
+
 ### MCP 服务器
 
 `extensions_config.json` 的 `mcpServers` 是 M2 工具列表的**第三源**（配置工具 → 内置 → MCP，按 `tool.name` 去重）。
@@ -229,31 +300,48 @@ stdio 服务器是**有状态子进程**：会话按 `(server, user_id:thread_id
 明确的 `Connection closed` 只驱逐那一个会话，**失败绝不自动重放**。停止/启用某台服务器后，
 打一次 `POST /api/mcp/cache/reset` 让本进程立刻换掉旧会话。
 
-技能目录默认是项目根下的 `skills/{public,custom}/<name>/SKILL.md`（`config.yaml` 的 `skills.path` 可改）。
+`skills.source=filesystem` 仅用于测试/本地调试，默认扫描项目根下的
+`skills/{public,custom}/<name>/SKILL.md`（`config.yaml` 的 `skills.path` 可改）。
+生产使用 `skills.source=git`：用户技能只属于创建者。保存会 commit/push Git 并记录
+不可变版本；安全扫描通过并点击生效后才进入运行时与向量索引。
 模型看到的是系统提示词尾部的 `<available_skills>` 索引（每技能一行 `name [category]: 截断描述`，
 描述截断到 `index_description_max_chars`；根目录 `skills.container_path` 与"目录名即技能名、
 SOP 固定 `SKILL.md`"的约定在块前说一次，路径可推），
 正文一律按需：`read_file` 读 SKILL.md、委派内置子代理 `skill-finder`（内部调
-`search_and_load_skills`，只回候选 name/path/description）后由 lead 读正文，或 `/skill-name` 注入
-—— 没有"全量注入"模式开关。
+`search_skills`，只回候选 skill_id/name/description）后由 lead 用系统内置的
+`load_skills(skill_id)` 读正文，或 `/skill-name` 注入 —— 没有"全量注入"模式开关。
 已激活的技能由 `<active_skills>`（在 `<durable_context_data>` 里）投影：名字、描述、目录，
 外加**核心 SOP 正文**。正文不进 state，每次投影按 `skill_context` 台账里的 path 现读，
 预算见 `skills.active_context`；正文还在消息里时默认不重复写（压缩之后它才是唯一副本）。
-`search_and_load_skills` 是两段式（本地 BM25 召回 `skills.search.candidate_k` → 可选精排
-`top_k`），默认只有本地通道；`skills.search.embedding` / `rerank` 不填地址就不发请求，
+技能发现与加载是**两段式**：`search_skills` 只属于 `skill-finder`（本地 BM25 召回
+`skills.search.candidate_k` → 可选精排 `top_k`），只回元数据、不计数、也不留给 lead；
+`load_skills` 是系统内置工具，委派与直连都在 lead 上，按 `skill_id` 返回正文并累加使用次数。
+默认只有本地通道；`skills.search.embedding` / `rerank` 不填地址就不发请求，
 地址和模型默认取顶层 `embedding` / `rerank`（section 里的同名字段可覆盖），失败也只降级
 （退回 BM25 / 融合顺序）并在 `retrieval.warnings` 里说明。加载即激活：
 结果里的 `path` 和 `read_file` 读 SKILL.md 走同一本 `skill_context` 台账。
+
+使用次数是 **PostgreSQL 权威 + Redis 排序**：每次成功 `load_skills` 写
+`skills.load_count`（DB）与 ZSET `<skills.usage.key_prefix>:<user_id>`（member = skill_id），
+两者不要求原子；进程启动时从 DB 异步 `ZADD ... GT` 播种，绝不把新值改小。
+提示词构建是同步的，所以每用户另有一份 top-K 缓存（启动播种、加载后、`refresh_seconds` 周期刷新）。
+私有技能不超过 `skills.usage.prompt_top_k`（默认 10）时全列，超过时按 Redis top-K 选，
+缺口用 DB `load_count` 补齐并按名字稳定排序；内置技能永远在索引里且不占配额。
 技能 Git 写入使用 **pygit2/libgit2**，运行时不依赖系统 `git` 可执行文件；仓库镜像、
 树/commit/push 都在进程内完成。SSH 认证使用 `skills.git.ssh_key`，值是 **base64 编码的
 OpenSSH 私钥内容**（通常从 `.env` 的 `SKILLS_GIT_SSH_KEY` 展开）；不会生成临时私钥文件。
 libgit2 的 SSH transport 是构建期特性：如果当前 pygit2 wheel 没有 libssh2 支持，服务会在
 初始化 Git 仓库时明确拒绝 SSH URL；此时需要换带 SSH 的 pygit2 构建，或改用 HTTPS 仓库。
 
-技能是**两层开关**：`skills.source: git` 时全局开关写 PostgreSQL 的 `skill_settings`
-（按内部 `skill_id`，admin），个人偏好仍写 `skills_prefs.json` 的
-`{user_id: {skill_id: bool}}`（任何登录用户），有效状态 = 两者相与。旧的
-`extensions_config.json` 技能开关与按名字的偏好用 `backend/scripts/migrate_skill_state.py` 迁移。
+Git 来源没有公共技能，也没有全局技能开关。每个用户在 `skills_prefs.json` 里维护
+自己的开关：`{user_id: {skill_id: bool}}`（键是内部 `skill_id`）。保存写 Git 草稿
+提交与 `skill_versions`；扫描针对不可变 commit；用户点击生效后才写 active 指针、
+刷新提示词/挂载快照并写 Milvus 索引 outbox。
+
+安全扫描同时运行**规则分析**（static / bytecode / pipeline / correlation）和 **LLM
+语义分析**；LLM 复用 `agents.default_model`（未配置时取 `models[0]`）的
+`model / base_url / api_key`，没有默认模型时扫描返回 503，不会静默退化成纯规则扫描。
+LLM 阶段会把该版本的技能内容发送给模型提供方。
 
 **内置技能是例外**（`skills.builtin`，默认 `skills/builtin`）：随项目发布、只读，
 不进 Git、不进 PostgreSQL，也不需要数据库迁移。`skills/builtin/<name>/SKILL.md`
@@ -266,11 +354,12 @@ libgit2 的 SSH transport 是构建期特性：如果当前 pygit2 wheel 没有 
 `extensions_config.json` 的同名条目都不生效，部署级开关只有 `skills.builtin.enabled`；
 `subagents.custom_agents.<name>.skills` 白名单仍然生效（`subagents.agents.<name>` 只覆盖超时/轮次/
 模型/token 预算，不含 skills），`/name` 与 `read_file` 照常解析，同名时内置优先、同名的 catalog
-行被隐藏并 warning（同名冲突告警也是进程级 warn-once，reload 时重置；新建草稿和审核通过都会拒绝内置保留名）。
+行被隐藏并 warning（同名冲突告警也是进程级 warn-once，reload 时重置；新建草稿会拒绝内置保留名）。
 加载只有渐进式两条：索引行（方括号标 `[builtin]`）→ `read_file` 读
 `<container_path>/builtin/<name>/SKILL.md`，或 `/name` 激活；**内置技能不参与
-`search_and_load_skills`**（filesystem 分支检索 `visible(include_builtin=False)`，
-Git 分支的检索服务从不接收内置技能），关键词通道开着也不会命中它。
+`search_skills` / `load_skills`，也不计入使用次数**（filesystem 分支检索
+`visible(include_builtin=False)`，Git 分支的检索服务从不接收内置技能），
+关键词通道开着也不会命中它。
 沙箱里 `<container_path>/builtin` 是宿主 `skills.builtin.path` 的**只读**映射，
 文件工具写不进去，`sandbox.mounts` 也不能覆盖 `<container_path>` 下的路径
 （宿主 bash 仍是已知的非隔离边界）。`GET /api/skills` 的内置行排在最前
@@ -278,6 +367,11 @@ Git 分支的检索服务从不接收内置技能），关键词通道开着也�
 Git runtime 缺失时 catalog 那一半照旧 fail-closed，内置行照样返回；
 `/api/skills/mine` 不含内置技能，技能页把它们放在只读的「内置技能」区块：
 没有编辑按钮、没有开关，也不跳编辑器。
+
+OpenViking Session Commit 完成后生成的 skills 走独立导入链路：worker 读取任务结果
+`session_skill_uris`，把每个 `SKILL.md` 导入当前用户的私有技能草稿，返回行带
+`source="extracted"` 与 `source_uri`。这些行停在 `unscanned`（页面显示「提炼 · 待扫描」），
+不会自动扫描或生效；用户需要在技能页显式扫描、点击生效。
 
 ## 认证（M9 §2）
 
@@ -454,18 +548,16 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `GET` | `/api/threads/{id}/artifacts/...` | 产物 |
 | `GET`/`PATCH` | `/api/mcp/config` | 读 MCP 配置（打码成 `****`）/ 启停一台已有服务器（`admin`） |
 | `POST` | `/api/mcp/cache/reset` | 清本进程的 MCP 工具缓存（`admin`） |
-| `GET` | `/api/skills` | 技能目录，`enabled` 是**有效状态**（`skills:read`；`?scope=global` 仅 `admin`；`?scope=public` 只返回已发布公共技能） |
-| `GET` | `/api/skills/mine` | 当前用户的私有草稿列表（`skills:read`） |
+| `GET` | `/api/skills` | 内置技能 + 当前用户已生效的私有技能（`skills:read`）；没有公共目录 |
+| `GET` | `/api/skills/mine` | 当前用户全部私有技能（含草稿、提炼来源与扫描状态，`skills:read`） |
 | `POST` | `/api/skills` | 新建私有草稿（`skills:write`） |
-| `POST` | `/api/skills/{skill_id}/draft/save` | 保存草稿版本并刷新目录快照（`skills:write`） |
-| `POST` | `/api/skills/{skill_id}/submit` / `withdraw` | 提交/撤回审核（`skills:write`） |
-| `DELETE` | `/api/skills/{skill_id}` | 删除私有草稿并刷新目录快照（`skills:write`） |
+| `POST` | `/api/skills/{skill_id}/draft/save` | Git commit + 不可变版本；不生效、不建索引（`skills:write`） |
+| `POST` | `/api/skills/{skill_id}/scan` | import `skill_scanner`，用规则 + 默认模型 LLM 扫描最新已保存版本的 Git commit 并持久化结果（`skills:write`） |
+| `GET` | `/api/skills/{skill_id}/scans` | 扫描历史（`skills:read`） |
+| `POST` | `/api/skills/{skill_id}/activate` | 扫描通过后生效、刷新快照并写索引 outbox（`skills:write`） |
+| `DELETE` | `/api/skills/{skill_id}` | 删除私有技能与 active 指针，并刷新目录/索引（`skills:write`） |
 | `PUT` | `/api/skills/{skill_id}/preference` | 开关"我用不用"（任何登录用户，只写 `skills_prefs.json`，按 `skill_id`） |
-| `PATCH` | `/api/skills/{skill_id}` | 全局开关（`admin`，`skills.source: git` 时写 PostgreSQL 的 `skill_settings`） |
 | `POST` | `/api/skills/reload` | 重建本进程的目录快照与挂载树（`admin`） |
-| `GET` | `/api/admin/skills/reviews` | 审核队列（`admin`） |
-| `POST` | `/api/admin/skills/reviews/{submission_id}/approve` / `reject` | 批准/驳回提交（`admin`） |
-| `POST` | `/api/admin/skills/{skill_id}/unpublish` / `activate` | 下架/切换公共激活版本（`admin`） |
 | `GET` | `/api/v1/auth/setup-status` | 库里有没有 admin（公开） |
 | `POST` | `/api/v1/auth/initialize` | 建第一个 admin（公开，且只在零 admin 时；要 username + password） |
 | `POST` | `/api/v1/auth/login/local` | 本地登录（公开，响应体不含 token）。body 为 `username` + `password` |
@@ -477,7 +569,8 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `POST` | `/api/v1/auth/change-password` | 改密 = 撤销所有会话（**仅会话**） |
 
 MCP **没有创建类路由**：`PUT /api/mcp/config`（整份替换 = 新建 + 删除）返回 404/405。
-技能创作与审核路由见上表（`POST /api/skills`、`/api/skills/mine`、`/api/admin/skills/reviews`）。
+技能创作、安全扫描与生效路由见上表（`POST /api/skills`、`/api/skills/mine`、
+`/api/skills/{id}/scan`、`/api/skills/{id}/activate`）。
 
 浏览器应走前端同源 `/api`，不要直接跨源打 8001（开发时 Next rewrite，生产时 nginx）。
 
@@ -575,6 +668,18 @@ uv run pytest tests/test_cube_integration.py -v
 
 有鉴权时再加 `E2B_API_KEY`；数据面域名不是 `cube.app` 时加 `E2B_DOMAIN`。用例跑真实 provider 的 acquire → `echo`/python3 →
 `/mnt/user-data/workspace` 双向读写 → canary → pause/release → 重新 acquire。
+
+AIO Sandbox 的真 Docker 用例同样默认跳过（会创建并删除真实容器）：
+
+```bash
+cd backend
+AIO_INTEGRATION=1 \
+REDIS_URL=redis://127.0.0.1:6379/0 \
+uv run pytest tests/test_aio_sandbox_integration.py -v
+```
+
+不设 `AIO_IMAGE` 时用默认的 `all-in-one-sandbox:1.11.0`（首次会拉镜像）。用例跑
+acquire → `echo`/python3 → 双向文件 → 二进制往返 → `stop` 后热恢复 → `shutdown` 清容器。
 
 ## 排障
 

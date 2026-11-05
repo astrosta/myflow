@@ -1,6 +1,6 @@
 # AIO Sandbox（Docker 容器隔离）Provider 设计
 
-> 状态：已确认（2026-11-05）；六项决策记录见 §12
+> 状态：已实现（2026-11-05）；六项决策见 §12，实施中的偏差见 §14
 > 关系：新增第四个 `SandboxProvider`，与 `agentkit.sandbox.local`（进程内路径映射）、
 > `agentkit.sandbox.cube`（CubeSandbox MicroVM / E2B 协议）并列；不改动它们的语义。
 > 上游参考：deerflow 的 `deerflow.community.aio_sandbox:AioSandboxProvider`（Docker 模式）。
@@ -500,7 +500,32 @@ AIO_INTEGRATION=1 AIO_IMAGE=<image> REDIS_URL=redis://... \
    "镜像太旧"变成一条可操作的启动/首用错误，不再用来切换实现。
    `Sandbox` 契约（退出码、超时、截断、`persistent_shell_sessions=False`）由它单独负责。
 
-## 13. 下一步
+## 13. 实现计划
 
-实现计划：`docs/superpowers/plans/2026-11-05-aio-sandbox-docker-provider.md`
-（任务拆解、TDD 步骤、验收命令）。
+`docs/superpowers/plans/2026-11-05-aio-sandbox-docker-provider.md`（任务拆解、TDD 步骤、验收命令），
+10 个任务已全部完成；全量后端测试 2532 passed / 8 skipped。
+
+## 14. 实施记录（与设计不同的地方）
+
+写代码时发现四处必须偏离原设计，记在这里，避免文档和实现对不上：
+
+1. **`host_root` 允许 Windows 绝对路径**。设计按 Cube 的假设只收 POSIX 路径，但 AIO provider
+   可以在 Docker Desktop（Windows 宿主）上跑，那时 daemon 看到的就是 `C:/Users/...`。
+   共享的 `_parse_host_root` 现在两种绝对路径都收，仍然拒绝相对路径、根路径和 `..`；
+   POSIX 部署行为不变（Cube 在 Linux 上只可能走 POSIX 分支）。
+2. **新增 `sandbox.aio.acquire_timeout_seconds`**（默认 120，与 cube 对齐）：设计漏写了
+   "等 Redis per-thread 锁的上限"这个参数。
+3. **`write_file` 在父目录就是挂载点时跳过 `mkdir -p`**：挂载点是 Docker 建的，再发一条命令
+   只是浪费一次往返；父目录更深时仍然先建。
+4. **传输失败单独建模**：新增 `AioTransportError`，它同时是 `SandboxError` 与 `OSError`。
+   `AioSandbox` 只负责报告一次，**是否丢 handle 由 provider 决定**：provider 收到信号后
+   `docker inspect` 一次，容器真的没了或停了才丢。设计里"连不上就丢 handle"太激进——
+   一次连接抖动不该让健康的沙箱重新冷启动。
+
+两条实测确认（影响后续维护）：
+
+- `bash.exec` 返回 404 时只有 `bash` 那一组报错，`file` 调用照常工作，所以"镜像太旧"能精确
+  落在命令路径上，不会连累文件工具。
+- `file.read_file` 读不存在的文件时 SDK 抛的是 `pydantic ValidationError`（服务端返回
+  `data: {}` 的错误信封），不是 `FileNotFoundException`；客户端已按"缺失或不可读"映射成
+  `FileNotFoundError`。这是 deerflow 也踩过的同一个坑。
