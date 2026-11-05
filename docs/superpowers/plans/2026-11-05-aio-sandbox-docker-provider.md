@@ -1,7 +1,7 @@
 # AIO Sandbox（Docker 容器隔离）Provider 实现计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: 用 superpowers:subagent-driven-development（推荐）或
-> superpowers:executing-plans 按任务执行。步骤用 checkbox（- [ ]）跟踪。
+> **已执行完毕（2026-11-05）。** 10 个任务按顺序落地，全量后端测试 2532 passed / 8 skipped。
+> 实施中与设计不同的四点记在 spec §14。
 
 **Goal:** 新增 `agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker`：把工具的文件与命令执行放进
 一台 Docker 主机上的 all-in-one-sandbox 容器，宿主线程目录 bind mount 进容器，复用现有
@@ -112,12 +112,12 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
   agentkit.sandbox.cube.mounts import build_host_mounts` 继续可用）。
 
 **Steps:**
-- [ ] Step 1: `git mv` 式搬迁（复制内容 → 新文件；`cube/*` 只留 `from ... import *` 风格的显式 re-export）。
-- [ ] Step 2: `build_host_mounts` 的配置依赖参数化：签名从
+- [x] Step 1: `git mv` 式搬迁（复制内容 → 新文件；`cube/*` 只留 `from ... import *` 风格的显式 re-export）。
+- [x] Step 2: `build_host_mounts` 的配置依赖参数化：签名从
       `cube: CubeSandboxConfig` 改成 `host_mount: HostMountConfig`；`cube/provider.py` 调用点传
       `self._cube.host_mount`。
-- [ ] Step 3: 跑 `uv run python -m pytest backend/tests/test_cube_mounts.py backend/tests/test_cube_locks.py backend/tests/test_cube_provider.py -q`，必须全绿。
-- [ ] Step 4: 提交（只 add 这 4 个源文件）。
+- [x] Step 3: 跑 `uv run python -m pytest backend/tests/test_cube_mounts.py backend/tests/test_cube_locks.py backend/tests/test_cube_provider.py -q`，必须全绿。
+- [x] Step 4: 提交（只 add 这 4 个源文件）。
 
 ### Task 2: 配置面
 
@@ -142,12 +142,12 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
   `STARTUP_ONLY_FIELDS["sandbox.aio"]`。
 
 **Steps:**
-- [ ] Step 1: 写测试：缺 `lease` 报错；`image` 默认 `1.11.0`；`release_action` 默认 `stop`、
+- [x] Step 1: 写测试：缺 `lease` 报错；`image` 默认 `1.11.0`；`release_action` 默认 `stop`、
       `publish_host`/`connect_host` 默认 `auto`；未知字段被拒；`test_cube_config.py` 仍全绿（别名生效）。
-- [ ] Step 2: 跑测试确认失败。
-- [ ] Step 3: 实现模型 + `STARTUP_ONLY_FIELDS` + 导出。
-- [ ] Step 4: 跑 `test_aio_config.py`、`test_cube_config.py` 全绿。
-- [ ] Step 5: 提交。
+- [x] Step 2: 跑测试确认失败。
+- [x] Step 3: 实现模型 + `STARTUP_ONLY_FIELDS` + 导出。
+- [x] Step 4: 跑 `test_aio_config.py`、`test_cube_config.py` 全绿。
+- [x] Step 5: 提交。
 
 ### Task 3: 依赖与 extras
 
@@ -157,8 +157,8 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
 - Test: 无（import 级验证放在 Task 6）
 
 **Steps:**
-- [ ] Step 1: 加 extras；`uv sync --extra aio` 能解析（可只验证 `uv lock --check` 或本地 resolve）。
-- [ ] Step 2: 提交。
+- [x] Step 1: 加 extras；`uv sync --extra aio` 能解析（可只验证 `uv lock --check` 或本地 resolve）。
+- [x] Step 2: 提交。
 
 ### Task 4: 拓扑解析（DooD 的关键）
 
@@ -173,12 +173,12 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
   `resolve_topology(config, docker_cli) -> Topology`。
 
 **Steps:**
-- [ ] Step 1: 测试：容器外 → 两端 `127.0.0.1`；容器内 + gateway 可读 →
+- [x] Step 1: 测试：容器外 → 两端 `127.0.0.1`；容器内 + gateway 可读 →
       `publish_host == connect_host == gateway`；容器内 + 推不出来 → 抛
       `SandboxRuntimeError` 且文案提到显式配置；显式配置值原样返回。
-- [ ] Step 2: 跑测试确认失败。
-- [ ] Step 3: 实现。
-- [ ] Step 4: 全绿；提交。
+- [x] Step 2: 跑测试确认失败。
+- [x] Step 3: 实现。
+- [x] Step 4: 全绿；提交。
 
 ### Task 5: Docker 控制面
 
@@ -194,11 +194,11 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
 - Consumes: `host_mounts.MountEntry`（`--mount type=bind,source=...,target=...[,readonly]`）。
 
 **Steps:**
-- [ ] Step 1: fake docker（记录 argv，回放 inspect JSON / ps 行 / 错误 stderr）先写出来。
-- [ ] Step 2: 测试：create 的 argv 含 `--label myflow.user=...`、`-p <publish_host>::8080`、
+- [x] Step 1: fake docker（记录 argv，回放 inspect JSON / ps 行 / 错误 stderr）先写出来。
+- [x] Step 2: 测试：create 的 argv 含 `--label myflow.user=...`、`-p <publish_host>::8080`、
       `--mount type=bind`、加固参数；`inspect` 解析宿主端口；`No such object` →
       `DockerContainerError(not_found=True)`；`list_by_labels` 解析 `ps` 输出。
-- [ ] Step 3: 实现；全绿；提交。
+- [x] Step 3: 实现；全绿；提交。
 
 ### Task 6: AIO 数据面客户端
 
@@ -220,14 +220,14 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
 - Consumes: 无 agentkit 依赖（只在内部懒加载 SDK），便于 fake 替换。
 
 **Steps:**
-- [ ] Step 1: fake AIO 客户端 + 命令契约测试：正常输出、`exit_code != 0`、
+- [x] Step 1: fake AIO 客户端 + 命令契约测试：正常输出、`exit_code != 0`、
       `timed_out` → `SandboxTimeoutError`、`killed`/`running` → `SandboxRuntimeError`、
       `env` 走结构化字段（不出现在命令字符串里）。
-- [ ] Step 2: 镜像能力测试：`bash.exec` 返回 404 → `SandboxRuntimeError`，文案含镜像 tag 与
+- [x] Step 2: 镜像能力测试：`bash.exec` 返回 404 → `SandboxRuntimeError`，文案含镜像 tag 与
       版本要求，且**没有**任何 `shell.*` 调用（fake 里断言）。
-- [ ] Step 3: 测试：并发两次命令 → 两个不同 session id，且都被 `close_session` 关闭。
-- [ ] Step 4: 测试：文件/glob/grep 映射（含 `truncated` 标志、bytes 上限）。
-- [ ] Step 5: 实现；全绿；提交。
+- [x] Step 3: 测试：并发两次命令 → 两个不同 session id，且都被 `close_session` 关闭。
+- [x] Step 4: 测试：文件/glob/grep 映射（含 `truncated` 标志、bytes 上限）。
+- [x] Step 5: 实现；全绿；提交。
 
 ### Task 7: `AioSandbox`（8 个契约方法）
 
@@ -243,9 +243,9 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
 - Consumes: `security.assert_virtual_path`、`local.list_dir.render_tree`、`client.AioClient`。
 
 **Steps:**
-- [ ] Step 1: 契约测试（对照 `test_cube_sandbox.py`）：退出码、超时、输出截断、路径越界、
+- [x] Step 1: 契约测试（对照 `test_cube_sandbox.py`）：退出码、超时、输出截断、路径越界、
       只读挂载、空目录 vs 失败、行范围、append、bytes 往返、glob/grep 截断。
-- [ ] Step 2: 实现；全绿；提交。
+- [x] Step 2: 实现；全绿；提交。
 
 ### Task 8: Provider 生命周期
 
@@ -263,12 +263,12 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
   `docker.DockerClient` / `client.SdkAioClient` / `sandbox.AioSandbox`。
 
 **Steps:**
-- [ ] Step 1: 测试：acquire 建容器 → 就绪 → canary；缓存命中不重复创建；
+- [x] Step 1: 测试：acquire 建容器 → 就绪 → canary；缓存命中不重复创建；
       `release` = `stop` 且再 acquire 是同一个 container id（热恢复）；
       `reset` 不动容器；`shutdown` = `rm -f`；LRU 驱逐 = `stop`；
       `mounts_hash` 不一致 → 持锁重建；容器消失 → `SandboxNotFoundError` + 放租约；
       `startup_check` 在 Redis 不可达 / 拓扑推不出时拒绝启动。
-- [ ] Step 2: 实现；全绿；提交。
+- [x] Step 2: 实现；全绿；提交。
 
 ### Task 9: 文档与示例配置
 
@@ -278,8 +278,8 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
 - Modify: docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md（状态改"已实现"）
 
 **Steps:**
-- [ ] Step 1: 写文档；`config.example.yaml` 与 `config.yaml` 注释块保持一致（`config.yaml` 本地不提交）。
-- [ ] Step 2: 提交。
+- [x] Step 1: 写文档；`config.example.yaml` 与 `config.yaml` 注释块保持一致（`config.yaml` 本地不提交）。
+- [x] Step 2: 提交。
 
 ### Task 10: 集成测试与全量验收
 
@@ -287,17 +287,17 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
 - Create: backend/tests/test_aio_sandbox_integration.py（opt-in，默认 skip）
 
 **Steps:**
-- [ ] Step 1: 写集成用例（`AIO_INTEGRATION=1 AIO_IMAGE=...1.11.0 REDIS_URL=...`，
+- [x] Step 1: 写集成用例（`AIO_INTEGRATION=1 AIO_IMAGE=...1.11.0 REDIS_URL=...`，
       不设 `AIO_IMAGE` 时用 `DEFAULT_AIO_IMAGE`）：
       acquire → `echo`/`python3` → 双向文件 → 二进制 → `stop` 后热恢复 → `shutdown` 清容器。
-- [ ] Step 2: 跑全量 `uv run python -m pytest backend/tests -q`，确认与基线一致（allow skip）。
-- [ ] Step 3: 提交 + 更新 spec 状态。
+- [x] Step 2: 跑全量 `uv run python -m pytest backend/tests -q`，确认与基线一致（allow skip）。
+- [x] Step 3: 提交 + 更新 spec 状态。
 
 ## 验收清单
 
-- [ ] `uv run python -m pytest backend/tests -q` 通过（新增用例全绿，原有基线不退）。
-- [ ] `sandbox.use` 切到 `agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker` 后，
+- [x] `uv run python -m pytest backend/tests -q` 通过（新增用例全绿，原有基线不退）。
+- [x] `sandbox.use` 切到 `agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker` 后，
       Gateway 能启动、能跑 `bash` 与文件工具，容器在 `docker ps` 里带 `myflow.*` labels。
-- [ ] `release` 后容器是 `Exited`（`stop`），再发一条消息容器回到 `Up` 且 container id 不变。
-- [ ] DooD 模式（Gateway 在容器里）下，一次真实 acquire 能拿到 `Up` 容器并成功执行命令。
-- [ ] 无 Redis 时启动失败，错误信息指向 `sandbox.aio.lease.redis_url`。
+- [x] `release` 后容器是 `Exited`（`stop`），再发一条消息容器回到 `Up` 且 container id 不变。
+- [x] DooD 模式（Gateway 在容器里）下，一次真实 acquire 能拿到 `Up` 容器并成功执行命令。
+- [x] 无 Redis 时启动失败，错误信息指向 `sandbox.aio.lease.redis_url`。
