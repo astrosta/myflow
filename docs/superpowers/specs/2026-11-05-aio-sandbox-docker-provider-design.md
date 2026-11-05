@@ -30,7 +30,7 @@
 
 - 不做 Kubernetes / 远程 provisioner 模式（deerflow 的 `provisioner_url` 分支）。
 - 不做 AIO 的 browser/VNC/mcp 能力接入（本设计只落地我们 `Sandbox` 契约需要的
-  file / shell / bash 三组 API）。
+  file / bash 两组 API；`/v1/shell` 那条持久 PTY 通道不用）。
 - 不改 Redis 租约、`thread_files.py`、上传/产物链路。
 - 不追求 deerflow 那套 quarantine / 跨进程 generation 记账（见 §11.2）。
 
@@ -38,16 +38,15 @@
 
 ### 2.1 镜像
 
-- 镜像：直接从官方仓库拉 `enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest`，
-  **不 pin tag**（已确认：跟随 latest）。
+- 镜像：`enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0`，
+  **pin 在 1.11.0**（已确认）。先前的 `latest` 不能碰：上游文档说这个浮动 tag 可能仍停在
+  1.0.0.x 线，而那一条线没有 `bash.exec`。
 - 容器内 AIO server 默认端口 **8080**；就绪探针是 `GET /v1/sandbox` 返回 200。
-- ⚠️ 上游文档明确说 `latest` 可能仍停在 1.0.0.x 线，而 `bash.exec` 需要 >= 1.9.3。
-  所以运行期必须做**能力探测**并具备降级传输（§6.1），不能假设 `bash.exec` 一定可用。
 - 镜像自带 `/mnt/user-data` 约定：deerflow 把宿主
   `users/{user_id}/threads/{thread_id}/user-data/{workspace,uploads,outputs}`
   挂到 `/mnt/user-data/{workspace,uploads,outputs}`，与我们的线程目录布局**完全一致**。
 - `bash.exec`（带 `env` 注入、`hard_timeout`）要求镜像 **>= 1.9.3**；旧镜像整个
-  `/v1/bash/*` 返回 404。我们的 provider 依赖它（见 §6.1），因此**必须 pin 版本**。
+  `/v1/bash/*` 返回 404。上游推荐区间是 1.9.3–1.11.0，我们 pin 的 **1.11.0** 正好落在区间上端。
 
 ### 2.2 数据面 SDK：`agent-sandbox`（PyPI，0.0.30）
 
@@ -77,7 +76,7 @@ sandbox.bash.close_session(session_id)
 
 sandbox.shell.exec_command(*, command, id=None, exec_dir=None, async_mode=None,
                            timeout=None, strict=None, no_change_timeout=None,
-                           hard_timeout=None, truncate=None)   # 持久 PTY 会话
+                           hard_timeout=None, truncate=None)   # 持久 PTY 会话；本设计不用
 ```
 
 依赖面：`httpx` + `pydantic`（运行期），`volcengine-python-sdk`（安装期）。
@@ -99,10 +98,7 @@ volcengine（`sys.modules` 里没有任何 volc 模块），所以它是"装得�
 | 类型 | 字段 | 对我们意味着什么 |
 |---|---|---|
 | `BashExecResult` | `session_id` / `command_id` / `command` / `status` / `stdout` / `stderr` / `exit_code` / `offset` / `stderr_offset` | 有退出码、有增量 offset，可同步也可轮询 |
-| `ShellCommandResult` | `session_id` / `command` / `status` / `output` / `console` | **没有 `exit_code`**，退出码要从 `shell.view()` 拿 |
-| `ShellViewResult` | `output` / `session_id` / `status` / `command` / `exit_code` / `console` | 降级传输拿退出码的地方 |
 | `CommandStatus`（bash） | `pending` / `running` / `completed` / `timed_out` / `killed` | §6.1 的状态映射 |
-| `BashCommandStatus`（shell） | `running` / `completed` / `no_change_timeout` / `hard_timeout` / `terminated` | 降级路径要单独映射 |
 | `FileListResult` | `path` / `files`（`FileInfo`: `name` / `path` / `is_directory` / `size`） | 树渲染直接可用 |
 | `FileGlobResult` | `files`（`GlobFileInfo`） / `total_count` / **`truncated`** | 截断标志原生就有，不用多取 1 条 |
 | `FileGrepResult` | `matches`（`GrepMatch`: `file` / `line_number` / `line_content`） / `match_count` / **`truncated`** | 直接映射我们的 `GrepMatch` |
@@ -273,14 +269,13 @@ Gateway 自己也是容器时（挂 `/var/run/docker.sock` 做 Docker-outside-of
 
 ### 6.1 `execute_command`
 
-**每次调用一个新建、用完即删的会话**，不做 PTY 复用。因为镜像是 `latest` 且
-上游说它可能停在 1.0.0.x，所以传输要**探测 + 降级**：
+**每次调用一个新建、用完即删的 bash 会话**，不做 PTY 复用。传输只有一条（`bash.exec`），
+因为默认镜像 pin 在 1.11.0，`env` 注入与 `hard_timeout` 都在支持区间内：
 
 ```text
-# 每个 handle 第一次用命令时探测一次（结果缓存到 handle）
-transport = "bash" if bash_supported() else "shell"
+# 每个 handle 第一次用命令时探测一次（结果缓存到 handle；1.11.0 必然通过）
+assert bash_supported()
 
-# A. bash 传输（优先；支持 env / hard_timeout / 退出码）
 session = bash.create_session()
 try:
     resp = bash.exec(command=command, session_id=session, env=env,
@@ -288,25 +283,15 @@ try:
                      async_mode=False, request_options={timeout: timeout + grace})
 finally:
     bash.close_session(session)
-
-# B. shell 传输（镜像不支持 bash.exec 时；用显式新建的会话，不用隐式持久 shell）
-session = shell.create_session(id=<uuid>)       # 每个调用独立会话
-try:
-    resp = shell.exec_command(command=command, id=session, hard_timeout=timeout)
-    if resp.data.status != "completed":         # running / hard_timeout / terminated
-        view = shell.view(id=session)           # 退出码只能从这里拿
-        exit_code = view.exit_code
-finally:
-    shell.cleanup_session(session)
 ```
 
-- `persistent_shell_sessions = False`：两种传输都用"每次新建会话"，cwd/export 不跨调用保留
+- **不做 shell 降级**：另一条通道（`/v1/shell`）的 `ShellCommandResult` 里连 `exit_code`
+  都没有，要再发一次 `shell.view()` 才拿得到，为它维护第二套状态枚举不值。镜像不支持
+  `bash.exec` 时**大声失败**，而不是悄悄换一条更弱的通道。
+- 能力探测保留但语义是"首用即断言"：`bash.exec` 返回 404 → `SandboxRuntimeError`，
+  文案带上当前 `sandbox.aio.image` 与 "needs >= 1.9.3 (recommended 1.11.0)"，不重试。
+- `persistent_shell_sessions = False`：每次新建会话，cwd/export 不跨调用保留
   （与 local / cube 一致），同时规避上游记录的隐式 PTY 并发损坏问题。
-- **env 注入只有 bash 传输能做**：镜像不支持 `bash.exec` 时，带 `env` 的调用
-  **直接失败**并给出可操作文案（"镜像 <tag> 不支持 /v1/bash/exec，升级到 >= 1.9.3 或去掉
-  request-scoped secret"），绝不把 secret 拼进命令字符串当降级。
-- shell 传输的状态是另一套枚举：`running`/`completed`/`no_change_timeout`/`hard_timeout`/`terminated`，
-  映射见下表。
 - `env` 走结构化字段，不拼进命令字符串：M9 的请求级 token 不会进 shell 历史，
   也不会留在容器 env（`docker inspect` 看不到）。
 - `hard_timeout` = `sandbox.bash_command_timeout`（服务端强杀，子进程一起死）。
@@ -320,9 +305,7 @@ finally:
 | `timed_out` | `SandboxTimeoutError("Command timed out after Xs")` |
 | `killed` | `SandboxRuntimeError("... was killed")` |
 | `running` / 其它 | `SandboxRuntimeError`（不重试、不重放：结果未知） |
-| `bash.exec` 404 | 探测一次后切 shell 传输（带 `env` 的调用仍失败，见上） |
-| shell `hard_timeout` / `no_change_timeout` | `SandboxTimeoutError`（超时，不重试） |
-| shell `terminated` | `SandboxRuntimeError`（会话没了，结果未知） |
+| `bash.exec` 404 | `SandboxRuntimeError`（镜像太旧；文案给版本要求，不重试） |
 
 - `execute_command_in_scope(scope=...)`：V1 直接透传（每次调用本来就是独立会话），
   但把 `scope` 记进日志，便于子代理并发排查。
@@ -365,7 +348,8 @@ finally:
 sandbox:
   use: agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker
   aio:
-    image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest
+    image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0
+                                    # 默认值即 1.11.0（>= 1.9.3 才有 bash.exec）
     pull_policy: missing            # missing | always（always = 每次启动先 pull）
     container_name_prefix: myflow-aio
     port: 8080                      # 容器内 AIO 端口
@@ -477,9 +461,9 @@ AIO_INTEGRATION=1 AIO_IMAGE=<image> REDIS_URL=redis://... \
 
 1. **镜像可达性**：`enterprise-public-cn-beijing.cr.volces.com` 不一定在所有环境可达。
    需要网络/代理或同源镜像（Dockerfile 只加依赖，不改 entrypoint）。
-2. **latest 的能力不可预知**：已确认跟随 `latest`，而它可能仍是 1.0.0.x 线（没有 `bash.exec`）。
-   因此 §6.1 的能力探测 + shell 降级是**必需路径**，不是可选优化；带 `env` 的命令在该镜像上
-   会明确失败，运维要知情。
+2. **镜像版本下限**：pin 到 `1.11.0`（上游推荐区间 1.9.3–1.11.0），所以 `bash.exec`、
+   `hard_timeout`、`env` 注入都可依赖。若运维把 `sandbox.aio.image` 换成更旧的 tag，
+   acquire 会**明确失败**并指出需要的版本；不会退化成"没有 env 注入也能跑"的假象。
 3. **DooD 的双重错误面**（已确认必须支持）：路径写错 → 容器起不来或挂到空目录；
    地址写错 → 容器起来了但 Gateway 连不上。§5.7 把两者都做成启动期检查，
    并且**拒绝**在推不出来时静默用 `0.0.0.0` 兜底（那会把 root shell 端口暴露到整台宿主）。
@@ -503,7 +487,7 @@ AIO_INTEGRATION=1 AIO_IMAGE=<image> REDIS_URL=redis://... \
 | # | 问题 | 决策 | 对设计的影响 |
 |---|---|---|---|
 | 1 | provider 命名 | `agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker` | 与 deerflow 对位；名字里带 `Docker`，为未来的远程/provisioner 模式留位置 |
-| 2 | 镜像 | 直接从官方仓库拉，**跟随 `latest`**，不 pin tag | 必须做能力探测 + shell 降级（§6.1）；带 `env` 的命令在旧镜像上明确失败 |
+| 2 | 镜像 | 官方仓库拉，**pin `1.11.0`**（先选 latest，后改为 1.11.0） | `bash.exec`/`env`/`hard_timeout` 都可依赖，§6.1 只剩一条传输；更老的镜像首用即失败 |
 | 3 | 部署形态 | **必须支持 Gateway 在容器内挂 `docker.sock`** | §5.7 的双根路径 + `publish_host` / `connect_host` 解析 + `trust_env=False`；拓扑错误一律启动期失败 |
 | 4 | `release_action` | **默认 `stop`** | 容器热保留，下一轮 `docker start` + 就绪探针即可复用；`remove` 作为可选 |
 | 5 | Redis 锁 | **复用 cube 的 `RedisThreadLock`**，`lease` 必填 | provider 构造时与 cube 同一套 `LockLease`/续租/丢失语义；多 worker 安全 |
@@ -512,9 +496,9 @@ AIO_INTEGRATION=1 AIO_IMAGE=<image> REDIS_URL=redis://... \
 由此产生的两条硬约束：
 
 1. `sandbox.aio.lease.redis_url` 必填，Redis 不可达即拒绝启动（与 `sandbox.cube` 同款）。
-2. `latest` 镜像上 `bash.exec` 可能不存在，所以"命令传输"是运行期探测出来的能力，
-   不是编译期假设；`Sandbox` 契约（退出码、超时、截断、`persistent_shell_sessions=False`）
-   在两种传输下必须一致。
+2. `bash.exec` 是唯一命令传输，默认镜像 1.11.0 支持它；能力探测仍然保留，但只用来把
+   "镜像太旧"变成一条可操作的启动/首用错误，不再用来切换实现。
+   `Sandbox` 契约（退出码、超时、截断、`persistent_shell_sessions=False`）由它单独负责。
 
 ## 13. 下一步
 

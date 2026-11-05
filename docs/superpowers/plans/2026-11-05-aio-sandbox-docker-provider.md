@@ -8,9 +8,9 @@
 `Sandbox` 契约、Redis per-thread 锁、`thread_files.py` 上传/产物链路。
 
 **Architecture:** 控制面用 `docker` CLI（create/start/stop/rm/inspect/ps），数据面用
-`agent-sandbox` SDK 的 file/bash/shell 三组 API；两者都藏在一个可替换的 `client.py`/`docker.py`
+`agent-sandbox` SDK（file / bash 两组 API）；两者都藏在一个可替换的 `client.py`/`docker.py`
 边界后面。容器按 `(user_id, thread_id)` 命名并打 `myflow.*` labels，发现时校验 `mounts_hash`；
-命令传输在运行期探测 `bash.exec` 能力，不支持时降级到显式 shell 会话。
+镜像 pin 在 `1.11.0`，所以命令只有一条传输（`bash.exec`），`env` 注入与 `hard_timeout` 都可用。
 Gateway 在容器里（DooD）时，挂载路径用双根模型翻译，连回容器用 `connect_host`。
 
 **Tech Stack:** Python 3.12, pydantic v2, agent-sandbox (AIO SDK), docker CLI, redis>=5, httpx,
@@ -20,8 +20,9 @@ pytest, fakeredis。
 
 ## Global Constraints
 
-- 六项已确认决策（见 spec §12）：命名 `AioSandboxProviderDocker` / 镜像跟随 `latest` /
-  必须支持 DooD / `release_action: stop` / 复用 Redis 锁且 `lease` 必填 / 只做现有 8 个方法。
+- 六项已确认决策（见 spec §12）：命名 `AioSandboxProviderDocker` / 镜像 pin
+  `all-in-one-sandbox:1.11.0` / 必须支持 DooD / `release_action: stop` / 复用 Redis 锁且
+  `lease` 必填 / 只做现有 8 个方法。
 - `Sandbox` 契约不变：命令返回文本（非零退出追加 `exit code N`）、文件缺失是
   `FileNotFoundError`、其它失败是 `OSError`、路径越界是 `PermissionError`、
   `persistent_shell_sessions = False`。
@@ -41,8 +42,9 @@ pytest, fakeredis。
    且**不允许**静默降级成 `0.0.0.0`。
 2. **死容器与缺文件混淆**：容器被外部删掉时若报成普通 `OSError`，handle 会一直留在缓存里。
    Task 6/8 分开 `SandboxNotFoundError` 与 `FileNotFoundError`。
-3. **`latest` 镜像没有 `bash.exec`**：带 `env` 的命令必须明确失败（不把 secret 拼进命令），
-   不带 `env` 的命令必须自动降级到 shell 传输且退出码仍正确。Task 6 的 fake 两种镜像都要覆盖。
+3. **镜像能力不对时不许"悄悄降级"**：默认 `1.11.0` 支持 `bash.exec`，但运维可以换镜像。
+   换到没有 `/v1/bash/exec` 的旧镜像时，Task 6 必须让命令**明确失败**（文案给出镜像 tag 与
+   "needs >= 1.9.3"），既不能把 secret 拼进命令字符串，也不能偷偷改走没有退出码的 `/v1/shell`。
 4. **并发命令**：AIO 的隐式持久 shell 在并发下会坏（上游记录）。每条命令必须新建并关闭会话，
    不碰隐式 shell。Task 6 用"两次并发调用 → 两个不同 session id"钉住。
 5. **`stop` 之后的热恢复**：`release` 停容器，下一次 `acquire` 必须 `start` + 就绪探针 + 重连，
@@ -65,7 +67,7 @@ backend/packages/harness/agentkit/
       __init__.py               # 导出 provider
       config_helpers.py         # 从 AppConfig 取 sandbox.aio 的小工具（如需要）
       docker.py                 # DockerClient + 容器规格 + 拓扑解析
-      client.py                 # AIO SDK 协议边界 + 适配 + 能力探测
+      client.py                 # AIO SDK 协议边界 + 适配 + bash.exec 能力断言
       sandbox.py                # AioSandbox（8 个契约方法）
       provider.py               # AioSandboxProviderDocker
     cube/
@@ -75,7 +77,7 @@ backend/packages/harness/agentkit/
 
 backend/tests/
   fakes/aio_docker.py           # fake docker CLI（记录 argv、回放 inspect/ps/network）
-  fakes/aio_sdk.py              # fake AIO 客户端（file/bash/shell，可注入失败与状态）
+  fakes/aio_sdk.py              # fake AIO 客户端（file/bash，可注入 404/失败/状态）
   test_aio_config.py
   test_aio_host_mounts.py       # 搬迁后的共享挂载（首要是回归 cube 的既有断言）
   test_aio_topology.py
@@ -131,16 +133,17 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
 - Produces: `AioSandboxNetworkConfig(mode: bridge|none, name: str|None)`；
   `AioSandboxResourcesConfig(cpus: float|None, memory: str|None, pids_limit: int|None)`；
   `AioSandboxLeaseConfig(redis_url: str, ttl_seconds: int = 30)`；
-  `AioSandboxConfig(image, pull_policy, container_name_prefix, port, publish_host, connect_host,
-  ready_timeout_seconds, request_timeout_seconds, release_action, max_cached_threads,
-  discover_existing, startup_healthcheck, env, network, resources, host_mount, lease,
-  orphan_policy, orphan_ttl_seconds)`。
+  `AioSandboxConfig(image=DEFAULT_AIO_IMAGE, pull_policy, container_name_prefix, port,
+  publish_host, connect_host, ready_timeout_seconds, request_timeout_seconds, release_action,
+  max_cached_threads, discover_existing, startup_healthcheck, env, network, resources,
+  host_mount, lease, orphan_policy, orphan_ttl_seconds)`，
+  其中 `DEFAULT_AIO_IMAGE = "enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0"`。
 - Produces: `SandboxConfig.aio: AioSandboxConfig | None = None`；
   `STARTUP_ONLY_FIELDS["sandbox.aio"]`。
 
 **Steps:**
-- [ ] Step 1: 写测试：缺 `image` / `lease` 报错；`release_action` 默认 `stop`；未知字段被拒；
-      `test_cube_config.py` 仍全绿（别名生效）。
+- [ ] Step 1: 写测试：缺 `lease` 报错；`image` 默认 `1.11.0`；`release_action` 默认 `stop`、
+      `publish_host`/`connect_host` 默认 `auto`；未知字段被拒；`test_cube_config.py` 仍全绿（别名生效）。
 - [ ] Step 2: 跑测试确认失败。
 - [ ] Step 3: 实现模型 + `STARTUP_ONLY_FIELDS` + 导出。
 - [ ] Step 4: 跑 `test_aio_config.py`、`test_cube_config.py` 全绿。
@@ -211,18 +214,20 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
   `glob(path, pattern, max_results) -> (paths, truncated)`、
   `grep(path, pattern, *, glob, literal, case_sensitive, max_results) -> (matches, truncated)`。
 - Produces: `SdkAioClient(base_url, timeout)`：懒 import `agent_sandbox`，
-  `httpx.Client(trust_env=False)` 注入，能力探测 `bash_supported()`（一次，缓存），
-  shell 降级路径（`create_session(id=uuid)` → `exec_command` → 必要时 `view` 取退出码 →
-  `cleanup_session`）。
+  `httpx.Client(trust_env=False)` 注入；每次命令 `bash.create_session()` → `bash.exec()` →
+  `bash.close_session()`；`bash.exec` 404 时抛 `SandboxRuntimeError`（文案含镜像 tag 与
+  "needs >= 1.9.3 (recommended 1.11.0)"），**不做** `/v1/shell` 降级。
 - Consumes: 无 agentkit 依赖（只在内部懒加载 SDK），便于 fake 替换。
 
 **Steps:**
-- [ ] Step 1: fake AIO 客户端 + 测试：两种镜像（bash 可用 / 404）各跑一遍命令契约：
-      正常输出、`exit_code != 0`、`timed_out`/`hard_timeout` → `SandboxTimeoutError`、
-      `killed`/`terminated` → `SandboxRuntimeError`、带 `env` 在 shell-only 镜像上明确失败。
-- [ ] Step 2: 测试：并发两次命令 → 两个不同 session id，且都调用 `close_session`/`cleanup_session`。
-- [ ] Step 3: 测试：文件/glob/grep 映射（含 `truncated` 标志、bytes 上限）。
-- [ ] Step 4: 实现；全绿；提交。
+- [ ] Step 1: fake AIO 客户端 + 命令契约测试：正常输出、`exit_code != 0`、
+      `timed_out` → `SandboxTimeoutError`、`killed`/`running` → `SandboxRuntimeError`、
+      `env` 走结构化字段（不出现在命令字符串里）。
+- [ ] Step 2: 镜像能力测试：`bash.exec` 返回 404 → `SandboxRuntimeError`，文案含镜像 tag 与
+      版本要求，且**没有**任何 `shell.*` 调用（fake 里断言）。
+- [ ] Step 3: 测试：并发两次命令 → 两个不同 session id，且都被 `close_session` 关闭。
+- [ ] Step 4: 测试：文件/glob/grep 映射（含 `truncated` 标志、bytes 上限）。
+- [ ] Step 5: 实现；全绿；提交。
 
 ### Task 7: `AioSandbox`（8 个契约方法）
 
@@ -282,7 +287,8 @@ docs/superpowers/specs/2026-11-05-aio-sandbox-docker-provider-design.md
 - Create: backend/tests/test_aio_sandbox_integration.py（opt-in，默认 skip）
 
 **Steps:**
-- [ ] Step 1: 写集成用例（`AIO_INTEGRATION=1 AIO_IMAGE=... REDIS_URL=...`）：
+- [ ] Step 1: 写集成用例（`AIO_INTEGRATION=1 AIO_IMAGE=...1.11.0 REDIS_URL=...`，
+      不设 `AIO_IMAGE` 时用 `DEFAULT_AIO_IMAGE`）：
       acquire → `echo`/`python3` → 双向文件 → 二进制 → `stop` 后热恢复 → `shutdown` 清容器。
 - [ ] Step 2: 跑全量 `uv run python -m pytest backend/tests -q`，确认与基线一致（allow skip）。
 - [ ] Step 3: 提交 + 更新 spec 状态。
