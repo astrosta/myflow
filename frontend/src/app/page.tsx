@@ -1,8 +1,10 @@
 import Link from "next/link";
 
+import { HomeAuthLink } from "@/components/auth/home-auth-link";
+
 /**
- * 落地页。静态、无数据依赖——它存在的意义是"不加载聊天页的任何东西"，
- * 所以这里不引用任何 markdown / 高亮 / SDK 代码（M5 §2）。
+ * 落地页。页面本身静态——它存在的意义是"不加载聊天页的任何东西"，
+ * 所以这里只挂一个很小的会话入口 island，不引用 markdown / 高亮 / SDK 代码（M5 §2）。
  */
 
 const FEATURES = [
@@ -29,9 +31,7 @@ export default function LandingPage() {
           <Link className="transition-colors hover:text-neutral-900" href="/workspace">
             工作区
           </Link>
-          <Link className="transition-colors hover:text-neutral-900" href="/login">
-            登录
-          </Link>
+          <HomeAuthLink />
         </nav>
       </header>
 
