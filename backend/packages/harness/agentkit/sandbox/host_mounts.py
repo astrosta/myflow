@@ -18,8 +18,8 @@ import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from typing import Protocol
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Protocol, Union
 
 from agentkit.config.app_config import AppConfig
 from agentkit.config.paths import Paths, get_paths
@@ -45,12 +45,17 @@ class HostMountSpec(Protocol):
     host_root: str | None
 
 
+#: A host path as the sandbox runtime sees it. POSIX for a Linux daemon or
+#: Cubelet; Windows for Docker Desktop on a Windows development host.
+HostPath = Union[PurePosixPath, PureWindowsPath]
+
+
 @dataclass(frozen=True, slots=True)
 class HostRoots:
     """Gateway-side and runtime-side names for the same shared project root."""
 
     local_root: Path
-    host_root: PurePosixPath
+    host_root: "HostPath"
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +114,10 @@ def to_host_path(local: Path, roots: HostRoots) -> str:
             f"host_mount.local_root {local_root}"
         )
     relative = resolved.relative_to(local_root)
-    return str(roots.host_root.joinpath(*relative.parts))
+    joined = roots.host_root.joinpath(*relative.parts)
+    # Docker accepts forward slashes for a Windows bind source; a POSIX path
+    # keeps its own separator either way.
+    return joined.as_posix() if isinstance(roots.host_root, PureWindowsPath) else str(joined)
 
 
 def build_host_mounts(
@@ -374,18 +382,28 @@ def _parse_container_path(value: str, field: str) -> str:
     return str(path)
 
 
-def _parse_host_root(value: str, field: str) -> PurePosixPath:
+def _parse_host_root(value: str, field: str) -> "HostPath":
+    """Parse a runtime-visible host path, rejecting roots and traversal.
+
+    POSIX and Windows absolute forms are both accepted: the first is what a
+    Linux daemon or Cubelet sees, the second is what Docker Desktop on Windows
+    sees. Anything relative, a filesystem root, or a '..' segment is rejected so
+    a project mount can never silently become a whole-disk mount.
+    """
+
     text = str(value).strip()
     if not text:
         raise SandboxRuntimeError(f"{field} must not be blank")
-    path = PurePosixPath(text)
-    if not path.is_absolute():
-        raise SandboxRuntimeError(f"{field} must be an absolute POSIX path: {text}")
-    if path.parent == path:
-        raise SandboxRuntimeError(f"{field} must not be the filesystem root: {text}")
-    if any(part == ".." for part in path.parts):
-        raise SandboxRuntimeError(f"{field} must not contain '..': {text}")
-    return path
+    for path_type in (PurePosixPath, PureWindowsPath):
+        path = path_type(text)
+        if not path.is_absolute():
+            continue
+        if path.parent == path:
+            raise SandboxRuntimeError(f"{field} must not be the filesystem root: {text}")
+        if any(part == ".." for part in path.parts):
+            raise SandboxRuntimeError(f"{field} must not contain '..': {text}")
+        return path
+    raise SandboxRuntimeError(f"{field} must be an absolute path: {text}")
 
 
 def _validate_local_root(local_root: Path, field: str) -> None:
@@ -397,7 +415,7 @@ def _validate_local_root(local_root: Path, field: str) -> None:
         raise SandboxRuntimeError(f"{field} is not a directory: {local_root}")
 
 
-def _validate_host_root(host_root: PurePosixPath, field: str) -> None:
+def _validate_host_root(host_root: HostPath, field: str) -> None:
     # Re-parse instead of trusting a hand-constructed HostRoots value.
     _parse_host_root(str(host_root), field)
 

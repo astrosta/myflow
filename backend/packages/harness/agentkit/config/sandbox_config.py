@@ -117,6 +117,11 @@ class AioSandboxConfig(BaseModel):
     )
     ready_timeout_seconds: float = Field(default=60, gt=0)
     request_timeout_seconds: float = Field(default=30, gt=0)
+    acquire_timeout_seconds: float = Field(
+        default=120,
+        gt=0,
+        description="How long acquire waits for the per-thread Redis lease.",
+    )
     release_action: Literal["stop", "remove"] = "stop"
     max_cached_threads: int = Field(default=64, ge=1)
     discover_existing: bool = True

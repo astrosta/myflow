@@ -7,6 +7,7 @@ is recorded, and a test can inject the failure it cares about.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agentkit.sandbox.aio_sandbox.client import (
@@ -35,6 +36,7 @@ class FakeAioClient:
     writes: list[dict[str, Any]] = field(default_factory=list)
     byte_writes: list[dict[str, Any]] = field(default_factory=list)
     commands: list[dict[str, Any]] = field(default_factory=list)
+    calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     pings: int = 0
     closed: bool = False
 
@@ -107,4 +109,66 @@ class FakeAioClient:
         return self.grep_result
 
 
-__all__ = ["FakeAioClient", "AioTransportError"]
+class HostMountedAioClient(FakeAioClient):
+    """A client whose file calls go through a container -> host mount map.
+
+    This is what makes provider tests exercise the real thing: the canary writes
+    on the host, the "sandbox" reads it through the mount, and the reverse.
+    """
+
+    def __init__(self, root_map: dict[str, str | Path], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.root_map = {key.rstrip("/"): Path(value) for key, value in root_map.items()}
+
+    def _host(self, path: str) -> Path:
+        normalized = "/" + path.strip("/")
+        for container, root in sorted(self.root_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if normalized == container or normalized.startswith(container + "/"):
+                relative = normalized[len(container):].lstrip("/")
+                return root / relative if relative else root
+        raise FileNotFoundError(path)
+
+    def read_text(self, path: str, *, start_line=None, end_line=None) -> str:
+        self.calls.append(("read_text", {"path": path}))
+        return self._host(path).read_text(encoding="utf-8")
+
+    def write_text(self, path: str, content: str, *, append: bool = False) -> None:
+        self.calls.append(("write_text", {"path": path, "append": append}))
+        target = self._host(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a" if append else "w", encoding="utf-8") as handle:
+            handle.write(content)
+
+    def read_bytes(self, path: str, *, max_bytes: int) -> bytes:
+        self.calls.append(("read_bytes", {"path": path}))
+        data = self._host(path).read_bytes()
+        if len(data) > max_bytes:
+            raise OSError(f"Failed to read {path}: it exceeds the {max_bytes}-byte limit")
+        return data
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        self.calls.append(("write_bytes", {"path": path}))
+        target = self._host(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+    def list_entries(self, path: str, *, max_depth: int) -> list[Entry]:
+        self.calls.append(("list_entries", {"path": path}))
+        root = self._host(path)
+        if not root.is_dir():
+            raise NotADirectoryError(path)
+        entries: list[Entry] = []
+        for child in sorted(root.iterdir()):
+            entries.append(
+                Entry(
+                    name=child.name,
+                    path=path.rstrip("/") + "/" + child.name,
+                    is_dir=child.is_dir(),
+                    size=None if child.is_dir() else child.stat().st_size,
+                )
+            )
+        return entries
+
+
+__all__ = ["FakeAioClient", "HostMountedAioClient", "AioTransportError"]
+
