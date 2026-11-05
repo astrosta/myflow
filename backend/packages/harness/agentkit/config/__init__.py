@@ -23,14 +23,21 @@ from agentkit.config.knowledge_config import KnowledgeBaseConfig
 from agentkit.config.llm_call_config import LlmCallConfig
 from agentkit.config.memory_config import MemoryConfig
 from agentkit.config.model_config import ModelConfig, ReasoningEffortOption
+from agentkit.config.observability_config import LangfuseConfig, ObservabilityConfig
 from agentkit.config.pii_config import PIIConfig
 from agentkit.config.runs_config import RunsConfig
 from agentkit.config.sandbox_config import (
+    DEFAULT_AIO_IMAGE,
+    AioSandboxConfig,
+    AioSandboxNetworkConfig,
+    AioSandboxResourcesConfig,
     CubeSandboxConfig,
     CubeSandboxHostMountConfig,
     CubeSandboxLeaseConfig,
     CubeSandboxNetworkConfig,
+    HostMountConfig,
     SandboxConfig,
+    SandboxLeaseConfig,
 )
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.config.skills_prefs import (
@@ -70,10 +77,16 @@ __all__ = [
     "AuthConfig",
     "LocalLoginConfig",
     "CheckpointerConfig",
+    "AioSandboxConfig",
+    "AioSandboxNetworkConfig",
+    "AioSandboxResourcesConfig",
     "CubeSandboxConfig",
     "CubeSandboxHostMountConfig",
     "CubeSandboxLeaseConfig",
     "CubeSandboxNetworkConfig",
+    "DEFAULT_AIO_IMAGE",
+    "HostMountConfig",
+    "SandboxLeaseConfig",
     "CustomSubagentConfig",
     "DatabaseConfig",
     "ExtensionsConfig",
@@ -83,7 +96,9 @@ __all__ = [
     "McpUserAuthConfig",
     "SkillToggleConfig",
     "MemoryConfig",
+    "LangfuseConfig",
     "ModelConfig",
+    "ObservabilityConfig",
     "PIIConfig",
     "ReasoningEffortOption",
     "RunsConfig",
