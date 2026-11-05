@@ -29,6 +29,9 @@ class FakeOsbHandle:
     root_map: dict[str, str] | None = None
     command_output: CommandOutput = field(default_factory=lambda: CommandOutput("", 0))
     command_error: BaseException | None = None
+    code_output: CommandOutput = field(default_factory=lambda: CommandOutput("", 0))
+    code_error: BaseException | None = None
+    code_calls: list[dict[str, Any]] = field(default_factory=list)
     text: str = ""
     text_error: BaseException | None = None
     byte_content: bytes = b""
@@ -150,6 +153,14 @@ class FakeOsbHandle:
         if self.root_map is not None:
             self._host(path).mkdir(parents=True, exist_ok=True)
 
+    def run_code(self, code: str, *, language: str, timeout: float) -> CommandOutput:
+        self.code_calls.append(
+            {"code": code, "language": language, "timeout": timeout}
+        )
+        if self.code_error is not None:
+            raise self.code_error
+        return self.code_output
+
     def close(self) -> None:
         self.closed = True
 
@@ -189,6 +200,7 @@ class FakeOsbClient:
         metadata: Mapping[str, str] | None = None,
         mounts: Sequence[MountEntry] = (),
         resource: Mapping[str, str] | None = None,
+        entrypoint: Sequence[str] | None = None,
     ) -> FakeOsbHandle:
         self.create_calls.append(
             {
@@ -199,6 +211,7 @@ class FakeOsbClient:
                 "metadata": dict(metadata or {}),
                 "mounts": list(mounts),
                 "resource": dict(resource or {}),
+                "entrypoint": list(entrypoint) if entrypoint else None,
             }
         )
         if self.create_error is not None:

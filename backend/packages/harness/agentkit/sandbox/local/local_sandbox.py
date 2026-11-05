@@ -9,16 +9,18 @@ import subprocess
 import threading
 
 from agentkit.sandbox.env_policy import build_sandbox_env
-from agentkit.sandbox.exceptions import SandboxTimeoutError
+from agentkit.sandbox.exceptions import SandboxRuntimeError, SandboxTimeoutError
 from agentkit.sandbox.file_operation_lock import get_file_operation_lock
 from agentkit.sandbox.local.list_dir import render_tree
 from agentkit.sandbox.path_patterns import mask_host_paths
 from agentkit.sandbox.sandbox import GrepMatch, Sandbox
 from agentkit.sandbox.search import glob_search, grep_search
+from agentkit.sandbox.run_code import run_code_via_command
 from agentkit.sandbox.security import (
     PathMapping,
     assert_writable,
     find_path_mapping,
+    is_host_bash_allowed,
     resolve_sandbox_path,
 )
 
@@ -173,6 +175,27 @@ class LocalSandbox(Sandbox):
             case_sensitive=case_sensitive,
             max_results=max_results,
         )
+
+    def run_code(
+        self,
+        code: str,
+        *,
+        language: str = "python",
+        timeout: float | None = None,
+    ) -> str:
+        """Run a snippet through the host shell.
+
+        This executes model-written code on the host, which is exactly what the
+        bash tool already does, so it needs the same explicit trust switch.
+        """
+
+        if not is_host_bash_allowed():
+            raise SandboxRuntimeError(
+                "run_code on the local provider executes model code on this host. "
+                "Set sandbox.allow_host_bash: true only on a trusted machine, or "
+                "switch sandbox.use to an isolating provider"
+            )
+        return run_code_via_command(self, code, language=language, timeout=timeout)
 
     def shutdown(self) -> None:
         with self._processes_guard:

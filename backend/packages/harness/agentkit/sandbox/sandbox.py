@@ -6,6 +6,8 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from agentkit.sandbox.exceptions import SandboxRuntimeError
+
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SIGPIPE = 13
 _FIND_SUCCESS_CODES = frozenset({0, 128 + _SIGPIPE, -_SIGPIPE})
@@ -59,6 +61,11 @@ class Sandbox(ABC):
     #: A third-party provider might reuse a session, so silence is not a clean shell.
     #: Consumers trust only an explicit ``False``; treat ``None`` like ``True``.
     persistent_shell_sessions: bool | None = None
+
+    #: Whether the provider can actually execute a code snippet. Only used for
+    #: diagnostics and startup checks: whether the model sees the run_code tool is
+    #: decided by sandbox.run_code.enabled, so tool assembly never builds a provider.
+    supports_run_code: bool = False
 
     @property
     def id(self) -> str:
@@ -171,3 +178,21 @@ class Sandbox(ABC):
         max_results: int = 100,
     ) -> tuple[list[GrepMatch], bool]:
         """Search file contents. Return ``(matches, truncated)``; do not drop the flag."""
+
+    def run_code(
+        self,
+        code: str,
+        *,
+        language: str = "python",
+        timeout: float | None = None,
+    ) -> str:
+        """Run one snippet and return its output as text.
+
+        The same output rules as execute_command: stdout, merged stderr, and a
+        trailing exit code N when the process did not exit 0. Providers with no way
+        to run code raise instead of pretending, so the tool reports a real reason.
+        """
+
+        raise SandboxRuntimeError(
+            f"run_code is not supported by {type(self).__name__}"
+        )

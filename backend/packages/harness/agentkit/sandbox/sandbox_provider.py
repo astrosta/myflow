@@ -76,8 +76,17 @@ def get_sandbox_provider(**kwargs: object) -> SandboxProvider:
     from agentkit.reflection import resolve_class
     from agentkit.sandbox.security import sandbox_use
 
+    # The provider class must come from the same config the caller hands to the
+    # constructor. Reading the ambient config here would build the process-wide
+    # "use: ..." provider while giving it someone else's settings, which is how a
+    # test that passes its own app_config ends up with a remote provider.
+    config = kwargs.get("app_config")
+    if config is None:
+        try:
+            config = get_app_config()
+        except Exception:
+            config = None
     try:
-        config = get_app_config()
         use = sandbox_use(config)
     except Exception:
         use = "agentkit.sandbox.local:LocalSandboxProvider"

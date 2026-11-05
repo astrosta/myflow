@@ -20,6 +20,7 @@ STARTUP_ONLY_FIELDS: dict[str,str] = {
     "sandbox.use": "get_sandbox_provider() 首次调用时按 use 创建单例；重载后的 AppConfig 不会重建它",
     "sandbox.cube": "CubeSandbox provider 与 lease 在首次获取时按配置构造；重载后的 AppConfig 不会重建它们",
     "sandbox.opensandbox": "OpenSandbox provider 与 lease 在首次获取时按配置构造；镜像、sandbox 与服务端地址都绑在这个单例上",
+    "sandbox.run_code": "run_code 工具的默认语言与墙钟在工具装配时读取；改了要重启才能作用到已缓存的 provider",
     "skills.container_path": "它被编译进系统提示词的技能索引和沙箱 mount；换路径要重建沙箱视图",
     "skills.builtin.path": "内置技能目录在 Sandbox provider 构造时固化为只读挂载；换路径要重启进程",
     "skills.builtin.enabled": "内置技能开关与只读挂载一起在 Sandbox provider 构造时冻结",

@@ -370,15 +370,17 @@ class OpenSandboxProvider(SandboxProvider):
         lease: LockLease,
     ) -> _OsbHandle:
         metadata = self._metadata(key, fingerprint)
+        image, entrypoint = self._creation_image()
         try:
             handle = self._client.create(
-                image=self._osb.image,
+                image=image,
                 timeout_seconds=self._osb.timeout_seconds,
                 ready_timeout_seconds=self._osb.ready_timeout_seconds,
                 env=dict(self._osb.env),
                 metadata=metadata,
                 mounts=mounts,
                 resource=dict(self._osb.resource),
+                entrypoint=entrypoint,
             )
         except Exception as exc:
             message = f"OpenSandbox create failed: {exc}"
@@ -411,6 +413,7 @@ class OpenSandboxProvider(SandboxProvider):
             mounts=mounts,
             command_timeout=float(self._app_config.sandbox.bash_command_timeout),
             on_transport_failure=lambda: self._probe_sandbox(handle.sandbox_id),
+            code_interpreter=self._uses_code_interpreter(),
         )
         return _OsbHandle(
             key=key,
@@ -431,6 +434,22 @@ class OpenSandboxProvider(SandboxProvider):
             paths=self._paths,
             field_prefix=_FIELD_PREFIX,
         )
+
+    def _uses_code_interpreter(self) -> bool:
+        """The interpreter needs both the extra image and the tool being on."""
+
+        return self._osb.run_code is not None and bool(
+            getattr(self._app_config.sandbox.run_code, "enabled", False)
+        )
+
+    def _creation_image(self) -> tuple[str, list[str] | None]:
+        """Pick the image (and entrypoint) this sandbox is created from."""
+
+        if not self._uses_code_interpreter():
+            return self._osb.image, None
+        config = self._osb.run_code
+        assert config is not None
+        return config.image, list(config.entrypoint)
 
     def _metadata(
         self, key: tuple[str, str | None], fingerprint: str

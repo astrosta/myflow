@@ -96,6 +96,51 @@ def test_scope_calls_share_the_fresh_process_model(tmp_path) -> None:
     assert len(handle.command_calls) == 1
 
 
+# -- run_code ---------------------------------------------------------------
+
+
+def test_run_code_uses_the_code_interpreter_when_configured(tmp_path) -> None:
+    handle = FakeOsbHandle(code_output=CommandOutput("42", 0))
+    sandbox = _sandbox(tmp_path, handle, code_interpreter=True)
+
+    assert sandbox.run_code("6 * 7") == "42"
+    assert handle.code_calls == [
+        {"code": "6 * 7", "language": "python", "timeout": 600.0}
+    ]
+    # The interpreter path must not fall back to the shell channel.
+    assert handle.command_calls == []
+
+
+def test_run_code_reports_a_non_zero_exit(tmp_path) -> None:
+    handle = FakeOsbHandle(code_output=CommandOutput("boom", 1))
+    sandbox = _sandbox(tmp_path, handle, code_interpreter=True)
+
+    output = sandbox.run_code("raise SystemExit(1)")
+
+    assert output.splitlines() == ["boom", "exit code 1"]
+
+def test_run_code_without_the_interpreter_uses_the_shell(tmp_path) -> None:
+    handle = FakeOsbHandle(command_output=CommandOutput("from-shell", 0))
+    sandbox = _sandbox(tmp_path, handle, code_interpreter=False)
+
+    assert sandbox.run_code("print(1)") == "from-shell"
+    assert handle.command_calls[0]["command"].startswith("python3 ")
+    assert handle.code_calls == []
+
+
+def test_run_code_maps_transport_failures_to_the_owner(tmp_path) -> None:
+    calls: list[str] = []
+    handle = FakeOsbHandle(code_error=OsbTransportError("server unreachable"))
+    sandbox = _sandbox(
+        tmp_path, handle, code_interpreter=True, on_transport_failure=lambda: calls.append("gone")
+    )
+
+    with pytest.raises(SandboxError):
+        sandbox.run_code("1 + 1")
+
+    assert calls == ["gone"]
+
+
 # -- files ------------------------------------------------------------------
 
 

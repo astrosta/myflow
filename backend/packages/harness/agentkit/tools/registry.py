@@ -15,6 +15,7 @@ from agentkit.sandbox.tools import (
     grep,
     ls,
     read_file,
+    run_code,
     str_replace,
     write_file,
 )
@@ -39,6 +40,7 @@ _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
     ("sandbox", glob),
     ("sandbox", grep),
     ("sandbox", bash_tool),
+    ("sandbox", run_code),
 )
 
 
@@ -136,6 +138,10 @@ def _apply_capability_filters(
 ) -> list[BaseTool]:
     """All capability filters live here. M9 adds non_interactive in this function."""
     bash_allowed = is_host_bash_allowed(app_config)
+    # Tolerate a partially-built config (tests hand in plain objects): only the
+    # presence of an enabled run_code section turns the tool on.
+    run_code_section = getattr(getattr(app_config, "sandbox", None), "run_code", None)
+    run_code_enabled = bool(getattr(run_code_section, "enabled", False))
     vision = _model_supports_vision(app_config, model_name)
     # 检索加载关掉时工具不出现：模型看不见它就不会调用，比调用后再回一句"已关闭"省一轮
     skill_search_enabled = bool(getattr(app_config.skills.search, "enabled", True))
@@ -144,6 +150,8 @@ def _apply_capability_filters(
     for tool in tools:
         if _is_bash_tool(tool.name) and not bash_allowed:
             hid_bash = True
+            continue
+        if tool.name == "run_code" and not run_code_enabled:
             continue
         if tool.name == "search_and_load_skills" and not skill_search_enabled:
             continue

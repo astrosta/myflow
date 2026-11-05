@@ -34,6 +34,8 @@ from agentkit.config.sandbox_config import (
     CubeSandboxNetworkConfig,
     HostMountConfig,
     OpenSandboxConfig,
+    OpenSandboxRunCodeConfig,
+    RunCodeConfig,
     SandboxConfig,
     SandboxLeaseConfig,
 )
@@ -82,6 +84,8 @@ __all__ = [
     "DEFAULT_OPENSANDBOX_IMAGE",
     "HostMountConfig",
     "OpenSandboxConfig",
+    "OpenSandboxRunCodeConfig",
+    "RunCodeConfig",
     "SandboxLeaseConfig",
     "CustomSubagentConfig",
     "DatabaseConfig",

@@ -44,6 +44,7 @@ from agentkit.sandbox.exceptions import (
 )
 from agentkit.sandbox.file_operation_lock import get_file_operation_lock
 from agentkit.sandbox.path_patterns import mask_host_paths
+from agentkit.sandbox.run_code import run_code_via_command
 from agentkit.sandbox.sandbox import GrepMatch, Sandbox
 from agentkit.sandbox.security import PathMapping, VirtualMount, assert_virtual_path
 
@@ -62,6 +63,9 @@ class CubeSandbox(Sandbox):
 
     #: Every ``execute_command`` starts a new shell; exports and cwd do not persist.
     persistent_shell_sessions: bool | None = False
+
+    #: The Cube template ships python3, so a snippet can run through the shell.
+    supports_run_code: bool = True
 
     def __init__(
         self,
@@ -270,6 +274,17 @@ class CubeSandbox(Sandbox):
             raise
         except Exception as exc:
             raise OSError(f"Failed to {action} {path}: {exc}") from exc
+
+    def run_code(
+        self,
+        code: str,
+        *,
+        language: str = "python",
+        timeout: float | None = None,
+    ) -> str:
+        """Run a snippet through the sandbox shell (the template has python3)."""
+
+        return run_code_via_command(self, code, language=language, timeout=timeout)
 
     def _assert_path(self, path: str, *, write: bool = False) -> str:
         return assert_virtual_path(path, self._virtual_mounts, write=write)

@@ -24,6 +24,7 @@ from agentkit.sandbox.file_operation_lock import get_file_operation_lock
 from agentkit.sandbox.host_mounts import MountEntry
 from agentkit.sandbox.opensandbox.client import Entry, OsbHandle, OsbTransportError
 from agentkit.sandbox.path_patterns import mask_host_paths
+from agentkit.sandbox.run_code import run_code_via_command
 from agentkit.sandbox.sandbox import GrepMatch, Sandbox
 from agentkit.sandbox.security import PathMapping, VirtualMount, assert_virtual_path
 
@@ -45,6 +46,10 @@ class OpenSandboxSandbox(Sandbox):
     #: Every execute_command runs in a new process; nothing persists.
     persistent_shell_sessions: bool | None = False
 
+    #: True unless configured otherwise: either the code interpreter or the shell
+    #: can run a snippet. RunCodeConfig decides whether the tool is exposed at all.
+    supports_run_code: bool = True
+
     def __init__(
         self,
         handle: OsbHandle,
@@ -54,9 +59,13 @@ class OpenSandboxSandbox(Sandbox):
         command_timeout: float = _DEFAULT_COMMAND_TIMEOUT,
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
         on_transport_failure: Callable[[], None] | None = None,
+        code_interpreter: bool = False,
     ) -> None:
         self._handle = handle
         self._id = sandbox_id
+        #: When the sandbox was created from the code-interpreter image, snippets
+        #: go through CodeInterpreterSync; otherwise the shared shell path runs them.
+        self._code_interpreter = code_interpreter
         self._on_transport_failure = on_transport_failure
         self._transport_notified = False
         self._transport_lock = threading.Lock()
@@ -96,6 +105,29 @@ class OpenSandboxSandbox(Sandbox):
                 env=env,
                 timeout=limit,
                 max_output_bytes=self.max_output_bytes,
+            )
+        text = output.text
+        if output.exit_code != 0:
+            text = (
+                f"{text.rstrip()}\nexit code {output.exit_code}"
+                if text
+                else f"exit code {output.exit_code}"
+            )
+        return mask_host_paths(text, self)
+
+    def run_code(
+        self,
+        code: str,
+        *,
+        language: str = "python",
+        timeout: float | None = None,
+    ) -> str:
+        limit = self.command_timeout if timeout is None else timeout
+        if not self._code_interpreter:
+            return run_code_via_command(self, code, language=language, timeout=limit)
+        with self._data_plane_errors("run code"):
+            output = self._handle.run_code(
+                code, language=language, timeout=float(limit)
             )
         text = output.text
         if output.exit_code != 0:

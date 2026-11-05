@@ -71,6 +71,41 @@ class CubeSandboxConfig(BaseModel):
     max_cached_threads: int = 64
 
 
+class RunCodeConfig(BaseModel):
+    """The run_code tool. Disabled by default: no tool means no wasted turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description="Expose the run_code tool to the model.",
+    )
+    default_language: str = Field(default="python")
+    timeout_seconds: float = Field(default=120, gt=0)
+
+
+class OpenSandboxRunCodeConfig(BaseModel):
+    """Code Interpreter image for the OpenSandbox provider.
+
+    Set it when snippets should run in a real interpreter: the sandbox is then
+    created from this image with this entrypoint, and run_code goes through
+    CodeInterpreterSync instead of the shell.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    image: str = Field(
+        default=(
+            "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/"
+            "code-interpreter:v1.1.0"
+        )
+    )
+    entrypoint: list[str] = Field(
+        default_factory=lambda: ["/opt/code-interpreter/code-interpreter.sh"]
+    )
+    ready_timeout_seconds: float = Field(default=30, gt=0)
+
+
 class OpenSandboxConfig(BaseModel):
     """OpenSandbox provider (agentkit.sandbox.opensandbox).
 
@@ -119,6 +154,10 @@ class OpenSandboxConfig(BaseModel):
     lease: SandboxLeaseConfig
     orphan_policy: Literal["report", "remove"] = "report"
     orphan_ttl_seconds: int = Field(default=86400, ge=0)
+    run_code: OpenSandboxRunCodeConfig | None = Field(
+        default=None,
+        description="Set to run snippets in the Code Interpreter instead of the shell.",
+    )
 
     @field_validator("domain", "image")
     @classmethod
@@ -163,6 +202,13 @@ class SandboxConfig(BaseModel):
         default_factory=list,
         description="Extra process-wide mounts as {container_path, local_path, read_only}.",
     )
+    run_code: RunCodeConfig = Field(
+        default_factory=RunCodeConfig,
+        description=format_field_description(
+            "sandbox.run_code",
+            field_doc="run_code tool: expose it, pick the default language and the wall clock.",
+        ),
+    )
     cube: CubeSandboxConfig | None = Field(
         default=None,
         description=format_field_description(
@@ -187,6 +233,8 @@ __all__ = [
     "CubeSandboxNetworkConfig",
     "HostMountConfig",
     "OpenSandboxConfig",
+    "OpenSandboxRunCodeConfig",
+    "RunCodeConfig",
     "SandboxConfig",
     "SandboxLeaseConfig",
 ]

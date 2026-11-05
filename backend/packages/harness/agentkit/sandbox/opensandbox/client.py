@@ -114,6 +114,10 @@ class OsbHandle(Protocol):
 
     def create_directories(self, path: str) -> None: ...
 
+    def run_code(
+        self, code: str, *, language: str, timeout: float
+    ) -> CommandOutput: ...
+
     def close(self) -> None: ...
 
 
@@ -132,6 +136,7 @@ class OsbClient(Protocol):
         metadata: Mapping[str, str] | None = None,
         mounts: Sequence[MountEntry] = (),
         resource: Mapping[str, str] | None = None,
+        entrypoint: Sequence[str] | None = None,
     ) -> OsbHandle: ...
 
     def connect(self, sandbox_id: str) -> OsbHandle: ...
@@ -151,6 +156,7 @@ class SdkOsbHandle:
     def __init__(self, sandbox: Any) -> None:
         self._sandbox = sandbox
         self.sandbox_id = str(getattr(sandbox, "id", "") or "")
+        self._interpreter: Any = None
 
     def is_running(self) -> bool:
         try:
@@ -250,7 +256,45 @@ class SdkOsbHandle:
         except Exception as exc:
             raise _map_file_error(exc, path, action="create") from exc
 
+    def run_code(
+        self, code: str, *, language: str, timeout: float
+    ) -> CommandOutput:
+        """Run one snippet in the Code Interpreter.
+
+        The interpreter is created on first use and reused, because creating it
+        costs a round trip to the sandbox. There is no per-run timeout in the SDK:
+        the caller's timeout is advisory here and enforced by the tool's own
+        wall clock on the gateway side.
+        """
+
+        del timeout
+        interpreter = self._code_interpreter()
+        try:
+            execution = interpreter.codes.run(
+                code, language=_ci_language(language)
+            )
+        except Exception as exc:
+            raise _map_command_error(exc, timeout) from exc
+        text = _code_text(execution)
+        return CommandOutput(
+            text=text, exit_code=_as_exit_code(getattr(execution, "exit_code", None))
+        )
+
+    def _code_interpreter(self) -> Any:
+        if self._interpreter is None:
+            from code_interpreter.sync.code_interpreter import CodeInterpreterSync
+
+            self._interpreter = CodeInterpreterSync.create(sandbox=self._sandbox)
+        return self._interpreter
+
     def close(self) -> None:
+        interpreter = self._interpreter
+        self._interpreter = None
+        if interpreter is not None:
+            try:
+                interpreter.close()
+            except Exception:  # noqa: BLE001 - best effort
+                logger.debug("closing the code interpreter failed", exc_info=True)
         try:
             self._sandbox.close()
         except Exception:  # noqa: BLE001 - closing twice must not raise
@@ -309,6 +353,7 @@ class SdkOsbClient:
         metadata: Mapping[str, str] | None = None,
         mounts: Sequence[MountEntry] = (),
         resource: Mapping[str, str] | None = None,
+        entrypoint: Sequence[str] | None = None,
     ) -> OsbHandle:
         sdk = self._import_sdk()
         volumes = [_volume(sdk, entry, index) for index, entry in enumerate(mounts)]
@@ -325,6 +370,8 @@ class SdkOsbClient:
             kwargs["volumes"] = volumes
         if resource:
             kwargs["resource"] = dict(resource)
+        if entrypoint:
+            kwargs["entrypoint"] = list(entrypoint)
         try:
             sandbox = sdk.SandboxSync.create(image, **kwargs)
         except Exception as exc:
@@ -462,6 +509,63 @@ def _volume(sdk: Any, entry: MountEntry, index: int) -> Any:
         mount_path=entry.container_path,
         read_only=entry.read_only,
     )
+
+
+#: Our aliases mapped onto the interpreter's SupportedLanguage values.
+_CI_LANGUAGE_ALIASES = {
+    "python3": "python",
+    "py": "python",
+    "js": "javascript",
+    "node": "javascript",
+    "ts": "typescript",
+    "sh": "bash",
+    "shell": "bash",
+}
+_CI_LANGUAGES = frozenset({"python", "javascript", "typescript", "bash", "java", "go"})
+
+
+def _ci_language(language: str) -> Any:
+    """Map an alias to the SDK enum member, failing loudly on an unknown one."""
+
+    normalized = (language or "").strip().lower() or "python"
+    normalized = _CI_LANGUAGE_ALIASES.get(normalized, normalized)
+    if normalized not in _CI_LANGUAGES:
+        raise SandboxRuntimeError(
+            f"the code interpreter cannot run {language!r}; supported: "
+            + ", ".join(sorted(_CI_LANGUAGES))
+        )
+    from code_interpreter import SupportedLanguage
+
+    member = getattr(SupportedLanguage, normalized.upper(), None)
+    return member if member is not None else normalized
+
+
+def _code_text(execution: Any) -> str:
+    """stdout, then the expression results, then errors: one readable blob."""
+
+    newline = chr(10)
+    parts: list[str] = []
+    stdout = _join_messages(getattr(getattr(execution, "logs", None), "stdout", None))
+    stderr = _join_messages(getattr(getattr(execution, "logs", None), "stderr", None))
+    if stdout:
+        parts.append(stdout.rstrip(newline))
+    for result in getattr(execution, "result", None) or ():
+        text = getattr(result, "text", None)
+        if text is None:
+            text = getattr(result, "data", None)
+        if text is None:
+            continue
+        parts.append(str(text).rstrip(newline))
+    if stderr:
+        parts.append(stderr.rstrip(newline))
+    error = getattr(execution, "error", None)
+    if error is not None:
+        parts.append(
+            str(getattr(error, "name", "") or "error")
+            + ": "
+            + str(getattr(error, "value", "") or "")
+        )
+    return newline.join(part for part in parts if part).strip()
 
 
 def _to_entry(row: Any) -> Entry:

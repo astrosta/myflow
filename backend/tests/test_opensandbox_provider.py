@@ -216,6 +216,50 @@ def test_stale_mounts_kill_and_recreate(tmp_path) -> None:
     assert len(client.create_calls) == 1
 
 
+# -- run_code wiring --------------------------------------------------------
+
+
+def _run_code_config(tmp_path: Path) -> AppConfig:
+    config = _config(
+        tmp_path,
+        run_code={
+            "image": "registry.example/code-interpreter:v1",
+            "entrypoint": ["/opt/code-interpreter/code-interpreter.sh"],
+        },
+    )
+    config.sandbox.run_code.enabled = True
+    return config
+
+
+def test_creation_uses_the_code_interpreter_image_when_enabled(tmp_path) -> None:
+    provider, client = _provider(tmp_path, config=_run_code_config(tmp_path))
+
+    provider.acquire("t1", user_id="u1")
+
+    call = client.create_calls[0]
+    assert call["image"] == "registry.example/code-interpreter:v1"
+    assert call["entrypoint"] == ["/opt/code-interpreter/code-interpreter.sh"]
+    sandbox = provider.get("osb:u1:t1")
+    assert sandbox is not None
+    assert sandbox._code_interpreter is True
+
+
+def test_creation_keeps_the_plain_image_when_the_tool_is_off(tmp_path) -> None:
+    config = _config(
+        tmp_path, run_code={"image": "registry.example/code-interpreter:v1"}
+    )
+    provider, client = _provider(tmp_path, config=config)
+
+    provider.acquire("t1", user_id="u1")
+
+    call = client.create_calls[0]
+    assert call["image"] == "python:3.12"
+    assert call["entrypoint"] is None
+    sandbox = provider.get("osb:u1:t1")
+    assert sandbox is not None
+    assert sandbox._code_interpreter is False
+
+
 # -- release / reset / shutdown --------------------------------------------
 
 
