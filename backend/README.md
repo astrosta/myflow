@@ -154,6 +154,18 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
 - 上次进程崩溃留下的沙箱：`orphan_policy: report`（默认）只在启动日志里列出 id；
    改成 `remove` 会 kill 掉超过 `orphan_ttl_seconds` 的孤儿。
 
+**run_code（跑一段代码）**：`sandbox.run_code.enabled: true` 才会把 `run_code` 工具
+交给模型（默认关着，模型看不见就不会调）。实现在 `Sandbox.run_code`：
+
+| provider | 走哪条路 |
+|---|---|
+| `opensandbox` | 配了 `opensandbox.run_code` 就走 **Code Interpreter**（镜像 + entrypoint 换成官方 code-interpreter，能返回表达式结果，支持 python/javascript/typescript/bash/java/go）；没配就走 shell 通道 |
+| `cube` | shell 通道（模板自带 `python3`），支持 python/javascript/bash |
+| `local` | shell 通道，但要求 `allow_host_bash: true`：这就是在宿主上跑模型代码，与 bash 工具同一个信任前提 |
+
+shell 通道会把片段写到 `/mnt/user-data/workspace/.myflow-run/`、跑完即删；typescript/java/go
+在 shell 通道下会明确报"需要 code interpreter"，不会猜着跑。
+
 **回滚**：`sandbox.use` 改回 local 或 cube 并重启即可；旧的 `osb:` sandbox_id 在
 `get()` 里是内存 miss，runtime 会重新 acquire；残留沙箱交给服务端的 TTL 或 `osb` CLI。
 

@@ -228,6 +228,14 @@ sandbox:
   # 所有 provider 共用：额外挂载 {container_path, local_path, read_only}。
   # cube/opensandbox 会把它并进宿主挂载并计入 mounts_hash；local 直接加映射。
   mounts: []
+  # run_code 工具（跑一段代码，一次调用拿输出）。默认关闭：关着模型看不见这个工具。
+  #   local      只有 allow_host_bash 为 true 才放行（等于在宿主上跑模型代码）
+  #   cube       走沙箱 shell（模板自带 python3）
+  #   opensandbox 配了 opensandbox.run_code 就走 Code Interpreter，否则走 shell
+  run_code:
+    enabled: false
+    default_language: python
+    timeout_seconds: 120
 
   # CubeSandbox（宿主挂载，Linux 同机部署）。默认保持注释：本地 provider 不需要这一节。
   # 取消注释前先装依赖：cd backend && uv sync --extra cube（= agentkit[cube,redis]），
@@ -273,8 +281,14 @@ sandbox:
 
   # OpenSandbox（容器隔离，由 opensandbox-server 托管）。默认保持注释。
   # 前置：
-  #   1) 起服务端：uvx opensandbox-server init-config ~/.sandbox.toml --example docker
-  #                uvx opensandbox-server        # 默认 127.0.0.1:8080，/health 可探
+  #   1) 起服务端（镜像自带的是 k8s 配置，要换成 docker 配置再跑；默认 127.0.0.1:8080，/health 可探）：
+  #        docker run --rm -v ~:/cfg opensandbox/server:release-1.2.0 init-config /cfg/.sandbox.toml --example docker
+  #        容器里绑 127.0.0.1 发布不出去：把 [server] host 改成 0.0.0.0，[docker] host_ip 改成 host.docker.internal
+  #        docker run -d --name opensandbox-server --add-host=host.docker.internal:host-gateway \
+  #          -v /var/run/docker.sock:/var/run/docker.sock \
+  #          -v ~/.sandbox.toml:/etc/opensandbox/config.toml:ro \
+  #          -e SANDBOX_CONFIG_PATH=/etc/opensandbox/config.toml \
+  #          -p 127.0.0.1:8080:8080 opensandbox/server:release-1.2.0
   #   2) 装依赖：  cd backend && uv sync --extra opensandbox（= agentkit[opensandbox,redis]）
   #      Gateway 不再需要 docker CLI：容器由服务端创建和管理。
   # sandbox.opensandbox 整段是 startup-only。
@@ -314,6 +328,15 @@ sandbox:
   #
   #   orphan_policy: report             # report | remove；remove 需配合 orphan_ttl_seconds
   #   orphan_ttl_seconds: 86400
+  #
+  #   # Code Interpreter：配了这段（且 sandbox.run_code.enabled=true）时，沙箱用这个
+  #   # 镜像 + entrypoint 创建，run_code 走解释器（能返回表达式结果、支持 ts/java/go）；
+  #   # 不配就走 shell 通道（只剩 python/javascript/bash）。
+  #   run_code:
+  #     image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.1.0
+  #     entrypoint:
+  #       - /opt/code-interpreter/code-interpreter.sh
+  #     ready_timeout_seconds: 30
 
 # ------------------------------------------------------------
 # M8 子代理委派。整段热重载。
