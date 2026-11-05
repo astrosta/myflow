@@ -1,6 +1,6 @@
 # AIO Sandbox（Docker 容器隔离）Provider 设计
 
-> 状态：待确认（2026-11-05）
+> 状态：已确认（2026-11-05）；六项决策记录见 §12
 > 关系：新增第四个 `SandboxProvider`，与 `agentkit.sandbox.local`（进程内路径映射）、
 > `agentkit.sandbox.cube`（CubeSandbox MicroVM / E2B 协议）并列；不改动它们的语义。
 > 上游参考：deerflow 的 `deerflow.community.aio_sandbox:AioSandboxProvider`（Docker 模式）。
@@ -38,8 +38,11 @@
 
 ### 2.1 镜像
 
-- 默认镜像：`enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest`。
+- 镜像：直接从官方仓库拉 `enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest`，
+  **不 pin tag**（已确认：跟随 latest）。
 - 容器内 AIO server 默认端口 **8080**；就绪探针是 `GET /v1/sandbox` 返回 200。
+- ⚠️ 上游文档明确说 `latest` 可能仍停在 1.0.0.x 线，而 `bash.exec` 需要 >= 1.9.3。
+  所以运行期必须做**能力探测**并具备降级传输（§6.1），不能假设 `bash.exec` 一定可用。
 - 镜像自带 `/mnt/user-data` 约定：deerflow 把宿主
   `users/{user_id}/threads/{thread_id}/user-data/{workspace,uploads,outputs}`
   挂到 `/mnt/user-data/{workspace,uploads,outputs}`，与我们的线程目录布局**完全一致**。
@@ -90,6 +93,20 @@ volcengine（`sys.modules` 里没有任何 volc 模块），所以它是"装得�
 - `bash.exec` 的返回带 `status`：`running` / `completed` / `timed_out` / `killed` /
   `terminated`；退出码在 `command.exit_code`。
 - 一次 `bash.exec` 有两条超时：`timeout`（命令自身）与 `hard_timeout`（服务端强杀）。
+
+### 2.4 结果类型（已核对 wheel 里的定义，不是猜的）
+
+| 类型 | 字段 | 对我们意味着什么 |
+|---|---|---|
+| `BashExecResult` | `session_id` / `command_id` / `command` / `status` / `stdout` / `stderr` / `exit_code` / `offset` / `stderr_offset` | 有退出码、有增量 offset，可同步也可轮询 |
+| `ShellCommandResult` | `session_id` / `command` / `status` / `output` / `console` | **没有 `exit_code`**，退出码要从 `shell.view()` 拿 |
+| `ShellViewResult` | `output` / `session_id` / `status` / `command` / `exit_code` / `console` | 降级传输拿退出码的地方 |
+| `CommandStatus`（bash） | `pending` / `running` / `completed` / `timed_out` / `killed` | §6.1 的状态映射 |
+| `BashCommandStatus`（shell） | `running` / `completed` / `no_change_timeout` / `hard_timeout` / `terminated` | 降级路径要单独映射 |
+| `FileListResult` | `path` / `files`（`FileInfo`: `name` / `path` / `is_directory` / `size`） | 树渲染直接可用 |
+| `FileGlobResult` | `files`（`GlobFileInfo`） / `total_count` / **`truncated`** | 截断标志原生就有，不用多取 1 条 |
+| `FileGrepResult` | `matches`（`GrepMatch`: `file` / `line_number` / `line_content`） / `match_count` / **`truncated`** | 直接映射我们的 `GrepMatch` |
+| `FileReadResult` | `content` / `file` | **没有 total_lines**，行范围只能交给服务端 |
 
 ## 3. 方案选择
 
@@ -165,11 +182,11 @@ agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker   ── provider 生命�
 1. `build_host_mounts()` 得到 `MountEntry` 列表（父挂载在前，沿用现有排序）。
 2. `docker run -d`：`--name`、`--label ...`、
    `--mount type=bind,source=...,target=...[,readonly]`（用 `--mount` 而不是 `-v`：
-   路径里可能有逗号/冒号）、`-p 127.0.0.1::8080`（随机宿主端口，只绑 loopback）、
+   路径里可能有逗号/冒号）、`-p <publish_host>::8080`（随机宿主端口；`publish_host` 见 §5.7）、
    `--cap-drop=ALL --security-opt no-new-privileges`、`--memory`、`--cpus`、`--pids-limit`、
    可选 `--network`。
 3. `docker inspect` 读 `NetworkSettings.Ports["8080/tcp"][0].HostPort`，拼出
-   `base_url = http://127.0.0.1:<port>`。
+   `base_url = http://<connect_host>:<port>`（`connect_host` 见 §5.7）。
 4. 就绪：轮询 `GET {base_url}/v1/sandbox`，预算 `ready_timeout_seconds`（默认 60s，
    与 deerflow 的 `SANDBOX_LOCAL_PROVIDER_READY_TIMEOUT` 同量级）。超时 → `docker rm -f` →
    `SandboxRuntimeError`。
@@ -219,13 +236,51 @@ agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker   ── provider 生命�
 - 不做 deerflow 的 quarantine/generation 记账：我们的模型是"容器可丢弃 + 宿主目录是唯一真相"，
   丢一个容器最多丢一次冷启动时间。
 
+### 5.7 Gateway 跑在容器里（DooD，已确认要支持）
+
+Gateway 自己也是容器时（挂 `/var/run/docker.sock` 做 Docker-outside-of-Docker），
+有两个"视角差"必须显式解决，否则容器能起来但连不上、或挂载源根本不存在：
+
+1. **挂载源路径**：bind mount 的 `source` 由 **daemon** 解析。
+   Gateway 看到 `/app/.myflow/...`，daemon 看到 `/opt/myflow/.myflow/...`。
+   → 沿用 cube 已有的双根模型：`host_mount.local_root`（Gateway 视角）+
+   `host_mount.host_root`（daemon 视角），由 `to_host_path()` 翻译；两者相同则写一个即可。
+2. **连回容器的地址**：发布端口落在**宿主机**上，Gateway 容器里的 `127.0.0.1:<port>`
+   指向自己，连不到。两种做法二选一，配置成一对参数：
+
+   | 配置 | 取值 | 说明 |
+   |---|---|---|
+   | `publish_host` | `auto` / `127.0.0.1` / `0.0.0.0` / 具体 IP | 发布端绑定地址 |
+   | `connect_host` | `auto` / `127.0.0.1` / `host.docker.internal` / 具体 IP | Gateway 用什么地址访问该端口 |
+
+   `auto` 的解析规则（`docker.py::resolve_topology()`）：
+   - 不在容器里（`/.dockerenv` 不存在且 `/proc/self/cgroup` 不含 docker/kubepods）→
+     两端都是 `127.0.0.1`；
+   - 在容器里 → `publish_host` = Docker 网桥网关 IP（`docker network inspect bridge` 的
+     `.IPAM.Config[0].Gateway`，默认 `172.17.0.1`），`connect_host` 同值；
+     若 `host.docker.internal` 可解析则优先用它（Docker Desktop / Linux 的
+     `--add-host=host.docker.internal:host-gateway`）。
+   - 解析不出来 → 启动即失败，报"显式配置 `sandbox.aio.connect_host` / `publish_host`"，
+     不猜、不静默降级成 `0.0.0.0`（那会把 root shell 端口暴露到整台宿主）。
+3. **HTTP 代理**：控制面流量走 loopback/私网，不能继承 `HTTP_PROXY`
+   （deerflow 有过 proxy 返回假 502 的教训）。AIO 客户端用
+   `httpx.Client(trust_env=False)` 注入，并且默认 `NO_PROXY` 语义只对私网地址生效。
+
+另外：DooD 模式下 `docker image inspect` 与 `docker run` 都是对宿主 daemon 发的，
+镜像缓存也在宿主上——首次 acquire 的拉取时间要算进 `ready_timeout_seconds`。
+
 ## 6. 数据面设计（契约 → AIO API）
 
 ### 6.1 `execute_command`
 
-**每次调用一个新建、用完即删的 `bash` 会话**，不做 PTY 复用：
+**每次调用一个新建、用完即删的会话**，不做 PTY 复用。因为镜像是 `latest` 且
+上游说它可能停在 1.0.0.x，所以传输要**探测 + 降级**：
 
 ```text
+# 每个 handle 第一次用命令时探测一次（结果缓存到 handle）
+transport = "bash" if bash_supported() else "shell"
+
+# A. bash 传输（优先；支持 env / hard_timeout / 退出码）
 session = bash.create_session()
 try:
     resp = bash.exec(command=command, session_id=session, env=env,
@@ -233,10 +288,25 @@ try:
                      async_mode=False, request_options={timeout: timeout + grace})
 finally:
     bash.close_session(session)
+
+# B. shell 传输（镜像不支持 bash.exec 时；用显式新建的会话，不用隐式持久 shell）
+session = shell.create_session(id=<uuid>)       # 每个调用独立会话
+try:
+    resp = shell.exec_command(command=command, id=session, hard_timeout=timeout)
+    if resp.data.status != "completed":         # running / hard_timeout / terminated
+        view = shell.view(id=session)           # 退出码只能从这里拿
+        exit_code = view.exit_code
+finally:
+    shell.cleanup_session(session)
 ```
 
-- `persistent_shell_sessions = False`：cwd/export 不跨调用保留（与 local / cube 一致），
-  同时天然规避上游记录的 PTY 并发损坏问题。
+- `persistent_shell_sessions = False`：两种传输都用"每次新建会话"，cwd/export 不跨调用保留
+  （与 local / cube 一致），同时规避上游记录的隐式 PTY 并发损坏问题。
+- **env 注入只有 bash 传输能做**：镜像不支持 `bash.exec` 时，带 `env` 的调用
+  **直接失败**并给出可操作文案（"镜像 <tag> 不支持 /v1/bash/exec，升级到 >= 1.9.3 或去掉
+  request-scoped secret"），绝不把 secret 拼进命令字符串当降级。
+- shell 传输的状态是另一套枚举：`running`/`completed`/`no_change_timeout`/`hard_timeout`/`terminated`，
+  映射见下表。
 - `env` 走结构化字段，不拼进命令字符串：M9 的请求级 token 不会进 shell 历史，
   也不会留在容器 env（`docker inspect` 看不到）。
 - `hard_timeout` = `sandbox.bash_command_timeout`（服务端强杀，子进程一起死）。
@@ -250,7 +320,9 @@ finally:
 | `timed_out` | `SandboxTimeoutError("Command timed out after Xs")` |
 | `killed` | `SandboxRuntimeError("... was killed")` |
 | `running` / 其它 | `SandboxRuntimeError`（不重试、不重放：结果未知） |
-| `bash.exec` 404 | `SandboxRuntimeError`，文案指明镜像版本要求（>= 1.9.3） |
+| `bash.exec` 404 | 探测一次后切 shell 传输（带 `env` 的调用仍失败，见上） |
+| shell `hard_timeout` / `no_change_timeout` | `SandboxTimeoutError`（超时，不重试） |
+| shell `terminated` | `SandboxRuntimeError`（会话没了，结果未知） |
 
 - `execute_command_in_scope(scope=...)`：V1 直接透传（每次调用本来就是独立会话），
   但把 `scope` 记进日志，便于子代理并发排查。
@@ -265,8 +337,8 @@ finally:
 | `download_file` | `file.download_file(path=...)`（流式） | 边读边累计，超过 `max_bytes` 断开并报 OSError |
 | `update_file(bytes)` | `file.upload_file(file=bytes, path=...)` | 真二进制，无 base64 |
 | `list_dir` | `file.list_path(path, max_depth=..., include_size=True)` | 用 `render_tree` 出同样的树形 glyphs |
-| `glob` | `file.glob_files(path=..., pattern=..., max_results=max+1, files_only=...)` | 多取 1 条判断截断 |
-| `grep` | `file.grep_files(path=..., pattern=..., include=glob, fixed_strings=literal, case_insensitive=not case_sensitive, max_results=max+1)` | 映射到 `GrepMatch(path, line_number, line)` |
+| `glob` | `file.glob_files(path=..., pattern=..., max_results=...)` | 直接用结果里的 `truncated` 标志 |
+| `grep` | `file.grep_files(path=..., pattern=..., include=glob, fixed_strings=literal, case_insensitive=not case_sensitive, max_results=...)` | `truncated` 标志 + 映射到 `GrepMatch(path, line_number, line)` |
 
 - `list_dir` 的"空目录 vs 失败"必须仍可区分：404 → `FileNotFoundError`；空列表 → `[]`。
 - 路径守卫：所有路径先过 `assert_virtual_path(path, virtual_mounts, write=...)`，
@@ -293,10 +365,12 @@ finally:
 sandbox:
   use: agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker
   aio:
-    image: <registry>/all-in-one-sandbox:1.11.0   # 必填；>= 1.9.3 才有 bash.exec
+    image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest
+    pull_policy: missing            # missing | always（always = 每次启动先 pull）
     container_name_prefix: myflow-aio
     port: 8080                      # 容器内 AIO 端口
-    publish_host: 127.0.0.1         # 宿主侧绑定地址；只允许 loopback 或显式列出
+    publish_host: auto              # auto | 127.0.0.1 | 0.0.0.0 | <ip>；见 §5.7
+    connect_host: auto              # auto | 127.0.0.1 | host.docker.internal | <ip>；见 §5.7
     ready_timeout_seconds: 60
     request_timeout_seconds: 30     # AIO HTTP 客户端超时（不是命令超时）
     release_action: stop            # stop | remove
@@ -314,7 +388,7 @@ sandbox:
     host_mount:                     # 与 sandbox.cube.host_mount 同形状
       local_root: /opt/myflow       # Gateway 看到的根（要覆盖 .myflow 与 skills/）
       host_root: /opt/myflow        # docker daemon 看到的同一个根；同机可省略
-    lease:                          # 可选；多 worker 必填
+    lease:                          # 必填：复用 Redis per-thread 锁（同 cube）
       redis_url: $REDIS_URL
       ttl_seconds: 30
     orphan_policy: report           # report | remove
@@ -332,8 +406,11 @@ sandbox:
 1. `docker version --format '{{.Server.Version}}'`（daemon 可达；失败 → `SandboxRuntimeError`）。
 2. `docker image inspect <image>`；缺失只 warning（首次 acquire 会拉）；可加 `pull: never` 开关变成硬失败。
 3. `validate_mount_sources()`（与 cube 同一函数）：根路径形状、技能源是否在根下。
-4. `GATEWAY_WORKERS > 1` 且没有 `lease` → 拒绝启动。
-5. `orphan_policy: remove` 时执行一次孤儿清理；`report` 只打印。
+4. **拓扑可解析**：`resolve_topology()` 能得出 `publish_host` / `connect_host`
+   （在容器里但推不出网关 IP → 拒绝启动并提示显式配置，见 §5.7）。
+5. `lease` 必填且 Redis `PING` 通（与 cube 一致：多 worker 共用一台 daemon 时靠它串行）；
+   未配或不可达 → 拒绝启动。
+6. `orphan_policy: remove` 时执行一次孤儿清理；`report` 只打印。
 
 ## 8. 共享代码搬迁（前置小重构）
 
@@ -399,12 +476,13 @@ AIO_INTEGRATION=1 AIO_IMAGE=<image> REDIS_URL=redis://... \
 ### 11.1 必须解决
 
 1. **镜像可达性**：`enterprise-public-cn-beijing.cr.volces.com` 不一定在所有环境可达。
-   需要内网镜像/代理，或自建同源镜像（Dockerfile 只加依赖，不改 entrypoint）。**待确认**。
-2. **镜像版本下限**：`bash.exec` 需要 >= 1.9.3。设计里 pin tag；运行期遇到 404 直接给出
-   可操作的报错（"upgrade image to >= 1.9.3"），不重试。
-3. **Gateway 与 Docker 是否同机**：默认同机（与 cube 的宿主挂载同款假设）。
-   若 Gateway 自己跑在容器里（DooD），`host_mount.host_root` 必须写 **daemon 视角**的路径，
-   并挂载 `/var/run/docker.sock`；本设计支持但不默认推荐。
+   需要网络/代理或同源镜像（Dockerfile 只加依赖，不改 entrypoint）。
+2. **latest 的能力不可预知**：已确认跟随 `latest`，而它可能仍是 1.0.0.x 线（没有 `bash.exec`）。
+   因此 §6.1 的能力探测 + shell 降级是**必需路径**，不是可选优化；带 `env` 的命令在该镜像上
+   会明确失败，运维要知情。
+3. **DooD 的双重错误面**（已确认必须支持）：路径写错 → 容器起不来或挂到空目录；
+   地址写错 → 容器起来了但 Gateway 连不上。§5.7 把两者都做成启动期检查，
+   并且**拒绝**在推不出来时静默用 `0.0.0.0` 兜底（那会把 root shell 端口暴露到整台宿主）。
 4. **文件属主**：容器内以 root 写宿主挂载，宿主文件会变 root 所有。canary 与
    `thread_files.py` 都会碰到，模板 umask / 挂载目录权限需要与 cube 相同的运维约定。
 
@@ -420,16 +498,25 @@ AIO_INTEGRATION=1 AIO_IMAGE=<image> REDIS_URL=redis://... \
 4. **端口暴露**：容器 HTTP 只绑 `127.0.0.1`，但它仍是本机进程可访问的 root 权限 shell。
    多租户主机上应把 Gateway 与 Docker 放进同一台专用机器。
 
-## 12. 需要你确认
+## 12. 决策记录（2026-11-05 已确认）
 
-1. **命名**：provider 路径用 `agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker`
-   （我的建议，与 deerflow 对位，名字里带 Docker 以区分未来的远程模式），
-   还是保持 `AioSandboxProvider`？
-2. **镜像**：用上游 volces 的 `all-in-one-sandbox` 并 pin 到哪个 tag（建议 `1.11.0`）？
-   是否需要内网 registry？
-3. **Gateway 部署形态**：宿主直跑（默认假设）还是要支持 Docker socket（DooD）模式？
-4. **`release_action` 默认值**：`stop`（容器热保留，下一轮秒起）还是 `remove`
-   （更干净，每轮冷启动）？
-5. **多 worker**：V1 就支持 `lease.redis_url`（复用 Redis 锁），还是先限定单 worker？
-6. **AIO 富能力**：要不要在 V1 就把 `browser`/`jupyter` 暴露成工具（会扩大设计范围）？
-   本设计建议先只落地现有 8 个文件/命令方法。
+| # | 问题 | 决策 | 对设计的影响 |
+|---|---|---|---|
+| 1 | provider 命名 | `agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker` | 与 deerflow 对位；名字里带 `Docker`，为未来的远程/provisioner 模式留位置 |
+| 2 | 镜像 | 直接从官方仓库拉，**跟随 `latest`**，不 pin tag | 必须做能力探测 + shell 降级（§6.1）；带 `env` 的命令在旧镜像上明确失败 |
+| 3 | 部署形态 | **必须支持 Gateway 在容器内挂 `docker.sock`** | §5.7 的双根路径 + `publish_host` / `connect_host` 解析 + `trust_env=False`；拓扑错误一律启动期失败 |
+| 4 | `release_action` | **默认 `stop`** | 容器热保留，下一轮 `docker start` + 就绪探针即可复用；`remove` 作为可选 |
+| 5 | Redis 锁 | **复用 cube 的 `RedisThreadLock`**，`lease` 必填 | provider 构造时与 cube 同一套 `LockLease`/续租/丢失语义；多 worker 安全 |
+| 6 | 能力范围 | **只做现有 8 个文件/命令方法** | 不接 AIO 的 browser/jupyter/code/mcp；`skills` 组也不接（技能仍走只读挂载） |
+
+由此产生的两条硬约束：
+
+1. `sandbox.aio.lease.redis_url` 必填，Redis 不可达即拒绝启动（与 `sandbox.cube` 同款）。
+2. `latest` 镜像上 `bash.exec` 可能不存在，所以"命令传输"是运行期探测出来的能力，
+   不是编译期假设；`Sandbox` 契约（退出码、超时、截断、`persistent_shell_sessions=False`）
+   在两种传输下必须一致。
+
+## 13. 下一步
+
+实现计划：`docs/superpowers/plans/2026-11-05-aio-sandbox-docker-provider.md`
+（任务拆解、TDD 步骤、验收命令）。
