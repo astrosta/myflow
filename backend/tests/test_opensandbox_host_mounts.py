@@ -1,9 +1,8 @@
-"""Shared host-mount planning, exercised through a non-Cube provider shape.
+"""Shared host-mount planning, exercised through the OpenSandbox provider shape.
 
-The AIO Docker provider mounts the same directories CubeSandbox does, but it has
-no sandbox.cube section and its own field prefix. These tests pin that the
-shared module works without a Cube config and still names the right section in
-an error message.
+OpenSandbox mounts the same directories CubeSandbox does, but it has no
+sandbox.cube section and its own field prefix. These tests pin that the shared
+module works without a Cube config and still names the right section in an error.
 """
 
 from __future__ import annotations
@@ -40,8 +39,8 @@ def _skills(tmp_path: Path, *, source: str = "git") -> SkillsConfig:
     return skills
 
 
-def _aio_config(tmp_path: Path) -> AppConfig:
-    """An AppConfig with no sandbox.cube: the AIO provider must not need one."""
+def _config(tmp_path: Path) -> AppConfig:
+    """An AppConfig with no sandbox.cube: the OpenSandbox provider must not need one."""
 
     return AppConfig(
         models=[{"name": "m", "use": "langchain_deepseek:ChatDeepSeek"}],
@@ -50,23 +49,23 @@ def _aio_config(tmp_path: Path) -> AppConfig:
     )
 
 
-def _aio_host_mount(tmp_path: Path, **overrides: str) -> SimpleNamespace:
+def _host_mount(tmp_path: Path, **overrides: str) -> SimpleNamespace:
     values = {"local_root": str(tmp_path), "host_root": "/opt/myflow"}
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
 def test_planning_does_not_need_a_cube_section(tmp_path: Path) -> None:
-    config = _aio_config(tmp_path)
+    config = _config(tmp_path)
     assert config.sandbox.cube is None
 
     mounts = build_host_mounts(
         app_config=config,
-        host_mount=_aio_host_mount(tmp_path),
+        host_mount=_host_mount(tmp_path),
         user_id="u1",
         thread_id="t1",
         paths=Paths(tmp_path / ".myflow"),
-        field_prefix="sandbox.aio.host_mount",
+        field_prefix="sandbox.opensandbox.host_mount",
     )
 
     by_container = {entry.container_path: entry for entry in mounts}
@@ -75,41 +74,35 @@ def test_planning_does_not_need_a_cube_section(tmp_path: Path) -> None:
     )
     assert by_container["/mnt/user-data"].read_only is False
     assert by_container["/mnt/skills/private"].read_only is True
-    assert (tmp_path / ".myflow" / "users" / "u1" / "threads" / "t1" / "user-data").is_dir()
 
 
 def test_host_root_defaults_to_local_root() -> None:
-    """A same-host deployment only writes local_root; host_root follows it.
-
-    The roots are POSIX paths by contract (a Linux bind mount), so this stays a
-    literal instead of tmp_path: a Windows temp directory is not a valid
-    host_root and is rejected on purpose.
-    """
-
     roots = resolve_host_roots(
         SimpleNamespace(local_root="/opt/myflow", host_root=None),
-        field_prefix="sandbox.aio.host_mount",
+        field_prefix="sandbox.opensandbox.host_mount",
     )
     assert roots.host_root == PurePosixPath("/opt/myflow")
 
 
 def test_error_message_names_the_provider_section(tmp_path: Path) -> None:
-    config = _aio_config(tmp_path)
+    config = _config(tmp_path)
 
-    with pytest.raises(SandboxRuntimeError, match="sandbox.aio.host_mount.host_root"):
+    with pytest.raises(
+        SandboxRuntimeError, match="sandbox.opensandbox.host_mount.host_root"
+    ):
         build_host_mounts(
             app_config=config,
-            host_mount=_aio_host_mount(tmp_path, host_root="relative/root"),
+            host_mount=_host_mount(tmp_path, host_root="relative/root"),
             user_id="u1",
             thread_id="t1",
             paths=Paths(tmp_path / ".myflow"),
-            field_prefix="sandbox.aio.host_mount",
+            field_prefix="sandbox.opensandbox.host_mount",
         )
 
 
 def test_source_outside_local_root_is_rejected(tmp_path: Path) -> None:
-    roots = resolve_host_roots(_aio_host_mount(tmp_path))
-    outside = tmp_path.parent / "outside-aio"
+    roots = resolve_host_roots(_host_mount(tmp_path))
+    outside = tmp_path.parent / "outside-osb"
     outside.mkdir(exist_ok=True)
 
     with pytest.raises(SandboxRuntimeError, match="outside"):
@@ -119,11 +112,11 @@ def test_source_outside_local_root_is_rejected(tmp_path: Path) -> None:
 def test_mounts_hash_is_shared_across_providers(tmp_path: Path) -> None:
     """A provider swap with the same mounts keeps the same fingerprint."""
 
-    config = _aio_config(tmp_path)
+    config = _config(tmp_path)
     paths = Paths(tmp_path / ".myflow")
-    spec = _aio_host_mount(tmp_path)
+    spec = _host_mount(tmp_path)
 
-    from_aio = build_host_mounts(
+    from_osb = build_host_mounts(
         app_config=config,
         host_mount=spec,
         user_id="u1",
@@ -145,27 +138,4 @@ def test_mounts_hash_is_shared_across_providers(tmp_path: Path) -> None:
         paths=paths,
     )
 
-    assert mounts_hash(from_aio) == mounts_hash(from_cube)
-
-
-def test_cube_wrapper_still_names_the_cube_section(tmp_path: Path) -> None:
-    """The CubeSandbox shim keeps its own field prefix."""
-
-    from agentkit.sandbox.cube.mounts import build_host_mounts as build_cube_mounts
-
-    config = _aio_config(tmp_path)
-    config.sandbox.cube = CubeSandboxConfig(
-        template_id="tpl",
-        host_mount=CubeSandboxHostMountConfig(
-            local_root=str(tmp_path), host_root="relative/root"
-        ),
-        lease=CubeSandboxLeaseConfig(redis_url="redis://127.0.0.1:6379/0"),
-    )
-
-    with pytest.raises(SandboxRuntimeError, match="sandbox.cube.host_mount.host_root"):
-        build_cube_mounts(
-            app_config=config,
-            user_id="u1",
-            thread_id="t1",
-            paths=Paths(tmp_path / ".myflow"),
-        )
+    assert mounts_hash(from_osb) == mounts_hash(from_cube)

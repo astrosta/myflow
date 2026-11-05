@@ -36,9 +36,9 @@ redis = [
 cube = [
     "agentkit[cube,redis]",
 ]
-# AIO sandbox（Docker 容器）provider 需要 AIO SDK 与 Redis lease。
-aio = [
-    "agentkit[aio,redis]",
+# OpenSandbox provider 需要 OpenSandbox SDK 与 Redis lease。
+opensandbox = [
+    "agentkit[opensandbox,redis]",
 ]
 [dependency-groups]
 dev = [

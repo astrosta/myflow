@@ -5,18 +5,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agentkit.config.reload_boundary import format_field_description
 
-DEFAULT_AIO_IMAGE = (
-    "enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0"
-)
-"""Pinned AIO sandbox image.
+DEFAULT_OPENSANDBOX_IMAGE = "python:3.12"
+"""Default sandbox image.
 
-The floating latest tag can still sit on the 1.0.0.x line, which predates the
-/v1/bash namespace: no per-command env injection, no server-side hard timeout.
-1.11.0 is the top of the line upstream recommends (1.9.3 through 1.11.0).
+OpenSandbox runs any image that has a shell, because only bash and the file API
+are used: no browser, no Jupyter, no AIO runtime. A stock python image is enough
+and keeps the pull small.
 """
 
 _ENV_KEY_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*$"
-_CONTAINER_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
 
 
 class HostMountConfig(BaseModel):
@@ -74,69 +71,56 @@ class CubeSandboxConfig(BaseModel):
     max_cached_threads: int = 64
 
 
-class AioSandboxNetworkConfig(BaseModel):
-    """Docker network for the sandbox container."""
+class OpenSandboxConfig(BaseModel):
+    """OpenSandbox provider (agentkit.sandbox.opensandbox).
+
+    The sandbox server owns containers; this section only says how to reach it
+    and what to ask for. There is no port, no container name and no docker
+    topology here: those live in the server's runtime configuration.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["bridge", "none"] = "bridge"
-    name: str | None = Field(
-        default=None,
-        description="Existing Docker network name; empty means the default bridge.",
+    domain: str = Field(
+        default="127.0.0.1:8080",
+        description="opensandbox-server address, host:port.",
     )
-
-
-class AioSandboxResourcesConfig(BaseModel):
-    """Container resource caps. An empty value means "do not pass the flag"."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    cpus: float | None = Field(default=None, gt=0)
-    memory: str | None = Field(default=None, description="Docker memory limit, e.g. 2g")
-    pids_limit: int | None = Field(default=None, gt=0)
-
-
-class AioSandboxConfig(BaseModel):
-    """AIO sandbox container provider (agentkit.sandbox.aio_sandbox)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    image: str = DEFAULT_AIO_IMAGE
-    pull_policy: Literal["missing", "always"] = "missing"
-    container_name_prefix: str = Field(
-        default="myflow-aio", pattern=_CONTAINER_NAME_PATTERN
+    protocol: Literal["http", "https"] = "http"
+    api_key: str = Field(
+        default="",
+        description="Leave empty to read OPEN_SANDBOX_API_KEY; redact in logs and errors.",
     )
-    port: int = Field(default=8080, gt=0, lt=65536)
-    publish_host: str = Field(
-        default="auto",
-        description="auto | 127.0.0.1 | 0.0.0.0 | <ip>; the host address the port binds to.",
+    image: str = DEFAULT_OPENSANDBOX_IMAGE
+    timeout_seconds: int = Field(
+        default=1800,
+        gt=0,
+        description="Sandbox TTL; the server reaps it after this long.",
     )
-    connect_host: str = Field(
-        default="auto",
-        description="auto | 127.0.0.1 | host.docker.internal | <ip>; how the Gateway reaches that port.",
-    )
-    ready_timeout_seconds: float = Field(default=60, gt=0)
+    ready_timeout_seconds: float = Field(default=30, gt=0)
     request_timeout_seconds: float = Field(default=30, gt=0)
     acquire_timeout_seconds: float = Field(
         default=120,
         gt=0,
         description="How long acquire waits for the per-thread Redis lease.",
     )
-    release_action: Literal["stop", "remove"] = "stop"
+    resource: dict[str, str] = Field(
+        default_factory=lambda: {"cpu": "2", "memory": "2Gi"},
+        description="Server-side resource limits, e.g. {cpu: '2', memory: '2Gi'}.",
+    )
+    env: dict[str, str] = Field(default_factory=dict)
+    release_action: Literal["keep", "destroy"] = Field(
+        default="keep",
+        description="keep leaves the sandbox to its TTL; destroy kills it on release.",
+    )
     max_cached_threads: int = Field(default=64, ge=1)
     discover_existing: bool = True
     startup_healthcheck: bool = True
-    env: dict[str, str] = Field(default_factory=dict)
-    network: AioSandboxNetworkConfig = Field(default_factory=AioSandboxNetworkConfig)
-    resources: AioSandboxResourcesConfig = Field(
-        default_factory=AioSandboxResourcesConfig
-    )
     host_mount: HostMountConfig
     lease: SandboxLeaseConfig
     orphan_policy: Literal["report", "remove"] = "report"
     orphan_ttl_seconds: int = Field(default=86400, ge=0)
 
-    @field_validator("image", "publish_host", "connect_host")
+    @field_validator("domain", "image")
     @classmethod
     def _not_blank(cls, value: str) -> str:
         text = value.strip()
@@ -186,25 +170,23 @@ class SandboxConfig(BaseModel):
             field_doc="CubeSandbox control-plane, host mount, and lease settings.",
         ),
     )
-    aio: AioSandboxConfig | None = Field(
+    opensandbox: OpenSandboxConfig | None = Field(
         default=None,
         description=format_field_description(
-            "sandbox.aio",
-            field_doc="AIO sandbox (Docker container) image, container, host mount, and lease settings.",
+            "sandbox.opensandbox",
+            field_doc="OpenSandbox server, image, host mount, and lease settings.",
         ),
     )
 
 
 __all__ = [
-    "DEFAULT_AIO_IMAGE",
-    "AioSandboxConfig",
-    "AioSandboxNetworkConfig",
-    "AioSandboxResourcesConfig",
+    "DEFAULT_OPENSANDBOX_IMAGE",
     "CubeSandboxConfig",
     "CubeSandboxHostMountConfig",
     "CubeSandboxLeaseConfig",
     "CubeSandboxNetworkConfig",
     "HostMountConfig",
+    "OpenSandboxConfig",
     "SandboxConfig",
     "SandboxLeaseConfig",
 ]

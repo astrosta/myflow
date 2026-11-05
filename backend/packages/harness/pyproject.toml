@@ -51,10 +51,10 @@ redis = [
 cube = [
     "e2b>=2.62,<3",
 ]
-# AIO sandbox（Docker 容器）provider 的数据面 SDK；Docker CLI 由部署机提供，
-# lease 复用 redis extra。
-aio = [
-    "agent-sandbox>=0.0.30",
+# OpenSandbox provider 的 Python SDK（sync 客户端）；Docker/K8s runtime 由
+# opensandbox-server 提供，lease 复用 redis extra。
+opensandbox = [
+    "opensandbox>=1.2,<2",
 ]
 # OpenViking thin adapter. Server 0.4.19 is external; this is only the HTTP SDK.
 openviking = [
