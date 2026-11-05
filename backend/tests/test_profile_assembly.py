@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+
 from agentkit.agents.leader_agent import assemble_agent
 from agentkit.agents.memory.openviking.profile_tools import configure_profile_updater
 from agentkit.config import AppConfig
@@ -64,6 +66,10 @@ def test_profile_tool_is_attached_even_when_memory_is_off(monkeypatch) -> None:
         configure_profile_updater(None)
 
     assert [tool.name for tool in captured["tools"]] == ["update_user_profile"]
+    assert any(
+        isinstance(middleware, HumanInTheLoopMiddleware)
+        for middleware in captured["middleware"]
+    )
 
 
 def test_no_profile_service_means_no_profile_tool(monkeypatch) -> None:
@@ -83,7 +89,7 @@ def test_memory_switch_still_adds_memory_tools_alongside_the_profile_tool(monkey
         configure_profile_updater(None)
 
     names = [tool.name for tool in captured["tools"]]
-    assert names == ["memory_search", "update_user_profile"]
+    assert names == ["memory_search", "update_user_profile", "memory_remember"]
 
 
 def _assemble_with_memory(monkeypatch, memory_tool) -> dict:

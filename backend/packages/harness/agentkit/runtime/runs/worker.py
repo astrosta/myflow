@@ -10,7 +10,7 @@ import inspect
 import re
 from contextlib import suppress
 from typing import Any, AsyncIterable, Callable, Mapping, Awaitable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 
 
 from langgraph.errors import GraphRecursionError
@@ -607,6 +607,8 @@ def serialize(chunk: Any, *, mode: str) -> Any:
 def to_jsonable(obj: Any) -> Any:
     if hasattr(obj, "model_dump"):                       # LangChain 消息、pydantic 模型
         return to_jsonable(obj.model_dump())
+    if is_dataclass(obj) and not isinstance(obj, type):  # Interrupt 等 LangGraph 类型
+        return to_jsonable(asdict(obj))
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
     if isinstance(obj, Mapping):

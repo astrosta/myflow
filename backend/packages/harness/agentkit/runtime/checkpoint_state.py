@@ -82,7 +82,10 @@ class CheckpointStateAccessor:
                 return
             seen.add(checkpoint_id)
             _reject_delta_checkpoint(snapshot)
-            if not _has_pending_tasks(snapshot):
+            # A paused graph normally is not a settled history entry. HITL is
+            # the exception: the pending interrupt is exactly what the client
+            # needs to render its confirmation panel after a refresh.
+            if not _has_pending_tasks(snapshot) or _pending_interrupts(snapshot):
                 yield snapshot
             current = getattr(snapshot, "parent_config", None)
 
@@ -180,8 +183,21 @@ def _has_pending_tasks(snapshot: Any) -> bool:
     return bool(tuple(getattr(snapshot, "next", ()) or ()))
 
 
+def _pending_interrupts(snapshot: Any) -> list[dict[str, Any]]:
+    """Flatten task interrupts into the shape the SDK exposes on values."""
+
+    out: list[dict[str, Any]] = []
+    for task in getattr(snapshot, "tasks", None) or ():
+        for item in getattr(task, "interrupts", None) or ():
+            out.append({"id": getattr(item, "id", None), "value": getattr(item, "value", None)})
+    return out
+
+
 def _public_state(snapshot: Any) -> dict[str, Any]:
     values = dict(getattr(snapshot, "values", None) or {})
+    interrupts = _pending_interrupts(snapshot)
+    if interrupts:
+        values["__interrupt__"] = interrupts
     configurable = (getattr(snapshot, "config", None) or {}).get("configurable") or {}
     parent = getattr(snapshot, "parent_config", None) or {}
     parent_configurable = parent.get("configurable") or {} if isinstance(parent, Mapping) else {}

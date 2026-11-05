@@ -27,6 +27,7 @@ import { mergeMessages, type TurnBaseline } from "../messages/order";
 import type { RunContext } from "../models/selection";
 import type { ChatMessage, ThreadState } from "../types";
 import type { ChatController } from "./chat-controller";
+import { buildResumeCommand, parseChatInterrupt } from "./interrupts";
 import { foldUpdateFrame, isRelevantUpdateFrame } from "./stream-state";
 import {
   createOptimisticHumanMessage,
@@ -126,6 +127,7 @@ export function useChat({
   const [turnBaseline, setTurnBaseline] = useState<TurnBaseline | null>(null);
   const [olderPages, setOlderPages] = useState<MessagePage[]>([]);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [interruptBusy, setInterruptBusy] = useState(false);
 
   // ---- 持久化历史 ----
   const newestPage = useQuery({
@@ -245,6 +247,15 @@ export function useChat({
   const streamMessages = useMemo(
     () => toChatMessages(stream.messages as unknown[] | undefined),
     [stream.messages],
+  );
+
+  /**
+   * SDK 会从 updates 帧里的 __interrupt__ 维护中断列表；这里只把它转成
+   * 面板需要的视图模型。刷新页面时 SDK 也会从 thread tasks 恢复同一份列表。
+   */
+  const interrupt = useMemo(
+    () => parseChatInterrupt(stream.interrupts),
+    [stream.interrupts],
   );
 
   /**
@@ -409,6 +420,28 @@ export function useChat({
     [stream, streamModes, effectiveThreadId, messages, runContextValue],
   );
 
+  const respondToInterrupt = useCallback(
+    async (decision: "approve" | "reject") => {
+      if (!interrupt || interruptBusy) return;
+      setInterruptBusy(true);
+      try {
+        /**
+         * 恢复不是"再发一条普通消息"：input 必须为空，Command(resume=...)
+         * 让 LangGraph 从 checkpoint 里的 interrupt 继续，而不是重跑这一轮。
+         */
+        await stream.submit(null as never, {
+          command: buildResumeCommand(interrupt, decision) as never,
+          context: runContextValue as never,
+          onDisconnect: "cancel",
+          streamMode: streamModes as never,
+        });
+      } finally {
+        setInterruptBusy(false);
+      }
+    },
+    [interrupt, interruptBusy, runContextValue, stream, streamModes],
+  );
+
   const stop = useCallback(async () => {
     await stream.stop();
     // §5.1：立刻失效相关缓存，**并安排一次跟进刷新**
@@ -442,6 +475,9 @@ export function useChat({
     loadingOlder,
     hasMoreBefore: moreBefore,
     error: stream.error ? String((stream.error as Error).message ?? stream.error) : null,
+    interrupt,
+    interruptBusy,
+    respondToInterrupt,
     recovery,
     dismissRecovery,
     submit,

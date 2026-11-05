@@ -28,6 +28,9 @@ function makeController(over: Partial<ChatController> = {}): ChatController {
     loadingOlder: false,
     hasMoreBefore: false,
     error: null,
+    interrupt: null,
+    interruptBusy: false,
+    respondToInterrupt: async () => {},
     recovery: null,
     dismissRecovery: () => {},
     submit: async () => {},
@@ -51,6 +54,25 @@ function renderView(controller: ChatController) {
     />,
   );
 }
+
+describe("ChatView 的图级中断", () => {
+  it("有待确认项时显示确认面板并锁住输入框", () => {
+    const view = renderView(
+      makeController({
+        interrupt: {
+          id: "i1",
+          toolName: "update_user_profile",
+          description: "确认更新画像",
+          allowedDecisions: ["approve", "reject"],
+          actionCount: 1,
+        },
+      }),
+    );
+
+    expect(view.getByRole("alertdialog", { name: "需要你确认" })).toBeTruthy();
+    expect(view.getByLabelText("消息输入框")).toHaveProperty("disabled", true);
+  });
+});
 
 describe("空会话：输入框在页面中间", () => {
   it("没有消息时显示引导文案", () => {

@@ -57,7 +57,6 @@ async def test_tool_writes_validated_fields_for_the_current_user() -> None:
                     "communication.format": ["steps", "bullets"],
                 },
                 "runtime": runtime({"user_id": "u1"}),
-                "confirmed": True,
             }
         )
     )
@@ -83,32 +82,6 @@ async def test_tool_writes_validated_fields_for_the_current_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_first_call_only_returns_a_confirmation_prompt() -> None:
-    updater = FakeUpdater()
-    tool = make_update_user_profile_tool(updater)
-    payload = {
-        "fields": {"identity.preferred_name": "小林", "work.role": "后端工程师"},
-        "runtime": runtime({"user_id": "u1"}),
-    }
-
-    result = json.loads(await tool.ainvoke(payload))
-
-    assert result["ok"] is False
-    assert result["status"] == "confirmation_required"
-    assert result["interrupt_before"] is True
-    assert "小林" in result["message"]
-    assert "confirmed=true" in result["message"]
-    assert result["updated"] == ["identity.preferred_name", "work.role"]
-    assert updater.calls == []
-
-    written = json.loads(await tool.ainvoke({**payload, "confirmed": True}))
-    assert written["ok"] is True
-    assert updater.calls == [
-        ("u1", {"identity.preferred_name": "小林", "work.role": "后端工程师"})
-    ]
-
-
-@pytest.mark.asyncio
 async def test_none_clears_a_field() -> None:
     updater = FakeUpdater()
     tool = make_update_user_profile_tool(updater)
@@ -118,7 +91,6 @@ async def test_none_clears_a_field() -> None:
             {
                 "fields": {"identity.preferred_name": None},
                 "runtime": runtime({"user_id": "u1"}),
-                "confirmed": True,
             }
         )
     )
@@ -205,11 +177,7 @@ async def test_missing_user_is_reported_and_not_written() -> None:
 async def test_etag_conflict_and_storage_failure_become_tool_errors() -> None:
     conflict = make_update_user_profile_tool(FakeUpdater(error=ProfileConflict("stale")))
     crashed = make_update_user_profile_tool(FakeUpdater(error=RuntimeError("db down")))
-    payload = {
-        "fields": {"work.role": "后端工程师"},
-        "runtime": runtime({"user_id": "u1"}),
-        "confirmed": True,
-    }
+    payload = {"fields": {"work.role": "后端工程师"}, "runtime": runtime({"user_id": "u1"})}
 
     assert json.loads(await conflict.ainvoke(payload))["error"] == "profile_update_failed"
     assert json.loads(await crashed.ainvoke(payload))["error"] == "profile_update_failed"
@@ -228,8 +196,6 @@ def test_description_names_every_field_and_the_call_gates() -> None:
         "推测",
         "密钥",
         "null",
-        "interrupt_before",
-        "confirmed=true",
     ):
         assert phrase in description
     # 工具名与注册名一致，避免 description 与实际入口漂移，

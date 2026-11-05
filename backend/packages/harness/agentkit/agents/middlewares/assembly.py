@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.runnables import RunnableConfig
 
+from agentkit.agents.memory.openviking.profile_interrupt import make_profile_interrupt_middleware
 from agentkit.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 from agentkit.agents.middlewares.durable_context_middleware import DurableContextMiddleware
 from agentkit.agents.middlewares.dynamic_context_middleware import DynamicContextMiddleware
@@ -132,7 +133,12 @@ def build_middlewares(
     """lead 的完整链：基础层 + 上下文投影 + 技能（Activation → Policy → DurableContext）。"""
     resolved = app_config or get_app_config()
     subagent_enabled = bool((config or {}).get("configurable", {}).get("subagent_enabled"))
-    chain = build_runtime_middlewares(resolved, include_uploads=True, lazy_init=True)
+    # after_model runs in reverse registration order. Register HITL first so it
+    # sees the final tool calls after PII redaction, subagent limits, and the
+    # other after_model middleware have all run; it then pauses only the
+    # profile tool before the tools node executes.
+    chain: list[AgentMiddleware] = [make_profile_interrupt_middleware()]
+    chain.extend(build_runtime_middlewares(resolved, include_uploads=True, lazy_init=True))
     chain.append(DynamicContextMiddleware(app_config=resolved))
 
     # 顺序硬约束（§3.9）：Activation 紧挨 Policy 紧挨 DurableContext。

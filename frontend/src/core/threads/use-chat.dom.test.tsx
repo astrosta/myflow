@@ -10,6 +10,7 @@ const { captured, streamMock } = vi.hoisted(() => {
     isLoading: false,
     isThreadLoading: false,
     error: null,
+    interrupts: [] as Array<{ id?: string; value?: unknown }>,
     submit: vi.fn(),
     stop: vi.fn(),
   };
@@ -70,6 +71,42 @@ describe("useChat 的缓存失效", () => {
     });
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["threads"] });
+  });
+});
+
+describe("useChat 的图级中断", () => {
+  it("允许时用 Command(resume) 续跑，而不是再发一条普通消息", async () => {
+    streamMock.interrupts = [
+      {
+        id: "interrupt-1",
+        value: {
+          action_requests: [
+            {
+              name: "update_user_profile",
+              args: { fields: { "identity.preferred_name": "小林" } },
+              description: "确认更新画像",
+            },
+          ],
+          review_configs: [{ allowed_decisions: ["approve", "reject"] }],
+        },
+      },
+    ];
+    streamMock.submit.mockClear();
+
+    const { result } = renderHook(() => useChat({ threadId: "t1" }), { wrapper });
+    expect(result.current.interrupt?.toolName).toBe("update_user_profile");
+
+    await act(async () => {
+      await result.current.respondToInterrupt("approve");
+    });
+
+    expect(streamMock.submit).toHaveBeenCalledWith(
+      null,
+      expect.objectContaining({
+        command: { resume: { decisions: [{ type: "approve" }] } },
+      }),
+    );
+    streamMock.interrupts = [];
   });
 });
 

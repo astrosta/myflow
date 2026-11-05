@@ -268,9 +268,10 @@ models:
 `memory-researcher` 通过只读工具 `memory_search` / `memory_read` / `memory_overview` 检索，
 lead 只拿结论与来源（`2026-11-02-retrieval-subagents-design.md`）。写入只有两个入口：用户在“我的画像”
 表单里保存，或用户在对话里**显式**说出画像信息后由内置工具 `update_user_profile` 写入
-（模型推断不写画像；工具与表单共用同一行和 etag）。工具声明了 `interrupt_before` 元数据：
-第一次调用只返回 `confirmation_required` 提示，不写库；模型把变更转述给用户并获得明确同意后，
-才带 `confirmed=true` 重试。
+（模型推断不写画像；工具与表单共用同一行和 etag）。写入工具由 `HumanInTheLoopMiddleware`
+在图层面暂停：模型发出 `update_user_profile` 后、工具执行前产生 interrupt，
+前端显示变更确认卡片，用户允许后用 `Command(resume={"decisions": [...]})` 续跑，
+拒绝则不执行工具。
 
 ### PII / 敏感信息边界
 

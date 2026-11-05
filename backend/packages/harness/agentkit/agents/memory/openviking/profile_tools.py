@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 TOOL_NAME = "update_user_profile"
 _ALLOWED_FIELDS = tuple(spec.path for spec in PROFILE_FIELD_SPECS)
-_SPECS_BY_PATH = {spec.path: spec for spec in PROFILE_FIELD_SPECS}
 
 
 class ProfileUpdater(Protocol):
@@ -82,11 +81,6 @@ def tool_description() -> str:
             "- 敏感信息：密钥、令牌、证件号、私人联系方式（工具会拒绝）；",
             "- 与画像无关的普通事实：那些交给记忆抽取，不要往画像里塞。",
             "",
-            "确认（interrupt_before）：",
-            "- 本工具默认不写库。第一次调用请省略 confirmed 或传 false；",
-            "- 返回 status=confirmation_required 时，把 message 里的变更转述给用户，等待用户明确同意；",
-            "- 用户同意后，用同一组 fields 再调用一次并传 confirmed=true；不要未经用户同意直接传 true。",
-            "",
             "写入规则：",
             "- 字段名必须来自下面的清单；值必须符合对应类型；",
             "- 删除某个字段时把值设为 null（例如用户说「以后不用叫我小林了」）；",
@@ -115,7 +109,6 @@ def make_update_user_profile_tool(updater: ProfileUpdater) -> BaseTool:
         fields: dict[str, Any],
         runtime: ToolRuntime[Any, Any] = None,
         note: str | None = None,
-        confirmed: bool = False,
     ) -> str:
         if note:
             logger.debug("update_user_profile note: %s", note[:200])
@@ -149,18 +142,6 @@ def make_update_user_profile_tool(updater: ProfileUpdater) -> BaseTool:
                     str(exc),
                     list(_ALLOWED_FIELDS),
                 )
-        if not confirmed:
-            return json.dumps(
-                {
-                    "ok": False,
-                    "status": "confirmation_required",
-                    "interrupt_before": True,
-                    "message": _confirmation_message(cleaned),
-                    "updated": [path for path in cleaned if path not in cleared],
-                    "cleared": cleared,
-                },
-                ensure_ascii=False,
-            )
         try:
             view = await updater.update_fields(user_id, cleaned)
         except ProfileConflict:
@@ -190,19 +171,6 @@ def make_update_user_profile_tool(updater: ProfileUpdater) -> BaseTool:
         )
 
     return update_user_profile
-
-
-def _confirmation_message(changes: Mapping[str, Any]) -> str:
-    lines = ["即将更新「我的画像」："]
-    for path, value in changes.items():
-        spec = _SPECS_BY_PATH[path]
-        rendered = "（删除）" if value is None else json.dumps(value, ensure_ascii=False)
-        lines.append(f"- {spec.label}（{path}）：{rendered}")
-    lines.append(
-        "请先向用户复述这些变更并等待明确同意；"
-        "用户同意后，用同一组 fields 再调用一次并传 confirmed=true。"
-    )
-    return "\n".join(lines)
 
 
 def _context(runtime: Any) -> dict[str, Any]:

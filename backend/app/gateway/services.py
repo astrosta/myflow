@@ -13,6 +13,7 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import BaseMessage
 from langchain_core.messages.utils import convert_to_messages
+from langgraph.types import Command
 
 from agentkit.agents.leader_agent import (
     CHECKPOINT_COORDINATE_KEYS,
@@ -371,9 +372,64 @@ def resolve_agent_factory(assistant_id: str) -> AgentFactory:
     from agentkit.agents.leader_agent import assemble_agent
     return assemble_agent
 
-def normalize_input(raw: dict|None, *, command: Any, trusted: bool) -> dict:
+_COMMAND_DECISIONS = frozenset({"approve", "reject"})
+
+
+def _normalize_resume_command(command: Any) -> Command:
+    """Accept only the HITL resume shape this gateway exposes.
+
+    LangGraph Command can also update state or jump to a node. Those are
+    graph-control primitives, not client input, so the HTTP boundary accepts
+    only {"resume": {"decisions": [...]}} and rebuilds the object itself.
+    """
+
+    if not isinstance(command, dict):
+        raise RunRequestInvalid("command must be an object")
+    if unknown := set(command) - {"resume"}:
+        raise RunRequestInvalid(f"command only supports resume; got {sorted(unknown)}")
+    resume = command.get("resume")
+    if not isinstance(resume, dict):
+        raise RunRequestInvalid("command.resume must be an object")
+    if unknown := set(resume) - {"decisions"}:
+        raise RunRequestInvalid(f"command.resume only supports decisions; got {sorted(unknown)}")
+    decisions = resume.get("decisions")
+    if not isinstance(decisions, list) or not decisions:
+        raise RunRequestInvalid("command.resume.decisions must be a non-empty list")
+
+    cleaned: list[dict[str, str]] = []
+    for index, decision in enumerate(decisions):
+        if not isinstance(decision, dict):
+            raise RunRequestInvalid(f"command.resume.decisions[{index}] must be an object")
+        if unknown := set(decision) - {"type", "message"}:
+            raise RunRequestInvalid(
+                f"command.resume.decisions[{index}] has unsupported keys: {sorted(unknown)}"
+            )
+        kind = decision.get("type")
+        if kind not in _COMMAND_DECISIONS:
+            raise RunRequestInvalid(
+                f"command.resume.decisions[{index}].type must be approve or reject"
+            )
+        item = {"type": kind}
+        message = decision.get("message")
+        if message is not None:
+            if not isinstance(message, str):
+                raise RunRequestInvalid(
+                    f"command.resume.decisions[{index}].message must be a string"
+                )
+            if len(message) > 2_000:
+                raise RunRequestInvalid(
+                    f"command.resume.decisions[{index}].message is too long"
+                )
+            item["message"] = message
+        cleaned.append(item)
+    return Command(resume={"decisions": cleaned})
+
+
+def normalize_input(raw: dict|None, *, command: Any, trusted: bool) -> dict | Command:
     if command is not None:
-        raise RunRequestInvalid(f"command {command!r} not allowed")
+        if raw:
+            raise RunRequestInvalid("input and command are mutually exclusive")
+        return _normalize_resume_command(command)
 
     if raw is None:
         return {}
@@ -488,7 +544,11 @@ def scope_idempotency_key(caller: RunCaller, thread_id: str, raw: str | None) ->
 
 def _ensure_same_admission(record: RunRecord, body: RunCreateRequest) -> None:
     stored = record.kwargs or {}
-    if stored.get("input") != body.input or record.assistant_id != body.assistant_id:
+    if (
+        stored.get("input") != body.input
+        or stored.get("command") != body.command
+        or record.assistant_id != body.assistant_id
+    ):
         raise IdempotencyKeyReused("Idempotency-Key already used with a different request")
 
 def redact_config_secrets(config: dict | None) -> dict | None:
@@ -532,6 +592,7 @@ def _is_redacted_key(key: Any) -> bool:
 def _persisted_kwargs(body: RunCreateRequest) -> dict:
     return {
         "input": body.input,                              # 原始值：幂等比对和 run API 回显都用它
+        "command": body.command,                          # resume 的幂等比对也要看决策
         "config": redact_config_secrets(body.config),
         "context": redact_context_secrets(body.context),
     }

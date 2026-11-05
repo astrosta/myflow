@@ -1,6 +1,7 @@
 import type { StreamRecoveryEvent } from "../api/gap";
 import type { MessageGroup } from "../messages/group";
 import type { ChatMessage, ThreadState, TodoItem } from "../types";
+import type { ChatInterrupt } from "./interrupts";
 
 /**
  * 聊天页唯一的状态入口。组件层**只**消费这个接口，不认识 SDK。
@@ -35,6 +36,12 @@ export interface ChatController {
 
   /** 致命错误（流断了、run 失败了）。`null` 表示没有 */
   error: string | null;
+  /** 图在工具执行前暂停，等待用户确认；`null` 表示没有待确认项 */
+  interrupt: ChatInterrupt | null;
+  /** 正在提交确认/拒绝，按钮需要禁用 */
+  interruptBusy: boolean;
+  /** 允许或拒绝当前图级中断，内部用 Command(resume=...) 续跑 */
+  respondToInterrupt: (decision: "approve" | "reject") => Promise<void>;
   /**
    * gap 恢复提示。**非空时界面必须显示"正在恢复"，不能显示"已完成"**——
    * 后端的 run 还在跑（§5.2）。

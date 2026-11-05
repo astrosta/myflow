@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 
 import { ArtifactPanel, type ArtifactPreviewLoader } from "./artifact-panel";
 import { Composer, type ModelControlProps } from "./composer";
+import { InterruptPanel } from "./interrupt-panel";
 import { MessageList } from "./message-list";
 import { StreamStatus } from "./stream-status";
 import { TodoPanel } from "./todo-panel";
@@ -98,6 +99,20 @@ export function ChatView({
             />
           )}
 
+          {controller.interrupt ? (
+            <div className="px-4 pb-2">
+              <div className="mx-auto w-full max-w-3xl">
+                <InterruptPanel
+                  busy={controller.interruptBusy}
+                  interrupt={controller.interrupt}
+                  onDecide={(decision) => {
+                    void controller.respondToInterrupt(decision);
+                  }}
+                />
+              </div>
+            </div>
+          ) : null}
+
           {controller.todos.length ? (
             <div className="px-4 pb-2">
               <div className="mx-auto w-full max-w-3xl">
@@ -108,7 +123,7 @@ export function ChatView({
 
           <Composer
             attachmentsDisabled={controller.threadId === null}
-            disabled={controller.threadLoading}
+            disabled={controller.threadLoading || controller.interrupt !== null}
             modelControl={modelControl}
             onSubmit={controller.submit}
             onStop={() => {
