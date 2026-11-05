@@ -214,10 +214,19 @@ observability:
 # 本地沙箱是路径映射，不是隔离。宿主 bash 默认关闭。
 # sandbox.use 是 startup-only：改了要重启。
 sandbox:
-  # 生产切 Cube：use: agentkit.sandbox.cube:CubeSandboxProvider，并启用下面的 cube 段。
+  # provider 三选一（不写 = local）。切 provider 只改这一行 + 展开对应的段：
+  #   agentkit.sandbox.local:LocalSandboxProvider         进程内路径映射，不是隔离边界
+  #   agentkit.sandbox.cube:CubeSandboxProvider          需要 cube 段 + CubeMaster/Cubelet
+  #   agentkit.sandbox.opensandbox:OpenSandboxProvider   需要 opensandbox 段 + opensandbox-server
   use: agentkit.sandbox.local:LocalSandboxProvider
-  allow_host_bash: false   # 仅在完全可信的本地环境设为 true
+  # 只对 local 生效：local 下默认不暴露 bash 工具。换成 cube/opensandbox 时这个开关被忽略
+  # （隔离来自 MicroVM/容器，bash 工具始终可用），不要在隔离环境里指望它关掉 bash。
+  allow_host_bash: false
+  # 所有 provider 共用：单条命令的墙钟超时（秒）。cube 用作服务端 hard timeout，
+  # opensandbox 用作 RunCommandOpts.timeout，local 用作子进程超时。
   bash_command_timeout: 600
+  # 所有 provider 共用：额外挂载 {container_path, local_path, read_only}。
+  # cube/opensandbox 会把它并进宿主挂载并计入 mounts_hash；local 直接加映射。
   mounts: []
 
   # CubeSandbox（宿主挂载，Linux 同机部署）。默认保持注释：本地 provider 不需要这一节。
