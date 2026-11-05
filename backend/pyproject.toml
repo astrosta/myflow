@@ -21,6 +21,9 @@ postgres = [
 knowledge = [
     "agentkit[knowledge]",
 ]
+observability = [
+    "agentkit[observability]",
+]
 # Git 技能目录的 active projection 依赖由 harness 的 skills extra 提供。
 skills = [
     "agentkit[skills]",
@@ -33,12 +36,17 @@ redis = [
 cube = [
     "agentkit[cube,redis]",
 ]
+# AIO sandbox（Docker 容器）provider 需要 AIO SDK 与 Redis lease。
+aio = [
+    "agentkit[aio,redis]",
+]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    # Redis 版桥的协议测试跑在 fakeredis 上：不需要真的 Redis 服务，也不进生产依赖
-    "fakeredis>=2.30",
+    # Redis 版桥的协议测试跑在 fakeredis 上：不需要真的 Redis 服务，也不进生产依赖。
+    # [lua] 提供 EVALSHA 支持；缺了它，Redis 版桥的脚本测试会全部报 unknown command。
+    "fakeredis[lua]>=2.30",
 ]
 
 [tool.uv.sources]

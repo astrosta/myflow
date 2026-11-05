@@ -33,9 +33,15 @@ knowledge = [
     "pymilvus>=2.5",
     "transformers>=4.51",
 ]
-# 技能目录的 Git/审核/检索运行时依赖。pymilvus 只用于 active projection。
+# Langfuse 可观测性。enabled=false 时不 import；启用前先 uv sync --extra observability。
+observability = [
+    "langfuse>=5.1,<6",
+]
+# 技能目录的 Git/扫描/检索运行时依赖。pymilvus 只用于 active projection；
+# cisco-ai-skill-scanner 的 import 名是 skill_scanner，由 security_scan.py 懒加载。
 skills = [
     "pymilvus>=2.5",
+    "cisco-ai-skill-scanner>=2.2,<3",
 ]
 # stream_bridge.backend=redis / GATEWAY_WORKERS>1 需要它（可选：没装也能跑 memory 后端）
 redis = [
@@ -44,6 +50,11 @@ redis = [
 # CubeSandbox provider 的 E2B 协议客户端；需与 redis extra 一起安装。
 cube = [
     "e2b>=2.62,<3",
+]
+# AIO sandbox（Docker 容器）provider 的数据面 SDK；Docker CLI 由部署机提供，
+# lease 复用 redis extra。
+aio = [
+    "agent-sandbox>=0.0.30",
 ]
 # OpenViking thin adapter. Server 0.4.19 is external; this is only the HTTP SDK.
 openviking = [
