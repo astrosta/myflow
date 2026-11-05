@@ -262,46 +262,41 @@ sandbox:
   #
   #   max_cached_threads: 64             # 进程内缓存上限；驱逐只丢 handle，不 pause/kill 远端
 
-  # AIO Sandbox（Docker 容器隔离）。默认保持注释：本地 provider 不需要这一节。
-  # 取消注释前先装依赖：cd backend && uv sync --extra aio（= agentkit[aio,redis]），
-  # 并确认部署机有可用的 docker CLI 与 daemon。sandbox.aio 整段是 startup-only。
+  # OpenSandbox（容器隔离，由 opensandbox-server 托管）。默认保持注释。
+  # 前置：
+  #   1) 起服务端：uvx opensandbox-server init-config ~/.sandbox.toml --example docker
+  #                uvx opensandbox-server        # 默认 127.0.0.1:8080，/health 可探
+  #   2) 装依赖：  cd backend && uv sync --extra opensandbox（= agentkit[opensandbox,redis]）
+  #      Gateway 不再需要 docker CLI：容器由服务端创建和管理。
+  # sandbox.opensandbox 整段是 startup-only。
   #
-  # 两种部署形态（publish_host / connect_host 留 auto 时按下面的规则自动判断，
-  # 判断不出来会拒绝启动，不会静默退化成 0.0.0.0）：
-  #   Gateway 在宿主上        → 两端都 127.0.0.1
-  #   Gateway 在容器里(DooD)  → 两端都是 Docker 网桥网关 IP（如 172.17.0.1），
-  #                             同时要把 /var/run/docker.sock 挂进 Gateway 容器，
-  #                             且 host_mount.host_root 写 daemon 视角的路径。
-  # aio:
-  #   image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0
-  #   pull_policy: missing              # missing | always（always = 每次启动先 pull）
-  #   container_name_prefix: myflow-aio
-  #   port: 8080                        # 容器内 AIO server 端口
-  #   publish_host: auto                # auto | 127.0.0.1 | 0.0.0.0 | <ip>
-  #   connect_host: auto                # auto | 127.0.0.1 | host.docker.internal | <ip>
-  #   ready_timeout_seconds: 60         # 容器起到 /v1/sandbox 返回 200 的上限
-  #   request_timeout_seconds: 30       # AIO HTTP 客户端超时，不是命令超时
+  # 镜像只要自带 bash 就够（grep 走 shell），不要求 AIO 那种大镜像。
+  # opensandbox:
+  #   domain: 127.0.0.1:8080            # 服务端地址，host:port
+  #   protocol: http                    # http | https
+  #   api_key: ""                       # 留空读 OPEN_SANDBOX_API_KEY
+  #   image: python:3.12
+  #   timeout_seconds: 1800             # sandbox TTL，到期由服务端回收
+  #   ready_timeout_seconds: 30
+  #   request_timeout_seconds: 30       # SDK HTTP 超时，不是命令超时
   #   acquire_timeout_seconds: 120      # 等 Redis per-thread 锁的上限
-  #   release_action: stop              # stop | remove；stop 让下一轮热恢复
-  #   max_cached_threads: 64            # 进程内缓存上限；驱逐只 stop，不 rm
-  #   discover_existing: true           # 进程重启后按 labels 捡回自己的容器
-  #   startup_healthcheck: true         # 启动时校验 docker / 拓扑 / 挂载 / Redis
+  #   resource:
+  #     cpu: "2"
+  #     memory: 2Gi
+  #   release_action: keep              # keep（交给 TTL）| destroy（释放即 kill）
+  #   max_cached_threads: 64            # 进程内缓存上限；驱逐只丢 handle
+  #   discover_existing: true           # 进程重启后按 metadata 捡回自己的 sandbox
+  #   startup_healthcheck: true         # 启动时校验服务端 /health、挂载、Redis
   #
-  #   # 容器级 env；不要放 secret（docker inspect 能看到）。请求级 token 走工具调用的 env。
+  #   # sandbox 级 env；不要放 secret。请求级 token 走工具调用的 env。
   #   env:
   #     TZ: Asia/Shanghai
-  #   network:
-  #     mode: bridge                    # bridge | none
-  #     name: null                      # 已有网络名；空 = 默认 bridge
-  #   resources:
-  #     cpus: 2
-  #     memory: 2g
-  #     pids_limit: 512
   #
-  #   # 宿主挂载：与 cube 段同形状。local_root 是 Gateway 视角，host_root 是 daemon 视角。
+  #   # 宿主挂载：与 cube 段同形状。local_root 是 Gateway 视角，
+  #   # host_root 是**服务端宿主**视角（卷源按它翻译）。
   #   host_mount:
   #     local_root: /opt/myflow
-  #     host_root: /opt/myflow           # DooD 时必须写成宿主上看得到的路径
+  #     host_root: /opt/myflow
   #
   #   # 必填：与 cube 共用同一个 per-thread Redis 锁。Redis 不可达时启动失败。
   #   lease:

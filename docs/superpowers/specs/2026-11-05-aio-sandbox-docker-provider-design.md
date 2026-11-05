@@ -1,6 +1,8 @@
 # AIO Sandbox（Docker 容器隔离）Provider 设计
 
-> 状态：已实现（2026-11-05）；六项决策见 §12，实施中的偏差见 §14
+> 状态：**已被取代（2026-11-05）**。AIO 镜像与自建 Docker 控制面都太重，现已换成
+> [OpenSandbox Provider 设计](2026-11-05-opensandbox-provider-design.md)（`agentkit.sandbox.opensandbox`）。
+> 本文件保留作为决策记录：宿主挂载、Redis 租约、canary、契约映射那部分仍然有效。
 > 关系：新增第四个 `SandboxProvider`，与 `agentkit.sandbox.local`（进程内路径映射）、
 > `agentkit.sandbox.cube`（CubeSandbox MicroVM / E2B 协议）并列；不改动它们的语义。
 > 上游参考：deerflow 的 `deerflow.community.aio_sandbox:AioSandboxProvider`（Docker 模式）。

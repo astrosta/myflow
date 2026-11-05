@@ -1,7 +1,9 @@
 # AIO Sandbox（Docker 容器隔离）Provider 实现计划
 
-> **已执行完毕（2026-11-05）。** 10 个任务按顺序落地，全量后端测试 2532 passed / 8 skipped。
-> 实施中与设计不同的四点记在 spec §14。
+> **已执行完毕（2026-11-05），随后被取代。** 10 个任务按顺序落地，之后整套 AIO 方案换成
+> [OpenSandbox Provider 设计](../specs/2026-11-05-opensandbox-provider-design.md)：AIO 镜像与自建
+> Docker 控制面太重。本计划保留作为执行记录；共用部分（宿主挂载、Redis 租约、canary、契约映射）
+> 在 OpenSandbox 里继续有效。
 
 **Goal:** 新增 `agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker`：把工具的文件与命令执行放进
 一台 Docker 主机上的 all-in-one-sandbox 容器，宿主线程目录 bind mount 进容器，复用现有

@@ -118,47 +118,44 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
 旧 checkpoint 里的 `cube:` sandbox_id 在回滚后 `get()` 返回 `None`，runtime 会重新 acquire
 本地沙箱；反过来从 local 切到 cube 也一样。
 
-### AIO Sandbox（Docker 容器隔离）
+### OpenSandbox（容器隔离）
 
-在 Docker 容器里跑工具：`sandbox.use: agentkit.sandbox.aio_sandbox:AioSandboxProviderDocker`，
-启用 `sandbox.aio`（`config.example.yaml` 里有整段注释模板）。容器里看到的
-`/mnt/user-data` 还是同一个宿主线程目录，上传与产物链路不变，所以和 local / cube 之间
-切换不需要迁数据。
+在容器里跑工具：`sandbox.use: agentkit.sandbox.opensandbox:OpenSandboxProvider`，启用
+`sandbox.opensandbox`（`config.example.yaml` 里有整段注释模板）。容器里看到的
+`/mnt/user-data` 还是同一个宿主线程目录，上传与产物链路不变，所以和 local / cube 之间切换
+不需要迁数据。
+
+**容器由 `opensandbox-server` 托管**，Gateway 不再驱动 docker：少了一整套端口发布、
+容器名、label 发现和孤儿扫描，Gateway 侧也不需要 `docker` CLI。
 
 前置条件：
 
-1. 部署机有可用的 `docker` CLI 与 daemon（provider 直接调 CLI，不引入 docker Python SDK）。
-2. 装依赖：`cd backend && uv sync --extra aio`（= `agentkit[aio,redis]`）。
-3. 镜像从官方仓库拉，默认 `all-in-one-sandbox:1.11.0`。**不要用 `latest`**：上游说这个
-   浮动 tag 可能仍停在 1.0.0.x 线，那条线没有 `/v1/bash/exec`（没有 per-command env 注入、
-   没有服务端 hard timeout），provider 会在第一次执行命令时直接报错要求升级镜像。
+1. 起服务端（默认 `127.0.0.1:8080`，`GET /health` 可探）：
+   ```bash
+   uvx opensandbox-server init-config ~/.sandbox.toml --example docker
+   uvx opensandbox-server
+   ```
+   Docker/Kubernetes runtime 都在服务端的 `~/.sandbox.toml` 里选，不在这份配置里。
+2. 装依赖：`cd backend && uv sync --extra opensandbox`（= `agentkit[opensandbox,redis]`）。
+3. 镜像只要自带 bash：默认 `python:3.12`。不需要 AIO 那种自带浏览器/Jupyter 的大镜像——
+   我们只用命令与文件 API（`grep` 走 shell）。
 4. 宿主挂载：`host_mount.local_root` 是 Gateway 进程看到的根（要覆盖 `.myflow` 与
-   `skills/`），`host_mount.host_root` 是 Docker daemon 看到的同一个根；同机时写一个即可。
-5. Redis 必填：`sandbox.aio.lease.redis_url`，与 cube 共用同一个 per-thread 锁；不可达时启动失败。
-
-**两种部署形态**（`publish_host` / `connect_host` 留 `auto` 时自动判断）：
-
-| 形态 | publish / connect | 额外要求 |
-|---|---|---|
-| Gateway 在宿主上 | 两端都 `127.0.0.1` | 无 |
-| Gateway 在容器里（DooD） | 两端都是 Docker 网桥网关 IP（如 `172.17.0.1`） | 挂载 `/var/run/docker.sock`；`host_mount.host_root` 写宿主视角路径 |
-
-自动判断在容器里推不出网关时会**拒绝启动**并提示显式配置，不会静默绑到 `0.0.0.0`
-（那等于把容器的 root shell 端口暴露到整台宿主）。Docker Desktop 之类的环境直接写死两端更稳。
+   `skills/`），`host_mount.host_root` 是**服务端宿主**看到的同一个根（卷源按它翻译）。
+5. Redis 必填：`sandbox.opensandbox.lease.redis_url`，与 cube 共用同一个 per-thread 锁；
+   不可达时启动失败。
 
 生命周期：
 
-- `release_action` 默认 `stop`：每轮结束后停容器，下一轮 `docker start` 热恢复，
-  容器 id 不变；改成 `remove` 则每轮冷启动。
-- `reset()` 不动容器；`shutdown()` 删除本进程持有的容器；LRU 驱逐只 `stop`。
-- acquire 会先用 `docker inspect` 复核缓存里的容器：被外部删掉就重建，被停掉就重启。
-- 挂载或技能路径变了（`mounts_hash` 不一致）会重建容器，不会带着过期挂载继续跑。
-- 上次进程崩溃留下的容器：`orphan_policy: report`（默认）只在启动日志里列出，
-  手动清理 `docker rm -f $(docker ps -aq --filter label=myflow.provider=aio)`；
-  改成 `remove` 会在启动时删掉超过 `orphan_ttl_seconds` 的孤儿。
+- `release_action` 默认 `keep`：每轮结束只放租约，沙箱留给 TTL（`timeout_seconds`）
+  回收，下一轮 `connect` 接回同一个沙箱；改成 `destroy` 则每轮 `kill`。
+- `reset()` 不动远端；`shutdown()` kill 本进程持有的沙箱；LRU 驱逐只丢 handle。
+- acquire 会用 `get_info()` 复核缓存：TTL 到期或被外部 kill 了就重建。
+- 挂载或技能路径变了（metadata 里 `myflow.mounts_hash` 不一致）会 kill 后重建。
+- 上次进程崩溃留下的沙箱：`orphan_policy: report`（默认）只在启动日志里列出 id；
+   改成 `remove` 会 kill 掉超过 `orphan_ttl_seconds` 的孤儿。
 
-**回滚**：`sandbox.use` 改回 local 或 cube 并重启即可；旧的 `aio:` sandbox_id 在
-`get()` 里是内存 miss，runtime 会重新 acquire。残留容器用上面那条 `docker rm -f` 清理。
+**回滚**：`sandbox.use` 改回 local 或 cube 并重启即可；旧的 `osb:` sandbox_id 在
+`get()` 里是内存 miss，runtime 会重新 acquire；残留沙箱交给服务端的 TTL 或 `osb` CLI。
 
 ### 模型与推理等级（输入框里的两个选择）
 
@@ -669,17 +666,18 @@ uv run pytest tests/test_cube_integration.py -v
 有鉴权时再加 `E2B_API_KEY`；数据面域名不是 `cube.app` 时加 `E2B_DOMAIN`。用例跑真实 provider 的 acquire → `echo`/python3 →
 `/mnt/user-data/workspace` 双向读写 → canary → pause/release → 重新 acquire。
 
-AIO Sandbox 的真 Docker 用例同样默认跳过（会创建并删除真实容器）：
+OpenSandbox 的真用例同样默认跳过（会创建并 kill 真实沙箱，需要一个在跑的服务端）：
 
 ```bash
 cd backend
-AIO_INTEGRATION=1 \
+OPENSANDBOX_INTEGRATION=1 \
+OPENSANDBOX_DOMAIN=127.0.0.1:8080 \
 REDIS_URL=redis://127.0.0.1:6379/0 \
-uv run pytest tests/test_aio_sandbox_integration.py -v
+uv run pytest tests/test_opensandbox_integration.py -v
 ```
 
-不设 `AIO_IMAGE` 时用默认的 `all-in-one-sandbox:1.11.0`（首次会拉镜像）。用例跑
-acquire → `echo`/python3 → 双向文件 → 二进制往返 → `stop` 后热恢复 → `shutdown` 清容器。
+不设 `OPENSANDBOX_IMAGE` 时用默认的 `python:3.12`。用例跑 acquire → `echo`/python3 →
+双向文件 → 二进制往返 → glob/grep → `release_action=destroy` 后重建 → `shutdown` 清沙箱。
 
 ## 排障
 
