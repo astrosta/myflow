@@ -27,6 +27,22 @@ from agentkit.sandbox.exceptions import SandboxRuntimeError, SandboxTimeoutError
 logger = logging.getLogger(__name__)
 
 _AUTH_STATUS_CODES = frozenset({401, 403})
+# Connection-level failures. They are the only hint that the container may be
+# gone, but they are not proof: the owner probes Docker before dropping a handle.
+_TRANSPORT_TYPE_NAMES = frozenset(
+    {
+        "ConnectError",
+        "ConnectTimeout",
+        "ConnectionError",
+        "NetworkError",
+        "PoolTimeout",
+        "ReadError",
+        "ReadTimeout",
+        "RemoteProtocolError",
+        "TransportError",
+        "WriteError",
+    }
+)
 _READY_PATH = "/v1/sandbox"
 _IMAGE_HINT = (
     "the sandbox image does not support POST /v1/bash/exec (needs "
@@ -34,6 +50,15 @@ _IMAGE_HINT = (
     "to a supported tag and recreate the container."
 )
 _READ_FAILED = "file not found or unreadable"
+
+
+class AioTransportError(SandboxRuntimeError, OSError):
+    """The container could not be reached at all.
+
+    Subclasses both families on purpose: a file operation must still look like
+    an OSError to the tool layer, while the owner also needs a signal that the
+    sandbox itself may be gone.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,9 +459,15 @@ def _type_names(exc: BaseException) -> set[str]:
     return {cls.__name__ for cls in type(exc).__mro__}
 
 
+def _is_transport_error(exc: BaseException) -> bool:
+    return bool(_type_names(exc) & _TRANSPORT_TYPE_NAMES)
+
+
 def _map_command_error(exc: BaseException, action: str) -> Exception:
     if isinstance(exc, (SandboxRuntimeError, SandboxTimeoutError)):
         return exc
+    if _is_transport_error(exc):
+        return AioTransportError(f"could not {action}: the sandbox is unreachable: {exc}")
     names = _type_names(exc)
     if "TimeoutException" in names or "TimeoutError" in names:
         return SandboxTimeoutError(f"the sandbox {action}: request timed out")
@@ -452,8 +483,12 @@ def _map_command_error(exc: BaseException, action: str) -> Exception:
 
 
 def _map_file_error(exc: BaseException, path: str, *, action: str) -> Exception:
-    if isinstance(exc, OSError):
+    if isinstance(exc, (SandboxRuntimeError, OSError)):
         return exc
+    if _is_transport_error(exc):
+        return AioTransportError(
+            f"could not {action} {path}: the sandbox is unreachable: {exc}"
+        )
     names = _type_names(exc)
     # The server reports read failures as an error envelope the SDK cannot
     # parse, so a pydantic ValidationError means "missing or unreadable".
@@ -475,6 +510,7 @@ def _map_file_error(exc: BaseException, path: str, *, action: str) -> Exception:
 
 __all__ = [
     "AioClient",
+    "AioTransportError",
     "CommandOutput",
     "Entry",
     "GrepResult",
