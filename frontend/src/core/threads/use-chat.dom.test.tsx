@@ -75,6 +75,40 @@ describe("useChat 的缓存失效", () => {
 });
 
 describe("useChat 的图级中断", () => {
+  it("从 updates 帧的 __interrupt__ 生成确认状态", () => {
+    streamMock.interrupts = [];
+    const { result } = renderHook(() => useChat({ threadId: "t1" }), { wrapper });
+    const options = captured.at(-1) as {
+      onUpdateEvent: (data: unknown, context: { mutate: () => void }) => void;
+    };
+
+    act(() => {
+      options.onUpdateEvent(
+        {
+          __interrupt__: [
+            {
+              id: "interrupt-1",
+              value: {
+                action_requests: [
+                  {
+                    name: "update_user_profile",
+                    args: { fields: { "identity.preferred_name": "小林" } },
+                    description: "确认更新画像",
+                  },
+                ],
+                review_configs: [{ allowed_decisions: ["approve", "reject"] }],
+              },
+            },
+          ],
+        },
+        { mutate: () => {} },
+      );
+    });
+
+    expect(result.current.interrupt?.toolName).toBe("update_user_profile");
+    streamMock.interrupts = [];
+  });
+
   it("允许时用 Command(resume) 续跑，而不是再发一条普通消息", async () => {
     streamMock.interrupts = [
       {

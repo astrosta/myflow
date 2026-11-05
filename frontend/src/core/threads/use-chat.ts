@@ -27,7 +27,12 @@ import { mergeMessages, type TurnBaseline } from "../messages/order";
 import type { RunContext } from "../models/selection";
 import type { ChatMessage, ThreadState } from "../types";
 import type { ChatController } from "./chat-controller";
-import { buildResumeCommand, parseChatInterrupt } from "./interrupts";
+import {
+  buildResumeCommand,
+  parseChatInterrupt,
+  updateFrameInterrupts,
+  type ChatInterrupt,
+} from "./interrupts";
 import { foldUpdateFrame, isRelevantUpdateFrame } from "./stream-state";
 import {
   createOptimisticHumanMessage,
@@ -128,6 +133,14 @@ export function useChat({
   const [olderPages, setOlderPages] = useState<MessagePage[]>([]);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [interruptBusy, setInterruptBusy] = useState(false);
+  /**
+   * The SDK manager only extracts __interrupt__ from values frames. The chat
+   * stream deliberately omits values (to avoid resending the whole transcript),
+   * so capture the interrupt from the updates frame directly.
+   */
+  const [pendingInterrupt, setPendingInterrupt] = useState<ChatInterrupt | null | undefined>(
+    undefined,
+  );
 
   // ---- 持久化历史 ----
   const newestPage = useQuery({
@@ -219,6 +232,13 @@ export function useChat({
       onThreadCreated?.(run.thread_id);
     },
     onUpdateEvent: (data, { mutate }) => {
+      // The SDK manager only looks for __interrupt__ on values frames; the
+      // chat stream uses updates, so keep the pending HITL request ourselves.
+      const interrupts = updateFrameInterrupts(data);
+      if (interrupts !== null) {
+        setPendingInterrupt(parseChatInterrupt(interrupts));
+        return;
+      }
       // §3.2：无关的帧要在调用 SDK 的状态改写器**之前**就拒掉
       if (!isRelevantUpdateFrame(data)) return;
       mutate((prev) => foldUpdateFrame(prev as ThreadState, data) as never);
@@ -250,12 +270,12 @@ export function useChat({
   );
 
   /**
-   * SDK 会从 updates 帧里的 __interrupt__ 维护中断列表；这里只把它转成
-   * 面板需要的视图模型。刷新页面时 SDK 也会从 thread tasks 恢复同一份列表。
+   * 实时中断来自 onUpdateEvent（SDK 只在 values 帧里自动提取）；刷新页面时
+   * 退回 SDK 从 history/thread tasks 恢复的 interrupts，两路都转成面板视图。
    */
   const interrupt = useMemo(
-    () => parseChatInterrupt(stream.interrupts),
-    [stream.interrupts],
+    () => (pendingInterrupt !== undefined ? pendingInterrupt : parseChatInterrupt(stream.interrupts)),
+    [pendingInterrupt, stream.interrupts],
   );
 
   /**
@@ -364,6 +384,9 @@ export function useChat({
         }
       }
 
+      // A new user turn supersedes any stale local HITL state; the stream will
+      // publish a fresh interrupt if the model asks for confirmation again.
+      setPendingInterrupt(null);
       const optimisticMessage = createOptimisticHumanMessage({ text });
       /**
        * §4.4：本地提交的那一轮要记一个身份基线。
@@ -423,6 +446,8 @@ export function useChat({
   const respondToInterrupt = useCallback(
     async (decision: "approve" | "reject") => {
       if (!interrupt || interruptBusy) return;
+      const resume = interrupt;
+      setPendingInterrupt(null);
       setInterruptBusy(true);
       try {
         /**
@@ -430,11 +455,15 @@ export function useChat({
          * 让 LangGraph 从 checkpoint 里的 interrupt 继续，而不是重跑这一轮。
          */
         await stream.submit(null as never, {
-          command: buildResumeCommand(interrupt, decision) as never,
+          command: buildResumeCommand(resume, decision) as never,
           context: runContextValue as never,
           onDisconnect: "cancel",
           streamMode: streamModes as never,
         });
+      } catch (error) {
+        // Keep the confirmation visible if resuming failed; the user can retry.
+        setPendingInterrupt(resume);
+        throw error;
       } finally {
         setInterruptBusy(false);
       }

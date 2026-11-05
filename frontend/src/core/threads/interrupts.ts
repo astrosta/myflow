@@ -33,10 +33,11 @@ function text(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-export function parseChatInterrupt(
-  interrupts: readonly { id?: string; value?: unknown }[] | undefined | null,
-): ChatInterrupt | null {
-  for (const interrupt of interrupts ?? []) {
+export function parseChatInterrupt(interrupts: unknown): ChatInterrupt | null {
+  const list = Array.isArray(interrupts) ? interrupts : interrupts ? [interrupts] : [];
+  for (const item of list) {
+    const interrupt = record(item);
+    if (!interrupt) continue;
     const value = record(interrupt.value);
     if (!value) continue;
     const actions = array(value.actionRequests ?? value.action_requests);
@@ -51,7 +52,7 @@ export function parseChatInterrupt(
     const decisions = allowed.length ? allowed : ["approve", "reject"];
 
     return {
-      id: interrupt.id,
+      id: typeof interrupt.id === "string" ? interrupt.id : undefined,
       toolName: text(first.name) || "工具",
       description: text(first.description) || "模型请求执行需要你确认的操作。",
       allowedDecisions: decisions,
@@ -59,6 +60,13 @@ export function parseChatInterrupt(
     };
   }
   return null;
+}
+
+/** Returns the raw interrupt list when this updates frame is an interrupt. */
+export function updateFrameInterrupts(data: unknown): unknown[] | null {
+  const frame = record(data);
+  if (!frame || !("__interrupt__" in frame)) return null;
+  return Array.isArray(frame.__interrupt__) ? frame.__interrupt__ : [];
 }
 
 export function buildResumeCommand(
