@@ -64,11 +64,6 @@ export interface ModelControlProps {
   effortOptions: ReasoningEffort[];
   effortId: string | null;
   effortLabel: string;
-  /** 当前模型是否支持思考；false 时选择器不显示思考开关 */
-  thinkingSupported?: boolean;
-  /** 用户是否显式打开了思考 */
-  thinkingEnabled?: boolean;
-  onToggleThinking?: () => void;
   loading?: boolean;
   error?: string | null;
   /** 某些厂商的 /models 没拉到（列表已回退到配置） */
@@ -207,9 +202,6 @@ export function Composer({
                   effortId={modelControl.effortId}
                   effortLabel={modelControl.effortLabel}
                   effortOptions={modelControl.effortOptions}
-                  thinkingEnabled={modelControl.thinkingEnabled}
-                  thinkingSupported={modelControl.thinkingSupported}
-                  onToggleThinking={modelControl.onToggleThinking}
                   error={modelControl.error}
                   loading={modelControl.loading}
                   models={modelControl.models}

@@ -8,6 +8,8 @@ import {
   groupByProvider,
   resolveEffort,
   resolveModel,
+  thinkingEnabledFor,
+  OFF_EFFORT,
 } from "./selection";
 
 function model(overrides: Partial<ModelInfo> = {}): ModelInfo {
@@ -109,6 +111,15 @@ describe("推理等级", () => {
     expect(resolveEffort(catalog.models[0]!, "high")).toBe("high");
     expect(effortLabel(catalog.models[0]!, "high")).toBe("High");
   });
+
+  it("显式 Off 不会被模型默认等级覆盖", () => {
+    const withDefault = model({
+      default_reasoning_effort: "low",
+      reasoning_efforts: catalog.models[0]!.reasoning_efforts,
+    });
+    expect(resolveEffort(withDefault, null)).toBe("low");
+    expect(resolveEffort(withDefault, OFF_EFFORT)).toBeNull();
+  });
 });
 
 describe("装配上下文", () => {
@@ -132,6 +143,12 @@ describe("装配上下文", () => {
       buildRunContext({ modelName: "flash", effortId: null, thinkingEnabled: false }),
     ).toEqual({ model_name: "flash" });
   });
+
+  it("思考等级 Off 关闭思考，选任意等级才打开", () => {
+    expect(thinkingEnabledFor(model(), null)).toBe(false);
+    expect(thinkingEnabledFor(model(), "low")).toBe(true);
+    expect(thinkingEnabledFor(model({ supports_thinking: false }), "low")).toBe(false);
+  });
 });
 
 describe("设置持久化", () => {
@@ -149,22 +166,6 @@ describe("设置持久化", () => {
     const parsed = parseSettings(JSON.stringify({ modelName: "flash", thinkingEnabled: false }));
     expect(parsed.modelName).toBe("flash");
     expect(parsed.reasoningEffort).toBeNull();
-    expect(parsed.thinkingEnabled).toBe(false);
-  });
-
-  it("旧版本写下的默认 thinking=true 不被当成用户显式打开", () => {
-    const parsed = parseSettings(JSON.stringify({ modelName: "flash", thinkingEnabled: true }));
-    expect(parsed.thinkingEnabled).toBe(false);
-    expect(parsed.thinkingTouched).toBe(false);
-  });
-
-  it("用户显式切换思考后持久化为 touched", () => {
-    const storage = memoryStorage();
-    saveSettings({ thinkingEnabled: true }, storage);
-    expect(loadSettings(storage)).toMatchObject({
-      thinkingEnabled: true,
-      thinkingTouched: true,
-    });
   });
 
   it("选择会写回本地并保留其它字段", () => {
@@ -174,8 +175,6 @@ describe("设置持久化", () => {
     expect(loadSettings(storage)).toEqual({
       modelName: "flash",
       reasoningEffort: "high",
-      thinkingEnabled: false,
-      thinkingTouched: false,
     });
   });
 
@@ -183,8 +182,6 @@ describe("设置持久化", () => {
     expect(parseSettings("{not json")).toEqual({
       modelName: null,
       reasoningEffort: null,
-      thinkingEnabled: false,
-      thinkingTouched: false,
     });
   });
 });

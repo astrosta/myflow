@@ -6,8 +6,8 @@ import type { ModelInfo } from "@/core/api/models";
 import { ModelPicker } from "./model-picker";
 
 /**
- * 三层上拉框：根菜单（模型 / 推理等级两行）→ 模型列表（厂商小字 + 打勾）
- * 或推理等级列表（Off + 候选 + 打勾）。候选全部来自 props（`/api/models`）。
+ * 三层上拉框：根菜单（模型 / 思考等级两行）→ 模型列表（厂商小字 + 打勾）
+ * 或思考等级列表（Off + 候选 + 打勾）。候选全部来自 props（`/api/models`）。
  */
 
 afterEach(cleanup);
@@ -56,7 +56,7 @@ const trigger = (view: ReturnType<typeof render>) =>
   view.getByRole("button", { name: /选择模型/ });
 
 describe("触发器", () => {
-  it("显示模型名（原样）与当前推理等级", () => {
+  it("显示模型名（原样）与当前思考等级", () => {
     const { view } = setup();
     expect(trigger(view).textContent).toContain("flash · Low");
   });
@@ -74,51 +74,25 @@ describe("触发器", () => {
 });
 
 describe("根菜单", () => {
-  it("点开先是模型 / 推理等级两行，各显示当前值", () => {
+  it("点开先是模型 / 思考等级两行，各显示当前值", () => {
     const { view } = setup();
     fireEvent.click(trigger(view));
 
-    const menu = view.getByRole("menu", { name: "模型与推理等级" });
+    const menu = view.getByRole("menu", { name: "模型与思考等级" });
     expect(menu.textContent).toContain("模型");
     expect(menu.textContent).toContain("flash");
-    expect(menu.textContent).toContain("推理等级");
+    expect(menu.textContent).toContain("思考等级");
     expect(menu.textContent).toContain("Low");
   });
 
-  it("模型没有候选时不显示推理等级那一行", () => {
+  it("模型没有候选时不显示思考等级那一行", () => {
     const plain = model({ reasoning_efforts: [] });
     const { view } = setup({ current: plain, effortOptions: [], effortId: null });
     fireEvent.click(trigger(view));
 
     const menu = view.getByRole("menu");
     expect(menu.textContent).toContain("模型");
-    expect(view.queryByRole("menuitem", { name: "推理等级" })).toBeNull();
-  });
-});
-
-describe("思考开关", () => {
-  it("模型支持思考时，根菜单显示开/关并回调", () => {
-    const onToggleThinking = vi.fn();
-    const { view } = setup({
-      thinkingEnabled: false,
-      thinkingSupported: true,
-      onToggleThinking,
-    });
-    fireEvent.click(trigger(view));
-
-    const row = view.getByRole("menuitem", { name: "思考" });
-    expect(row.textContent).toContain("关");
-    fireEvent.click(row);
-
-    expect(onToggleThinking).toHaveBeenCalledTimes(1);
-    expect(view.queryByRole("menu")).toBeNull();
-  });
-
-  it("模型不支持思考时不显示这一行", () => {
-    const { view } = setup({ thinkingSupported: false });
-    fireEvent.click(trigger(view));
-
-    expect(view.queryByRole("menuitem", { name: "思考" })).toBeNull();
+    expect(view.queryByRole("menuitem", { name: "思考等级" })).toBeNull();
   });
 });
 
@@ -190,13 +164,13 @@ describe("模型列表", () => {
   });
 });
 
-describe("推理等级列表", () => {
+describe("思考等级列表", () => {
   it("Off 在最前面，当前等级后面打勾，且不显示描述", () => {
     const { view } = setup();
     fireEvent.click(trigger(view));
-    fireEvent.click(view.getByRole("menuitem", { name: "推理等级" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "思考等级" }));
 
-    const menu = view.getByRole("menu", { name: "推理等级列表" });
+    const menu = view.getByRole("menu", { name: "思考等级列表" });
     const rows = view.getAllByRole("menuitemradio");
     expect(rows.map((row) => row.textContent)).toEqual(["Off", "Low✓", "High"]);
     expect(menu.textContent).not.toContain("这条描述不该显示");
@@ -205,7 +179,7 @@ describe("推理等级列表", () => {
   it("没选等级时 Off 打勾", () => {
     const { view } = setup({ effortId: null, effortLabel: "Off" });
     fireEvent.click(trigger(view));
-    fireEvent.click(view.getByRole("menuitem", { name: "推理等级" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "思考等级" }));
 
     const rows = view.getAllByRole("menuitemradio");
     expect(rows[0]?.getAttribute("aria-checked")).toBe("true");
@@ -216,13 +190,13 @@ describe("推理等级列表", () => {
   it("选等级回调 id，选 Off 回调 null，都收起菜单", () => {
     const { view, onSelectEffort } = setup();
     fireEvent.click(trigger(view));
-    fireEvent.click(view.getByRole("menuitem", { name: "推理等级" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "思考等级" }));
     fireEvent.click(view.getByRole("menuitemradio", { name: "High" }));
     expect(onSelectEffort).toHaveBeenCalledWith("high");
     expect(view.queryByRole("menu")).toBeNull();
 
     fireEvent.click(trigger(view));
-    fireEvent.click(view.getByRole("menuitem", { name: "推理等级" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "思考等级" }));
     fireEvent.click(view.getByRole("menuitemradio", { name: "Off" }));
     expect(onSelectEffort).toHaveBeenLastCalledWith(null);
   });
@@ -235,16 +209,16 @@ describe("层级导航", () => {
     fireEvent.click(view.getByRole("menuitem", { name: "模型" }));
     fireEvent.click(view.getByRole("button", { name: "返回模型" }));
 
-    expect(view.getByRole("menu", { name: "模型与推理等级" })).toBeTruthy();
+    expect(view.getByRole("menu", { name: "模型与思考等级" })).toBeTruthy();
   });
 
-  it("推理等级列表也能退回根菜单", () => {
+  it("思考等级列表也能退回根菜单", () => {
     const { view } = setup();
     fireEvent.click(trigger(view));
-    fireEvent.click(view.getByRole("menuitem", { name: "推理等级" }));
-    fireEvent.click(view.getByRole("button", { name: "返回推理等级" }));
+    fireEvent.click(view.getByRole("menuitem", { name: "思考等级" }));
+    fireEvent.click(view.getByRole("button", { name: "返回思考等级" }));
 
-    expect(view.getByRole("menu", { name: "模型与推理等级" })).toBeTruthy();
+    expect(view.getByRole("menu", { name: "模型与思考等级" })).toBeTruthy();
   });
 
   it("Esc 关闭，再次打开回到根菜单", () => {
@@ -255,6 +229,6 @@ describe("层级导航", () => {
     expect(view.queryByRole("menu")).toBeNull();
 
     fireEvent.click(trigger(view));
-    expect(view.getByRole("menu", { name: "模型与推理等级" })).toBeTruthy();
+    expect(view.getByRole("menu", { name: "模型与思考等级" })).toBeTruthy();
   });
 });

@@ -8,15 +8,15 @@ import { groupByProvider } from "@/core/models/selection";
 import { cn } from "@/lib/utils";
 
 /**
- * 输入框右下角的模型 / 推理等级选择器（样式参考 DeepSeek Harness 的 composer）。
+ * 输入框右下角的模型 / 思考等级选择器（样式参考 DeepSeek Harness 的 composer）。
  *
  * 三层：
  *
  * ```text
  * 触发器（Flash · Off）
- *   └─ 根菜单：模型 / 推理等级 两行（各显示当前值）
+ *   └─ 根菜单：模型 / 思考等级 两行（各显示当前值）
  *        ├─ 模型列表：厂商小字 + 该厂商的模型，当前项打勾
- *        └─ 推理等级列表：Off / Low / Medium / High，当前项打勾
+ *        └─ 思考等级列表：Off / Low / Medium / High，当前项打勾
  * ```
  *
  * 候选全部来自 `/api/models`（网关带着配置里的 key 去调厂商 `/models`）；
@@ -29,10 +29,6 @@ export interface ModelPickerProps {
   effortOptions: ReasoningEffort[];
   effortId: string | null;
   effortLabel: string;
-  /** 模型支持思考时，根菜单显示「思考」开关 */
-  thinkingSupported?: boolean;
-  thinkingEnabled?: boolean;
-  onToggleThinking?: () => void;
   loading?: boolean;
   error?: string | null;
   vendorErrors?: readonly string[];
@@ -52,9 +48,6 @@ export function ModelPicker({
   effortOptions,
   effortId,
   effortLabel: currentEffortLabel,
-  thinkingSupported = false,
-  thinkingEnabled = false,
-  onToggleThinking,
   loading = false,
   error = null,
   vendorErrors = [],
@@ -105,7 +98,7 @@ export function ModelPicker({
         aria-haspopup="menu"
         aria-label={
           current && hasEffort
-            ? "选择模型，当前 " + modelLabel(current) + "，推理等级 " + effortText
+            ? "选择模型，当前 " + modelLabel(current) + "，思考等级 " + effortText
             : "选择模型"
         }
         className={cn(
@@ -137,16 +130,6 @@ export function ModelPicker({
               modelLabelText={current ? modelLabel(current) : "选择模型"}
               onOpenEfforts={() => setView("efforts")}
               onOpenModels={() => setView("models")}
-              thinkingEnabled={thinkingEnabled}
-              thinkingSupported={thinkingSupported}
-              onToggleThinking={
-                onToggleThinking
-                  ? () => {
-                      onToggleThinking();
-                      setOpen(false);
-                    }
-                  : undefined
-              }
             />
           ) : view === "models" ? (
             <ModelList
@@ -178,43 +161,30 @@ export function ModelPicker({
 }
 
 const VIEW_LABELS: Record<PickerView, string> = {
-  root: "模型与推理等级",
+  root: "模型与思考等级",
   models: "模型列表",
-  efforts: "推理等级列表",
+  efforts: "思考等级列表",
 };
 
-/** 根菜单：模型 / 推理等级两行，各显示当前值，点进去再看列表。 */
+/** 根菜单：模型 / 思考等级两行，各显示当前值，点进去再看列表。 */
 function RootMenu({
   modelLabelText,
   effortText,
   hasEffort,
   onOpenModels,
   onOpenEfforts,
-  thinkingSupported,
-  thinkingEnabled,
-  onToggleThinking,
 }: {
   modelLabelText: string;
   effortText: string;
   hasEffort: boolean;
   onOpenModels: () => void;
   onOpenEfforts: () => void;
-  thinkingSupported: boolean;
-  thinkingEnabled: boolean;
-  onToggleThinking?: () => void;
 }) {
   return (
     <div className="flex flex-col gap-1">
       <EntryRow label="模型" onClick={onOpenModels} value={modelLabelText} />
       {hasEffort ? (
-        <EntryRow label="推理等级" onClick={onOpenEfforts} value={effortText} />
-      ) : null}
-      {thinkingSupported && onToggleThinking ? (
-        <EntryRow
-          label="思考"
-          onClick={onToggleThinking}
-          value={thinkingEnabled ? "开" : "关"}
-        />
+        <EntryRow label="思考等级" onClick={onOpenEfforts} value={effortText} />
       ) : null}
     </div>
   );
@@ -296,7 +266,7 @@ function ModelList({
   );
 }
 
-/** 推理等级列表：Off + 模型公布的候选（当前项打勾）。 */
+/** 思考等级列表：Off + 模型公布的候选（当前项打勾）。 */
 function EffortList({
   effortOptions,
   effortId,
@@ -310,7 +280,7 @@ function EffortList({
 }) {
   return (
     <div className="flex flex-col gap-1">
-      <BackRow label="推理等级" onBack={onBack} />
+      <BackRow label="思考等级" onBack={onBack} />
       <OptionRow
         checked={effortId === null}
         label={NO_EFFORT_LABEL}

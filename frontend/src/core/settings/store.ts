@@ -5,23 +5,13 @@
 export interface UserSettings {
   /** `config.yaml` 里 `models[].name` 之一；null = 用服务端默认 */
   modelName: string | null;
-  /** 推理等级 id（`models[].reasoning_efforts[].id`）；null = 不指定，交给 provider */
+  /** 思考等级 id（`models[].reasoning_efforts[].id`）；null = Off（思考关） */
   reasoningEffort: string | null;
-  thinkingEnabled: boolean;
-  /**
-   * 是否由用户显式切换过。旧版本的 `thinkingEnabled: true` 只是默认值，
-   * 不能被当成"用户打开了思考"——否则升级后仍然关不掉。
-   */
-  thinkingTouched: boolean;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
   modelName: null,
   reasoningEffort: null,
-  // Thinking is opt-in: a capable model is not a reason to spend reasoning
-  // tokens on every turn. The composer exposes an explicit toggle.
-  thinkingEnabled: false,
-  thinkingTouched: false,
 };
 
 export const SETTINGS_STORAGE_KEY = "myflow.settings.v1";
@@ -51,12 +41,6 @@ export function parseSettings(raw: string | null): UserSettings {
       modelName: typeof parsed.modelName === "string" ? parsed.modelName : null,
       reasoningEffort:
         typeof parsed.reasoningEffort === "string" ? parsed.reasoningEffort : null,
-      // Old versions wrote the default true into storage as soon as the user
-      // changed a model. Without the touched marker that true is not evidence
-      // of an explicit choice, so treat it as "not configured" (off).
-      thinkingEnabled:
-        parsed.thinkingTouched === true && parsed.thinkingEnabled === true,
-      thinkingTouched: parsed.thinkingTouched === true,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -78,7 +62,6 @@ export function saveSettings(
   storage?: StorageLike | null,
 ): UserSettings {
   const next = { ...loadSettings(storage), ...patch };
-  if (patch.thinkingEnabled !== undefined) next.thinkingTouched = true;
   const resolved = resolveStorage(storage);
   try {
     resolved?.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));

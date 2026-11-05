@@ -11,6 +11,8 @@ import {
   effortOptions,
   resolveEffort,
   resolveModel,
+  thinkingEnabledFor,
+  OFF_EFFORT,
   type ModelSelection,
   type RunContext,
 } from "./selection";
@@ -29,8 +31,6 @@ export interface ModelSelectionController {
   effortId: string | null;
   effortLabel: string;
   selection: ModelSelection;
-  thinkingSupported: boolean;
-  thinkingEnabled: boolean;
   runContext: RunContext;
   loading: boolean;
   error: string | null;
@@ -38,7 +38,6 @@ export interface ModelSelectionController {
   vendorErrors: string[];
   selectModel: (name: string) => void;
   selectEffort: (id: string | null) => void;
-  toggleThinking: () => void;
 }
 
 export function useModelSelection(): ModelSelectionController {
@@ -69,15 +68,13 @@ export function useModelSelection(): ModelSelectionController {
   }, []);
 
   const selectEffort = useCallback((id: string | null) => {
-    setStored(saveSettings({ reasoningEffort: id }));
+    // null 在 UI 上写的是 Off；存 sentinel 才能压过模型配置里的 default。
+    setStored(saveSettings({ reasoningEffort: id ?? OFF_EFFORT }));
   }, []);
 
-  const thinkingSupported = current?.supports_thinking === true;
-  const thinkingEnabled = thinkingSupported && stored.thinkingEnabled;
-  const toggleThinking = useCallback(() => {
-    if (!thinkingSupported) return;
-    setStored(saveSettings({ thinkingEnabled: !stored.thinkingEnabled }));
-  }, [stored.thinkingEnabled, thinkingSupported]);
+  // 等级就是思考开关：Off（null）不发 thinking_enabled，后端走关闭分支；
+  // 选了任何等级才打开思考，等级值同时作为 reasoning_effort 下发。
+  const thinkingEnabled = thinkingEnabledFor(current, effortId);
 
   const selection = useMemo<ModelSelection>(
     () => ({
@@ -96,14 +93,11 @@ export function useModelSelection(): ModelSelectionController {
     effortId,
     effortLabel: effortLabel(current, effortId),
     selection,
-    thinkingSupported,
-    thinkingEnabled,
     runContext: buildRunContext(selection),
     loading: query.isLoading,
     error: query.error instanceof Error ? query.error.message : null,
     vendorErrors: query.data?.vendor_errors ?? [],
     selectModel,
     selectEffort,
-    toggleThinking,
   };
 }

@@ -10,6 +10,9 @@ import type { ModelCatalog, ModelInfo, ReasoningEffort } from "../api/models";
  * 3. null 表示“不指定”：不下发 model_name / reasoning_effort，走服务端默认。
  */
 
+// Sentinel for an explicit Off choice. Plain null means "use the model default".
+export const OFF_EFFORT = "__off__";
+
 export interface ModelSelection {
   modelName: string | null;
   effortId: string | null;
@@ -35,9 +38,21 @@ export function effortOptions(model: ModelInfo | null): ReasoningEffort[] {
   return model?.reasoning_efforts?.length ? model.reasoning_efforts : [];
 }
 
+/**
+ * 思考等级就是思考开关：Off（null）关闭，选了任何等级才打开。
+ * 模型不支持思考时永远关闭，即使本地还留着旧的等级 id。
+ */
+export function thinkingEnabledFor(
+  model: ModelInfo | null,
+  effortId: string | null,
+): boolean {
+  return model?.supports_thinking === true && effortId !== null;
+}
+
 export function resolveEffort(model: ModelInfo | null, storedId: string | null): string | null {
   const options = effortOptions(model);
   if (!options.length) return null;
+  if (storedId === OFF_EFFORT) return null;
   if (storedId && options.some((item) => item.id === storedId)) return storedId;
   return model?.default_reasoning_effort ?? null;
 }
