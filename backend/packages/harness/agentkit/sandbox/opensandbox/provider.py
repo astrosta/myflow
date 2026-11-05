@@ -791,6 +791,9 @@ def _default_client(config: OpenSandboxConfig) -> OsbClient:
         protocol=config.protocol,
         api_key=config.api_key,
         request_timeout=config.request_timeout_seconds,
+        endpoint_host=config.endpoint_host,
+        endpoint_host_map=config.endpoint_host_map,
+        use_server_proxy=config.use_server_proxy,
     )
 
 

@@ -156,6 +156,23 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
 5. Redis 必填：`sandbox.opensandbox.lease.redis_url`，与 E2B 共用同一个 per-thread 锁；
    不可达时启动失败。
 
+**数据面地址（Gateway 在宿主机 vs 在容器）**：直连模式（`use_server_proxy: false`，默认）
+下，服务端返回的 endpoint 由它的 `[server] host` 和 `[docker] host_ip` 决定。典型配置
+`server.host: 0.0.0.0` + `docker.host_ip: host.docker.internal` 会返回
+`host.docker.internal:<宿主端口>/proxy/<端口>`。这个名字只在 OpenSandbox 容器里指向宿主；
+Gateway 在宿主机上解析不到它，表现为请求发不出去（`pre_send`、`status=None`）。配置里按部署位置二选一：
+
+- **Gateway 在宿主机**：服务端返回 `host.docker.internal` 时设
+  `sandbox.opensandbox.endpoint_host: 127.0.0.1`，或精确映射
+  `endpoint_host_map: {host.docker.internal: 127.0.0.1}`。
+- **Gateway 在容器里**：保留服务端返回值（给 Gateway 容器加
+  `--add-host=host.docker.internal:host-gateway`），或把服务端返回的 host 映射成容器实际可达的
+  宿主机/网关 IP。
+
+改写只替换 host，服务端发布的端口和 `/proxy/...` 路径原样保留；`endpoint_host_map` 的 key 可以带端口，
+用来只改 44772/18080 中的一个。控制面（`domain`）不受影响。`use_server_proxy: true` 是 SDK 已弃用的
+代理数据面路径，文件下载曾出现 400，默认不建议打开。
+
 生命周期：
 
 - `release_action` 默认 `keep`：每轮结束只放租约，沙箱留给 TTL（`timeout_seconds`）

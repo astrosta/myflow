@@ -16,6 +16,21 @@ and keeps the pull small.
 _ENV_KEY_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*$"
 
 
+def _host_only(value: str, field: str) -> str:
+    """Validate a rewrite destination: a host or IP, never a URL or host:port."""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    if "://" in text or "/" in text or any(ch.isspace() for ch in text):
+        raise ValueError(f"{field} must be a host without a scheme or path: {value!r}")
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    if text.count(":") == 1:
+        raise ValueError(f"{field} must be a host, not host:port: {value!r}")
+    return text
+
+
 class HostMountConfig(BaseModel):
     """Shared host-mount section: what the Gateway sees vs what the runtime sees."""
 
@@ -143,6 +158,30 @@ class OpenSandboxConfig(BaseModel):
         default="",
         description="Leave empty to read OPEN_SANDBOX_API_KEY; redact in logs and errors.",
     )
+    endpoint_host: str = Field(
+        default="",
+        description=(
+            "Host the Gateway uses for direct sandbox data-plane endpoints. "
+            "Empty keeps the server-authored host; set 127.0.0.1 when the "
+            "Gateway runs on the Docker host and the server returns "
+            "host.docker.internal. Do not include a scheme or path."
+        ),
+    )
+    endpoint_host_map: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Per-host rewrite for server-authored endpoints, e.g. "
+            "{host.docker.internal: 127.0.0.1}. Keys may be host or host:port; "
+            "values are hosts and keep the original port/path."
+        ),
+    )
+    use_server_proxy: bool = Field(
+        default=False,
+        description=(
+            "Route data-plane traffic through the server proxy (deprecated in "
+            "the OpenSandbox SDK). Leave false for direct endpoints."
+        ),
+    )
     image: str = DEFAULT_OPENSANDBOX_IMAGE
     timeout_seconds: int = Field(
         default=1800,
@@ -184,6 +223,27 @@ class OpenSandboxConfig(BaseModel):
         if not text:
             raise ValueError("must not be blank")
         return text
+
+    @field_validator("endpoint_host")
+    @classmethod
+    def _endpoint_host_shape(cls, value: str) -> str:
+        return _host_only(value, "endpoint_host")
+
+    @field_validator("endpoint_host_map")
+    @classmethod
+    def _endpoint_host_map_shape(cls, value: dict[str, str]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for source, target in value.items():
+            key = str(source).strip().lower()
+            if not key or "://" in key or "/" in key or any(ch.isspace() for ch in key):
+                raise ValueError(
+                    f"endpoint_host_map key must be host or host:port: {source!r}"
+                )
+            host = _host_only(str(target), f"endpoint_host_map[{source!r}]")
+            if not host:
+                raise ValueError(f"endpoint_host_map[{source!r}] must not be blank")
+            result[key] = host
+        return result
 
     @field_validator("env")
     @classmethod

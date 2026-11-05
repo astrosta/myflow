@@ -485,3 +485,29 @@ def test_lru_eviction_drops_the_handle_but_keeps_the_sandbox(tmp_path) -> None:
     assert client.killed == []
     assert client.created[0].closed is True
     assert provider.get("osb:u1:t1") is None
+
+def test_default_client_forwards_endpoint_rewrite_settings(monkeypatch, tmp_path) -> None:
+    from agentkit.sandbox.opensandbox import provider as provider_module
+
+    captured: dict = {}
+
+    class FakeSdkClient:
+        def __init__(self, domain, **kwargs) -> None:
+            captured.update(domain=domain, **kwargs)
+
+    monkeypatch.setattr(provider_module, "SdkOsbClient", FakeSdkClient)
+    config = _config(
+        tmp_path,
+        endpoint_host="127.0.0.1",
+        endpoint_host_map={"host.docker.internal": "127.0.0.1"},
+        use_server_proxy=False,
+    )
+    osb = config.sandbox.opensandbox
+    assert osb is not None
+
+    provider_module._default_client(osb)
+
+    assert captured["domain"] == osb.domain
+    assert captured["endpoint_host"] == "127.0.0.1"
+    assert captured["endpoint_host_map"] == {"host.docker.internal": "127.0.0.1"}
+    assert captured["use_server_proxy"] is False

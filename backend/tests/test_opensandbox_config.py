@@ -61,6 +61,9 @@ def test_defaults() -> None:
     assert parsed.domain == "127.0.0.1:8080"
     assert parsed.protocol == "http"
     assert parsed.api_key == ""
+    assert parsed.endpoint_host == ""
+    assert parsed.endpoint_host_map == {}
+    assert parsed.use_server_proxy is False
     assert parsed.image == DEFAULT_OPENSANDBOX_IMAGE == "python:3.12"
     assert parsed.timeout_seconds == 1800
     assert parsed.ready_timeout_seconds == 30
@@ -119,6 +122,45 @@ def test_resource_and_timeout_bounds() -> None:
         _config(max_cached_threads=0)
     with pytest.raises(ValidationError):
         _config(timeout_seconds=0)
+
+
+def test_endpoint_rewrite_for_host_and_container_deployments() -> None:
+    host = _config(endpoint_host="127.0.0.1").sandbox.opensandbox
+    assert host is not None
+    assert host.endpoint_host == "127.0.0.1"
+
+    container = _config(
+        endpoint_host_map={"host.docker.internal": "host.docker.internal"}
+    ).sandbox.opensandbox
+    assert container is not None
+    assert container.endpoint_host_map == {"host.docker.internal": "host.docker.internal"}
+
+
+def test_endpoint_rewrite_rejects_urls_and_host_ports() -> None:
+    for value in ("http://127.0.0.1", "127.0.0.1/proxy", "127.0.0.1:44772"):
+        with pytest.raises(ValidationError):
+            _config(endpoint_host=value)
+
+    with pytest.raises(ValidationError):
+        _config(endpoint_host_map={"http://host.docker.internal": "127.0.0.1"})
+    with pytest.raises(ValidationError):
+        _config(endpoint_host_map={"host.docker.internal": "127.0.0.1:44772"})
+    with pytest.raises(ValidationError):
+        _config(endpoint_host_map={"host.docker.internal": ""})
+
+
+def test_endpoint_host_map_keys_may_include_a_port() -> None:
+    parsed = _config(
+        endpoint_host_map={"host.docker.internal:44772": "127.0.0.1"}
+    ).sandbox.opensandbox
+    assert parsed is not None
+    assert parsed.endpoint_host_map == {"host.docker.internal:44772": "127.0.0.1"}
+
+
+def test_use_server_proxy_is_opt_in() -> None:
+    parsed = _config(use_server_proxy=True).sandbox.opensandbox
+    assert parsed is not None
+    assert parsed.use_server_proxy is True
 
 
 def test_model_builds_directly() -> None:

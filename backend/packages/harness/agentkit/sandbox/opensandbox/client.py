@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import logging
 import posixpath
+from urllib.parse import urlsplit
+
+import httpx
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -301,6 +304,61 @@ class SdkOsbHandle:
             logger.debug("closing the OpenSandbox handle failed", exc_info=True)
 
 
+class _EndpointRewriteTransport(httpx.BaseTransport):
+    """Rewrite the host of data-plane requests before they leave the Gateway.
+
+    OpenSandbox returns a *server-authored* endpoint string, for example
+    host.docker.internal:44772/proxy/44772. That name is meaningful inside a
+    container, not necessarily to a Gateway process on the host. Rewriting at
+    the transport layer keeps the SDK and its adapters unchanged: every
+    command/file/SSE request is routed through the same mapping.
+
+    ``host_map`` keys may be a bare host or host:port. A destination is a bare
+    host; the original port and path are preserved. ``fallback_host`` applies
+    to every request whose host:port is not the control-plane netloc, which
+    covers the common "server returns host.docker.internal" case without
+    listing each endpoint port.
+    """
+
+    def __init__(
+        self,
+        inner: httpx.BaseTransport,
+        *,
+        host_map: Mapping[str, str] | None = None,
+        fallback_host: str = "",
+        control_netloc: str = "",
+    ) -> None:
+        self._inner = inner
+        self._host_map = {
+            _normalize_host_key(key): _normalize_host_value(value)
+            for key, value in (host_map or {}).items()
+        }
+        self._fallback_host = _normalize_host_value(fallback_host)
+        self._control_netloc = _normalize_host_key(control_netloc)
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        target = self._target_for(request.url)
+        if target:
+            request.url = request.url.copy_with(host=target)
+            # httpx wrote the Host header when the request was built; keep it
+            # in sync with the rewritten URL or httpcore sends the old name.
+            request.headers["host"] = request.url.netloc.decode("ascii")
+        return self._inner.handle_request(request)
+
+    def _target_for(self, url: httpx.URL) -> str | None:
+        host = _normalize_host_key(url.host)
+        netloc = _normalize_host_key(url.netloc.decode("ascii"))
+        target = self._host_map.get(netloc) or self._host_map.get(host)
+        if target is not None:
+            return target
+        if self._fallback_host and netloc != self._control_netloc:
+            return self._fallback_host
+        return None
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 class SdkOsbClient:
     """OsbClient over the official opensandbox SDK (sync flavour)."""
 
@@ -311,14 +369,21 @@ class SdkOsbClient:
         protocol: str = "http",
         api_key: str = "",
         request_timeout: float = 30.0,
+        endpoint_host: str = "",
+        endpoint_host_map: Mapping[str, str] | None = None,
+        use_server_proxy: bool = False,
     ) -> None:
         self.domain = domain
         self.protocol = protocol
         self.api_key = api_key
         self.request_timeout = request_timeout
+        self.endpoint_host = endpoint_host.strip()
+        self.endpoint_host_map = dict(endpoint_host_map or {})
+        self.use_server_proxy = bool(use_server_proxy)
         self._sdk: Any = None
         self._config: Any = None
         self._manager: Any = None
+        self._transport: _EndpointRewriteTransport | None = None
 
     # -- server -----------------------------------------------------------
 
@@ -340,6 +405,13 @@ class SdkOsbClient:
         self._close_manager()
         self._config = None
         self._sdk = None
+        transport = self._transport
+        self._transport = None
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:  # noqa: BLE001 - closing twice must not raise
+                logger.debug("closing the endpoint transport failed", exc_info=True)
 
     # -- sandboxes --------------------------------------------------------
 
@@ -432,12 +504,25 @@ class SdkOsbClient:
             from opensandbox.config import ConnectionConfigSync
 
             del sdk
-            self._config = ConnectionConfigSync(
-                domain=self.domain,
-                protocol=self.protocol,
-                api_key=self.api_key or None,
-                request_timeout=timedelta(seconds=float(self.request_timeout)),
+            options = {
+                "domain": self.domain,
+                "protocol": self.protocol,
+                "api_key": self.api_key or None,
+                "request_timeout": timedelta(seconds=float(self.request_timeout)),
+                "use_server_proxy": self.use_server_proxy,
+            }
+            # Build the SDK transport first, then wrap it. Passing a transport
+            # makes the SDK treat it as caller-owned, so close() below is the
+            # one place that releases it.
+            base = ConnectionConfigSync(**options)
+            inner = base.new_owned_transport()
+            self._transport = _EndpointRewriteTransport(
+                inner,
+                host_map=self.endpoint_host_map,
+                fallback_host=self.endpoint_host,
+                control_netloc=_domain_netloc(self.domain),
             )
+            self._config = ConnectionConfigSync(**options, transport=self._transport)
         return self._config
 
     def _manager_client(self) -> Any:
@@ -679,6 +764,39 @@ def _map_file_error(exc: BaseException, path: str, *, action: str) -> Exception:
     if _is_not_found(exc):
         return FileNotFoundError(f"{path}: no such file or directory")
     return OSError(f"Failed to {action} {path}: {exc}")
+
+
+def _normalize_host_key(value: str) -> str:
+    """Case-fold a host or host:port and remove IPv6 brackets."""
+
+    text = str(value or "").strip().lower()
+    if text.startswith("[") and "]" in text:
+        host, rest = text[1:].split("]", 1)
+        text = host + rest
+    return text
+
+
+def _normalize_host_value(value: str) -> str:
+    """A rewrite destination is a host (IPv6 brackets allowed), never a URL."""
+
+    text = str(value or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return text
+
+
+def _domain_netloc(domain: str) -> str:
+    """Extract the control-plane host:port from a config domain."""
+
+    text = str(domain or "").strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("/", 1)[0]
+    try:
+        netloc = urlsplit("//" + text).netloc or ""
+    except ValueError:
+        return ""
+    return _normalize_host_key(netloc)
 
 
 __all__ = [

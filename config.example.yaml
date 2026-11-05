@@ -304,6 +304,17 @@ sandbox:
   #   domain: 127.0.0.1:8080            # 服务端地址，host:port
   #   protocol: http                    # http | https
   #   api_key: ""                       # 留空读 OPEN_SANDBOX_API_KEY
+  #
+  #   # 数据面直连地址。服务端按 [docker] host_ip 生成 endpoint；Gateway 与
+  #   # OpenSandbox 容器的网络位置不同，看到的可达主机名也不同：
+  #   #   Gateway 在宿主机：服务端返回 host.docker.internal:<宿主端口> 时，
+  #   #     endpoint_host: 127.0.0.1（或宿主机在容器网络里的可达 IP）。
+  #   #   Gateway 在容器里：保留服务端返回值（容器需 --add-host=host.docker.internal:host-gateway），
+  #   #     或把服务端返回值映射成实际可达的宿主机/网关地址。
+  #   # endpoint_host 为空 = 使用服务端返回的 host；只改 host，端口和 /proxy/... 路径保留。
+  #   endpoint_host: ""
+  #   endpoint_host_map: {}             # 精确映射，key 可为 host 或 host:port，例如 {host.docker.internal: 127.0.0.1}
+  #   use_server_proxy: false           # SDK 已弃用的代理数据面；保持 false 走直连
   #   image: python:3.12
   #   timeout_seconds: 1800             # sandbox TTL，到期由服务端回收
   #   ready_timeout_seconds: 30
