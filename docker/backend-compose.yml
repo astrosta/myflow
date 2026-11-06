@@ -3,6 +3,10 @@
 #
 # 在仓库根目录：
 #   docker compose -f docker/backend-compose.yml up -d --build
+#
+# SANDBOX_HOST_ROOT 必须在仓库根 .env：与 config.yaml host_mount.host_root、
+# opensandbox allowed_host_paths 相同。Gateway 容器内 local_root=/app，
+# 把宿主机项目的 .myflow / skills 挂进来，沙箱才能看到同一份数据。
 
 name: myflow-backend
 
@@ -23,7 +27,5 @@ services:
     volumes:
       - ../config.yaml:/app/config.yaml:ro
       - ../.env:/app/.env:ro
-      - backend_data:/app/.myflow
-
-volumes:
-  backend_data:
+      - ${SANDBOX_HOST_ROOT:?set SANDBOX_HOST_ROOT in the repo root .env}/.myflow:/app/.myflow
+      - ${SANDBOX_HOST_ROOT:?set SANDBOX_HOST_ROOT in the repo root .env}/skills:/app/skills:ro

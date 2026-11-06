@@ -24,7 +24,8 @@ execd_image = "opensandbox/execd:v1.1.0"
 
 [storage]
 # 1.2 起空列表是全部拒绝，[""] 也会被丢掉。必须盖住 Gateway 提交的 host_root。
-allowed_host_paths = ["/home/liyuanbo/python/myflow"]
+# 占位符由 docker-compose 启动时替换成仓库根 .env 的 SANDBOX_HOST_ROOT。
+allowed_host_paths = ["@SANDBOX_HOST_ROOT@"]
 
 [store]
 type = "sqlite"

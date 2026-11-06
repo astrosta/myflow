@@ -43,6 +43,65 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/docs
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/workspace
 ```
 
+## Docker
+
+仓库根需要已有 `config.yaml` 和 `.env`（含 `MYFLOW_HOST`、`SANDBOX_HOST_ROOT` 等）。先起依赖，再起网关 / 前端。
+
+### 依赖服务（`docker/docker-compose.yml`）
+
+Postgres、Redis、Milvus、OpenViking、Gitea、OpenSandbox、Langfuse。端口与账号对齐 `config.yaml` / `.env`；除 Langfuse（`${MYFLOW_HOST}:3050`）外，其余只绑 `127.0.0.1`。
+
+在仓库根或 `docker/` 下执行均可（后者须带 `--env-file`）：
+
+```bash
+# 仓库根
+docker compose -f docker/docker-compose.yml --env-file .env up -d
+
+# 或进入 docker/
+cd docker && docker compose --env-file ../.env up -d
+```
+
+停止依赖：
+
+```bash
+docker compose -f docker/docker-compose.yml --env-file .env down
+```
+
+### 网关与前端
+
+各自一份镜像与 compose，不包含上述依赖；地址仍写在 `config.yaml` / `.env`。在仓库根执行：
+
+```bash
+# 网关：构建并后台启动，对外 8001
+docker compose -f docker/backend-compose.yml up -d --build
+
+# 前端：构建并后台启动，对外 127.0.0.1:2026
+# /api 默认转到宿主机 8001。网关在别的地址时：
+#   GATEWAY_UPSTREAM=192.168.1.10:8001 docker compose -f docker/frontend-compose.yml up -d --build
+docker compose -f docker/frontend-compose.yml up -d --build
+```
+
+只构建、不启动：
+
+```bash
+docker build -f docker/backend.Dockerfile -t myflow-backend:local .
+docker build -f docker/frontend.Dockerfile -t myflow-frontend:local .
+```
+
+探活：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/docs
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:2026/workspace
+```
+
+停止网关 / 前端：
+
+```bash
+docker compose -f docker/backend-compose.yml down
+docker compose -f docker/frontend-compose.yml down
+```
+
 ## 测试
 
 ```bash

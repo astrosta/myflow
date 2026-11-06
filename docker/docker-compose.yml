@@ -8,6 +8,7 @@
 #   openviking   127.0.0.1:1933         配置只来自挂载的 ov.conf
 #   gitea ssh    127.0.0.1:2222         SKILLS_GIT_REPOSITORY
 #   opensandbox  127.0.0.1:8080         sandbox.opensandbox.domain，无 API key
+#                allowed_host_paths ← 仓库根 .env 的 SANDBOX_HOST_ROOT
 #   langfuse     ${MYFLOW_HOST}:3050    唯一对局域网开放的端口（容器内 3000）
 #                宿主机地址只在仓库根 .env 的 MYFLOW_HOST。其余端口只绑 127.0.0.1
 #                账号与 S3/Redis/ClickHouse 口令在 langfuse/env.example
@@ -208,9 +209,19 @@ services:
       sandbox-image-code-interpreter:
         condition: service_completed_successfully
     environment:
-      SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
+      SANDBOX_CONFIG_PATH: /tmp/opensandbox.toml
+      # 与 config.yaml host_mount.host_root 同源；启动时写入 allowed_host_paths。
+      SANDBOX_HOST_ROOT: ${SANDBOX_HOST_ROOT:?set SANDBOX_HOST_ROOT in the repo root .env}
       # config.yaml 的 api_key 为空；非交互启动必须显式确认。
       OPENSANDBOX_INSECURE_SERVER: "YES"
+    # TOML 不吃环境变量；把 @SANDBOX_HOST_ROOT@ 换成仓库根 .env 的值再启动。
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        set -eu;
+        sed "s|@SANDBOX_HOST_ROOT@|$${SANDBOX_HOST_ROOT}|g"
+        /etc/opensandbox/config.toml.in > /tmp/opensandbox.toml;
+        exec opensandbox-server
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -218,7 +229,7 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./opensandbox.toml:/etc/opensandbox/config.toml:ro
+      - ./opensandbox.toml:/etc/opensandbox/config.toml.in:ro
       - opensandbox_data:/var/lib/opensandbox
     healthcheck:
       test:

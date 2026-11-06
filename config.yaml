@@ -481,8 +481,8 @@ sandbox:
     request_timeout_seconds: 30       # SDK HTTP 超时，不是命令超时
     acquire_timeout_seconds: 120      # 等 Redis per-thread 锁的上限
     resource:
-      cpu: "1"
-      memory: 1Gi
+      cpu: "2"
+      memory: 2Gi
     release_action: keep              # keep（交给 TTL）| destroy（释放即 kill）
     max_cached_threads: 64            # 进程内缓存上限；驱逐只丢 handle
     discover_existing: true           # 进程重启后按 metadata 捡回自己的 sandbox
@@ -499,10 +499,11 @@ sandbox:
 
     # 宿主挂载：与 cube 段同形状。local_root 是 Gateway 视角，
     # host_root 是**服务端宿主**视角（卷源按它翻译）。
-    # 同一台机器上两者都是项目根；opensandbox.toml 的 allowed_host_paths 必须包含 host_root。
+    # host_root 来自仓库根 .env 的 SANDBOX_HOST_ROOT；opensandbox.toml
+    # 的 allowed_host_paths 与 backend-compose 挂载共用同一变量。
     host_mount:
-      local_root: /home/liyuanbo/python/myflow
-      host_root: /home/liyuanbo/python/myflow
+      local_root: /app
+      host_root: $SANDBOX_HOST_ROOT
 
     # 必填：与 cube 共用同一个 per-thread Redis 锁。Redis 不可达时启动失败。
     lease:
@@ -512,9 +513,9 @@ sandbox:
     orphan_policy: report             # report | remove；remove 需配合 orphan_ttl_seconds
     orphan_ttl_seconds: 86400
 
-    endpoint_host: "127.0.0.1"
-    # endpoint_host_map:
-    #   host.docker.internal: 127.0.0.1
+    # endpoint_host: "127.0.0.1"
+    endpoint_host_map:
+      host.docker.internal: $DOCKER0_IP
 
     # SDK 已弃用的代理数据面；保持 false 走直连
     use_server_proxy: false

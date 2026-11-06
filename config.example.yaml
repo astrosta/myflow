@@ -337,10 +337,11 @@ sandbox:
   #     TZ: Asia/Shanghai
   #
   #   # 宿主挂载（E2B provider 没有这一概念）。local_root 是 Gateway 视角，
-  #   # host_root 是**服务端宿主**视角（卷源按它翻译）。
+  #   # host_root 是**服务端宿主**视角（卷源按它翻译）。host_root 写
+  #   # $SANDBOX_HOST_ROOT（仓库根 .env）；opensandbox.toml allowed_host_paths 同值。
   #   host_mount:
   #     local_root: /opt/myflow
-  #     host_root: /opt/myflow
+  #     host_root: $SANDBOX_HOST_ROOT
   #
   #   # 必填：与 E2B 共用同一个 per-thread Redis 锁。Redis 不可达时启动失败。
   #   lease:

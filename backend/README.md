@@ -153,6 +153,8 @@ Gateway 的 checkpointer 由 `database.backend` 决定（memory / sqlite / postg
    我们只用命令与文件 API（`grep` 走 shell）。
 4. 宿主挂载：`host_mount.local_root` 是 Gateway 进程看到的根（要覆盖 `.myflow` 与
    `skills/`），`host_mount.host_root` 是**服务端宿主**看到的同一个根（卷源按它翻译）。
+   生产写 `$SANDBOX_HOST_ROOT`（仓库根 `.env`）；`opensandbox.toml` 的
+   `allowed_host_paths` 与 `backend-compose` 挂载共用该变量。
 5. Redis 必填：`sandbox.opensandbox.lease.redis_url`，与 E2B 共用同一个 per-thread 锁；
    不可达时启动失败。
 
