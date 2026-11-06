@@ -16,6 +16,9 @@ eggs/
 .eggs/
 lib/
 lib64/
+# 上面的 lib/ 是 Python 打包目录；不要误伤前端源码。
+!frontend/src/lib/
+!frontend/src/lib/**
 parts/
 sdist/
 var/
