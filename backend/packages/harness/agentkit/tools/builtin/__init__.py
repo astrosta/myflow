@@ -1,3 +1,3 @@
-from agentkit.tools.builtin.fake_tool import fake_tool
+"""Built-in tools live in sibling modules; import them by path."""
 
-__all__ = ["fake_tool"]
+__all__: list[str] = []

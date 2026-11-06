@@ -2,8 +2,6 @@ import logging
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
-from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode
 
 from agentkit.client import StreamEvent, translate_stream
 
@@ -211,25 +209,6 @@ def test_values_only_human_message_is_synthesized_once() -> None:
     assert len(tuples) == 1
     assert tuples[0].data["type"] == "human"
     assert tuples[0].data["content"] == "hello"
-
-
-def test_fake_tool_progress_is_a_custom_stream_event() -> None:
-    from agentkit.tools.builtin import fake_tool
-
-    graph = StateGraph(MessagesState)
-    graph.add_node("tools", ToolNode([fake_tool]))
-    graph.add_edge(START, "tools")
-    graph.add_edge("tools", END)
-    app = graph.compile()
-    call = AIMessage(
-        content="",
-        tool_calls=[{"name": "fake_tool", "args": {"message": "hi"}, "id": "c1", "type": "tool_call"}],
-    )
-    custom = _of_type(
-        _events(*app.stream({"messages": [call]}, stream_mode=["custom", "values"])),
-        "custom",
-    )
-    assert custom == [StreamEvent(type="custom", data={"type": "fake_tool_progress"})]
 
 
 def test_custom_chunk_without_type_is_discarded(caplog: pytest.LogCaptureFixture) -> None:

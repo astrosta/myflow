@@ -11,16 +11,17 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple \
     MYFLOW_CONFIG_PATH=/app/config.yaml
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock README.md ./
 COPY backend/pyproject.toml backend/pyproject.toml
