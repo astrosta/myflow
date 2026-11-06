@@ -45,6 +45,12 @@ export interface ToolListPage {
   next_cursor: string | null;
 }
 
+export interface ToolStatusChannels {
+  keyword: string;
+  embedding: string;
+  rerank: string;
+}
+
 export interface ToolStatus {
   enabled: boolean;
   reachable: boolean;
@@ -55,6 +61,7 @@ export interface ToolStatus {
   sync: string;
   /** ready | building | unavailable | disabled | error */
   index: string;
+  channels: ToolStatusChannels;
   indexed_tools: number;
   total_tools: number;
   last_sync_at: string | null;
@@ -280,6 +287,11 @@ export async function getToolsStatus(): Promise<ToolStatus> {
     admin_events: raw.admin_events ?? "disabled",
     sync: raw.sync ?? "disabled",
     index: raw.index ?? "disabled",
+    channels: {
+      keyword: raw.channels?.keyword ?? "disabled",
+      embedding: raw.channels?.embedding ?? "disabled",
+      rerank: raw.channels?.rerank ?? "disabled",
+    },
     indexed_tools: raw.indexed_tools ?? 0,
     total_tools: raw.total_tools ?? 0,
     last_sync_at: raw.last_sync_at ?? null,

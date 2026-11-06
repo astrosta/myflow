@@ -41,6 +41,12 @@ class ToolStateRequest(BaseModel):
     enabled: bool
 
 
+class ToolChannelsStatus(BaseModel):
+    keyword: str = "disabled"
+    embedding: str = "disabled"
+    rerank: str = "disabled"
+
+
 class ToolStatusResponse(BaseModel):
     enabled: bool
     reachable: bool = False
@@ -48,6 +54,7 @@ class ToolStatusResponse(BaseModel):
     admin_events: str = "disabled"
     sync: str = "disabled"
     index: str = "disabled"
+    channels: ToolChannelsStatus = Field(default_factory=ToolChannelsStatus)
     indexed_tools: int = 0
     total_tools: int = 0
     last_sync_at: str | None = None
