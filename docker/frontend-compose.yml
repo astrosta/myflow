@@ -1,0 +1,30 @@
+# 只跑 MyFlow 前端。网关、数据库和其它依赖不在这里启动。
+# /api 由容器内 nginx 转到 GATEWAY_UPSTREAM，默认是宿主机的 8001。
+#
+# 在仓库根目录：
+#   docker compose -f docker/frontend-compose.yml up -d --build
+
+name: myflow-frontend
+
+services:
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend.Dockerfile
+    image: myflow-frontend:local
+    container_name: myflow-frontend
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_BASE_URL: /api
+      GATEWAY_UPSTREAM: ${GATEWAY_UPSTREAM:-host.docker.internal:8001}
+      GATEWAY_INTERNAL_URL: http://${GATEWAY_UPSTREAM:-host.docker.internal:8001}
+    env_file:
+      - ../.env
+    ports:
+      - "127.0.0.1:2026:2026"
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+      - ../.env:/app/.env:ro

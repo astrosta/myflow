@@ -1,0 +1,13 @@
+.git
+.venv
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.egg-info
+frontend/node_modules
+frontend/.next
+docs
+agent-transcripts
+*.md
+!README.md

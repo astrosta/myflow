@@ -1,0 +1,29 @@
+# 只跑 MyFlow 网关。Postgres、Redis、Milvus、OpenViking、Git、OpenSandbox
+# 仍由 config.yaml / .env 指向已有地址，不在这里启动。
+#
+# 在仓库根目录：
+#   docker compose -f docker/backend-compose.yml up -d --build
+
+name: myflow-backend
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+    image: myflow-backend:local
+    container_name: myflow-backend
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - ../.env
+    environment:
+      MYFLOW_CONFIG_PATH: /app/config.yaml
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+      - ../.env:/app/.env:ro
+      - backend_data:/app/.myflow
+
+volumes:
+  backend_data:

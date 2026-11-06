@@ -73,7 +73,7 @@ models:
 # cookie 只在 HTTPS / 本机 localhost / 显式 opt-in 时持久化（§2.4）。
 # ------------------------------------------------------------
 auth:
-  enabled: true
+  enabled: false
   jwt_secret: ""                # 生产写 $AUTH_JWT_SECRET
   jwt_ttl_seconds: 86400        # 没有 refresh token：过期就重新登录
   allow_registration: false
@@ -414,7 +414,7 @@ subagent_runtime:
 skills:
   # git：生产目录（Git 是唯一内容源，PostgreSQL 拥有身份/版本/扫描/active 指针）。
   # filesystem：仅测试/本地调试时扫描本地 skills/ 目录，不提供用户创作。
-  source: git                 # startup-only：切换来源要重启
+  source: filesystem                 # startup-only：切换来源要重启
 
   # 内置技能：随项目发布、只读，不进 Git/数据库；每个子目录一个技能（builtin/<name>/SKILL.md）。
   # enabled 与 path 都是 startup-only：只读挂载在 Sandbox provider 构造时固定，改完要重启进程。
@@ -458,7 +458,7 @@ skills:
 
   # 每个用户的技能使用次数：Redis ZSET 只做 top-K 排序，PostgreSQL load_count 持久化。
   usage:
-    enabled: true
+    enabled: false
     redis_url: $REDIS_URL           # 留空则退回 PostgreSQL load_count
     key_prefix: myflow:skills:usage # key = <prefix>:<user_id>
     prompt_top_k: 10                # 私有技能超过 N 个时，system prompt 只列前 N 个
@@ -477,7 +477,7 @@ skills:
   # 检索并一次加载最相关的几个技能正文。默认只有本地 BM25，不需要任何外部服务；
   # embedding / rerank 要填地址才开（代码里没有默认端点）。
   search:
-    enabled: true                 # 关掉后这个工具不注册，技能只能靠索引 + read_file
+    enabled: false                 # 关掉后这个工具不注册，技能只能靠索引 + read_file
     candidate_k: 20               # 召回交给精排的候选数
     top_k: 3                      # 最终加载几个技能的正文
     rrf_k: 60                     # 两路召回融合的 RRF k
@@ -486,7 +486,7 @@ skills:
     max_context_chars: 12000      # 一次加载的正文总预算
 
     keyword:                      # 本地稀疏通道
-      enabled: true
+      enabled: false
       bm25_k1: 1.2
       bm25_b: 0.75
       keyword_weight: 2.0         # domain_keywords 的分数倍数
