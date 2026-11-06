@@ -30,6 +30,7 @@ from agentkit.agents.middlewares.summarization_middleware import create_summariz
 from agentkit.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
 from agentkit.agents.middlewares.title_middleware import TitleMiddleware
 from agentkit.agents.middlewares.tool_error_handling_middleware import ToolErrorHandlingMiddleware
+from agentkit.agents.middlewares.tool_search_middleware import ToolSearchMiddleware
 from agentkit.agents.middlewares.uploads_middleware import UploadsMiddleware
 from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.secret_context import new_owner_token
@@ -129,6 +130,7 @@ def build_middlewares(
     user_id: str | None = None,
     available_skills: frozenset[str] | None = None,
     subagent_policy: SubagentPolicy | None = None,
+    defer_contextforge_tools: bool = False,
 ) -> list[AgentMiddleware]:
     """lead 的完整链：基础层 + 上下文投影 + 技能（Activation → Policy → DurableContext）。"""
     resolved = app_config or get_app_config()
@@ -153,6 +155,8 @@ def build_middlewares(
             snapshot=snapshot,
         )
     )
+    if defer_contextforge_tools:
+        chain.append(ToolSearchMiddleware(deferred=True))
     chain.append(
         DurableContextMiddleware(
             skills_container_path=resolved.skills.container_path,

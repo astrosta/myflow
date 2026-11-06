@@ -122,8 +122,12 @@ def merge_artifacts(existing, new):
     return _merge_unique(existing, new)
 
 
+PROMOTED_MAX_ENTRIES = 64
+
+
 def merge_promoted(existing, new):
-    return _merge_unique(existing, new)
+    merged = _merge_unique(existing, new)
+    return merged[-PROMOTED_MAX_ENTRIES:]
 
 
 def merge_todos(existing, new):
