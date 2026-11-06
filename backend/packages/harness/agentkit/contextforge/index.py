@@ -14,7 +14,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agentkit.config.contextforge_config import TOOLS_COLLECTION, ToolVectorStoreConfig
+from agentkit.config.contextforge_config import (
+    TOOLS_COLLECTION,
+    ToolKeywordConfig,
+    ToolVectorStoreConfig,
+)
 from agentkit.contextforge.models import ContextForgeTool
 
 logger = logging.getLogger(__name__)
@@ -88,13 +92,19 @@ class ToolVectorIndex:
         *,
         dimensions: int,
         client: Any | None = None,
+        keyword: ToolKeywordConfig | None = None,
+        rrf_k: int = 60,
     ) -> None:
         if int(dimensions) <= 0:
             raise ValueError("dimensions must be positive")
+        if int(rrf_k) <= 0:
+            raise ValueError("rrf_k must be positive")
         self._config = config
         self._dimensions = int(dimensions)
         self._collection = TOOLS_COLLECTION
         self._client = client
+        self._keyword = keyword or ToolKeywordConfig()
+        self._rrf_k = int(rrf_k)
 
     def _client_instance(self) -> Any:
         if self._client is not None:
@@ -292,9 +302,7 @@ class ToolVectorIndex:
                 DataType.VARCHAR,
                 max_length=65535,
                 enable_analyzer=True,
-                analyzer_params={"type": self._config.keyword_analyzer}
-                if hasattr(self._config, "keyword_analyzer")
-                else {"type": "chinese"},
+                analyzer_params={"type": self._keyword.analyzer},
             )
             schema.add_field("tags", DataType.VARCHAR, max_length=2048)
             schema.add_field("parameters", DataType.VARCHAR, max_length=2048)
@@ -323,12 +331,8 @@ class ToolVectorIndex:
                 index_type="SPARSE_INVERTED_INDEX",
                 metric_type="BM25",
                 params={
-                    "bm25_k1": self._config.bm25_k1
-                    if hasattr(self._config, "bm25_k1")
-                    else 1.2,
-                    "bm25_b": self._config.bm25_b
-                    if hasattr(self._config, "bm25_b")
-                    else 0.75,
+                    "bm25_k1": self._keyword.bm25_k1,
+                    "bm25_b": self._keyword.bm25_b,
                 },
             )
             client.create_collection(
@@ -452,7 +456,7 @@ class ToolVectorIndex:
                 client.hybrid_search(
                     collection_name=self._collection,
                     reqs=requests,
-                    ranker=RRFRanker(60),
+                    ranker=RRFRanker(self._rrf_k),
                     limit=limit,
                     output_fields=OUTPUT_FIELDS,
                     consistency_level=self._config.consistency_level,

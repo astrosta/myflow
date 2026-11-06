@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from agentkit.authz import ADMIN_ROLE
-from agentkit.config import get_app_config
-from agentkit.contextforge.admin import ContextForgeAdminClient
 from agentkit.contextforge.models import ContextForgeTool, ToolWrite
 
 from backend.app.gateway.deps import require_scope
 from backend.app.gateway.errors import ContextForgeDisabled, InvalidToolHeaderAPI
+from backend.app.gateway.tools_deps import get_contextforge_admin_client
 from agentkit.contextforge.runtime import get_contextforge_runtime
 from agentkit.tools.search.service import get_tool_search_runtime
 
@@ -34,25 +33,10 @@ router = APIRouter(prefix="/tools", tags=["tools"])
 AdminCaller = Annotated[RunCaller, Depends(require_scope(ADMIN_ROLE))]
 
 
-def get_contextforge_admin_client(request: Request) -> ContextForgeAdminClient:
+async def _request_refresh(request: Request, reason: str = "admin") -> None:
     runtime = get_contextforge_runtime()
     if runtime is not None:
-        return runtime.admin
-    config = get_app_config().contextforge
-    if not config.enabled:
-        raise ContextForgeDisabled("ContextForge tool management is disabled")
-    client = getattr(request.app.state, "contextforge_admin_client", None)
-    if client is not None:
-        return client
-    client = ContextForgeAdminClient(config)
-    request.app.state.contextforge_admin_client = client
-    return client
-
-
-def _request_refresh(request: Request, reason: str = "admin") -> None:
-    runtime = get_contextforge_runtime()
-    if runtime is not None:
-        runtime.request_refresh_async(reason)
+        await runtime.request_refresh(reason)
 
 
 def _summary(tool: ContextForgeTool) -> ToolSummary:
@@ -217,7 +201,7 @@ async def create_tool(
     tool = await client.create_tool(body)
     if body.enabled is False and tool.enabled:
         tool = await client.set_tool_state(tool.id, False)
-    _request_refresh(request)
+    await _request_refresh(request)
     return _detail(tool)
 
 
@@ -239,7 +223,7 @@ async def update_tool(
     tool = await client.update_tool(tool_id, updated)
     if tool.enabled is not body.enabled:
         tool = await client.set_tool_state(tool_id, body.enabled)
-    _request_refresh(request)
+    await _request_refresh(request)
     return _detail(tool)
 
 
@@ -252,7 +236,7 @@ async def delete_tool(
     del caller
     client = get_contextforge_admin_client(request)
     await client.delete_tool(tool_id)
-    _request_refresh(request)
+    await _request_refresh(request)
     return Response(status_code=204)
 
 
@@ -266,5 +250,5 @@ async def set_tool_state(
     del caller
     client = get_contextforge_admin_client(request)
     tool = await client.set_tool_state(tool_id, body.enabled)
-    _request_refresh(request)
+    await _request_refresh(request)
     return _detail(tool)

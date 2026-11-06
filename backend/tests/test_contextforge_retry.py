@@ -71,3 +71,43 @@ async def test_timeout_is_not_retried() -> None:
         await middleware.awrap_tool_call(_request(), handler)
     assert calls["n"] == 1
     assert runtime.refreshes == 0
+
+def test_sync_path_refreshes_once_and_retries() -> None:
+    runtime = FakeRuntime()
+    middleware = ToolRefreshRetryMiddleware(
+        enabled=True,
+        refresh_timeout_seconds=1,
+        runtime_provider=lambda: runtime,
+    )
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("tool not found")
+        return ToolMessage(content="ok", tool_call_id="call-1")
+
+    result = middleware.wrap_tool_call(_request(), handler)
+    assert isinstance(result, ToolMessage)
+    assert calls["n"] == 2
+    assert runtime.refreshes == 1
+    assert runtime.retries == [("github_search", "success")]
+
+
+def test_sync_path_timeout_is_not_retried() -> None:
+    runtime = FakeRuntime()
+    middleware = ToolRefreshRetryMiddleware(
+        enabled=True,
+        refresh_timeout_seconds=1,
+        runtime_provider=lambda: runtime,
+    )
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        raise RuntimeError("request timeout")
+
+    with pytest.raises(RuntimeError):
+        middleware.wrap_tool_call(_request(), handler)
+    assert calls["n"] == 1
+    assert runtime.refreshes == 0

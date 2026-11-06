@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -49,6 +50,23 @@ class ToolRefreshRetryMiddleware(AgentMiddleware[AgentState]):
             return False
         return True
 
+    def _refresh_sync(self) -> bool:
+        """Best-effort refresh for the synchronous tool path.
+
+        LangGraph invokes synchronous tools off the async path; if a loop is
+        already running here we cannot block it, so the original error is kept
+        and the async wrapper remains the retry path.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(self._refresh())
+            except Exception:  # noqa: BLE001 - caller keeps the original error
+                return False
+            return True
+        return False
+
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
@@ -90,7 +108,36 @@ class ToolRefreshRetryMiddleware(AgentMiddleware[AgentState]):
         return retry_result
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Callable) -> ToolMessage | Any:
-        return handler(request)
+        if not self._enabled:
+            return handler(request)
+        try:
+            result = handler(request)
+        except (GraphBubbleUp, KeyboardInterrupt):
+            raise
+        except Exception as exc:  # noqa: BLE001 - classify before deciding
+            if classify_tool_error(exc) is RefreshableToolError.NONE:
+                raise
+            if not self._refresh_sync():
+                raise
+            retry_result = handler(request)
+            self._record_retry(request, retry_result)
+            return retry_result
+
+        if classify_tool_error(result) is RefreshableToolError.NONE:
+            return result
+        if not self._refresh_sync():
+            return result
+        retry_result = handler(request)
+        self._record_retry(request, retry_result)
+        return retry_result
+
+    def _record_retry(self, request: ToolCallRequest, result: Any) -> None:
+        runtime = self._runtime_provider()
+        if runtime is not None:
+            runtime.record_retry(
+                tool_name=self._name(request),
+                result="success" if not _is_error(result) else "failed",
+            )
 
 
 def _is_error(value: Any) -> bool:

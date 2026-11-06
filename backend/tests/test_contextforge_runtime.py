@@ -84,3 +84,25 @@ async def test_index_failure_keeps_the_snapshot(monkeypatch) -> None:
     assert runtime.status()["indexed_tools"] == 1
     assert runtime.status()["sync"] == "error"
     await runtime.stop()
+
+@pytest.mark.asyncio
+async def test_admin_refresh_can_be_configured_synchronous(monkeypatch) -> None:
+    invalidate_contextforge_cache("test-sync")
+    config = ContextForgeConfig(
+        enabled=True,
+        base_url="http://cf",
+        admin_token="",
+        tool_loading="eager",
+        search={"enabled": False},
+        sync={"admin_refresh_async": False},
+    )
+    runtime = ContextForgeRuntime(config, admin=FakeAdmin(), index=None)
+
+    async def fake_load(config):
+        return [_tool()]
+
+    monkeypatch.setattr("agentkit.contextforge.runtime.load_contextforge_tools", fake_load)
+    await runtime.request_refresh("admin")
+    assert runtime.status()["sync"] == "ready"
+    assert runtime.status()["indexed_tools"] == 1
+    await runtime.stop()

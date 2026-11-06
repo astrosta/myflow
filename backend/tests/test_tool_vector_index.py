@@ -12,6 +12,7 @@ class FakeClient:
     def __init__(self, *, dim: int = 8) -> None:
         self.dim = dim
         self.reqs = []
+        self.ranker = None
 
     def has_collection(self, name):
         assert name == "myflow_tools_catalog"
@@ -30,6 +31,7 @@ class FakeClient:
 
     def hybrid_search(self, **kwargs):
         self.reqs = kwargs["reqs"]
+        self.ranker = kwargs["ranker"]
         return [[{"entity": {"tool_name": "github_search", "description": "d", "tags": "[]", "parameters": "[]"}, "distance": 0.8}]]
 
     def search(self, **kwargs):
@@ -84,3 +86,19 @@ async def test_sync_embeds_only_changed_documents(monkeypatch) -> None:
 
 async def _async_none():
     return None
+
+@pytest.mark.asyncio
+async def test_hybrid_search_uses_configured_rrf_k() -> None:
+    from agentkit.config.contextforge_config import ToolKeywordConfig
+
+    client = FakeClient()
+    index = ToolVectorIndex(
+        ToolVectorStoreConfig(uri="http://milvus"),
+        dimensions=8,
+        client=client,
+        keyword=ToolKeywordConfig(analyzer="english", bm25_k1=2.0, bm25_b=0.5),
+        rrf_k=37,
+    )
+    await index.hybrid_search(vector=[0.0] * 8, query="github code", limit=5)
+    assert client.ranker._k == 37
+    assert index._keyword.analyzer == "english"

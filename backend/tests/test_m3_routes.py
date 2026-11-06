@@ -47,6 +47,16 @@ EXPECTED_ROUTES = {
     ("POST", "/api/threads/{thread_id}/uploads"),
     ("DELETE", "/api/threads/{thread_id}/uploads/{filename}"),
     ("GET", "/api/threads/{thread_id}/artifacts/{path:path}"),
+    # ContextForge 工具管理：浏览器只打同源 /api/tools，token 留在网关。
+    ("GET", "/api/tools"),
+    ("POST", "/api/tools"),
+    ("GET", "/api/tools/status"),
+    ("POST", "/api/tools/reindex"),
+    ("GET", "/api/tools/search"),
+    ("GET", "/api/tools/{tool_id}"),
+    ("PUT", "/api/tools/{tool_id}"),
+    ("DELETE", "/api/tools/{tool_id}"),
+    ("POST", "/api/tools/{tool_id}/state"),
     # M7 §2.4：MCP 配置与技能目录（没有 PUT /config：整份替换属"创建"，M7 不注册）
     ("GET", "/api/mcp/config"),
     ("PATCH", "/api/mcp/config"),
@@ -157,7 +167,7 @@ def _routes(application: FastAPI) -> set[tuple[str, str]]:
 
 
 def test_route_inventory_matches_m3() -> None:
-    actual = _routes(create_app())
+    actual = _routes(create_app(use_openviking_memory=True))
     assert actual == EXPECTED_ROUTES, (
         f"added: {sorted(actual - EXPECTED_ROUTES)}\n"
         f"removed: {sorted(EXPECTED_ROUTES - actual)}"

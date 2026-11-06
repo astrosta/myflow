@@ -104,6 +104,15 @@ class ContextForgeRuntime:
         del event
         self.request_refresh_async("admin_events")
 
+    async def request_refresh(self, reason: str) -> None:
+        """Refresh after an admin write, honoring the configured sync mode."""
+        if not self.config.enabled:
+            return
+        if self.config.sync.admin_refresh_async:
+            self.request_refresh_async(reason)
+            return
+        await self.refresh_and_sync(reason=reason)
+
     def request_refresh_async(self, reason: str) -> None:
         if not self.config.enabled:
             return
@@ -276,6 +285,8 @@ def build_contextforge_runtime(config: ContextForgeConfig) -> ContextForgeRuntim
             index = ToolVectorIndex(
                 config.search.vector_store,
                 dimensions=config.search.embedding.dimensions,
+                keyword=config.search.keyword,
+                rrf_k=config.search.rrf_k,
             )
             reranker = build_reranker(config.search.rerank)
     except Exception:  # noqa: BLE001 - retrieval degrades to local BM25
