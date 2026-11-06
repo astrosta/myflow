@@ -85,7 +85,7 @@ function renderPage() {
 }
 
 describe("记忆管理页", () => {
-  it("左侧只显示当前类型的记忆列表，右侧只显示选中记忆的标题和正文", async () => {
+  it("左侧只显示当前类型的记忆目录，右侧只显示选中记忆的标题和正文", async () => {
     makeTypes();
     mockedList.mockResolvedValue({
       type: "preferences",
@@ -114,9 +114,12 @@ describe("记忆管理页", () => {
       directory.compareDocumentPosition(content) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
 
-    // 左侧只列当前类型的记忆，没有 overview 目录卡片
-    expect(await within(directory).findByText("偏好简洁，先给结论。")).toBeTruthy();
-    expect(within(directory).getByText("回复尽量简短。")).toBeTruthy();
+    // 左侧只列当前类型的记忆目录，不展示 abstract 或 overview 卡片
+    expect(await within(directory).findByText("style")).toBeTruthy();
+    expect(within(directory).getByText("reply")).toBeTruthy();
+    for (const abstract of ["偏好简洁，先给结论。", "回复尽量简短。"]) {
+      expect(within(directory).queryByText(abstract)).toBeNull();
+    }
     expect(within(directory).queryByText("Preferences Overview")).toBeNull();
     expect(screen.queryByRole("heading", { name: "目录" })).toBeNull();
 

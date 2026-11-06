@@ -861,7 +861,7 @@ OpenViking 的 L0/L1 是**目录级 sidecar**（`.abstract.md` / `.overview.md`�
 | 界面元素 | OpenViking 调用 | 说明 |
 |---|---|---|
 | 类型筛选 | `GET /api/memory/items/types` | 七类 + 中文名，来自代码常量 |
-| 列表项摘要 | `find(query="", target_uri=[<type>], filter=…, level=[2])` | 用记录里的 `abstract`；网关截断到 500 字符并标记 `abstract_truncated`；空摘要显示“暂无摘要” |
+| 列表项目录 | `find(query="", target_uri=[<type>], filter=…, level=[2])` | 用记录里的 `uri` 与 `updated_at`；`abstract` 仍由网关截断到 500 字符返回，但左侧目录不再展示 |
 | 详情目录（TOC） | `overview(<folder>)` | `.overview.md` 正文；网关解析成 `toc`（标题 + 相对链接）返回，前端渲染成可点击目录 |
 | 点击目录项 | `read(<file_uri>)` | L2 正文；同时返回 `sha256`，编辑时做乐观并发 |
 | 编辑保存 | `write(<file_uri>, content, mode="replace", options={"edit_source": "manual"})` | 带 `expected_sha256`；OpenViking 异步重建父目录 sidecar |
@@ -869,7 +869,8 @@ OpenViking 的 L0/L1 是**目录级 sidecar**（`.abstract.md` / `.overview.md`�
 
 为什么列表用 `find` 而不是 `ls`：`ls` 的 abstract 只挂在目录节点上，具体记忆文件没有摘要；
 `find` 支持“无 query + filter”的过滤型查询（OpenViking `_find_by_filter`），能直接返回 level=2 记录的
-`uri` 与 `abstract`，正好是列表要的两列。`find` 没有 offset，因此服务端一次取 `limit + 1` 条、
+`uri`（以及 abstract/更新时间）。当前左侧目录只用 URI 派生文件名，不再展示 abstract；该字段仍保留在
+API 响应中供其他视图或兼容使用。`find` 没有 offset，因此服务端一次取 `limit + 1` 条、
 按 URI 排序后返回 `has_more`；`limit` 上限 200，前端不翻页，只提示“仅显示前 N 条”。
 
 #### 4.9.3 服务端保护（安全边界）
@@ -896,8 +897,8 @@ OpenViking 的 L0/L1 是**目录级 sidecar**（`.abstract.md` / `.overview.md`�
 #### 4.9.5 界面约定
 
 - 文案统一写“记忆”，不写“条目/知识卡片”；类型名只出现在筛选栏；
-- 列表项展示：类型标签、由文件名派生的可读标题、摘要、最后更新时间（OpenViking 返回时）；
-- 详情页左侧是 `.overview.md` 渲染的目录，右侧是选中记忆的正文/编辑器；
+- 左侧目录项只展示由文件名派生的可读标题和最后更新时间；不再展示 `abstract`（短记忆的摘要常与正文相同），正文只在右侧展示；
+- 页面左侧是当前类型的记忆目录，右侧是选中记忆的正文/编辑器；
 - 编辑只对**当前选中的记忆文件**开放；目录里的 sidecar 不出现在 TOC 里；
 - 删除必须二次确认，并在成功后刷新列表；
 - 页面不提供全文搜索框（本设计不做记忆搜索页），只按类型筛选。
@@ -2132,7 +2133,7 @@ Onboarding 卡片：
 交互：
 
 - 打开页面先请求 `GET /api/memory/items/types`，再按默认类型（`preferences`）请求列表；
-- 切换类型 = 重新请求列表并清空右侧详情；列表项只展示摘要（`abstract`），从不展示全文；
+- 切换类型 = 重新请求列表并清空右侧详情；左侧只展示记忆目录（文件名 + 更新时间），不展示 `abstract` 或正文；
 - 点击列表项 → `GET /api/memory/items/detail?uri=<file>`：用返回的 `toc` 渲染目录；`toc` 里的 `link`
   条目可点击，`heading` 条目只做分组标题；
 - 点击目录项 → `GET /api/memory/items/content?uri=<toc.uri>`，右侧用 Markdown 渲染正文；

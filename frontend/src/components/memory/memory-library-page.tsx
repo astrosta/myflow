@@ -210,14 +210,6 @@ export function MemoryLibraryPage() {
                           <span className="block truncate text-sm font-medium">
                             {displayName(item.name)}
                           </span>
-                          <span
-                            className={
-                              "mt-1 block line-clamp-2 text-xs leading-relaxed " +
-                              (selected ? "text-neutral-300" : "text-neutral-600")
-                            }
-                          >
-                            {item.abstract || "暂无摘要"}
-                          </span>
                           {item.updated_at ? (
                             <span
                               className="mt-1 block text-[11px] text-neutral-400"
