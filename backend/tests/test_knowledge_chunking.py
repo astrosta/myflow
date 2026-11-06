@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agentkit.knowledge.chunking import chunk_document
 from agentkit.knowledge.config import KnowledgeBaseConfig
 from agentkit.knowledge.text import clean_text
@@ -156,6 +158,63 @@ def test_legal_chunks_split_by_article_and_keep_the_chapter_path() -> None:
     # 不跨条合并
     assert "第二条" not in chunks[0].content
     assert "第一条" not in chunks[1].content
+
+
+@pytest.mark.parametrize(
+    "decorate",
+    [
+        lambda text: f"**{text}**",
+        lambda text: f"> {text}",
+        lambda text: f"- {text}",
+        lambda text: "\u200b" + text,
+    ],
+)
+def test_legal_section_keeps_article_number_but_not_decorated_body(decorate) -> None:
+    first = (
+        "第一条 为保证我分行个金客户经理制的顺利实施，有效调动个金客户经理的积极性，"
+        "促进个金业务快速、稳定地发展，根据总行要求，特制定本办法。"
+    )
+    second = "第二条 本办法适用于我分行个金客户经理。"
+    text = (
+        "# 个金客户经理管理考核暂行办法\n\n"
+        "## 第一章 总 则\n\n"
+        f"{decorate(first)}\n\n"
+        f"{decorate(second)}\n"
+    )
+
+    chunks = chunk_document(
+        text, KnowledgeBaseType.LEGAL, _config(), token_counter=CharCounter()
+    )
+
+    sections = {chunk.section for chunk in chunks}
+    # MinerU 把条文加粗/加引用时，section 仍只能保留条号，不能带整段正文。
+    assert sections == {
+        "个金客户经理管理考核暂行办法 / 第一章 总 则 / 第一条",
+        "个金客户经理管理考核暂行办法 / 第一章 总 则 / 第二条",
+    }
+    assert any("第一条 为保证" in chunk.content for chunk in chunks)
+
+
+def test_legal_article_heading_is_collapsed_to_its_number() -> None:
+    first = "第一条 为保证业务顺利实施，制定本办法。"
+    text = (
+        "# 某某办法\n\n"
+        "## 第一章 总 则\n\n"
+        f"### {first}\n\n"
+        f"{first}\n\n"
+        "第二条 本办法适用于某某机构。\n"
+    )
+
+    chunks = chunk_document(
+        text, KnowledgeBaseType.LEGAL, _config(), token_counter=CharCounter()
+    )
+
+    assert all("为保证" not in chunk.section for chunk in chunks)
+    assert not any("/ 第一条 / 第二条" in chunk.section for chunk in chunks)
+    assert {chunk.section for chunk in chunks} == {
+        "某某办法 / 第一章 总 则 / 第一条",
+        "某某办法 / 第一章 总 则 / 第二条",
+    }
 
 
 def test_legal_without_clause_markers_falls_back_to_plain_packing() -> None:

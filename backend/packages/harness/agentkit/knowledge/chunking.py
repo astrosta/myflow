@@ -16,12 +16,27 @@ from agentkit.knowledge.types import KnowledgeBaseType
 _FENCE = chr(96) * 3
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _QUESTION_RE = re.compile(r"^\s*(?:#{1,6}\s*)?(?:Q|问(?:题)?)\s*[:：]\s*(.*)$", re.IGNORECASE)
+
+# MinerU often emits legal articles as bold/blockquote/list lines, e.g.
+# "**第一条 为保证……**". Strip those Markdown decorations before looking for
+# the article number; the number alone is the useful section label.
+_LINE_DECORATION = r"(?:[>#*_~`+\-•·\u200b-\u200f\u2060\ufeff]+\s*)*"
+_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
+_LEADING_DECORATION_RE = re.compile(r"^(?:[>#*_~`+\-•·]+\s*)+")
+_TRAILING_DECORATION_RE = re.compile(r"[\s*_~`]+$")
 _API_RE = re.compile(
     r"(?:\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/\S+|\b(?:class|def|function)\s+\w+)",
     re.IGNORECASE,
 )
+_ARTICLE = (
+    r"第\s*[一二三四五六七八九十百千万0-9]+\s*条"
+    r"(?:之\s*[一二三四五六七八九十]+\s*)?"
+    r"|Article\s+\d+(?:[.-]\d+)*"
+    r"|§\s*\d+(?:\.\d+)*"
+    r"|条款\s*\d+"
+)
 _CLAUSE_RE = re.compile(
-    r"(?m)^(?=\s*(?:第[一二三四五六七八九十百千万0-9]+条|Article\s+\d+|§\s*\d+|条款\s*\d+))",
+    rf"(?m)^(?=\s*{_LINE_DECORATION}(?:{_ARTICLE}))",
     re.IGNORECASE,
 )
 # 法律法规比安全合规多两类边界：
@@ -29,13 +44,11 @@ _CLAUSE_RE = re.compile(
 #   2. 编/章/节/分编 的标题行（法律文件的层级比普通文档深）。
 # 条本身的识别沿用 _CLAUSE_RE 的写法，另外补 “第X条之一” 这种修订后的条号。
 _LEGAL_CLAUSE_RE = re.compile(
-    r"(?m)^(?=\s*(?:第[一二三四五六七八九十百千万0-9]+条(?:之[一二三四五六七八九十]+)?"
-    r"|Article\s+\d+(?:[.-]\d+)*|§\s*\d+(?:\.\d+)*|条款\s*\d+|\d+\.\d+(?:\.\d+)*\s))",
+    rf"(?m)^(?=\s*{_LINE_DECORATION}(?:{_ARTICLE}|\d+\.\d+(?:\.\d+)*\s))",
     re.IGNORECASE,
 )
 _LEGAL_ARTICLE_RE = re.compile(
-    r"^\s*(第[一二三四五六七八九十百千万0-9]+条(?:之[一二三四五六七八九十]+)?|Article\s+\d+(?:[.-]\d+)*"
-    r"|§\s*\d+(?:\.\d+)*|条款\s*\d+|[0-9]+(?:\.[0-9]+)+)",
+    rf"^\s*{_LINE_DECORATION}({_ARTICLE}|\d+\.\d+(?:\.\d+)*)",
     re.IGNORECASE,
 )
 _STEP_RE = re.compile(
@@ -89,6 +102,58 @@ def _sections(markdown: str) -> list[_Section]:
         body.append(line)
     flush()
     return sections
+
+
+def _clean_clause_line(value: str) -> str:
+    """Strip invisible characters and Markdown decoration around a clause line."""
+
+    text = _INVISIBLE_RE.sub("", value or "").strip()
+    text = _LEADING_DECORATION_RE.sub("", text)
+    return _TRAILING_DECORATION_RE.sub("", text).strip()
+
+
+def _clause_label(part: str) -> str:
+    """Return only the clause number (第一条 / Article 20 / ...), never the body."""
+
+    first_line = (part or "").strip().split("\n", 1)[0]
+    match = _LEGAL_ARTICLE_RE.match(_clean_clause_line(first_line))
+    if match is None:
+        return ""
+    label = match.group(1)[:40]
+    if label.startswith("第"):
+        label = re.sub(r"\s+", "", label)
+    return label
+
+
+def _section_title(section: _Section) -> str:
+    """Keep the heading path, but collapse a heading that is really article text."""
+
+    parts: list[str] = []
+    for raw in section.path:
+        value = _clean_clause_line(raw)
+        label = _clause_label(value)
+        if label and len(value) > len(label) + 24:
+            value = label
+        if value:
+            parts.append(value)
+    return " / ".join(parts)
+
+
+def _title_with_clause(title: str, label: str) -> str:
+    if not label:
+        return title
+    if not title:
+        return label
+    parts = title.split(" / ")
+    last = parts[-1]
+    if _clause_label(last):
+        if last == label:
+            return title
+        # A heading that was actually article text (e.g. MinerU turned
+        # "第一条 …" into a heading) must not accumulate sibling articles.
+        parts[-1] = label
+        return " / ".join(parts)
+    return f"{title} / {label}"
 
 
 def _count(counter: TokenCounter, text: str) -> int:
@@ -315,15 +380,14 @@ def _security_clauses(sections: list[_Section], fallback: str) -> list[tuple[str
     source = sections or [_Section((), fallback)]
     output: list[tuple[str, str]] = []
     for section in source:
+        title = _section_title(section)
         parts = [part for part in _CLAUSE_RE.split(section.body) if part.strip()]
         if len(parts) <= 1:
             if section.body.strip():
-                output.append((section.title, section.body.strip()))
+                output.append((title, section.body.strip()))
             continue
         for part in parts:
-            first_line = part.strip().split("\n", 1)[0]
-            clause = first_line.split("：", 1)[0][:80]
-            output.append((f"{section.title} / {clause}".strip(" /"), part.strip()))
+            output.append((_title_with_clause(title, _clause_label(part)), part.strip()))
     return output
 
 
@@ -338,17 +402,17 @@ def _legal_clauses(sections: list[_Section], fallback: str) -> list[tuple[str, s
     source = sections or [_Section((), fallback)]
     output: list[tuple[str, str]] = []
     for section in source:
+        title = _section_title(section)
         parts = [part for part in _LEGAL_CLAUSE_RE.split(section.body) if part.strip()]
         if len(parts) <= 1:
             if section.body.strip():
-                output.append((section.title, section.body.strip()))
+                output.append((title, section.body.strip()))
             continue
         for part in parts:
             body = part.strip()
-            match = _LEGAL_ARTICLE_RE.match(body)
-            # 条款号进 section：引用时“《XX法》第三条”比“第三章某段”有用得多
-            label = match.group(1)[:40] if match else body.split("\n", 1)[0][:80]
-            output.append((f"{section.title} / {label}".strip(" /"), body))
+            # 条款号进 section：引用时“《XX法》第三条”比“第三章某段”有用得多。
+            # 拿不到条号时宁可不加标签，也不能把整段正文塞进 section。
+            output.append((_title_with_clause(title, _clause_label(body)), body))
     return output
 
 
