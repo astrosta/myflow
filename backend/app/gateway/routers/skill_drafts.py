@@ -13,13 +13,10 @@ There is no submit/withdraw/admin-review route in v2.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
-import json
 import logging
-import queue
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import Awaitable
 from typing import Annotated, Any, TypeVar
 
 from fastapi import APIRouter, Depends, File, Path, Query, Request, Response, UploadFile
@@ -41,6 +38,7 @@ from agentkit.skills.domain import (
 from agentkit.skills.package import MAX_SKILL_PATH_CHARS, validate_skill_path
 from agentkit.skills.parser import SkillParseError, parse_skill_text
 from backend.app.gateway import skills_catalog
+from backend.app.gateway.skill_scan_stream import scan_event_stream
 from backend.app.gateway.deps import get_skill_author_service, require_scope
 from backend.app.gateway.errors import (
     SkillConflictAPI,
@@ -588,79 +586,19 @@ def _wants_scan_stream(request: Request) -> bool:
     return "text/event-stream" in accept
 
 
-def _sse(event: str, payload: dict[str, Any]) -> str:
-    body = json.dumps(payload, ensure_ascii=False)
-    return f"event: {event}\ndata: {body}\n\n"
-
-
 def _scan_stream(
     service: AuthorService,
     caller: RunCaller,
     skill_id: str,
 ) -> StreamingResponse:
     """Push the scan phases, then the same JSON body the non-stream route returns."""
-
-    async def events() -> AsyncIterator[str]:
-        # queue.Queue, not asyncio.Queue: the scanner thread must enqueue a
-        # status before scan() returns, or the sentinel can overtake it.
-        statuses: queue.Queue[str | None] = queue.Queue()
-
-        def on_status(message: str) -> None:
-            text = str(message).strip()[:200]
-            if text:
-                statuses.put(text)
-
-        async def work() -> SecurityScanRecord:
-            try:
-                return await service.scan_security(
-                    owner_user_id=caller.user_id or "",
-                    skill_id=skill_id,
-                    on_status=on_status,
-                )
-            finally:
-                statuses.put(None)
-
-        logger.info("Security scan started for skill %s", skill_id)
-        task = asyncio.create_task(work())
-        try:
-            while True:
-                message = await asyncio.to_thread(statuses.get)
-                if message is None:
-                    break
-                yield _sse("status", {"message": message})
-            scan = await task
-        except SkillScanUnavailable as exc:
-            yield _sse(
-                "error",
-                {"status": 503, "code": "skill_scanner_unavailable", "detail": str(exc)},
-            )
-            return
-        except SkillConflict as exc:
-            yield _sse("error", {"status": 409, "code": "skill_conflict", "detail": str(exc)})
-            return
-        except InvalidSkillPackage as exc:
-            yield _sse(
-                "error",
-                {"status": 422, "code": "invalid_skill_package", "detail": str(exc)},
-            )
-            return
-        except Exception:
-            logger.exception("Security scan failed for skill %s", skill_id)
-            yield _sse(
-                "error",
-                {"status": 500, "code": "internal_error", "detail": "Internal server error"},
-            )
-            return
-        logger.info(
-            "Security scan finished for skill %s status=%s duration_ms=%s",
-            skill_id,
-            scan.status,
-            scan.duration_ms,
-        )
-        yield _sse("result", _scan_response(scan).model_dump(mode="json"))
-
     return StreamingResponse(
-        events(),
+        scan_event_stream(
+            service,
+            owner_user_id=caller.user_id or "",
+            skill_id=skill_id,
+            render_result=lambda scan: _scan_response(scan).model_dump(mode="json"),
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
