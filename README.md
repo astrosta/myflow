@@ -45,7 +45,9 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/workspace
 
 ## Docker
 
-仓库根需要已有 `config.yaml` 和 `.env`（含 `SANDBOX_HOST_ROOT`、`LANGFUSE_BASE_URL` 等）。先起依赖，再起网关 / 前端。
+仓库根需要已有 `config.yaml` 和 `.env`（含 `SANDBOX_HOST_ROOT`、`DATABASE_URL`、`LANGFUSE_BASE_URL` 等）。先起依赖，再起网关 / 前端。
+
+网关容器加入依赖项目的 Docker 网络 `myflow-deps_default`，用服务名访问 Postgres / Redis 等（见 `.env.example`）。依赖对外仍多绑 `127.0.0.1`，容器互访不走宿主机端口。
 
 ### 依赖服务（`docker/docker-compose.yml`）
 
@@ -69,10 +71,10 @@ docker compose -f docker/docker-compose.yml --env-file .env down
 
 ### 网关与前端
 
-各自一份镜像与 compose，不包含上述依赖；地址仍写在 `config.yaml` / `.env`。在仓库根执行：
+各自一份镜像与 compose，不包含上述依赖；连接串写在 `.env`（服务名）。在仓库根执行：
 
 ```bash
-# 网关：构建并后台启动，对外 8001
+# 网关：加入 myflow-deps_default，对外 8001（须已 up 依赖）
 docker compose -f docker/backend-compose.yml --env-file .env up -d --build
 
 # 前端：构建并后台启动，对外 0.0.0.0:2026

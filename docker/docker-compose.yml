@@ -13,6 +13,9 @@
 #                账号与 S3/Redis/ClickHouse 口令在 langfuse/env.example
 #                其余依赖端口只绑 127.0.0.1
 #
+# 项目名 myflow-deps → 默认网络 myflow-deps_default。
+# backend-compose 以 external 加入该网络，用服务名互访（不必改上面的 127.0.0.1 发布）。
+#
 # Langfuse 复用上面的 postgres（库 postgres）和 redis（用户 myflow）。
 # 它的 MinIO、ClickHouse 独立，不碰 Milvus 那套 etcd/minio。
 # 不在这里：DeepSeek、SiliconFlow embedding/rerank、MinerU 云端。

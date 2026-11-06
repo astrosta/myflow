@@ -87,7 +87,7 @@ auth:
 database:
   backend: sqlite          # memory | sqlite | postgres   startup-only
   sqlite_dir: .myflow
-  url: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/myflow   # 仅 postgres
+  url: $DATABASE_URL   # 仅 postgres；容器内服务名见 .env.example
   checkpoint_channel_mode: full   # full | delta，启动时冻结
   postgres_schema: ""             # 非空时钉 search_path
 
@@ -301,7 +301,7 @@ sandbox:
   #
   # 镜像只要自带 bash 就够（grep 走 shell），不要求 AIO 那种大镜像。
   # opensandbox:
-  #   domain: 127.0.0.1:8080            # 服务端地址，host:port
+  #   domain: $OPEN_SANDBOX_DOMAIN      # 服务端 host:port；容器内 opensandbox:8080
   #   protocol: http                    # http | https
   #   api_key: ""                       # 留空读 OPEN_SANDBOX_API_KEY
   #

@@ -1,12 +1,17 @@
 # 只跑 MyFlow 网关。Postgres、Redis、Milvus、OpenViking、Git、OpenSandbox
-# 仍由 config.yaml / .env 指向已有地址，不在这里启动。
+# 由 docker/docker-compose.yml（项目名 myflow-deps）提供；本文件加入同一
+# Docker 网络，用服务名互访（postgres / redis / milvus …）。
 #
-# 在仓库根目录：
-#   docker compose -f docker/backend-compose.yml up -d --build
+# 先起依赖，再起网关（在仓库根）：
+#   docker compose -f docker/docker-compose.yml --env-file .env up -d
+#   docker compose -f docker/backend-compose.yml --env-file .env up -d --build
 #
 # SANDBOX_HOST_ROOT 必须在仓库根 .env：与 config.yaml host_mount.host_root、
 # opensandbox allowed_host_paths 相同。Gateway 容器内 local_root=/app，
 # 把宿主机项目的 .myflow / skills 挂进来，沙箱才能看到同一份数据。
+#
+# LANGFUSE_BASE_URL 在 .env 里给浏览器 / NEXTAUTH（公网）；容器内上报
+# 观测数据改走下方 environment 覆盖到 langfuse-web:3000。
 
 name: myflow-backend
 
@@ -24,8 +29,17 @@ services:
       - ../.env
     environment:
       MYFLOW_CONFIG_PATH: /app/config.yaml
+      # 覆盖 .env 里给浏览器用的公网 LANGFUSE_BASE_URL，只影响本容器。
+      LANGFUSE_BASE_URL: http://langfuse-web:3000
     volumes:
       - ../config.yaml:/app/config.yaml:ro
       - ../.env:/app/.env:ro
       - ${SANDBOX_HOST_ROOT:?set SANDBOX_HOST_ROOT in the repo root .env}/.myflow:/app/.myflow
       - ${SANDBOX_HOST_ROOT:?set SANDBOX_HOST_ROOT in the repo root .env}/skills:/app/skills:ro
+    networks:
+      - deps
+
+networks:
+  deps:
+    external: true
+    name: myflow-deps_default
