@@ -12,10 +12,13 @@ from agentkit.contextforge.models import ContextForgeTool, ToolWrite
 
 from backend.app.gateway.deps import require_scope
 from backend.app.gateway.errors import ContextForgeDisabled, InvalidToolHeaderAPI
+from agentkit.contextforge.runtime import get_contextforge_runtime
+
 from backend.app.gateway.models.tools import (
     ToolDetail,
     ToolListResponse,
     ToolStateRequest,
+    ToolStatusResponse,
     ToolSummary,
 )
 from backend.app.gateway.tools_wire import (
@@ -31,6 +34,9 @@ AdminCaller = Annotated[RunCaller, Depends(require_scope(ADMIN_ROLE))]
 
 
 def get_contextforge_admin_client(request: Request) -> ContextForgeAdminClient:
+    runtime = get_contextforge_runtime()
+    if runtime is not None:
+        return runtime.admin
     config = get_app_config().contextforge
     if not config.enabled:
         raise ContextForgeDisabled("ContextForge tool management is disabled")
@@ -40,6 +46,12 @@ def get_contextforge_admin_client(request: Request) -> ContextForgeAdminClient:
     client = ContextForgeAdminClient(config)
     request.app.state.contextforge_admin_client = client
     return client
+
+
+def _request_refresh(request: Request, reason: str = "admin") -> None:
+    runtime = get_contextforge_runtime()
+    if runtime is not None:
+        runtime.request_refresh_async(reason)
 
 
 def _summary(tool: ContextForgeTool) -> ToolSummary:
@@ -115,6 +127,38 @@ async def list_tools(
     )
 
 
+@router.get("/status", response_model=ToolStatusResponse)
+async def tool_status(
+    request: Request,
+    caller: AdminCaller,
+) -> ToolStatusResponse:
+    del caller, request
+    runtime = get_contextforge_runtime()
+    if runtime is None:
+        return ToolStatusResponse(enabled=False)
+    return ToolStatusResponse.model_validate(runtime.status())
+
+
+@router.post("/reindex")
+async def reindex_tools(
+    request: Request,
+    caller: AdminCaller,
+) -> dict[str, object]:
+    del caller
+    runtime = get_contextforge_runtime()
+    if runtime is None:
+        raise ContextForgeDisabled("ContextForge tool management is disabled")
+    stats = await runtime.reindex()
+    return {
+        "scanned": stats.scanned,
+        "changed": stats.changed,
+        "upserted": stats.upserted,
+        "deleted": stats.deleted,
+        "duration_ms": stats.duration_ms,
+        "error": stats.error,
+    }
+
+
 @router.get("/{tool_id}", response_model=ToolDetail)
 async def get_tool(
     tool_id: str,
@@ -137,6 +181,7 @@ async def create_tool(
     tool = await client.create_tool(body)
     if body.enabled is False and tool.enabled:
         tool = await client.set_tool_state(tool.id, False)
+    _request_refresh(request)
     return _detail(tool)
 
 
@@ -158,6 +203,7 @@ async def update_tool(
     tool = await client.update_tool(tool_id, updated)
     if tool.enabled is not body.enabled:
         tool = await client.set_tool_state(tool_id, body.enabled)
+    _request_refresh(request)
     return _detail(tool)
 
 
@@ -170,6 +216,7 @@ async def delete_tool(
     del caller
     client = get_contextforge_admin_client(request)
     await client.delete_tool(tool_id)
+    _request_refresh(request)
     return Response(status_code=204)
 
 
@@ -182,4 +229,6 @@ async def set_tool_state(
 ) -> ToolDetail:
     del caller
     client = get_contextforge_admin_client(request)
-    return _detail(await client.set_tool_state(tool_id, body.enabled))
+    tool = await client.set_tool_state(tool_id, body.enabled)
+    _request_refresh(request)
+    return _detail(tool)

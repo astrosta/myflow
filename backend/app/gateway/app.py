@@ -23,6 +23,11 @@ from agentkit.agents.memory.openviking.runtime import (
     build_profile_services,
     configure_openviking_memory,
 )
+from agentkit.contextforge.runtime import (
+    ContextForgeRuntime,
+    build_contextforge_runtime,
+    reset_contextforge_runtime,
+)
 from agentkit.config import AppConfig, get_app_config
 from agentkit.observability import configure_observability, shutdown_observability
 from agentkit.knowledge.service import configure_knowledge_service, reset_knowledge_service
@@ -97,6 +102,29 @@ async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRunti
             logger.exception("Stopping the failed skill runtime also failed")
         raise
     return runtime
+
+
+async def start_contextforge_runtime(app: FastAPI, app_config: AppConfig) -> None:
+    """Build the process tool runtime. Failing to reach ContextForge is non-fatal."""
+    runtime: ContextForgeRuntime | None = None
+    try:
+        runtime = build_contextforge_runtime(app_config.contextforge)
+        app.state.contextforge = runtime
+        if runtime is not None:
+            await runtime.start()
+    except Exception:  # noqa: BLE001 - tools degrade, the gateway still starts
+        logger.warning("ContextForge runtime failed to start", exc_info=True)
+        app.state.contextforge = runtime
+
+
+async def stop_contextforge_runtime(app: FastAPI) -> None:
+    runtime = getattr(app.state, "contextforge", None)
+    try:
+        if runtime is not None:
+            await runtime.stop()
+    finally:
+        app.state.contextforge = None
+        reset_contextforge_runtime()
 
 
 def start_profile_services(
@@ -313,6 +341,7 @@ async def lifespan(app: FastAPI):
                     app.state.knowledge_service = await configure_knowledge_service(
                         app_config.knowledge_base
                     )
+                    await start_contextforge_runtime(app, app_config)
                     # M8 §10.1：进程级子代理容量控制器在这里冻结一次（subagent_runtime.* 是
                     # startup-only）。建在启动时而不是"第一个启用子代理的 run"，是为了让 YAML
                     # 里那个值在启动那一刻就定下来——热重载不能悄悄抬高已经宣告出去的容量。
@@ -345,6 +374,7 @@ async def lifespan(app: FastAPI):
                         # release 自己的沙箱。reset 顺带 shutdown（本地杀进程，远程 kill 容器），
                         # 那是网络 IO——必须在线程池里跑，不能占着正在收尾的事件循环。
                         await shutdown_sandbox_provider()
+                        await stop_contextforge_runtime(app)
                         await stop_skill_runtime(app)
                         cancel_detached()
                         await services.bridge.aclose()  # 最后放掉桥的连接池（Redis 后端才有事可做）
