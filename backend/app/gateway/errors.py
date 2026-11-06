@@ -10,6 +10,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from agentkit.authz import ADMIN_ROLE
+from agentkit.contextforge.models import (
+    ContextForgeAuthError,
+    ContextForgeConflict,
+    ContextForgeError,
+    ContextForgeNotFound,
+    ContextForgeProtocolError,
+    ContextForgeTimeout,
+    ContextForgeUnavailable,
+    ContextForgeValidationError,
+)
 from agentkit.knowledge.errors import KnowledgeError
 from agentkit.persistence.base import InvalidCursor
 from agentkit.persistence.json_compat import InvalidMetadataFilterError
@@ -141,6 +151,20 @@ class McpServerNotFound(Exception):
     code: ClassVar[str] = "mcp_server_not_found"
 
 
+class ContextForgeDisabled(Exception):
+    """The contextforge block is disabled in this deployment."""
+
+    status_code: ClassVar[int] = 503
+    code: ClassVar[str] = "contextforge_disabled"
+
+
+class InvalidToolHeaderAPI(Exception):
+    """A masked header had no stored value to restore."""
+
+    status_code: ClassVar[int] = 422
+    code: ClassVar[str] = "invalid_tool_header"
+
+
 class SkillNotFound(Exception):
     """技能不存在、已被删除，或不属于当前用户。"""
 
@@ -269,6 +293,16 @@ def install_error_handlers(app: FastAPI) -> None:
         CompactionDisabled,
         SummarizationFailed,
         McpServerNotFound,
+        ContextForgeDisabled,
+        InvalidToolHeaderAPI,
+        ContextForgeError,
+        ContextForgeAuthError,
+        ContextForgeConflict,
+        ContextForgeNotFound,
+        ContextForgeProtocolError,
+        ContextForgeTimeout,
+        ContextForgeUnavailable,
+        ContextForgeValidationError,
         SkillNotFound,
         SkillRuntimeUnavailable,
         SkillScannerUnavailable,

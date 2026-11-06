@@ -56,6 +56,7 @@ from backend.app.gateway.routers import (
     skills,
     thread_runs,
     threads,
+    tools,
     uploads,
 )
 from backend.app.gateway.skills_catalog import (
@@ -422,6 +423,7 @@ def create_app(*, use_openviking_memory: bool | None = None) -> FastAPI:
     application.include_router(skill_drafts.router, prefix="/api")
     application.include_router(skills.router, prefix="/api")
     # Human-facing knowledge base; same /api prefix as the rest of the browser API.
+    application.include_router(tools.router, prefix="/api")
     application.include_router(knowledge.router, prefix="/api")
     # The profile/onboarding surface is DB-backed identity data and is always
     # available. The OpenViking switch additionally mounts admin status/flush;
