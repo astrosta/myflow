@@ -54,8 +54,6 @@ def test_profile_schema_lists_every_supported_field(client) -> None:
         "identity.preferred_name",
         "identity.locale",
         "communication.language",
-        "accessibility.needs",
-        "boundaries",
         "communication.tone",
         "communication.verbosity",
         "communication.format",
@@ -65,21 +63,20 @@ def test_profile_schema_lists_every_supported_field(client) -> None:
         "work.expertise",
     ]
     by_path = {field["path"]: field for field in body["fields"]}
-    assert by_path["communication.tone"]["kind"] == "choice"
-    assert [option["value"] for option in by_path["communication.tone"]["options"]] == [
-        "neutral",
-        "friendly",
-        "formal",
-        "direct",
-    ]
-    assert by_path["communication.format"]["kind"] == "multi_choice"
+    assert by_path["communication.tone"]["kind"] == "text"
+    assert by_path["communication.format"]["kind"] == "string_list"
     assert by_path["work.tools"]["kind"] == "string_list"
     assert by_path["work.tools"]["max_items"] == 20
     assert by_path["identity.preferred_name"]["explicit_only"] is True
     assert by_path["communication.tone"]["explicit_only"] is False
-    assert by_path["identity.locale"]["placeholder"] == "例如：zh-CN"
+    assert by_path["identity.locale"]["placeholder"] == "例如：杭州、zh-CN"
+    assert "中性" in by_path["communication.tone"]["description"]
+    assert "要点" in by_path["communication.format"]["description"]
+    assert all("options" not in field for field in body["fields"])
     assert "identity.pronouns" not in by_path
     assert "identity.timezone" not in by_path
+    assert "accessibility.needs" not in by_path
+    assert "boundaries" not in by_path
     assert all(field["label"] and field["group_label"] for field in body["fields"])
 
 
@@ -95,10 +92,10 @@ def test_get_patch_conflict_and_clear(client) -> None:
 
     patched = client.patch(
         "/api/memory/profile",
-        json={"fields": {"communication.tone": "direct"}, "etag": etag},
+        json={"fields": {"communication.tone": "温和"}, "etag": etag},
     )
     assert patched.status_code == 200
-    assert patched.json()["fields"]["communication.tone"]["value"] == "direct"
+    assert patched.json()["fields"]["communication.tone"]["value"] == "温和"
 
     stale = client.patch(
         "/api/memory/profile",

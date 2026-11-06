@@ -19,6 +19,8 @@
 7. 运行时不再生成 `data/personalization/`；真实用户画像不得写入仓库文件。
 8. `identity.md` 的头像目前为「未设置」；需要时把图片放到 `config/personalization/assets/avatar.png`，并把该行改为相对路径——头像只是给人看的元数据，不会注入提示词。
 
+画像字段全部自由填写；字段描述里的“常见”写法只是提示，不是枚举约束。
+
 字段映射（`profile.md` → 内部 `field_path`）：
 
 | 文件 key | field_path |
@@ -33,7 +35,5 @@
 | `domains` | `work.domains` |
 | `tools` | `work.tools` |
 | `expertise` | `work.expertise` |
-| `accessibility_needs` | `accessibility.needs` |
-| `boundaries` | `boundaries` |
 
 设计文档：`docs/plans/2026-10-29-openviking-memory-module-design.md`。

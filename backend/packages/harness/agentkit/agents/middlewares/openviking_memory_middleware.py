@@ -42,7 +42,9 @@ class OpenVikingMemoryMiddleware(AgentMiddleware):
         self._facade = facade
         self._user_id = user_id
         self._agent_name = agent_name
-        self._detector = detector or CommitSignalDetector()
+        # after_agent must stay deterministic: the model-backed fallback belongs
+        # to the worker, after the turn is appended, so it cannot delay the reply.
+        self._detector = detector or CommitSignalDetector(use_default_model=False)
         self._seen: set[tuple[str, int | str]] = set()
         self._ended_turns: set[str] = set()
         self._registered_turns: set[str] = set()

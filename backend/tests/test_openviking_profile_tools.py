@@ -54,7 +54,7 @@ async def test_tool_writes_validated_fields_for_the_current_user() -> None:
                 "fields": {
                     "identity.preferred_name": " 小林 ",
                     "communication.language": "auto",
-                    "communication.format": ["steps", "bullets"],
+                    "communication.format": ["要点", "表格"],
                 },
                 "runtime": runtime({"user_id": "u1"}),
             }
@@ -75,7 +75,7 @@ async def test_tool_writes_validated_fields_for_the_current_user() -> None:
             {
                 "identity.preferred_name": "小林",
                 "communication.language": "auto",
-                "communication.format": ["steps", "bullets"],
+                "communication.format": ["要点", "表格"],
             },
         )
     ]
@@ -121,21 +121,47 @@ async def test_unknown_field_returns_the_allowed_list_and_writes_nothing() -> No
 
 
 @pytest.mark.asyncio
-async def test_invalid_value_lists_the_allowed_options_and_writes_nothing() -> None:
+async def test_formerly_enumerated_fields_accept_free_text() -> None:
     updater = FakeUpdater()
     tool = make_update_user_profile_tool(updater)
 
     result = json.loads(
         await tool.ainvoke(
             {
-                "fields": {"communication.tone": "sarcastic"},
+                "fields": {
+                    "communication.tone": "温和",
+                    "communication.verbosity": "两三句话",
+                    "work.expertise": "资深",
+                },
+                "runtime": runtime({"user_id": "u1"}),
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert updater.calls[0][1] == {
+        "communication.tone": "温和",
+        "communication.verbosity": "两三句话",
+        "work.expertise": "资深",
+    }
+
+
+@pytest.mark.asyncio
+async def test_invalid_value_reports_the_reason_and_writes_nothing() -> None:
+    updater = FakeUpdater()
+    tool = make_update_user_profile_tool(updater)
+
+    result = json.loads(
+        await tool.ainvoke(
+            {
+                "fields": {"communication.tone": "x" * 300},
                 "runtime": runtime({"user_id": "u1"}),
             }
         )
     )
 
     assert result["error"] == "invalid_value"
-    assert "neutral" in result["message"]
+    assert "256" in result["message"]
     assert updater.calls == []
 
 
@@ -147,7 +173,7 @@ async def test_a_secret_shaped_value_is_rejected_before_storage() -> None:
     result = json.loads(
         await tool.ainvoke(
             {
-                "fields": {"boundaries": ["sk-" + "a" * 24]},
+                "fields": {"work.tools": ["sk-" + "a" * 24]},
                 "runtime": runtime({"user_id": "u1"}),
             }
         )
@@ -192,12 +218,16 @@ def test_description_names_every_field_and_the_call_gates() -> None:
         "以后叫我",
         "以后都用英文",
         "这次用英文",
-        "一次性的任务指令",
+        "一次性指令",
         "推测",
         "密钥",
         "null",
+        "自由填写",
+        "常见",
     ):
         assert phrase in description
+    assert "无障碍" not in description
+    assert "边界" not in description
     # 工具名与注册名一致，避免 description 与实际入口漂移，
     # 并声明这是需要先确认再写入的工具。
     tool = make_update_user_profile_tool(FakeUpdater())

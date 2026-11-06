@@ -255,7 +255,7 @@ models:
 | 面 | 说明 |
 |---|---|
 | `GET /api/memory/profile` | 当前画像字段；行不存在返回空字段（不 404） |
-| `GET /api/memory/profile/schema` | 全部受支持字段的元数据，前端按它渲染全字段表单 |
+| `GET /api/memory/profile/schema` | 全部受支持字段的元数据，前端按它渲染全字段表单；字段均为自由填写，描述中的“常见”只是提示 |
 | `PATCH /api/memory/profile` | 部分更新；`null` 删除字段；列表整列表替换；etag CAS |
 | `GET/POST /api/memory/profile/suggestions` `/onboarding` | 画像建议与引导 |
 | `GET /api/memory/items/types` | 记忆管理支持的七类记忆与中文名（不含 skills） |

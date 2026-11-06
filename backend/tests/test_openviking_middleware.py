@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+import agentkit.agents.memory.openviking.signals as signal_module
 from agentkit.agents.memory.openviking.contracts import SessionRef, TurnDecision
 from agentkit.agents.middlewares.openviking_memory_middleware import OpenVikingMemoryMiddleware
 from agentkit.runtime.run_finalizers import (
@@ -254,6 +255,29 @@ async def test_detector_adds_a_correction_to_the_turn_end() -> None:
     assert len(facade.turn_ends) == 1
     assert facade.turn_ends[0][1].signals == ("USER_CORRECTION",)
     assert facade.commits == []
+
+
+@pytest.mark.asyncio
+async def test_after_agent_stays_rule_only_and_never_builds_a_model(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def factory():
+        calls.append(1)
+        return object()
+
+    monkeypatch.setattr(signal_module, "_create_default_model", factory)
+    facade = FakeFacade()
+    middleware = OpenVikingMemoryMiddleware(facade)
+    context = {"user_id": "u1", "thread_id": "t1", "run_id": "r1"}
+    human = HumanMessage(content="我住杭州", id="h1")
+    ai = AIMessage(content="好的", id="a1")
+
+    await middleware.abefore_agent({"messages": [human]}, runtime(context))
+    await middleware.aafter_agent({"messages": [human, ai]}, runtime(context))
+
+    assert calls == []
+    assert len(facade.turn_ends) == 1
+    assert facade.turn_ends[0][1].signals == ()
 
 
 @pytest.mark.asyncio

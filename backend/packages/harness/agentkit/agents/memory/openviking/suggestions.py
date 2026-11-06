@@ -320,26 +320,26 @@ def _candidates(hit: MemoryHit) -> list[tuple[str, Any, str, float]]:
         found.append(("communication.language", "en-US", "偏好英文表达", 0.78))
 
     if any(token in text for token in ("简洁", "简短", "简明", "少废话")):
-        found.append(("communication.verbosity", "concise", "偏好简洁输出", 0.74))
+        found.append(("communication.verbosity", "简洁", "偏好简洁输出", 0.74))
     elif any(token in text for token in ("详细", "展开说明", "逐步解释")):
-        found.append(("communication.verbosity", "detailed", "偏好详细输出", 0.72))
+        found.append(("communication.verbosity", "详细", "偏好详细输出", 0.72))
 
     if any(token in text for token in ("直接", "直白", "别绕")):
-        found.append(("communication.tone", "direct", "偏好直接语气", 0.70))
+        found.append(("communication.tone", "直接", "偏好直接语气", 0.70))
     elif "正式" in text:
-        found.append(("communication.tone", "formal", "偏好正式语气", 0.66))
+        found.append(("communication.tone", "正式", "偏好正式语气", 0.66))
     elif "友好" in text or "亲切" in text:
-        found.append(("communication.tone", "friendly", "偏好友好语气", 0.62))
+        found.append(("communication.tone", "友好", "偏好友好语气", 0.62))
 
     formats = []
     if "表格" in text:
-        formats.append("tables")
+        formats.append("表格")
     if "列表" in text or "要点" in text:
-        formats.append("bullets")
+        formats.append("要点")
     if "步骤" in text or "分步" in text:
-        formats.append("steps")
+        formats.append("分步")
     if "代码优先" in text:
-        formats.append("code_first")
+        formats.append("代码优先")
     if formats:
         found.append(("communication.format", formats, "偏好输出格式", 0.68))
 
@@ -366,19 +366,6 @@ def _candidates(hit: MemoryHit) -> list[tuple[str, Any, str, float]]:
     ]
     if domains:
         found.append(("work.domains", domains, "用户提到工作领域", 0.60))
-
-    if any(token in text for token in ("不要", "别", "禁止", "避免")):
-        boundary = _match(r"((?:不要|别|禁止|避免)[^。！？!?]{1,120})", text)
-        if boundary:
-            found.append(("boundaries", [boundary], "用户说明边界", 0.60))
-
-    accessibility = [
-        item
-        for item in ("色盲", "色弱", "阅读障碍", "大字", "屏幕阅读器")
-        if item in text
-    ]
-    if accessibility:
-        found.append(("accessibility.needs", accessibility, "用户说明无障碍需求", 0.60))
 
     return found
 

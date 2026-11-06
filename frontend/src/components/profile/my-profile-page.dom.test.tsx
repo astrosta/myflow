@@ -57,7 +57,6 @@ function spec(
     kind,
     description: label + "说明",
     placeholder: "",
-    options: [],
     max_length: 256,
     max_items: 10,
     item_max_length: 64,
@@ -75,46 +74,27 @@ function makeSchema(): { schema_version: number; fields: ProfileFieldSpec[] } {
         max_length: 64,
         explicit_only: true,
       }),
-      spec("identity.locale", "地区", "identity", "身份", "locale", {
-        placeholder: "例如：zh-CN",
+      spec("identity.locale", "地区", "identity", "身份", "text", {
+        description: "用户所在的地区或语言区域，可自由填写",
+        placeholder: "例如：杭州、zh-CN",
       }),
-      spec("communication.language", "语言偏好", "communication", "沟通", "language", {
-        options: [
-          { value: "zh-CN", label: "简体中文" },
-          { value: "zh-TW", label: "繁体中文" },
-          { value: "en", label: "English" },
-          { value: "auto", label: "跟随当前对话语言" },
-        ],
+      spec("communication.language", "语言偏好", "communication", "沟通", "text", {
+        description:
+          "助手回复使用的语言，可自由填写；常见：zh-CN（简体中文）、en（English）、auto（跟随当前对话）",
+        placeholder: "例如：zh-CN 或 auto",
       }),
-      spec("accessibility.needs", "无障碍需求", "accessibility", "无障碍", "string_list", {
-        explicit_only: true,
-        item_max_length: 120,
+      spec("communication.tone", "偏好语气", "communication", "沟通", "text", {
+        description: "助手回复的语气，可自由填写；常见：中性、友好、正式、直接",
+        placeholder: "例如：中性、直接",
       }),
-      spec("boundaries", "边界", "boundaries", "边界", "string_list", {
-        explicit_only: true,
-        item_max_length: 200,
+      spec("communication.verbosity", "详细程度", "communication", "沟通", "text", {
+        description: "回答的篇幅，可自由填写；常见：简洁、均衡、详细",
+        placeholder: "例如：简洁",
       }),
-      spec("communication.tone", "偏好语气", "communication", "沟通", "choice", {
-        options: [
-          { value: "neutral", label: "中性" },
-          { value: "friendly", label: "友好" },
-          { value: "formal", label: "正式" },
-          { value: "direct", label: "直接" },
-        ],
-      }),
-      spec("communication.verbosity", "详细程度", "communication", "沟通", "choice", {
-        options: [
-          { value: "concise", label: "简洁" },
-          { value: "balanced", label: "均衡" },
-          { value: "detailed", label: "详细" },
-        ],
-      }),
-      spec("communication.format", "偏好格式", "communication", "沟通", "multi_choice", {
-        options: [
-          { value: "bullets", label: "要点" },
-          { value: "tables", label: "表格" },
-          { value: "steps", label: "分步" },
-        ],
+      spec("communication.format", "偏好格式", "communication", "沟通", "string_list", {
+        description: "回答优先使用的结构，可自由填写；常见：要点、表格、分步",
+        placeholder: "例如：要点、表格",
+        max_items: 5,
       }),
       spec("work.role", "工作角色", "work", "工作", "text", {
         placeholder: "例如：后端工程师",
@@ -124,12 +104,9 @@ function makeSchema(): { schema_version: number; fields: ProfileFieldSpec[] } {
       spec("work.tools", "常用工具", "work", "工作", "string_list", {
         max_items: 20,
       }),
-      spec("work.expertise", "专业水平", "work", "工作", "choice", {
-        options: [
-          { value: "beginner", label: "入门" },
-          { value: "intermediate", label: "进阶" },
-          { value: "expert", label: "专家" },
-        ],
+      spec("work.expertise", "专业水平", "work", "工作", "text", {
+        description: "讲解深度，可自由填写；常见：入门、进阶、专家",
+        placeholder: "例如：进阶",
       }),
     ],
   };
@@ -194,10 +171,9 @@ describe("我的画像：全字段表单", () => {
     for (const label of [
       "地区",
       "语言偏好",
-      "无障碍需求",
-      "边界",
       "偏好语气",
       "详细程度",
+      "偏好格式",
       "工作角色",
       "工作领域",
       "常用工具",
@@ -205,15 +181,17 @@ describe("我的画像：全字段表单", () => {
     ]) {
       expect(screen.getByLabelText(label)).toBeTruthy();
     }
-    // 多选字段用 fieldset/legend 分组；没有“还没有画像信息”的空状态
-    expect(screen.getByRole("group", { name: "偏好格式" })).toBeTruthy();
+    // 所有字段都是填充模式：没有下拉框或复选框。
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
     expect(screen.queryByText("还没有画像信息。")).toBeNull();
+    expect(screen.getByText(/常见：中性、友好、正式、直接/)).toBeTruthy();
 
     fireEvent.change(name, { target: { value: " 小林 " } });
     fireEvent.change(screen.getByLabelText("语言偏好"), { target: { value: "en" } });
-    fireEvent.change(screen.getByLabelText("偏好语气"), { target: { value: "direct" } });
-    fireEvent.click(screen.getByLabelText("要点"));
-    expect(screen.getByText("多个值用顿号分隔，最多 20 项")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("偏好语气"), { target: { value: "直接" } });
+    fireEvent.change(screen.getByLabelText("偏好格式"), { target: { value: "要点、表格" } });
+    expect(screen.getByText(/多个值用顿号分隔，最多 20 项/)).toBeTruthy();
     fireEvent.change(screen.getByLabelText("常用工具"), {
       target: { value: "FastAPI、Postgres" },
     });
@@ -224,8 +202,8 @@ describe("我的画像：全字段表单", () => {
         {
           "identity.preferred_name": "小林",
           "communication.language": "en",
-          "communication.tone": "direct",
-          "communication.format": ["bullets"],
+          "communication.tone": "直接",
+          "communication.format": ["要点", "表格"],
           "work.tools": ["FastAPI", "Postgres"],
         },
         1,
@@ -257,7 +235,7 @@ describe("我的画像：全字段表单", () => {
           observed_at: "2026-11-02T00:00:00Z",
         },
         "communication.format": {
-          value: ["bullets", "steps"],
+          value: ["要点", "分步"],
           source: "user_manual",
           evidence_tier: "USER_CONFIRMED",
           confidence: 1,
@@ -276,9 +254,8 @@ describe("我的画像：全字段表单", () => {
 
     const name = (await screen.findByLabelText("称呼")) as HTMLInputElement;
     await waitFor(() => expect(name.value).toBe("小王"));
-    expect((screen.getByLabelText("语言偏好") as HTMLSelectElement).value).toBe("zh-CN");
-    expect((screen.getByLabelText("要点") as HTMLInputElement).checked).toBe(true);
-    expect((screen.getByLabelText("分步") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("语言偏好") as HTMLInputElement).value).toBe("zh-CN");
+    expect((screen.getByLabelText("偏好格式") as HTMLInputElement).value).toBe("要点、分步");
     expect(screen.getByText("没有未保存的修改。")).toBeTruthy();
 
     fireEvent.change(name, { target: { value: "" } });

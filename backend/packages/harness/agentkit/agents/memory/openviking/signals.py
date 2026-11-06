@@ -8,6 +8,10 @@ the turn-end control event.
 A signal that is already present (for example EXPLICIT_REMEMBER set by the
 built-in memory_remember tool) wins. Detection is skipped entirely in that
 case so the tool and the heuristic path cannot disagree.
+
+The rule pass is cheap and safe in `after_agent`. The model fallback uses the
+process default chat model and is enabled only in the worker, after the turn is
+appended, so it never delays the visible reply.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import logging
 import re
 import unicodedata
 from dataclasses import replace
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from agentkit.agents.memory.openviking.contracts import (
     SignalContext,
@@ -137,20 +141,31 @@ _FAILED_RUN_STATUSES = frozenset({"error", "aborted", "timeout"})
 
 
 class CommitSignalDetector:
-    """Rule-first detector with an optional bounded light-model fallback.
+    """Rule-first detector with a bounded default-model fallback.
 
-    The model is intentionally generic: any object with an async ainvoke that
-    returns text or a message-like object with content works. A missing, slow,
-    or malformed model never fails a turn; it degrades to no signals.
+    When no model is injected, the process default chat model is built lazily
+    on the first turn that needs it. The model is intentionally generic: any
+    object with an async ainvoke that returns text or a message-like object
+    with content works. A missing, slow, or malformed model never fails a turn;
+    it degrades to no signals.
     """
 
     def __init__(
         self,
         *,
         model: Any | None = None,
+        model_factory: Callable[[], Any | None] | None = None,
+        use_default_model: bool = True,
         timeout_seconds: float = 1.5,
     ) -> None:
         self._model = model
+        if model_factory is not None:
+            self._model_factory = model_factory
+        elif use_default_model:
+            self._model_factory = _create_default_model
+        else:
+            self._model_factory = _no_model
+        self._model_resolved = model is not None
         self._timeout_seconds = max(0.0, float(timeout_seconds))
 
     async def detect(self, ctx: SignalContext) -> tuple[SignalKind, ...]:
@@ -161,8 +176,10 @@ class CommitSignalDetector:
             return existing
 
         detected = self._rule_signals(ctx)
-        if not detected and self._model is not None and _worth_model_call(ctx):
-            detected = await self._model_signals(ctx)
+        if not detected and _worth_model_call(ctx):
+            model = self._resolved_model()
+            if model is not None:
+                detected = await self._model_signals(ctx, model)
         return order_signals(detected)
 
     async def detect_decision(
@@ -209,7 +226,23 @@ class CommitSignalDetector:
             signals.append("SESSION_END")
         return signals
 
-    async def _model_signals(self, ctx: SignalContext) -> list[SignalKind]:
+    def _resolved_model(self) -> Any | None:
+        if self._model_resolved:
+            return self._model
+        self._model_resolved = True
+        try:
+            self._model = self._model_factory()
+        except Exception:
+            logger.warning(
+                "commit signal default model could not be built; using rules only",
+                exc_info=True,
+            )
+            self._model = None
+        return self._model
+
+    async def _model_signals(
+        self, ctx: SignalContext, model: Any
+    ) -> list[SignalKind]:
         prompt = (
             "You classify one user turn for long-term-memory commit signals. "
             "Return JSON only: {\"signals\": [...], \"evidence_quote\": \"...\"}. "
@@ -223,7 +256,7 @@ class CommitSignalDetector:
         )
         try:
             response = await asyncio.wait_for(
-                self._model.ainvoke(prompt),
+                model.ainvoke(prompt),
                 timeout=self._timeout_seconds,
             )
         except Exception:
@@ -305,6 +338,16 @@ def _failure_recovery(ctx: SignalContext) -> bool:
 
 def _worth_model_call(ctx: SignalContext) -> bool:
     return bool((ctx.user_text or "").strip() or ctx.assistant_text or ctx.has_tool_error)
+
+
+def _create_default_model() -> Any:
+    from agentkit.models.factory import create_chat_model
+
+    return create_chat_model(thinking_enabled=False, attach_tracing=False)
+
+
+def _no_model() -> None:
+    return None
 
 
 def _payload_from_response(response: Any) -> Mapping[str, Any] | None:

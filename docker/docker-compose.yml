@@ -6,6 +6,7 @@
 #   milvus       127.0.0.1:19530        无鉴权（VECTOR_STORE_URI）
 #                etcd、minio 只给 Milvus standalone，不对外
 #   openviking   127.0.0.1:1933         配置只来自挂载的 ov.conf
+#   gitea web    0.0.0.0:3001           Web UI（容器内 3000）
 #   gitea ssh    127.0.0.1:2222         SKILLS_GIT_REPOSITORY
 #   opensandbox  127.0.0.1:8080         sandbox.opensandbox.domain，无 API key
 #                allowed_host_paths ← 仓库根 .env 的 SANDBOX_HOST_ROOT
@@ -169,13 +170,14 @@ services:
       USER_GID: "1000"
       GITEA__database__DB_TYPE: sqlite3
       # SSH 克隆地址对齐 SKILLS_GIT_REPOSITORY=ssh://git@127.0.0.1:2222/...
-      GITEA__server__ROOT_URL: http://127.0.0.1:3001/
+      # 外网打开 Web 时在 .env 设 GITEA_ROOT_URL=http://<公网IP或域名>:3001/
+      GITEA__server__ROOT_URL: ${GITEA_ROOT_URL:-http://127.0.0.1:3001/}
       GITEA__server__SSH_DOMAIN: 127.0.0.1
       GITEA__server__SSH_PORT: "2222"
       GITEA__server__SSH_LISTEN_PORT: "22"
       GITEA__server__START_SSH_SERVER: "true"
     ports:
-      - "127.0.0.1:3001:3000"
+      - "0.0.0.0:3001:3000"
       - "127.0.0.1:2222:22"
     volumes:
       - gitea_data:/data

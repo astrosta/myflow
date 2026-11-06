@@ -41,11 +41,12 @@ async def profile(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_removed_fields_are_ignored_and_dropped_on_next_write(tmp_path: Path) -> None:
-    """旧行里的 pronouns/timezone 不再映射；下一次写入时从 frontmatter 里消失。"""
+    """旧行里的已删除字段不再映射；下一次写入时从 frontmatter 里消失。"""
 
     seed = tmp_path / "legacy.md"
     seed.write_text(
-        "---\npreferred_name: 小王\npronouns: they/them\ntimezone: Asia/Shanghai\n---\n",
+        "---\npreferred_name: 小王\npronouns: they/them\ntimezone: Asia/Shanghai\n"
+        "accessibility_needs: [字号调大]\nboundaries: [不要主动发邮件]\n---\n",
         encoding="utf-8",
     )
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -64,12 +65,16 @@ async def test_removed_fields_are_ignored_and_dropped_on_next_write(tmp_path: Pa
         second = await service.patch("u1", {"work.role": "后端工程师"}, etag=first.etag)
         assert "identity.pronouns" not in second.fields
         assert "identity.timezone" not in second.fields
+        assert "accessibility.needs" not in second.fields
+        assert "boundaries" not in second.fields
 
         async with sessions() as session:
             row = await session.get(MemoryProfileDocumentRow, "u1")
             assert row is not None
             assert "pronouns" not in row.content
             assert "timezone" not in row.content
+            assert "accessibility_needs" not in row.content
+            assert "boundaries" not in row.content
             assert "role: " in row.content
     finally:
         await engine.dispose()

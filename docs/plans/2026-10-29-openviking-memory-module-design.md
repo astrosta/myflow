@@ -22,6 +22,8 @@
 > 修订（2026-11-02，画像全字段表单 + 写入工具）：`我的画像` 改为**始终展示全部受支持字段**
 > （无值即空白，可填写后一次保存）；新增内置工具 `update_user_profile`，只在用户**显式、持久**
 > 陈述画像信息时由模型调用，写入仍走 `ProfileService`（etag CAS）。原子抽取链路依旧不写画像。
+> 修订（画像字段自由填写）：移除无障碍需求和边界字段（当前 10 个字段）；所有字段取消枚举，
+> 改为自由填写，描述里的常见值仅作友好提示；`update_user_profile` 的描述同步精简。
 > 修订（2026-10-30，审计决议 v2）：删除压缩窗口捕获与自动召回；OpenViking session 使用 **idle-only auto-commit**（86400 秒）；创建 session 固定显式设置 `DEFAULT_SESSION_MEMORY_TYPES`（6 类）`memory_policy` 与 idle-only `auto_commit_policy`；`get_session(auto_create=True)` 不再用于新建；强制单 `memory_worker`；`memory_sync_state` 增加 session 生命周期字段；ToolPart / PII / API 契约按 OpenViking Server 0.4.19 修正。
 > 修订（2026-11-03，记忆类型与会话技能分离）：记忆查询、模型工具与记忆管理页支持
 > **7 类**：`preferences` / `entities` / `events` / `cases` / `trajectories` /
@@ -415,7 +417,7 @@ OpenViking 只保存自动抽取的记忆：
 
 | 内容 | 存储 | 维护方式 |
 |---|---|---|
-| 用户当前稳定身份/工作/沟通/无障碍状态 | `memory_profile_documents` | 用户结构化表单，MyFlow 不启用 OpenViking 同名类型 |
+| 用户当前稳定身份/工作/沟通偏好 | `memory_profile_documents` | 用户结构化表单，MyFlow 不启用 OpenViking 同名类型 |
 | 喜好、厌恶、沟通风格、工具偏好 | `preferences` | 自动抽取 |
 | 人、项目、组织、产品、工具等实体及其稳定关系 | `entities` | 自动抽取 |
 | 发生过的原子事件、决定、承诺、进展、结果 | `events` | 自动抽取 |
@@ -462,16 +464,13 @@ OpenViking 只保存自动抽取的记忆：
 
 | 分组 | 字段 | 类型 |
 |---|---|---|
-| 身份 | `identity.preferred_name` / `identity.locale` | string |
-| 沟通 | `communication.language` | string |
-| 沟通 | `communication.tone` | neutral / friendly / formal / direct |
-| 沟通 | `communication.verbosity` | concise / balanced / detailed |
-| 沟通 | `communication.format` | bullets / tables / steps / prose / code_first 多选 |
-| 工作 | `work.role` | string |
-| 工作 | `work.domains` / `work.tools` | string list |
-| 工作 | `work.expertise` | beginner / intermediate / expert |
-| 无障碍 | `accessibility.needs` | string list |
-| 边界 | `boundaries` | string list |
+| 身份 | `identity.preferred_name` / `identity.locale` | 自由填写 string |
+| 沟通 | `communication.language` / `communication.tone` / `communication.verbosity` | 自由填写 string |
+| 沟通 | `communication.format` | 自由填写 string list |
+| 工作 | `work.role` / `work.expertise` | 自由填写 string |
+| 工作 | `work.domains` / `work.tools` | 自由填写 string list |
+
+画像字段不再有枚举类型，全部按自由文本填写；描述里的“常见”值只是给用户的提示，不是允许值清单。无障碍需求和边界字段已移除。
 
 `profile.md` 使用 YAML frontmatter + 可读正文，只由 MyFlow 写入：
 
@@ -480,8 +479,7 @@ OpenViking 只保存自动抽取的记忆：
 preferred_name: 小王
 locale: zh-CN
 language: zh-CN
-format: [bullets, steps]
-boundaries: [不要主动发邮件]
+format: [要点, 分步]
 ---
 
 # 用户画像
@@ -504,8 +502,6 @@ boundaries: [不要主动发邮件]
 | `domains` | `work.domains` |
 | `tools` | `work.tools` |
 | `expertise` | `work.expertise` |
-| `accessibility_needs` | `accessibility.needs` |
-| `boundaries` | `boundaries` |
 
 规则：
 
@@ -514,7 +510,7 @@ boundaries: [不要主动发邮件]
 - `DELETE /api/memory/profile/{field_path}` 删除单个字段；
 - `DELETE /api/memory/profile` 清空整份画像：写入**固定的空模板常量**（所有字段为空、正文仅标题，不使用可能演进的 seed 文件），生成新 etag，不删除行；GET 始终返回空字段而不是 404；
 - `GET /api/memory/profile` 行不存在时用 `INSERT ... ON CONFLICT DO NOTHING` 创建，再读取；GET 必须幂等，不能因并发首次读取产生唯一键冲突；
-- `PATCH` 的列表字段（`format`/`domains`/`tools`/`accessibility.needs`/`boundaries`）采用**整列表替换**语义；
+- `PATCH` 的列表字段（`format`/`domains`/`tools`）采用**整列表替换**语义；
   清空统一传 `null`（前端把空输入序列化成 `null`）。`communication.format` 的空数组 `[]` 会 422
   （格式必须非空），所以不要用 `[]` 表示清空，也不要用省略字段表示清空；
 - 写入使用 PostgreSQL 事务 + 行级 etag 比较；不涉及文件锁、`fsync` 或 `os.replace`；
@@ -528,23 +524,23 @@ boundaries: [不要主动发邮件]
 #### 画像字段清单与前端渲染（2026-11-02）
 
 字段定义只有一份来源：`agentkit/agents/memory/profile_schema.py` 的 `PROFILE_FIELD_SPECS`（顺序即
-`PROFILE_FIELD_PRIORITY`）。每条 spec 含 `path / label / group / kind / options / max_length /
-max_items / item_max_length / explicit_only / placeholder / description`，同时被三处消费：
+`PROFILE_FIELD_PRIORITY`）。每条 spec 含 `path / label / group / kind / max_length / max_items /
+item_max_length / explicit_only / placeholder / description`，同时被三处消费：
 
-1. `validate_profile_value()`：类型、枚举、长度、列表项上限、语言标签格式、密钥与脱敏标记扫描；
+1. `validate_profile_value()`：类型、长度、列表项上限、密钥与脱敏标记扫描；不再有枚举约束或语言标签格式约束；
 2. `GET /api/memory/profile/schema`：前端**必须**按它渲染，不允许在前端维护第二份字段清单；
 3. `update_user_profile` 工具的 description：模型看到的就是这份清单。
 
 前端规则：
 
-- 无论有没有值，12 个字段**始终全部渲染**；没有值的字段显示空白控件，不显示“未设置”占位文案，
+- 无论有没有值，10 个字段**始终全部渲染**；没有值的字段显示空白输入框，不显示“未设置”占位文案，
   也不再出现“还没有画像信息”的空状态页；
-- 控件由 `kind` 决定：`text` → 单行输入；`language` → 下拉（含“跟随当前对话语言”=`auto`）；
-  `locale` → 单行输入 + 合法示例 placeholder；`choice` → 下拉（含“暂不设置”空选项）；
-  `multi_choice` → 复选组；`string_list` → 逗号分隔的单行输入，按 `max_items` / `item_max_length` 校验；
+- 控件由 `kind` 决定：`text` → 单行输入；`string_list` → 顿号分隔的单行输入，
+  按 `max_items` / `item_max_length` 校验；不再有 `choice` / `multi_choice` 下拉或复选框；
+- 字段描述里的“常见”写法原样展示为输入框下方的提示，仅作参考，不限制可填内容；
 - 表单预填当前值；用户改完后点一次“保存”，提交**所有有变化的字段**；被清空的字段提交 `null`；
-- `explicit_only` 字段（称呼/无障碍/边界）在表单里照常可填，但只能由用户本人填写；
-  建议卡片接受这些字段时必须二次确认并展示 evidence（见下面的 ProfileSuggester 规则）。
+- `explicit_only` 字段（称呼）在表单里照常可填，但只能由用户本人填写；
+  建议卡片接受时必须展示 evidence（见下面的 ProfileSuggester 规则）。
 
 #### 内置工具 `update_user_profile`（2026-11-02）
 
@@ -559,8 +555,8 @@ update_user_profile(
 
 - 成功：`{"ok": true, "updated": ["communication.language"], "cleared": [], "profile_etag": "..."}`；
 - 失败：`{"error": "invalid_field" | "invalid_value" | "missing_user" | "profile_update_failed",
-  "message": "...", "allowed_fields": [...]}`；`invalid_value` 的消息必须带该字段的允许值；
-  模型拿到 `invalid_field` / `invalid_value` 后应按清单改正再试一次，不要重复同一个坏值；
+  "message": "...", "allowed_fields": [...]}`；`invalid_value` 的消息说明该字段的类型或长度要求；
+  模型拿到 `invalid_field` / `invalid_value` 后应按清单或 message 改正再试一次，不要重复同一个坏值；
 - 写入路径：`ProfileService.update_fields(user_id, fields)` —— 读当前快照 etag → `patch()`；
   冲突时重读重试**一次**，仍冲突返回 `profile_update_failed`，绝不覆盖并发的表单写入；
 - 工具与表单写同一行、同一 etag CAS；不存在第二套画像，也不复制 Markdown；
@@ -570,8 +566,7 @@ update_user_profile(
 模型调用门槛（全部写进 tool description，并有测试断言这些触发条件文本存在）：
 
 1. 用户明确说出跨会话稳定的画像信息时才调用：「以后叫我小林」「以后都用英文」「少寒暄，直接给结论」「回答尽量用要点或表格」「我在 UTC+8」「我常驻杭州」
-   「我是后端工程师」「我主要用 FastAPI 和 Postgres」「按专家水平解释」「记一下我看不清小字」
-   「不要主动给我打电话」；
+   「我是后端工程师」「我主要用 FastAPI 和 Postgres」「按专家水平解释」；
 2. 一次性的任务指令不调用：「这次用英文」「这一段先写代码」「这轮详细一点」只影响当前任务；
 3. 推测不调用：用户没有明说的偏好、从代码或工具输出推断出的角色/地区、模型自己的补充；
 4. 不写敏感值：密钥、令牌、证件号、私人联系方式；值里出现这些内容必须返回 `invalid_value`；
@@ -608,7 +603,7 @@ class ProfileSuggestion:
 
 规则：
 
-- `identity.preferred_name`、`accessibility.needs`、`boundaries` 可以由自动记忆生成建议，但**绝不自动写入**；必须由用户在表单中明确确认，UI 必须展示 evidence_quote / evidence_uri；
+- `identity.preferred_name` 等字段可以由自动记忆生成建议，但**绝不自动写入**；必须由用户在表单中明确确认，UI 必须展示 evidence_quote / evidence_uri；
 - 其余字段同样只是建议；`accept` 是唯一的写入路径，建议本身不等同于事实；
 - `preferences` 中的语气/详细程度/格式 → `communication.*`；
 - `entities` 中的项目/工具/角色 → `work.*`；
@@ -1634,16 +1629,19 @@ for each uri:
 - `evidence_quote` 必须能在当前消息/run 证据中匹配；否则降级 `NONE`；
 - 超时/模型失败/非法 JSON → 空列表（`NONE`）；
 - 纯招呼/告别/致谢不调用模型；
+- 模型默认使用进程默认 chat model（`create_chat_model()`，关闭 thinking），首次需要时懒加载并缓存；
+  默认模型构建失败只记 warning，降级为纯规则；
 - 默认超时 1.5s；失败只影响信号，不影响对话；
 - 只有 `CAPTURE` 的 turn 才调用；`SKIP` 用规则处理；
-- 检测在 worker 中执行，不在 `after_agent` 同步调用模型；`after_agent` 只做确定性规则，保证主链路不被 1.5s 模型拖慢；
+- 检测在 worker 中执行，不在 `after_agent` 同步调用模型；middleware 的 `after_agent` 使用
+  `CommitSignalDetector(use_default_model=False)` 只做确定性规则，保证主链路不被 1.5s 模型拖慢；
 - 输入中的 tool 状态来自 `SignalContext`（由 turn_end 携带），worker 不从内存猜 run 状态。
 
 调用优先级：
 
 1. 宿主确定性信号（run error、tool error/recovery、显式完成/记住、纠错关键词）；
 2. 规则门（打招呼、空消息；确认类不拦截）；
-3. 轻量模型（仅在有候选信号或消息足够长时，worker 内）；
+3. 默认 chat model（仅在有候选信号或消息足够长时，worker 内；首次使用懒加载）；
 4. 全部失败 → 空列表（等同 `NONE`），由 OpenViking idle auto-commit 兜底。
 
 ### 7.2 TurnPolicy 打招呼策略
@@ -2044,7 +2042,7 @@ MyFlow 提供“我的画像”、画像建议、onboarding、“记忆管理”
 | `FailedPreconditionError` | 409 | 上一个 archive 失败；走 runbook |
 | `InvalidArgumentError` | 422 | 请求/配置校验失败 |
 | 工具内 invalid memory_type / URI | tool error | 内部工具返回结构化错误，不使用 HTTP 422 |
-| 工具内 `update_user_profile` 字段/值非法 | tool error | `invalid_field` / `invalid_value`；消息带允许值列表，不写任何字段 |
+| 工具内 `update_user_profile` 字段/值非法 | tool error | `invalid_field` / `invalid_value`；消息说明字段或格式/长度要求，不写任何字段 |
 | 工具内 `update_user_profile` etag 冲突（重试后） | tool error | `profile_update_failed`；不覆盖并发表单写入 |
 | 记忆管理：URI 越权 / sidecar / 目录 / 非 `.md` | 422 `invalid_memory_uri` | 不触达 OpenViking；消息说明允许范围 |
 | 记忆管理：`expected_sha256` 不一致 | 409 `memory_conflict` | 返回当前 `sha256`，前端提示刷新后再改 |
@@ -2068,15 +2066,14 @@ MyFlow 提供“我的画像”、画像建议、onboarding、“记忆管理”
 
 | 分组 | 控件（按 spec 的 `kind`） |
 |---|---|
-| 身份 | 称呼 `text`、地区 `locale` |
-| 沟通 | 语言 `language` 下拉、语气 `choice`、详细程度 `choice`、输出格式 `multi_choice` |
-| 工作 | 角色 `text`、领域 `string_list`、工具 `string_list`、专长 `choice` |
-| 无障碍 | 需求 `string_list` |
-| 边界 | 边界 `string_list` |
+| 身份 | 称呼、地区：单行输入 |
+| 沟通 | 语言、语气、详细程度：单行输入；输出格式：顿号分隔单行输入 |
+| 工作 | 角色、专长：单行输入；领域、工具：顿号分隔单行输入 |
 
-交互（2026-11-02 修订）：
+交互：
 
-- **始终展示全部 12 个字段**，分 5 组排列；没有值的字段渲染空白控件，不显示“还没有填写画像”空状态；
+- **始终展示全部 10 个字段**，分 3 组排列；没有值的字段渲染空白输入框，不显示“还没有填写画像”空状态；
+- 所有字段都是填充模式；描述里的“常见”写法只作为输入框下方的提示，不渲染下拉或复选框；
 - 页面加载并行请求 `GET /api/memory/profile` 与 `GET /api/memory/profile/schema`，用 schema 预填表单；
 - 用户改完点一次“保存”：只提交**与预填值不同的字段**；清空的字段提交 `null`；列表字段整列表提交；
 - 保存走 `PATCH /api/memory/profile`，body 为 `{fields, expected_revision}`（或 `etag`）；成功后用响应重填表单，
@@ -2100,7 +2097,7 @@ Onboarding 卡片：
 - onboarding 未完成时先不显示建议；
 - onboarding 完成或已有基础 profile 后，在表单下方显示“发现可能的画像信息”；
 - 每条建议展示 field、value、evidence quote、来源 URI，并明确标注“建议，尚未写入”；
-- 操作：`接受` / `修改后接受` / `忽略`；敏感字段（称呼/无障碍/边界）必须在二次确认弹窗中展示 evidence 后才能接受；
+- 操作：`接受` / `修改后接受` / `忽略`；称呼等 `explicit_only` 字段必须在二次确认弹窗中展示 evidence 后才能接受；
 - 接受走 `POST /api/memory/profile/suggestions/{id}/accept`，body 必带当前 `etag`；忽略走 `dismiss`；
 - 建议只在打开页面时按需拉取，不进入聊天上下文。
 
@@ -2463,20 +2460,20 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 - `TurnCaptureWorker` 的 `MemoryMessageAdapter.is_recordable` 过滤、hidden/SKIP 过滤、OpenViking payload 转换、turn_end/missing_turn_end timeout 批量 append；
 - `CaptureDedupStore` 的 pending/appending/appended/租约/重复投递/崩溃重启对账；正常 `appended` 在启动时不被扫描；不承诺 exactly-once；
 - 本地 adapter 的固定 golden fixture；不引入 `langchain-openviking`；
-- `CommitSignalDetector` schema/证据校验/超时降级；
+- `CommitSignalDetector` 默认模型懒加载/缓存、schema/证据校验/超时降级；
 - `CommitCoordinator` 状态机、重试、无 SQL debounce；idle auto-commit 与显式 signal 的边界；
 - `MemoryFacade` 错误映射；
 - `memory_types` 固定为 `DEFAULT_SESSION_MEMORY_TYPES`；7 类查询目录与 `tools` 模板校验；
 - Session Skill：commit task 完成/失败/超时、`session_skill_uris` 解析、SKILL.md 导入、source=extracted、待扫描草稿、重复导入幂等；
 - `ProfileService` DB profile 解析/重建、字段校验、etag 冲突、删除字段/清空；
 - `update_fields()` 读 etag 后 CAS、冲突重读重试一次、二次冲突报错不覆盖；
-- `profile_schema` 是唯一字段来源：`validate_profile_value` 与 spec 一致（枚举/长度/列表项/语言标签/密钥扫描）、
-  schema 路由覆盖全部字段且顺序稳定；
-- `update_user_profile` 工具：成功/未知字段/非法值（含允许值提示）/敏感值拒绝/`null` 清空/缺用户/持久层异常，
+- `profile_schema` 是唯一字段来源：`validate_profile_value` 与 spec 一致（类型/长度/列表项/密钥扫描，
+  不再校验枚举或语言标签）、schema 路由覆盖全部字段且顺序稳定；
+- `update_user_profile` 工具：成功/未知字段/非法值（含格式与长度提示）/敏感值拒绝/`null` 清空/缺用户/持久层异常，
   以及 description 里必须存在的中文触发词与“不要推断/不要写敏感值”约束；
 - 工具注册：profile 服务存在时 lead agent 拿到 `update_user_profile`（`memory.openviking.enabled=false` 也一样），
   子代理拿不到；没有 profile 服务时不注册；
-- 前端全字段表单：12 个字段全渲染、空值渲染空控件、只提交变化字段、清空提交 `null`、409 提示与撤销；
+- 前端全字段表单：10 个字段全渲染、空值渲染空输入框、只提交变化字段、清空提交 `null`、409 提示与撤销；
 - 记忆管理服务：过滤型 `find` 的 target/filter/level 参数、摘要截断、按 URI 排序、`has_more`；
 - 记忆管理 URI 白名单：`~`/`..`/编码穿越、跨用户、非七类、非 `.md`、目录、`.abstract.md`/`.overview.md` 全部拒绝；
 - 记忆管理详情：`overview` 解析成 `toc`（标题层级 + 链接解析）；缺 overview 时用 `ls` 降级；
@@ -2550,7 +2547,7 @@ MYFLOW_REDIS_URL=redis://127.0.0.1:6379/0
 
 ### 13.5 实现记录（2026-11-02 画像表单、写入工具与记忆管理）
 
-- 字段唯一来源：新增 `agentkit/agents/memory/profile_schema.py`（12 个 `ProfileFieldSpec` + 校验）；
+- 字段唯一来源：新增 `agentkit/agents/memory/profile_schema.py`（当前 10 个 `ProfileFieldSpec` + 校验）；
   `agentkit/agents/memory/types.py` 保留旧导出名，避免调用点大改；列表项也做密钥/脱敏标记扫描。
 - HTTP：新增 `GET /api/memory/profile/schema`；`PATCH /api/memory/profile` 支持 `null` 删除字段。
 - 工具：新增 `update_user_profile`（`openviking/profile_tools.py`），description 由 schema 生成，

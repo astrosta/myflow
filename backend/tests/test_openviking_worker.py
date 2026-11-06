@@ -9,10 +9,12 @@ import pytest_asyncio
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+import agentkit.agents.memory.openviking.signals as signal_module
 from agentkit.agents.memory.openviking.adapter import MemoryMessageAdapter
 from agentkit.agents.memory.openviking.config import OpenVikingMemoryConfig, SessionSkillsConfig
 from agentkit.agents.memory.openviking.contracts import CapturedMessage
 from agentkit.agents.memory.openviking.session import SessionManager
+from agentkit.agents.memory.openviking.signals import CommitSignalDetector
 from agentkit.agents.memory.openviking.store import CaptureDedupStore, MemorySyncStore
 from agentkit.agents.memory.openviking.stream import InMemoryCaptureStream, MemoryMessagePublisher
 from agentkit.agents.memory.openviking.worker import TurnCaptureWorker, WorkerSupervisor
@@ -89,6 +91,15 @@ class RecordingSkillImporter:
         return []
 
 
+class SignalModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ainvoke(self, prompt: str) -> str:
+        self.calls += 1
+        return '{"signals": ["TASK_COMPLETE"]}'
+
+
 @pytest_asyncio.fixture
 async def stack():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -106,7 +117,14 @@ async def stack():
     sessions = SessionManager(sync_store, client, config)
     stream = InMemoryCaptureStream()
     publisher = MemoryMessagePublisher(stream)
-    worker = TurnCaptureWorker(MemoryMessageAdapter(), stream, dedup, sessions, sync_store)
+    worker = TurnCaptureWorker(
+        MemoryMessageAdapter(),
+        stream,
+        dedup,
+        sessions,
+        sync_store,
+        detector=CommitSignalDetector(use_default_model=False),
+    )
     yield client, sync_store, dedup, sessions, stream, publisher, worker
     await engine.dispose()
 
@@ -329,6 +347,32 @@ async def test_worker_detects_a_signal_when_turn_end_has_none(stack) -> None:
 
     assert await worker.handle(control) == "flushed"
     assert len(client.appended) == 1
+    assert client.commits == [ref.ov_session_id]
+
+
+@pytest.mark.asyncio
+async def test_worker_uses_the_default_model_when_rules_are_silent(stack, monkeypatch) -> None:
+    client, sync_store, dedup, sessions, stream, publisher, _worker = stack
+    model = SignalModel()
+    monkeypatch.setattr(signal_module, "_create_default_model", lambda: model)
+    worker = TurnCaptureWorker(
+        MemoryMessageAdapter(),
+        stream,
+        dedup,
+        sessions,
+        sync_store,
+    )
+    ref = await sessions.resolve_capture_context("u1", "t1")
+    client.seed(ref.ov_session_id)
+    human = await publisher.publish_human(
+        ref, "r1", HumanMessage(content="我住杭州"), sequence=0
+    )
+
+    assert await worker.handle(human) == "buffered"
+    control = await publisher.publish_turn_end(ref, "r1")
+
+    assert await worker.handle(control) == "flushed"
+    assert model.calls == 1
     assert client.commits == [ref.ov_session_id]
 
 

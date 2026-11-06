@@ -72,6 +72,21 @@ def test_memory_tools_document_their_arguments() -> None:
     assert overview.args_schema.model_json_schema()["properties"]["uri"]["description"]
 
 
+def test_explicit_remember_tool_documents_non_explicit_memory() -> None:
+    tool = make_memory_remember_tool()
+    description = tool.description or ""
+
+    assert "无需用户明确要求" in description
+    assert "偏好" in description
+    assert "客观事实" in description
+    assert "情景事件" in description
+
+    text_description = tool.args_schema.model_json_schema()["properties"]["text"]["description"]
+    assert "偏好" in text_description
+    assert "客观事实" in text_description
+    assert "情景事件" in text_description
+
+
 @pytest.mark.asyncio
 async def test_search_tool_maps_hits_and_user() -> None:
     facade = FakeFacade()

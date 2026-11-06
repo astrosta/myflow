@@ -23,7 +23,7 @@ import {
   type ProfileView,
 } from "@/core/api/memory";
 
-const GROUP_ORDER = ["identity", "communication", "work", "accessibility", "boundaries"];
+const GROUP_ORDER = ["identity", "communication", "work"];
 
 function readableError(error: unknown): string {
   if (error instanceof MemoryApiError) {
@@ -33,23 +33,12 @@ function readableError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function formatProfileValue(
-  path: string,
-  value: unknown,
-  specs: Record<string, ProfileFieldSpec>,
-): string {
-  const spec = specs[path];
-  if (Array.isArray(value)) {
-    const labels = new Map((spec?.options ?? []).map((option) => [option.value, option.label]));
-    return value.map((item) => labels.get(String(item)) ?? String(item)).join("、");
-  }
-  if (typeof value === "string" && spec?.options.length) {
-    return spec.options.find((option) => option.value === value)?.label ?? value;
-  }
+function formatProfileValue(value: unknown): string {
+  if (Array.isArray(value)) return value.map((item) => String(item)).join("、");
   return String(value ?? "");
 }
 
-function draftValueFromField(spec: ProfileFieldSpec, value: unknown): string {
+function draftValueFromField(value: unknown): string {
   if (Array.isArray(value)) return value.join("、");
   if (value === null || value === undefined) return "";
   return String(value);
@@ -61,7 +50,7 @@ export function draftFromProfile(
 ): Record<string, string> {
   const draft: Record<string, string> = {};
   for (const spec of specs) {
-    draft[spec.path] = draftValueFromField(spec, fields[spec.path]?.value);
+    draft[spec.path] = draftValueFromField(fields[spec.path]?.value);
   }
   return draft;
 }
@@ -77,13 +66,6 @@ function serializeValue(spec: ProfileFieldSpec, raw: string): unknown {
   if (spec.kind === "string_list") {
     const items = splitItems(raw);
     return items.length ? items : null;
-  }
-  if (spec.kind === "multi_choice") {
-    const picked = new Set(splitItems(raw));
-    const ordered = spec.options
-      .map((option) => option.value)
-      .filter((value) => picked.has(value));
-    return ordered.length ? ordered : null;
   }
   const text = raw.trim();
   return text ? text : null;
@@ -102,7 +84,7 @@ export function changedFields(
     const next = serializeValue(spec, draft[spec.path] ?? "");
     const before = serializeValue(
       spec,
-      draftValueFromField(spec, fields[spec.path]?.value),
+      draftValueFromField(fields[spec.path]?.value),
     );
     if (JSON.stringify(next) !== JSON.stringify(before)) {
       changes[spec.path] = next;
@@ -257,8 +239,8 @@ export function MyProfilePage() {
         <header className="border-b border-neutral-200 pb-5">
           <h1 className="text-xl font-semibold tracking-tight text-neutral-900">我的画像</h1>
           <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-            全部字段都在这里：没有填写的就是空白，填好后点“保存修改”。你也可以在对话里明确告诉我，
-            我再更新这些字段。
+            全部字段都在这里，直接填写即可；字段下方列出的常见写法只是提示。填好后点“保存修改”，
+            也可以在对话里明确告诉我，我再更新这些字段。
           </p>
         </header>
 
@@ -317,7 +299,7 @@ export function MyProfilePage() {
                     {specByPath[suggestion.field_path]?.label ?? suggestion.field_path}
                   </p>
                   <p className="mt-1 text-sm text-neutral-900">
-                    {formatProfileValue(suggestion.field_path, suggestion.value, specByPath)}
+                    {formatProfileValue(suggestion.value)}
                   </p>
                   <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">
                     {suggestion.reason} · 置信度 {Math.round(suggestion.confidence * 100)}%
@@ -424,46 +406,9 @@ function ProfileField({
   const id = "profile-" + spec.path;
   const hint =
     spec.kind === "string_list"
-      ? `多个值用顿号分隔，最多 ${spec.max_items} 项`
-      : spec.kind === "multi_choice"
-        ? "可多选"
-        : spec.description;
+      ? `${spec.description}；多个值用顿号分隔，最多 ${spec.max_items} 项`
+      : spec.description;
   const suffix = spec.explicit_only ? " · 仅在你明确要求记录时写入" : "";
-
-  if (spec.kind === "multi_choice") {
-    return (
-      <fieldset>
-        <legend className="block text-xs font-medium text-neutral-600">{spec.label}</legend>
-        <div className="mt-2 flex flex-wrap gap-3">
-          {spec.options.map((option) => {
-            const picked = splitItems(draft).includes(option.value);
-            return (
-              <label
-                className="flex items-center gap-1.5 text-sm text-neutral-700"
-                key={option.value}
-              >
-                <input
-                  checked={picked}
-                  onChange={() => {
-                    const current = new Set(splitItems(draft));
-                    if (current.has(option.value)) current.delete(option.value);
-                    else current.add(option.value);
-                    onChange(Array.from(current).join(", "));
-                  }}
-                  type="checkbox"
-                />
-                {option.label}
-              </label>
-            );
-          })}
-        </div>
-        <p className="mt-1 text-[11px] text-neutral-400">
-          {hint}
-          {suffix}
-        </p>
-      </fieldset>
-    );
-  }
 
   return (
     <div>
@@ -471,35 +416,15 @@ function ProfileField({
         {spec.label}
       </label>
       <div className="mt-1.5">
-        {spec.kind === "choice" || spec.kind === "language" ? (
-          <select
-            className="block h-9 w-full rounded-md border border-neutral-300 bg-white px-3 text-sm text-neutral-900"
-            id={id}
-            onChange={(event) => onChange(event.target.value)}
-            value={draft}
-          >
-            <option value="">暂不设置</option>
-            {draft && !spec.options.some((option) => option.value === draft) ? (
-              // 后端允许任意 BCP-47 标签：已有值不在下拉选项里时也要能显示出来
-              <option value={draft}>{draft}</option>
-            ) : null}
-            {spec.options.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <input
-            className="block h-9 w-full rounded-md border border-neutral-300 px-3 text-sm text-neutral-900 placeholder:text-neutral-400"
-            id={id}
-            maxLength={spec.kind === "string_list" ? undefined : spec.max_length}
-            onChange={(event) => onChange(event.target.value)}
-            placeholder={spec.placeholder}
-            type="text"
-            value={draft}
-          />
-        )}
+        <input
+          className="block h-9 w-full rounded-md border border-neutral-300 px-3 text-sm text-neutral-900 placeholder:text-neutral-400"
+          id={id}
+          maxLength={spec.kind === "string_list" ? undefined : spec.max_length}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={spec.placeholder}
+          type="text"
+          value={draft}
+        />
       </div>
       <p className="mt-1 text-[11px] text-neutral-400">
         {hint}

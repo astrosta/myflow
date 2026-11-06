@@ -8,18 +8,7 @@ export interface ProfileFieldView {
   observed_at: string;
 }
 
-export interface ProfileFieldOption {
-  value: string;
-  label: string;
-}
-
-export type ProfileFieldKind =
-  | "text"
-  | "locale"
-  | "language"
-  | "choice"
-  | "multi_choice"
-  | "string_list";
+export type ProfileFieldKind = "text" | "string_list";
 
 export interface ProfileFieldSpec {
   path: string;
@@ -29,7 +18,6 @@ export interface ProfileFieldSpec {
   kind: ProfileFieldKind;
   description: string;
   placeholder: string;
-  options: ProfileFieldOption[];
   max_length: number;
   max_items: number;
   item_max_length: number;

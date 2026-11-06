@@ -76,11 +76,6 @@ class ProfileResponse(BaseModel):
     fields: dict[str, ProfileFieldResponse] = Field(default_factory=dict)
 
 
-class ProfileFieldOptionResponse(BaseModel):
-    value: str
-    label: str
-
-
 class ProfileFieldSpecResponse(BaseModel):
     path: str
     label: str
@@ -89,7 +84,6 @@ class ProfileFieldSpecResponse(BaseModel):
     kind: str
     description: str
     placeholder: str = ""
-    options: list[ProfileFieldOptionResponse] = Field(default_factory=list)
     max_length: int
     max_items: int
     item_max_length: int
@@ -192,10 +186,6 @@ def _field_spec_response(spec: ProfileFieldSpec) -> ProfileFieldSpecResponse:
         kind=spec.kind,
         description=spec.description,
         placeholder=spec.placeholder,
-        options=[
-            ProfileFieldOptionResponse(value=option.value, label=option.label)
-            for option in spec.options
-        ],
         max_length=spec.max_length,
         max_items=spec.max_items,
         item_max_length=spec.item_max_length,

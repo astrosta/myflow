@@ -109,6 +109,8 @@ async def test_suggestions_are_generated_and_accept_updates_profile(stack) -> No
 
     fields = {item.field_path for item in items}
     assert {"identity.preferred_name", "communication.verbosity", "work.tools"} <= fields
+    assert "accessibility.needs" not in fields
+    assert "boundaries" not in fields
     assert all(item.profile_etag for item in items)
 
     accepted, view = await suggestions.accept(
@@ -116,8 +118,8 @@ async def test_suggestions_are_generated_and_accept_updates_profile(stack) -> No
         next(item.id for item in items if item.field_path == "communication.verbosity"),
     )
     assert accepted.status == "accepted"
-    assert view.fields["communication.verbosity"] == "concise"
-    assert (await profile.get_snapshot("u1")).fields["communication.verbosity"] == "concise"
+    assert view.fields["communication.verbosity"] == "简洁"
+    assert (await profile.get_snapshot("u1")).fields["communication.verbosity"] == "简洁"
 
 
 @pytest.mark.asyncio

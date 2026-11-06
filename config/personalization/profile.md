@@ -9,8 +9,6 @@ role: ""
 domains: []
 tools: []
 expertise: ""
-accessibility_needs: []
-boundaries: []
 ---
 
 # 用户画像
@@ -27,5 +25,3 @@ boundaries: []
 - 领域：
 - 工具：
 - 专长：
-- 无障碍需求：
-- 边界：

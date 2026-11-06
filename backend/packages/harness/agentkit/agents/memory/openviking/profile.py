@@ -41,8 +41,6 @@ _FIELD_TO_KEY = {
     "work.domains": "domains",
     "work.tools": "tools",
     "work.expertise": "expertise",
-    "accessibility.needs": "accessibility_needs",
-    "boundaries": "boundaries",
 }
 _KEY_TO_FIELD = {key: field for field, key in _FIELD_TO_KEY.items()}
 _EMPTY_BODY = "# 用户画像\n\n> 用户身份（profile）。助手身份在 identity.md，助手原则在 soul.md。\n"
@@ -57,8 +55,6 @@ _PROFILE_LABELS = {
     "work.domains": "工作领域",
     "work.tools": "常用工具",
     "work.expertise": "专业水平",
-    "accessibility.needs": "无障碍需求",
-    "boundaries": "边界",
 }
 
 

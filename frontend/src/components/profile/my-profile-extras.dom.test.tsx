@@ -50,14 +50,9 @@ const SCHEMA_FIELD: ProfileFieldSpec = {
   label: "详细程度",
   group: "communication",
   group_label: "沟通",
-  kind: "choice",
-  description: "回答的篇幅",
-  placeholder: "",
-  options: [
-    { value: "concise", label: "简洁" },
-    { value: "balanced", label: "均衡" },
-    { value: "detailed", label: "详细" },
-  ],
+  kind: "text",
+  description: "回答的篇幅，可自由填写；常见：简洁、均衡、详细",
+  placeholder: "例如：简洁",
   max_length: 256,
   max_items: 10,
   item_max_length: 64,
@@ -73,7 +68,6 @@ const NAME_FIELD: ProfileFieldSpec = {
   kind: "text",
   description: "希望被称呼的名字或昵称",
   placeholder: "例如：小林",
-  options: [],
   max_length: 64,
   explicit_only: true,
 };
@@ -123,7 +117,7 @@ describe("我的画像：引导、建议与错误", () => {
         {
           id: "s1",
           field_path: "communication.verbosity",
-          value: "concise",
+          value: "简洁",
           evidence_uri: "viking://user/u/memories/preferences/style.md",
           evidence_quote: "喜欢简洁",
           confidence: 0.74,
@@ -149,7 +143,7 @@ describe("我的画像：引导、建议与错误", () => {
 
     renderPage();
     expect(await screen.findByText("让助手更懂你")).toBeTruthy();
-    // 建议值按 schema 的标签展示，而不是裸的内部枚举值
+    // 建议值直接展示用户可读文本。
     const suggestionsPanel = await screen.findByRole("region", { name: "画像建议" });
     expect(within(suggestionsPanel).getByText("详细程度")).toBeTruthy();
     expect(within(suggestionsPanel).getByText("简洁")).toBeTruthy();

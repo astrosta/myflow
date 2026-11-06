@@ -54,6 +54,8 @@ class TurnCaptureWorker:
         self._sync_store = sync_store
         self._lease_seconds = lease_seconds
         self._missing_turn_end_timeout = max(0, int(missing_turn_end_timeout_seconds))
+        # The worker is the only place allowed to use the model-backed fallback:
+        # detection runs after the turn is appended, off the reply path.
         self._detector = detector or CommitSignalDetector()
         self._session_skills = session_skills or SessionSkillsConfig()
         self._session_skill_importer = session_skill_importer
