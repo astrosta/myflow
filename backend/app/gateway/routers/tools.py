@@ -13,6 +13,7 @@ from agentkit.contextforge.models import ContextForgeTool, ToolWrite
 from backend.app.gateway.deps import require_scope
 from backend.app.gateway.errors import ContextForgeDisabled, InvalidToolHeaderAPI
 from agentkit.contextforge.runtime import get_contextforge_runtime
+from agentkit.tools.search.service import get_tool_search_runtime
 
 from backend.app.gateway.models.tools import (
     ToolDetail,
@@ -156,6 +157,41 @@ async def reindex_tools(
         "deleted": stats.deleted,
         "duration_ms": stats.duration_ms,
         "error": stats.error,
+    }
+
+
+@router.get("/search")
+async def search_tools_preview(
+    request: Request,
+    caller: AdminCaller,
+    q: str = Query(min_length=1, max_length=4000),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> dict[str, object]:
+    del caller, request
+    service = get_tool_search_runtime()
+    if service is None:
+        return {"query": q, "results": [], "retrieval": {"index": "unavailable"}}
+    outcome = await service.search(task_query=q)
+    return {
+        "query": q,
+        "results": [
+            {
+                "tool_name": hit.entry.name,
+                "display_name": hit.entry.display_name,
+                "description": hit.entry.description,
+                "tags": list(hit.entry.tags),
+                "parameters": list(hit.entry.parameters),
+                "score": hit.score,
+            }
+            for hit in outcome.hits[:limit]
+        ],
+        "retrieval": {
+            "index": outcome.index_kind,
+            "channels": list(outcome.channels),
+            "candidates": outcome.candidates,
+            "reranked": outcome.reranked,
+            "warnings": list(outcome.warnings),
+        },
     }
 
 

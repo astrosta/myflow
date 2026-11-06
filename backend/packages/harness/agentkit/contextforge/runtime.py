@@ -19,6 +19,11 @@ from agentkit.contextforge.cache import (
 from agentkit.contextforge.catalog import build_entries
 from agentkit.contextforge.index import ToolIndexSyncStats, ToolVectorIndex
 from agentkit.contextforge.loader import load_contextforge_tools
+from agentkit.tools.search.service import (
+    ToolSearchService,
+    reset_tool_search_runtime,
+    set_tool_search_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +97,7 @@ class ContextForgeRuntime:
         if self.index is not None:
             await self.index.aclose()
         await self.admin.aclose()
+        reset_tool_search_runtime()
         self._started = False
 
     async def _on_admin_event(self, event: Any) -> None:
@@ -282,6 +288,16 @@ def build_contextforge_runtime(config: ContextForgeConfig) -> ContextForgeRuntim
         reranker=reranker,
     )
     configure_contextforge_runtime(runtime)
+    if config.search.enabled:
+        set_tool_search_runtime(
+            ToolSearchService(
+                index=index,
+                embedder=embedder,
+                reranker=reranker,
+                config=config.search,
+                snapshot_provider=runtime.get_entries,
+            )
+        )
     return runtime
 
 
