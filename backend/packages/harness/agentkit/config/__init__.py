@@ -2,6 +2,16 @@ from agentkit.config.agents_config import AgentsConfig
 from agentkit.config.app_config import AppConfig, get_app_config, set_app_config
 from agentkit.config.auth_config import INTERNAL_AUTH_TOKEN_ENV, AuthConfig, LocalLoginConfig
 from agentkit.config.checkpointer_config import CheckpointerConfig
+from agentkit.config.contextforge_config import (
+    AdminEventsConfig,
+    ContextForgeConfig,
+    ContextForgeSyncConfig,
+    ToolEmbeddingConfig,
+    ToolKeywordConfig,
+    ToolRerankConfig,
+    ToolSearchConfig,
+    ToolVectorStoreConfig,
+)
 from agentkit.config.database_config import DatabaseConfig
 from agentkit.config.extensions_config import (
     EXTENSIONS_CONFIG_FILENAME,
@@ -71,8 +81,11 @@ from agentkit.config.tool_config import ToolConfig
 __all__ = [
     "EXTENSIONS_CONFIG_FILENAME",
     "INTERNAL_AUTH_TOKEN_ENV",
+    "AdminEventsConfig",
     "AgentsConfig",
     "AppConfig",
+    "ContextForgeConfig",
+    "ContextForgeSyncConfig",
     "AuthConfig",
     "LocalLoginConfig",
     "CheckpointerConfig",
@@ -113,6 +126,11 @@ __all__ = [
     "SummarizationConfig",
     "TitleConfig",
     "ToolConfig",
+    "ToolEmbeddingConfig",
+    "ToolKeywordConfig",
+    "ToolRerankConfig",
+    "ToolSearchConfig",
+    "ToolVectorStoreConfig",
     "atomic_write_extensions_config",
     "drop_null_config_entries",
     "effective_subagent_concurrency",

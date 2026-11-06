@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from agentkit.config.agents_config import AgentsConfig
 from agentkit.config.auth_config import AuthConfig
 from agentkit.config.checkpointer_config import CheckpointerConfig
+from agentkit.config.contextforge_config import ContextForgeConfig
 from agentkit.config.database_config import DatabaseConfig
 from agentkit.config.file_signature import ConfigSignature, get_config_signature
 from agentkit.config.knowledge_config import (
@@ -43,14 +44,17 @@ _SHARED_SERVICE_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
     "embedding": (
         ("knowledge_base", "embedding"),
         ("skills", "search", "embedding"),
+        ("contextforge", "search", "embedding"),
     ),
     "rerank": (
         ("knowledge_base", "retrieval", "rerank"),
         ("skills", "search", "rerank"),
+        ("contextforge", "search", "rerank"),
     ),
     "vector_store": (
         ("knowledge_base", "vector_store"),
         ("skills", "search", "vector_store"),
+        ("contextforge", "search", "vector_store"),
     ),
 }
 
@@ -91,6 +95,7 @@ class AppConfig(BaseModel):
     checkpointer: CheckpointerConfig = Field(default_factory=CheckpointerConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    contextforge: ContextForgeConfig = Field(default_factory=ContextForgeConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     # Shared by knowledge_base and skills.search; each section keeps only its own
     # enabled/collection/timeout/instruction overrides.
