@@ -459,7 +459,7 @@ skills:
 
   # 每个用户的技能使用次数：Redis ZSET 只做 top-K 排序，PostgreSQL load_count 持久化。
   usage:
-    enabled: false
+    enabled: true
     redis_url: $REDIS_URL           # 留空则退回 PostgreSQL load_count
     key_prefix: myflow:skills:usage # key = <prefix>:<user_id>
     prompt_top_k: 10                # 私有技能超过 N 个时，system prompt 只列前 N 个
@@ -487,7 +487,7 @@ skills:
     max_context_chars: 12000      # 一次加载的正文总预算
 
     keyword:                      # 本地稀疏通道
-      enabled: false
+      enabled: true              # 示例至少保留一路召回；关闭时 search.enabled 也必须关
       bm25_k1: 1.2
       bm25_b: 0.75
       keyword_weight: 2.0         # domain_keywords 的分数倍数
@@ -524,6 +524,89 @@ skills:
     max_body_chars: 4000          # 单个技能正文预算
     max_context_chars: 8000       # 整块正文总预算
     skip_bodies_still_in_context: true   # 正文还在消息里就不重复写（压缩之后才会补）
+
+
+
+
+# ------------------------------------------------------------
+# ContextForge 工具管理（可选）。enabled=false 时不发任何网络请求。
+#
+# 部署前提（ContextForge 侧）：
+#   MCPGATEWAY_ADMIN_API_ENABLED=true   # /admin/events 与 /tools 管理 API 才会挂载
+#   MCPGATEWAY_UI_ENABLED 可以保持 false
+#   admin_token 需要 admin.events（或 *）权限；GET /admin/events 不需要 CSRF
+# 多 worker 部署时 ContextForge 需要 Redis，跨进程的事件才会出现在 /admin/events。
+#
+# MyFlow 不落工具表：ContextForge 是唯一写入目标；运行时从 MCP 端点加载，
+# 再把文档写进下面这个独立的 Milvus collection。工具更新有三条路径：
+#   1. 管理页写操作 -> 网关异步刷新；
+#   2. 订阅 GET /admin/events；
+#   3. 工具调用 not-found / 参数校验错误 -> 刷新 + index.sync() + 重试一次。
+# 安装：uv sync --all-packages --all-extras（或 --extra contextforge）。
+# ------------------------------------------------------------
+contextforge:
+  enabled: false
+  base_url: ""                    # 例如 http://127.0.0.1:4444
+  admin_token: ""                 # 生产用 $CONTEXTFORGE_ADMIN_TOKEN；需 admin.events 或 *
+  agent_token: ""                 # 可留空；默认复用 admin_token
+  mcp_url: ""                     # 留空 = <base_url>/mcp；有虚拟服务器时自动加 /servers/<id>/mcp
+  virtual_server_id: ""
+  verify_tls: true
+  request_timeout_seconds: 15
+  connect_timeout_seconds: 5
+  tool_name_prefix: false
+  tool_loading: auto              # auto | eager | deferred；非 eager 需要 search.enabled
+  deferred_threshold: 24          # 工具数超过这个值才藏起 schema，先走 search_tools
+
+  sync:
+    admin_refresh_async: true     # 管理页写操作立即返回，刷新在后台跑
+    startup_sync: true
+    sync_timeout_seconds: 60
+    cache_ttl_seconds: 60
+    retry_on_tool_error: true
+    tool_error_refresh_timeout_seconds: 10
+    gc_on_manual_reindex: true
+
+  admin_events:
+    enabled: true                 # ContextForge 未开管理 API 时可关掉，避免重连日志
+    url: ""                       # 留空 = <base_url>/admin/events
+    token: ""                     # 留空复用 admin_token
+    reconnect_min_seconds: 1
+    reconnect_max_seconds: 60
+    read_timeout_seconds: 90
+    debounce_ms: 500
+    refresh_min_interval_seconds: 5
+
+  search:                         # search_tools 的召回策略
+    enabled: true
+    candidate_k: 20
+    top_k: 5
+    rrf_k: 60
+    min_score: null
+    max_document_chars: 4000
+    max_description_chars: 500
+    max_result_chars: 6000
+
+    keyword:                      # Milvus 内的 BM25 稀疏通道
+      enabled: true
+      analyzer: chinese           # destructive：建 collection 前确定
+      bm25_k1: 1.2
+      bm25_b: 0.75
+
+    embedding:                    # 复用顶层 embedding 的地址、模型与维度
+      enabled: true
+      query_instruction: "Given a task, retrieve the tool that can perform it"
+
+    rerank:                       # 可选精排；失败自动保留融合顺序
+      enabled: false
+
+    vector_store:                 # 复用顶层 Milvus 连接，只固定 collection
+      collection: myflow_tools_catalog
+      metric_type: COSINE
+      index_type: AUTOINDEX
+      consistency_level: Strong
+      flush: true
+      timeout_seconds: 30
 
 
 # ------------------------------------------------------------

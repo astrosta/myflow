@@ -32,6 +32,11 @@ mcp = [
 knowledge = [
     "pymilvus>=2.5",
 ]
+# ContextForge：MCP 工具加载 + 工具目录的 Milvus 向量/BM25 collection。
+contextforge = [
+    "langchain-mcp-adapters>=0.3",
+    "pymilvus>=2.5",
+]
 # Langfuse 可观测性。enabled=false 时不 import；启用前先 uv sync --extra observability。
 observability = [
     "langfuse>=5.1,<6",
