@@ -106,3 +106,25 @@ async def test_admin_refresh_can_be_configured_synchronous(monkeypatch) -> None:
     assert runtime.status()["sync"] == "ready"
     assert runtime.status()["indexed_tools"] == 1
     await runtime.stop()
+
+@pytest.mark.asyncio
+async def test_synchronous_admin_refresh_keeps_the_successful_write(monkeypatch) -> None:
+    invalidate_contextforge_cache("test-sync-failure")
+    config = ContextForgeConfig(
+        enabled=True,
+        base_url="http://cf",
+        admin_token="",
+        tool_loading="eager",
+        search={"enabled": False},
+        sync={"admin_refresh_async": False},
+    )
+    runtime = ContextForgeRuntime(config, admin=FakeAdmin(), index=None)
+
+    async def failing_load(config):
+        raise RuntimeError("contextforge down")
+
+    monkeypatch.setattr("agentkit.contextforge.runtime.load_contextforge_tools", failing_load)
+    await runtime.request_refresh("admin")
+    assert runtime.status()["sync"] == "degraded"
+    assert runtime.status()["last_error"] == "RuntimeError"
+    await runtime.stop()

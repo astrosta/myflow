@@ -106,11 +106,7 @@ export function ToolManagementPage() {
   });
 
   const refreshAll = async () => {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["tools"] }),
-      listQuery.refetch(),
-      statusQuery.refetch(),
-    ]);
+    await queryClient.invalidateQueries({ queryKey: ["tools"] });
   };
 
   if (sessionLoading) {
@@ -487,8 +483,12 @@ function ToolStatusBar({ adminEvents, error, loading, status }: ToolStatusBarPro
             {status.last_sync_reason ? "（" + status.last_sync_reason + "）" : ""}
           </span>
         ) : null}
-        {status?.reachable === false ? <span className="text-amber-700">ContextForge 不可达</span> : null}
-        {status?.auth_ok === false ? <span className="text-amber-700">管理凭据无效</span> : null}
+        {status?.enabled && status.reachable === false ? (
+          <span className="text-amber-700">ContextForge 不可达</span>
+        ) : null}
+        {status?.enabled && status.auth_ok === false ? (
+          <span className="text-amber-700">管理凭据无效</span>
+        ) : null}
         {status?.last_error ? <span className="text-red-600">{status.last_error}</span> : null}
         {error ? <span className="text-red-600">{error}</span> : null}
       </div>

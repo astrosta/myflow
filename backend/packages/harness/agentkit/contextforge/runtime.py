@@ -111,7 +111,14 @@ class ContextForgeRuntime:
         if self.config.sync.admin_refresh_async:
             self.request_refresh_async(reason)
             return
-        await self.refresh_and_sync(reason=reason)
+        try:
+            await self.refresh_and_sync(reason=reason)
+        except Exception as exc:  # noqa: BLE001 - the write already succeeded
+            logger.warning(
+                "ContextForge synchronous refresh failed: %s", type(exc).__name__
+            )
+            self._sync_status = "degraded"
+            self._last_error = type(exc).__name__
 
     def request_refresh_async(self, reason: str) -> None:
         if not self.config.enabled:

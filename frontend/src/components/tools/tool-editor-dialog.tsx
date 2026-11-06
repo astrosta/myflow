@@ -580,7 +580,7 @@ function ToolEditorForm({ initial, onClose, onSaved, toolId }: ToolEditorFormPro
           onChange={(event) => set("enabled", event.target.checked)}
           type="checkbox"
         />
-        创建后立即启用
+        启用工具
       </label>
 
       {formError ? (
