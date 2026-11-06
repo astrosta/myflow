@@ -9,9 +9,9 @@
 #   gitea ssh    127.0.0.1:2222         SKILLS_GIT_REPOSITORY
 #   opensandbox  127.0.0.1:8080         sandbox.opensandbox.domain，无 API key
 #                allowed_host_paths ← 仓库根 .env 的 SANDBOX_HOST_ROOT
-#   langfuse     ${MYFLOW_HOST}:3050    唯一对局域网开放的端口（容器内 3000）
-#                宿主机地址只在仓库根 .env 的 MYFLOW_HOST。其余端口只绑 127.0.0.1
+#   langfuse     0.0.0.0:3050          对外端口（容器内 3000）；NEXTAUTH_URL 用 LANGFUSE_BASE_URL
 #                账号与 S3/Redis/ClickHouse 口令在 langfuse/env.example
+#                其余依赖端口只绑 127.0.0.1
 #
 # Langfuse 复用上面的 postgres（库 postgres）和 redis（用户 myflow）。
 # 它的 MinIO、ClickHouse 独立，不碰 Milvus 那套 etcd/minio。
@@ -283,7 +283,8 @@ services:
       LANGFUSE_S3_BATCH_EXPORT_REGION: auto
       LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: http://langfuse-minio:9000
       LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: http://127.0.0.1:9090
-      NEXTAUTH_URL: http://${MYFLOW_HOST:?set MYFLOW_HOST in the repo root .env}:3050
+      # 浏览器打开 Langfuse 的根地址；与仓库根 .env 的 LANGFUSE_BASE_URL 对齐。
+      NEXTAUTH_URL: ${LANGFUSE_BASE_URL:?set LANGFUSE_BASE_URL in the repo root .env}
       LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
       TELEMETRY_ENABLED: "true"
       LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
@@ -296,8 +297,8 @@ services:
       - ./langfuse/env.example
     depends_on: *langfuse-depends-on
     ports:
-      # 唯一发布到所有网卡的端口，对齐 NEXTAUTH_URL。
-      - "3050:3000"
+      # 对外绑定所有网卡，对齐 NEXTAUTH_URL / LANGFUSE_BASE_URL。
+      - "0.0.0.0:3050:3000"
     environment:
       <<: *langfuse-env
       # 浏览器直传只走本机 MinIO，不对外。
