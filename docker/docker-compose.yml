@@ -169,13 +169,15 @@ services:
       USER_UID: "1000"
       USER_GID: "1000"
       GITEA__database__DB_TYPE: sqlite3
-      # SSH 克隆地址对齐 SKILLS_GIT_REPOSITORY=ssh://git@127.0.0.1:2222/...
+      # SSH：用镜像自带的 OpenSSH 听容器内 :22（宿主机 2222→22）。
+      # 不要开 START_SSH_SERVER，否则会和 opensshd 抢 :22，容器直接挂掉。
+      # 克隆：容器内 ssh://git@gitea:22/...；宿主机 ssh://git@127.0.0.1:2222/...
       # 外网打开 Web 时在 .env 设 GITEA_ROOT_URL=http://<公网IP或域名>:3001/
       GITEA__server__ROOT_URL: ${GITEA_ROOT_URL:-http://127.0.0.1:3001/}
+      GITEA__server__DISABLE_SSH: "false"
       GITEA__server__SSH_DOMAIN: 127.0.0.1
       GITEA__server__SSH_PORT: "2222"
-      GITEA__server__SSH_LISTEN_PORT: "22"
-      GITEA__server__START_SSH_SERVER: "true"
+      GITEA__server__START_SSH_SERVER: "false"
     ports:
       - "0.0.0.0:3001:3000"
       - "127.0.0.1:2222:22"
