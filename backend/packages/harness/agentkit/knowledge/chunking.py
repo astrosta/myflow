@@ -10,7 +10,7 @@ from agentkit.knowledge.config import (
     KnowledgeBaseConfig,
 )
 from agentkit.knowledge.models import KnowledgeChunk
-from agentkit.knowledge.tokenizer import TokenCounter, build_token_counter
+from agentkit.knowledge.tokenizer import ApproximateTokenCounter, TokenCounter
 from agentkit.knowledge.types import KnowledgeBaseType
 
 _FENCE = chr(96) * 3
@@ -453,9 +453,7 @@ def chunk_document(
     resolved_type = knowledge_type if isinstance(knowledge_type, KnowledgeBaseType) else KnowledgeBaseType(knowledge_type)
     chunking = config.chunking if isinstance(config, KnowledgeBaseConfig) else config
     type_config = chunking.types[resolved_type.value]
-    counter = token_counter
-    if counter is None:
-        counter = build_token_counter(chunking.tokenizer).counter
+    counter = token_counter or ApproximateTokenCounter()
     max_tokens = min(type_config.chunk_size_tokens, chunking.max_chunk_tokens)
     overlap = min(type_config.chunk_overlap_tokens, max_tokens - 1)
     sections = _sections(text)

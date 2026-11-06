@@ -42,7 +42,7 @@ from agentkit.knowledge.parsers.text import LocalTextParser
 from agentkit.knowledge.rerank import RerankScore, Reranker, build_reranker
 from agentkit.knowledge.store.base import KnowledgeStore
 from agentkit.knowledge.store.memory import MemoryKnowledgeStore
-from agentkit.knowledge.tokenizer import TokenCounter, build_token_counter
+from agentkit.knowledge.tokenizer import ApproximateTokenCounter, TokenCounter
 from agentkit.knowledge.types import KnowledgeBaseType, parse_type
 from agentkit.knowledge.vector_store.milvus import MilvusVectorStore
 
@@ -113,7 +113,7 @@ class KnowledgeService:
         )
         # None means the rerank stage is switched off in config; ordering stays RRF.
         self._reranker = reranker if reranker is not None else build_reranker(config.retrieval.rerank)
-        self._token_counter = token_counter or build_token_counter(config.chunking.tokenizer).counter
+        self._token_counter = token_counter or ApproximateTokenCounter()
         self._root = resolve_path(config.storage_dir)
         self._semaphore = asyncio.Semaphore(config.max_ingest_concurrency)
         self._tasks: dict[str, asyncio.Task] = {}
@@ -347,12 +347,17 @@ class KnowledgeService:
 
         from agentkit.knowledge.text import clean_document_text
 
-        cleaned = clean_document_text(parsed.markdown)
+        # Cleaning is also regex/unicode-heavy; keep it off the event loop.
+        cleaned = await asyncio.to_thread(clean_document_text, parsed.markdown)
         if len(cleaned) < 20:
             raise InvalidKnowledgeRequest("No usable text was extracted from this document")
 
         await self._store.update_document_status(user_id, document_id, status="chunking")
-        chunks = chunk_document(
+        # Tokenizer loading and regex-heavy splitting are synchronous CPU work.
+        # Running them on the event loop freezes every HTTP request and the
+        # document-status poll that the UI needs while a document is chunking.
+        chunks = await asyncio.to_thread(
+            chunk_document,
             cleaned,
             base.type,
             self._config,

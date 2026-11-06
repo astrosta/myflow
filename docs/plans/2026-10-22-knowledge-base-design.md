@@ -14,6 +14,8 @@
 > `2026-11-02-retrieval-subagents-design.md`。
 > 第五轮改动（业务噪声清洗、FAQ 仅问题向量、四类文档父子块）见 §17；本轮要求
 > 删除现有知识库数据后重建，不保留旧 collection 兼容。
+> 2026-11-06 修订：分片 token 计数固定为内置近似计数，`chunking.tokenizer` 配置项、
+> Qwen tokenizer / transformers 依赖均已移除；本文中相关内容仅作为历史记录。
 > 参考：阿里云开发者社区《阿里云百炼 + Spring AI：企业级 RAG 知识库从0到1的完整搭建实战》
 > （https://developer.aliyun.com/article/1743969）。
 > 目标不是复刻它的托管知识库，而是沿用其“知识库创建 → 文档入库 → 解析清洗 → 分片 →

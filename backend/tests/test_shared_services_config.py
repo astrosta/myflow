@@ -58,7 +58,6 @@ def test_shared_services_fill_both_consumers_without_overwriting_policies() -> N
     assert cfg.skills.search.embedding.query_instruction.startswith("Given a task")
     assert cfg.knowledge_base.embedding.timeout_seconds == 11
     assert cfg.skills.search.embedding.timeout_seconds == 7
-    assert cfg.knowledge_base.chunking.tokenizer.model == "shared-embedding"
 
     assert cfg.knowledge_base.retrieval.rerank.base_url == "http://rerank:8000"
     assert cfg.skills.search.rerank.model == "shared-reranker"

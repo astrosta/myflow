@@ -141,6 +141,16 @@ def test_full_local_config_uses_token_defaults() -> None:
     assert set(cfg.chunking.types) == set(KNOWLEDGE_BASE_TYPES)
 
 
+def test_chunking_has_no_tokenizer_config() -> None:
+    """Token accounting is built in; the old tokenizer section must not return."""
+
+    assert "tokenizer" not in KnowledgeBaseConfig().chunking.model_dump()
+    with pytest.raises(ValidationError, match="tokenizer"):
+        KnowledgeBaseConfig.model_validate(
+            {"chunking": {"tokenizer": {"provider": "approximate"}}}
+        )
+
+
 def test_overlap_must_be_smaller_than_chunk_and_max_covers_all_types() -> None:
     with pytest.raises(ValidationError, match="chunk_overlap_tokens"):
         KnowledgeBaseConfig.model_validate(

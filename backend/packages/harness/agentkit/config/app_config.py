@@ -177,14 +177,6 @@ class AppConfig(BaseModel):
                 continue
             for path in paths:
                 _merge_common_service(patched, path, common)
-            if key == "embedding":
-                model = common.get("model")
-                if isinstance(model, str) and model.strip():
-                    _merge_common_service(
-                        patched,
-                        ("knowledge_base", "chunking", "tokenizer"),
-                        {"model": model},
-                    )
         return patched
 
     @model_validator(mode="after")

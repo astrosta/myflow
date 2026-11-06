@@ -31,7 +31,6 @@ mcp = [
 ]
 knowledge = [
     "pymilvus>=2.5",
-    "transformers>=4.51",
 ]
 # Langfuse 可观测性。enabled=false 时不 import；启用前先 uv sync --extra observability。
 observability = [

@@ -528,7 +528,7 @@ skills:
 
 # ------------------------------------------------------------
 # 知识库（MinerU + Qwen3-Embedding-8B + Milvus）
-# enabled=false 时不需要装 pymilvus/transformers，也不会给 agent 挂检索工具。
+# enabled=false 时不需要装 pymilvus，也不会给 agent 挂检索工具。
 # 启用前必须填写所有服务地址：代码里没有默认端点。
 # 安装：uv sync --all-packages --all-extras（会同时装 postgres/mcp 等 extra）
 # ------------------------------------------------------------
@@ -572,11 +572,7 @@ knowledge_base:
     max_download_bytes: 536870912
 
   chunking:
-    tokenizer:
-      provider: qwen             # qwen | approximate
-      # model 默认取顶层 embedding.model；需要单独指定时再写在这里。
-      path: ""                  # 可选：本地 tokenizer 目录
-      local_files_only: false
+    # 分片固定使用内置近似 token 计数，没有 tokenizer 配置项。
     min_chunk_tokens: 32
     max_chunk_tokens: 1024
     separators: ["\n\n", "\n", "。", "！", "？", "；", ". ", "! ", "? ", "; ", "，", ", ", " "]

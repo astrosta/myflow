@@ -26,15 +26,6 @@ _EXTENSION = re.compile(r"^[a-z0-9][a-z0-9+_-]{0,15}$")
 _COLLECTION = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,254}$")
 
 
-class TokenizerConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    provider: Literal["qwen", "approximate"] = "qwen"
-    model: str = "Qwen/Qwen3-Embedding-8B"
-    path: str = ""
-    local_files_only: bool = False
-
-
 class ChunkTypeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,7 +57,6 @@ def _default_chunk_types() -> dict[str, ChunkTypeConfig]:
 class ChunkingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tokenizer: TokenizerConfig = Field(default_factory=TokenizerConfig)
     min_chunk_tokens: int = Field(default=32, ge=0, le=1024)
     max_chunk_tokens: int = Field(default=1024, ge=32, le=8192)
     separators: list[str] = Field(default_factory=lambda: list(DEFAULT_SEPARATORS))

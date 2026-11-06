@@ -634,8 +634,9 @@ config.yaml**，代码里没有默认端点；启用时缺 `parse.local.endpoint
 `embedding`、`rerank`、`vector_store`；`knowledge_base.embedding`、
 `knowledge_base.vector_store`、`knowledge_base.retrieval.rerank` 和
 `skills.search.*` 只保留 collection、开关、超时、重试、指令等个性化字段，
-同名字段仍可覆盖顶层值。`chunking.tokenizer.model` 默认也取顶层
-`embedding.model`，需要局部 tokenizer 时再单独指定。
+同名字段仍可覆盖顶层值。分片 token 计量固定使用内置的近似计数器（CJK 字符/
+英文词），没有 `chunking.tokenizer` 配置项；不加载模型 tokenizer，也不需要
+`transformers`。
 
 MinerU 的**接口路径也是配置**：本地 `parse.local.file_parse_path`（默认 `/v1/file_parse`）、
 云端 `parse.cloud.file_urls_path`（默认 `/api/v4/file-urls/batch`）与
@@ -645,7 +646,8 @@ MinerU 的**接口路径也是配置**：本地 `parse.local.file_parse_path`（
 服务端临时地址，不配置。
 
 ```bash
-# 只在启用知识库时需要；同时保留 postgres/mcp 等其它 extra
+# 只在启用知识库时需要；同时保留 postgres/mcp 等其它 extra。
+# knowledge extra 只含 pymilvus，不再安装 transformers。
 uv sync --all-packages --all-extras
 ```
 
@@ -658,7 +660,9 @@ Qwen3-Embedding-8B（4096 维）→ Milvus。元数据与文档状态共用主�
 法律法规（`legal`）。默认 token 档位：技术 512/64，运维/安全/法律 512/0，
 FAQ 384/0，API 768/0；硬上界 1024 token。FAQ 只对问题做 embedding，正文仍保存 Q+A。
 运维/安全/API/法律超长逻辑单元使用父子块：父块存父 collection，子块带 parent_id；
-检索命中子块后返回父块全文。分片和查询都走 Qwen3 tokenizer，不可用时会明确回退近似计数。
+检索命中子块后返回父块全文。分片使用内置近似 token 计数，不加载 tokenizer、
+不访问 Hugging Face；清洗和切分在 worker 线程执行，不会阻塞 Gateway 的事件循环
+和文档状态轮询。
 
 清洗在通用文本规范化后，确定性删除目录页、前言、版权声明、免责声明、修订记录和
 重复块；原始上传文件保留。该版本的 Milvus schema 新增 `parent_id` 和

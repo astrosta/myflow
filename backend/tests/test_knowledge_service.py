@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -157,7 +160,6 @@ def _config(tmp_path: Path, **overrides) -> KnowledgeBaseConfig:
         "vector_store": {"uri": "http://milvus:19530"},
         "retrieval": {"max_context_chars": 1200},
         "chunking": {
-            "tokenizer": {"provider": "approximate"},
             "types": {
                 "technical": {"chunk_size_tokens": 64, "chunk_overlap_tokens": 0},
                 "operations": {"chunk_size_tokens": 64, "chunk_overlap_tokens": 0},
@@ -314,6 +316,46 @@ async def test_markdown_upload_runs_pipeline_and_updates_counters(tmp_path) -> N
     assert refreshed.document_count == 1
     assert refreshed.chunk_count == document.chunk_count
     await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chunking_does_not_block_the_event_loop(tmp_path, monkeypatch) -> None:
+    import agentkit.knowledge.service as service_module
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_chunk(*_args, **_kwargs):
+        entered.set()
+        release.wait(timeout=3)
+        return [KnowledgeChunk(index=0, content="切分结果")]
+
+    monkeypatch.setattr(service_module, "chunk_document", slow_chunk)
+    service, store = await _service(tmp_path)
+    base = await service.create_base(user_id="u1", name="产品文档", knowledge_type="technical")
+    timer = threading.Timer(0.6, release.set)
+    timer.start()
+    started = time.perf_counter()
+    try:
+        await service.add_documents(
+            user_id="u1",
+            base_id=base.id,
+            uploads=[FakeUpload("manual.md", ("# 标题\n\n" + "正文。" * 100).encode())],
+        )
+        # If chunk_document ran on the event loop, this coroutine could not
+        # resume until the 0.6s release timer fired.
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        resumed = time.perf_counter()
+        assert resumed - started < 0.4
+    finally:
+        release.set()
+        timer.cancel()
+        await service.wait_for_idle(timeout=5)
+        await service.aclose()
+
+    document = (await store.list_documents("u1", base.id))[0]
+    assert document.status == "ready"
 
 
 @pytest.mark.asyncio
