@@ -1,5 +1,6 @@
 # 只跑 MyFlow 前端。网关、数据库和其它依赖不在这里启动。
 # /api 由容器内 nginx 转到 GATEWAY_UPSTREAM，默认是宿主机的 8001。
+# 对外绑定仓库根 .env 的 MYFLOW_HOST:2026（服务器 IP，不对仅本机）。
 #
 # 在仓库根目录：
 #   docker compose -f docker/frontend-compose.yml up -d --build
@@ -24,7 +25,7 @@ services:
     env_file:
       - ../.env
     ports:
-      - "127.0.0.1:2026:2026"
+      - "${MYFLOW_HOST:?set MYFLOW_HOST in the repo root .env}:2026:2026"
     volumes:
       - ../config.yaml:/app/config.yaml:ro
       - ../.env:/app/.env:ro

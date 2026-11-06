@@ -231,3 +231,6 @@ skills_prefs.json
 # 运行时用户画像（按用户生成；模板在 config/personalization/profile.md）
 data/personalization/
 .vscode
+
+# 运维配置（含密钥与本机路径）。模板见 config.example.yaml。
+config.yaml

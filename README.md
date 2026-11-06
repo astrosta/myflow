@@ -75,10 +75,10 @@ docker compose -f docker/docker-compose.yml --env-file .env down
 # 网关：构建并后台启动，对外 8001
 docker compose -f docker/backend-compose.yml up -d --build
 
-# 前端：构建并后台启动，对外 127.0.0.1:2026
+# 前端：构建并后台启动，对外 ${MYFLOW_HOST}:2026（服务器 IP）
 # /api 默认转到宿主机 8001。网关在别的地址时：
 #   GATEWAY_UPSTREAM=192.168.1.10:8001 docker compose -f docker/frontend-compose.yml up -d --build
-docker compose -f docker/frontend-compose.yml up -d --build
+docker compose -f docker/frontend-compose.yml --env-file .env up -d --build
 ```
 
 只构建、不启动：
@@ -92,7 +92,7 @@ docker build -f docker/frontend.Dockerfile -t myflow-frontend:local .
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/docs
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:2026/workspace
+curl -s -o /dev/null -w "%{http_code}\n" http://${MYFLOW_HOST}:2026/workspace
 ```
 
 停止网关 / 前端：
