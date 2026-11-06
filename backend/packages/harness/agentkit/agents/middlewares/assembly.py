@@ -30,6 +30,7 @@ from agentkit.agents.middlewares.summarization_middleware import create_summariz
 from agentkit.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
 from agentkit.agents.middlewares.title_middleware import TitleMiddleware
 from agentkit.agents.middlewares.tool_error_handling_middleware import ToolErrorHandlingMiddleware
+from agentkit.agents.middlewares.tool_refresh_retry_middleware import ToolRefreshRetryMiddleware
 from agentkit.agents.middlewares.tool_search_middleware import ToolSearchMiddleware
 from agentkit.agents.middlewares.uploads_middleware import UploadsMiddleware
 from agentkit.config import AppConfig, get_app_config
@@ -118,6 +119,15 @@ def build_runtime_middlewares(
     # PII 工具参数还原必须在 ToolErrorHandling 之内：无法解析的 handle 会被
     # 错误处理收成可恢复的 ToolMessage，而不是把整轮打崩。
     chain.append(PIIMiddleware(app_config=app_config))
+    from agentkit.contextforge.runtime import get_contextforge_runtime
+
+    chain.append(
+        ToolRefreshRetryMiddleware(
+            enabled=bool(app_config.contextforge.sync.retry_on_tool_error),
+            refresh_timeout_seconds=app_config.contextforge.sync.tool_error_refresh_timeout_seconds,
+            runtime_provider=get_contextforge_runtime,
+        )
+    )
     return chain
 
 
