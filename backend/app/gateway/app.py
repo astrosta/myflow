@@ -103,11 +103,15 @@ async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRunti
     return runtime
 
 
-async def start_contextforge_runtime(app: FastAPI, app_config: AppConfig) -> None:
+async def start_contextforge_runtime(
+    app: FastAPI, app_config: AppConfig, session_factory: Any
+) -> None:
     """Build the process tool runtime. Failing to reach ContextForge is non-fatal."""
     runtime: ContextForgeRuntime | None = None
     try:
-        runtime = build_contextforge_runtime(app_config.contextforge)
+        runtime = build_contextforge_runtime(
+            app_config.contextforge, session_factory=session_factory
+        )
         app.state.contextforge = runtime
         if runtime is not None:
             await runtime.start()
@@ -183,6 +187,24 @@ async def stop_skill_runtime(app: FastAPI) -> None:
         app.state.skill_catalog = None
         app.state.skill_search = None
         reset_skill_runtime()
+
+
+def preflight_contextforge(app_config: AppConfig) -> None:
+    """固定 GATEWAY_WORKERS=1（rev.9 §6.4）。
+
+    ContextForge runtime 是进程级的：一个 /admin/events 订阅器、一个午夜任务、
+    一把同步锁。多 worker 启动会让每个进程各自订阅、各自午夜同步同一个目录，
+    重复写入且互相看不到对方的事件。宁可起不来，也不要悄悄双写。
+    """
+    if not app_config.contextforge.enabled:
+        return
+    workers = gateway_worker_count()
+    if workers > 1:
+        raise RuntimeError(
+            "contextforge.enabled=true with GATEWAY_WORKERS>1: every worker would "
+            "run its own /admin/events subscriber and midnight sync against the same "
+            "catalog. Run a single gateway worker (rev.9 §6.4)."
+        )
 
 
 def preflight_auth(app_config: AppConfig) -> AuthSettings:
@@ -290,6 +312,9 @@ async def stop_openviking_memory(
 async def lifespan(app: FastAPI):
     """Open the database before the checkpointer, and close it after."""
     app_config = get_app_config()
+    # 固定单 worker 的两个理由在这里都成立：认证桶不能共享，ContextForge 的
+    # 进程级同步/订阅器/午夜任务也不能被复制到多个 worker。
+    preflight_contextforge(app_config)
     preflight_auth(app_config)
     await init_engine_from_config(app_config.database)
     try:
@@ -340,7 +365,7 @@ async def lifespan(app: FastAPI):
                     app.state.knowledge_service = await configure_knowledge_service(
                         app_config.knowledge_base
                     )
-                    await start_contextforge_runtime(app, app_config)
+                    await start_contextforge_runtime(app, app_config, session_factory)
                     # M8 §10.1：进程级子代理容量控制器在这里冻结一次（subagent_runtime.* 是
                     # startup-only）。建在启动时而不是"第一个启用子代理的 run"，是为了让 YAML
                     # 里那个值在启动那一刻就定下来——热重载不能悄悄抬高已经宣告出去的容量。

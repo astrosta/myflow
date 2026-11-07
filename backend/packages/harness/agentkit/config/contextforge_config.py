@@ -23,11 +23,36 @@ class ContextForgeSyncConfig(BaseModel):
 
     admin_refresh_async: bool = True
     startup_sync: bool = True
+    #: Local wall-clock time of the daily full tools/list.  Single worker, so a
+    #: plain process task is enough; jitter only spreads restarts apart.
+    daily_at: str = "00:00"
+    #: "local" means the gateway host zone; anything else is an IANA zone name.
+    timezone: str = "local"
+    daily_jitter_seconds: int = Field(default=60, ge=0, le=3600)
     sync_timeout_seconds: float = Field(default=60.0, gt=0)
     cache_ttl_seconds: int = Field(default=60, ge=5)
     retry_on_tool_error: bool = True
     tool_error_refresh_timeout_seconds: float = Field(default=10.0, gt=0)
     gc_on_manual_reindex: bool = True
+
+    @field_validator("daily_at")
+    @classmethod
+    def _daily_at_shape(cls, value: str) -> str:
+        """Fail at load time, not at 23:59 on the first night."""
+        from agentkit.contextforge.daily import parse_daily_at
+
+        text = str(value or "").strip()
+        parse_daily_at(text)
+        return text
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_shape(cls, value: str) -> str:
+        from agentkit.contextforge.daily import resolve_timezone
+
+        text = str(value or "").strip() or "local"
+        resolve_timezone(text)
+        return text
 
 
 class AdminEventsConfig(BaseModel):
