@@ -250,9 +250,25 @@ class ToolVectorIndex:
         tool that stopped being callable, lost its owner, was disabled or became
         unreachable).  Tools the sync service decides to retire are removed
         through ``delete_by_ids``.
+
+        Because a full sync deletes every row outside the snapshot's tool ids, a
+        non-empty snapshot in which no record carries a usable id is refused
+        with an error stat instead of emptying the collection.  That is the
+        shape produced by a caller still handing the pre-rev.9 catalog entries
+        (no tool id, no call name, no owner).  An all-non-callable catalog is a
+        real snapshot and still prunes, because its records do carry ids.
         """
         started = time.monotonic()
         try:
+            if records and not any(_carries_tool_id(record) for record in records):
+                logger.warning(
+                    "Tool index sync refused: %d records carry no tool id", len(records)
+                )
+                return ToolIndexSyncStats(
+                    scanned=len(records),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    error="UnrecognizedToolRecords",
+                )
             await self.ensure_collection(self._dimensions)
             indexable = [record for record in records if _is_indexable(record)]
             keep = {str(record.id) for record in indexable}
@@ -615,6 +631,17 @@ def _owner_expression(owner_user_id: str | None) -> str:
             "owner_user_id is required: tool retrieval is always owner-scoped"
         )
     return f"{_OWNER_FIELD} == {json.dumps(owner, ensure_ascii=False)}"
+
+
+def _carries_tool_id(record: Any) -> bool:
+    """Does this even look like a tool record?
+
+    The sync contract is the store's ``ContextForgeToolRecord``, whose ``id``
+    is the collection key.  A caller handing the old catalog entries has no
+    ``id`` attribute at all, which is how ``sync`` tells "the catalog is empty"
+    apart from "these are the wrong objects".
+    """
+    return bool(_text(getattr(record, "id", "")))
 
 
 def _is_indexable(record: Any) -> bool:

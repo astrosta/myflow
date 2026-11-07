@@ -13,6 +13,7 @@ import pytest
 from pymilvus import DataType, FunctionType
 
 from agentkit.config.contextforge_config import ToolKeywordConfig, ToolVectorStoreConfig
+from agentkit.contextforge.catalog import ToolCatalogEntry
 from agentkit.contextforge.index import (
     COLLECTION_NAME,
     OUTPUT_FIELDS,
@@ -384,6 +385,29 @@ async def test_dimension_mismatch_is_reported() -> None:
 
 
 @pytest.mark.asyncio
+async def test_collection_built_with_another_dimension_is_rejected() -> None:
+    """A pre-existing collection built with a different dim must not be reused.
+
+    The query-vector precheck cannot see this: the caller's vector matches the
+    configured dim, and only describe_collection knows the stored dim.
+    """
+    fake = FakeMilvus(dim=8)
+    index = _index(fake, dimensions=4)
+
+    with pytest.raises(ToolIndexUnavailable, match="dimension mismatch: expected 4, got 8"):
+        await index.ensure_collection(4)
+
+    assert fake.created == []
+    assert fake.loaded == []
+    # The search path runs the same inspection, so it fails loudly too.
+    with pytest.raises(ToolIndexUnavailable, match="dimension mismatch"):
+        await index.hybrid_search(
+            vector=[0.0] * 4, query="github", owner_user_id="u1", limit=5
+        )
+    assert fake.hybrid_searches == []
+
+
+@pytest.mark.asyncio
 async def test_hybrid_search_uses_the_configured_rrf_k() -> None:
     fake = FakeMilvus()
     index = _index(
@@ -573,6 +597,71 @@ async def test_full_sync_drops_rows_that_stopped_being_owner_scoped() -> None:
     )
 
     assert (stats.upserted, stats.deleted) == (0, 1)
+    assert fake.stored == {}
+
+
+@pytest.mark.asyncio
+async def test_sync_refuses_a_snapshot_whose_records_carry_no_tool_id() -> None:
+    """Stale callers must not be able to empty the collection and call it success.
+
+    The old runtime handed ``sync`` the pre-rev.9 ``ToolCatalogEntry`` rows,
+    which carry no tool id: every record was unindexable, so a full sync saw an
+    empty ``keep`` set and deleted the entire collection while reporting success.
+    """
+    stale = [
+        ToolCatalogEntry(
+            name="github_search",
+            display_name="github_search",
+            description="search github code",
+            tags=("code",),
+            parameters=("query",),
+            server="contextforge",
+            content="github_search GitHub code search",
+            content_hash="stale-hash",
+            updated_at=0,
+            owner="u1",
+        )
+    ]
+    fake = FakeMilvus(stored={"tool-1": "h1", "tool-2": "h2"})
+    index = _index(fake)
+    embedder = Embedder()
+
+    stats = await index.sync(stale, embedder=embedder, full=True)
+
+    assert stats.error == "UnrecognizedToolRecords"
+    assert (stats.changed, stats.upserted, stats.deleted) == (0, 0, 0)
+    assert fake.deletes == []
+    assert fake.written == []
+    assert embedder.texts == []
+    assert sorted(fake.stored) == ["tool-1", "tool-2"]
+
+    # An incremental sync refuses the same snapshot: it is unusable in both
+    # modes, and staying silent would hide the caller bug just as well.
+    incremental = await index.sync(stale, embedder=embedder)
+    assert incremental.error == "UnrecognizedToolRecords"
+    assert (incremental.upserted, incremental.deleted) == (0, 0)
+    assert fake.deletes == []
+    assert sorted(fake.stored) == ["tool-1", "tool-2"]
+
+
+@pytest.mark.asyncio
+async def test_full_sync_still_prunes_a_catalog_of_nothing_but_non_callable_tools() -> None:
+    """The guard must not mask a real empty index: these records do carry ids."""
+    records = [
+        _record(id="tool-1", callable=False),
+        _record(id="tool-2", name="gitlab_search", enabled=False),
+        _record(id="tool-3", name="offline_tool", reachable=False),
+    ]
+    fake = FakeMilvus(stored={"tool-1": "h1", "tool-2": "h2", "tool-3": "h3"})
+    index = _index(fake)
+    embedder = Embedder()
+
+    stats = await index.sync(records, embedder=embedder, full=True)
+
+    assert stats.error is None
+    assert (stats.changed, stats.upserted, stats.deleted) == (0, 0, 3)
+    assert embedder.texts == []
+    assert fake.written == []
     assert fake.stored == {}
 
 
