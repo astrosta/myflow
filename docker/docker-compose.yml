@@ -209,6 +209,8 @@ services:
       AUTH_ENCRYPTION_SECRET: ${CONTEXTFORGE_AUTH_SECRET:-myflow-contextforge-auth-secret-32}
       PLATFORM_ADMIN_EMAIL: ${CONTEXTFORGE_ADMIN_EMAIL:-admin@example.com}
       PLATFORM_ADMIN_PASSWORD: ${CONTEXTFORGE_ADMIN_PASSWORD:-changeme-local}
+      # 未设置时镜像默认 changeme（8 位），邮箱登录开启时启动会被拒。
+      DEFAULT_USER_PASSWORD: ${CONTEXTFORGE_DEFAULT_USER_PASSWORD:-myflow-user-local}
       PLATFORM_ADMIN_FULL_NAME: Platform Administrator
     ports:
       - "127.0.0.1:4444:4444"
