@@ -165,26 +165,6 @@ def test_a_reserved_command_or_unknown_skill_is_not_activated(tmp_path):
         assert seen["request"] is original, text
 
 
-def test_a_user_disabled_skill_is_not_activated(tmp_path, monkeypatch):
-    prefs = tmp_path / "skills_prefs.json"
-    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(prefs))
-    write_skill(tmp_path, "public", "pdf-processing")
-    from agentkit.config.skills_prefs import write_user_skill_pref
-
-    write_user_skill_pref("u1", "pdf-processing", False)
-    activation, _ = _middlewares(tmp_path)
-    original = _request([HumanMessage(content="/pdf-processing go", id="m1")], {"user_id": "u1"})
-    seen: dict = {}
-
-    def handler(request: ModelRequest):
-        seen["request"] = request
-        return "ok"
-
-    activation.wrap_model_call(original, handler)
-
-    assert seen["request"] is original
-
-
 def test_the_audit_tag_is_logged_on_activation(tmp_path, caplog):
     write_skill(tmp_path, "public", "pdf-processing")
     activation, _ = _middlewares(tmp_path)

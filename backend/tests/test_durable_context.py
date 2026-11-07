@@ -445,24 +445,6 @@ def test_active_context_can_be_switched_off(tmp_path) -> None:
     assert "BODY-MARKER" not in rendered
 
 
-def test_a_skill_the_user_switched_off_gets_no_body(tmp_path, monkeypatch) -> None:
-    from agentkit.config.skills_prefs import write_user_skill_pref
-    from fakes.skill_tree import write_skill
-
-    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(tmp_path / "skills_prefs.json"))
-    write_skill(tmp_path, "public", "pdf", body="# 正文\nBODY-MARKER\n")
-    write_user_skill_pref("u1", "pdf", False)
-
-    rendered = _render_active(
-        _active_middleware(tmp_path),
-        [HumanMessage(content="hi", id="u1")],
-        [{"name": "pdf", "path": "/mnt/skills/public/pdf/SKILL.md", "description": "PDF"}],
-    )
-
-    assert "- pdf: PDF | dir=/mnt/skills/public/pdf/SKILL.md" in rendered
-    assert "BODY-MARKER" not in rendered
-
-
 def test_a_vanished_skill_file_still_renders_its_line(tmp_path) -> None:
     rendered = _render_active(
         _active_middleware(tmp_path),

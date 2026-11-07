@@ -225,11 +225,6 @@ __marimo__/
 
 .myflow
 
-# M7：API 可写的运行时配置（含凭据）。模板见 extensions_config.example.json。
-extensions_config.json
-.extensions_config.json.lock
-skills_prefs.json
-.skills_prefs.json.lock
 
 # 运行时用户画像（按用户生成；模板在 config/personalization/profile.md）
 data/personalization/

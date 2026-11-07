@@ -257,7 +257,7 @@ models:
 | `GET /api/memory/profile` | 当前画像字段；行不存在返回空字段（不 404） |
 | `GET /api/memory/profile/schema` | 全部受支持字段的元数据，前端按它渲染全字段表单；字段均为自由填写，描述中的“常见”只是提示 |
 | `PATCH /api/memory/profile` | 部分更新；`null` 删除字段；列表整列表替换；etag CAS |
-| `GET/POST /api/memory/profile/suggestions` `/onboarding` | 画像建议与引导 |
+| `GET/POST /api/memory/profile/onboarding` | 画像引导 |
 | `GET /api/memory/items/types` | 记忆管理支持的七类记忆与中文名（不含 skills） |
 | `GET /api/memory/items` | 按类型列记忆摘要（OpenViking 过滤型 `find`，不落库） |
 | `GET /api/memory/items/detail` / `content` | 详情目录（`.overview.md`）与记忆正文（`read`） |
@@ -290,12 +290,6 @@ checkpoint 或日志；进程重启后旧 handle 不可解析，工具必须 fai
 - **tool result 不在本策略保证范围内**：`ToolMessage` 中的敏感信息由工具自身负责；
 - 多模态、上传文件和 artifact 内容暂不覆盖，由对应工具/上传层负责。
 
-**技能开关走第二份文件**：`extensions_config.json`（模板 `extensions_config.example.json`，已 gitignored）。
-它**由 API 读写**，所以整份 `config.yaml` 不能变成 API 可写。路径优先级和 `config.yaml` 一样，环境变量是
-`MYFLOW_EXTENSIONS_CONFIG_PATH`：显式路径或环境变量指向的文件不存在会直接报错，
-只有"项目根下搜不到"才算没配扩展。所有读-改-写走 `agentkit.config.update_extensions_config()`：
-进程内 `threading.Lock` + 跨进程文件咨询锁 + 原子写。`mcpServers` 已下线，历史键在读取时忽略。
-
 ### Langfuse 可观测性（远程自建）
 
 Langfuse 已在远程机器上运行；MyFlow 只做客户端接入，不管理 Langfuse 的 ClickHouse/Postgres/Redis/MinIO。
@@ -327,8 +321,7 @@ observability:
 
 ## ContextForge 工具管理（可选）
 
-ContextForge 是 MCP 工具的**唯一来源和写入目标**：`extensions_config.json` 的普通
-`mcpServers` 来源已下线；MyFlow 不建工具表，也不复制 CRUD 语义。浏览器只打同源
+ContextForge 是 MCP 工具的**唯一来源和写入目标**：MyFlow 不建工具表，也不复制 CRUD 语义。浏览器只打同源
 `/api/tools`，ContextForge 的 admin token 始终留在网关。
 
 部署前提（ContextForge 1.1.0）：
@@ -577,7 +570,7 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `GET` | `/api/skills/{skill_id}/scans` | 扫描历史（`skills:read`） |
 | `POST` | `/api/skills/{skill_id}/activate` | 扫描通过后生效、刷新快照并写索引 outbox（`skills:write`） |
 | `DELETE` | `/api/skills/{skill_id}` | 删除私有技能与 active 指针，并刷新目录/索引（`skills:write`） |
-| `PUT` | `/api/skills/{skill_id}/preference` | 开关"我用不用"（任何登录用户，只写 `skills_prefs.json`，按 `skill_id`） |
+| `PUT` | `/api/skills/{skill_id}/preference` | 开关"我用不用"（任何登录用户，写 PostgreSQL 的 `skills.enabled`，按 `skill_id`） |
 | `POST` | `/api/skills/reload` | 重建本进程的目录快照与挂载树（`admin`） |
 | `GET` | `/api/v1/auth/setup-status` | 库里有没有 admin（公开） |
 | `POST` | `/api/v1/auth/initialize` | 建第一个 admin（公开，且只在零 admin 时；要 username + password） |

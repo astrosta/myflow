@@ -11,8 +11,8 @@ from agentkit.skills.types import Skill, SkillCategory, SkillPathError
 from fakes.skill_tree import skill_text, skills_config, symlinks_available, write_skill
 
 
-def _names(root, enabled_map=None):
-    skills = load_skills(skills_config(root), enabled_map=enabled_map or {})
+def _names(root):
+    skills = load_skills(skills_config(root))
     return sorted((skill.name, skill.category.value, skill.enabled) for skill in skills)
 
 
@@ -29,7 +29,7 @@ def test_custom_overrides_public(tmp_path):
     write_skill(tmp_path, "public", "csv-tools", description="public 版")
     write_skill(tmp_path, "custom", "csv-tools", description="custom 版")
 
-    skills = load_skills(skills_config(tmp_path), enabled_map={})
+    skills = load_skills(skills_config(tmp_path))
 
     assert len(skills) == 1
     assert skills[0].category is SkillCategory.CUSTOM
@@ -95,7 +95,7 @@ def test_validate_refuses_a_missing_file(tmp_path):
 def test_chinese_frontmatter_is_read_as_utf8(tmp_path):
     write_skill(tmp_path, "public", "pdf-processing", description="处理 PDF 文档，支持中文")
 
-    skills = load_skills(skills_config(tmp_path), enabled_map={})
+    skills = load_skills(skills_config(tmp_path))
 
     assert skills[0].description == "处理 PDF 文档，支持中文"
 
@@ -127,21 +127,20 @@ def test_directory_without_skill_md_is_ignored(tmp_path):
     assert _names(tmp_path) == []
 
 
-def test_enabled_defaults_to_true_and_comes_from_the_map(tmp_path):
+def test_filesystem_skills_are_enabled_by_default(tmp_path):
     write_skill(tmp_path, "public", "one")
     write_skill(tmp_path, "public", "two")
 
     assert _names(tmp_path) == [("one", "public", True), ("two", "public", True)]
-    assert _names(tmp_path, {"one": False}) == [("one", "public", False), ("two", "public", True)]
 
 
 def test_every_call_rescans_the_disk(tmp_path):
     write_skill(tmp_path, "public", "one")
-    assert [skill.name for skill in load_skills(skills_config(tmp_path), enabled_map={})] == ["one"]
+    assert [skill.name for skill in load_skills(skills_config(tmp_path))] == ["one"]
 
     write_skill(tmp_path, "custom", "two")
 
-    assert sorted(skill.name for skill in load_skills(skills_config(tmp_path), enabled_map={})) == [
+    assert sorted(skill.name for skill in load_skills(skills_config(tmp_path))) == [
         "one",
         "two",
     ]
@@ -151,7 +150,7 @@ def test_relative_paths_and_container_paths(tmp_path):
     write_skill(tmp_path, "public", "pdf-processing")
 
     skill = load_skills(
-        skills_config(tmp_path, container_path="/mnt/skills"), enabled_map={}
+        skills_config(tmp_path, container_path="/mnt/skills")
     )[0]
 
     assert skill.relative_path.as_posix() == "pdf-processing"

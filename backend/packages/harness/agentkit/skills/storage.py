@@ -1,25 +1,24 @@
 """技能扫描与 live registry（M7 §3.4）。
 
 扫描规则本身（包边界、目录名、符号链接）在 scan.py：内置技能与 public/custom 共用
-同一份，规则只写一遍。这里负责 **两个 category 的合并**（custom 覆盖 public）、
-把全局开关落到 Skill.enabled 上，以及 **内置技能 overlay**：内置技能没有全局/个人开关，
-只受 agent 白名单限制，同名时压过 catalog 行，读 catalog 失败时照样留在索引里。
+同一份，规则只写一遍。这里负责 **两个 category 的合并**（custom 覆盖 public）
+以及 **内置技能 overlay**：内置技能只受 agent 白名单限制，同名时压过 catalog 行，
+读 catalog 失败时照样留在索引里。
 
 load_skills() **每次调用都扫盘**，不缓目录：技能刚被运维加进来，下一次组装提示词
-就该出现在索引里。缓的是 JSON 里的两层开关。
+就该出现在索引里。文件系统来源不再有全局/个人 JSON 开关。
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.skills.builtin import load_builtin_skills
-from agentkit.skills.prefs import effective_enabled, global_enabled_map, read_user_skill_prefs
 from agentkit.skills.scan import is_within, scan_skill_category
 from agentkit.skills.types import Skill, SkillCategory, SkillPathError
 
@@ -45,7 +44,7 @@ def _warn_builtin_collision(name: str, category: SkillCategory) -> None:
     logger.warning("Skill %s: builtin hides the %s row", name, category.value)
 
 
-def load_skills(config: SkillsConfig, *, enabled_map: Mapping[str, bool]) -> list[Skill]:
+def load_skills(config: SkillsConfig) -> list[Skill]:
     """**每次调用都扫盘**（不缓目录）。返回值已做 custom > public 的覆盖。"""
     found: dict[str, Skill] = {}
     root = config.root_dir()
@@ -54,6 +53,7 @@ def load_skills(config: SkillsConfig, *, enabled_map: Mapping[str, bool]) -> lis
             root / category.value,
             category=category,
             container_path=config.container_path,
+            enabled=True,
         ):
             previous = found.get(skill.name)
             if previous is not None:
@@ -64,11 +64,8 @@ def load_skills(config: SkillsConfig, *, enabled_map: Mapping[str, bool]) -> lis
                     previous.category.value,
                 )
             found[skill.name] = skill
-    # 全局开关在这里落到 Skill.enabled；个人偏好是 prefs 的事（§2.4），不进扫描。
-    return [
-        replace(skill, enabled=enabled_map.get(skill.name, True))  # 扫描到的新技能默认开
-        for skill in found.values()
-    ]
+    # 文件系统来源只是本地调试/只读目录：没有全局或个人 JSON 开关。
+    return list(found.values())
 
 
 def validate_skill_file_path(skill: Skill) -> Path:
@@ -101,17 +98,9 @@ class SkillRegistry:
     config: SkillsConfig | None = None
     user_id: str | None = None
     available_skills: frozenset[str] | None = None
-    prefs_path: Path | None = None
-    _enabled_map: Mapping[str, bool] | None = field(default=None, repr=False)
     snapshot: "SkillSnapshot | None" = None
     #: 注入点：给了就用它，没给就按 config 扫（loader 自带指纹缓存）。测试固定内置技能用。
     builtin_skills: tuple[Skill, ...] | None = None
-
-    def enabled_map(self) -> Mapping[str, bool]:
-        return self._enabled_map if self._enabled_map is not None else global_enabled_map()
-
-    def prefs(self) -> Mapping[str, bool]:
-        return read_user_skill_prefs(self.user_id, path=self.prefs_path)
 
     def _snapshot_skills(self, *, available_skills: frozenset[str] | None) -> list[Skill]:
         snapshot = self.snapshot
@@ -167,18 +156,17 @@ class SkillRegistry:
             return self._snapshot_skills(available_skills=None)
         if self.config is None:
             raise ValueError("SkillRegistry needs config when no snapshot is supplied")
-        return load_skills(self.config, enabled_map=self.enabled_map())
+        return load_skills(self.config)
 
     def _catalog_visible(self) -> list[Skill]:
         """现有可见性逻辑：两层开关 + agent 白名单，只作用于 catalog/filesystem 行。"""
         if self.snapshot is not None:
             return self._snapshot_skills(available_skills=self.available_skills)
-        prefs = self.prefs()
         allowed = self.available_skills
         return [
             skill
             for skill in self._catalog_skills()
-            if effective_enabled(skill, prefs) and (allowed is None or skill.name in allowed)
+            if allowed is None or skill.name in allowed
         ]
 
     def load(self) -> list[Skill]:

@@ -13,7 +13,6 @@ import hashlib
 import html
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from langchain.agents import AgentState
@@ -60,7 +59,6 @@ class SkillActivationMiddleware(AgentMiddleware[AgentState]):
         user_id: str | None = None,
         available_skills: frozenset[str] | None = None,
         owner_token: str | None = None,
-        prefs_path: Path | None = None,
         snapshot: "SkillSnapshot | None" = None,
     ) -> None:
         super().__init__()
@@ -68,7 +66,6 @@ class SkillActivationMiddleware(AgentMiddleware[AgentState]):
         self._user_id = user_id
         self._available_skills = available_skills
         self._owner_token = owner_token or new_owner_token()
-        self._prefs_path = prefs_path
         # A snapshot is an immutable catalog generation.  When present, slash
         # resolution never rescans the filesystem; Skill.skill_file is the
         # authoritative body path prepared by the catalog service.
@@ -95,7 +92,6 @@ class SkillActivationMiddleware(AgentMiddleware[AgentState]):
             config=self._config,
             user_id=user_id,
             available_skills=self._available_skills,
-            prefs_path=self._prefs_path,
             snapshot=self._snapshot,
         )
 

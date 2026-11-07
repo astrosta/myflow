@@ -218,7 +218,6 @@ async def test_http_save_scan_activate_and_delete_refresh_the_catalog(
 ) -> None:
     harness = await build_harness(tmp_path)
     monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
-    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(tmp_path / "skills_prefs.json"))
     config_path = write_app_config(
         tmp_path,
         source="git",

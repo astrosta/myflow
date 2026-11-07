@@ -3,7 +3,7 @@
 两种来源，两种路径，**不混用**：
 
 - `skills.source = filesystem`（仅测试/本地调试）：保留 M7 的文件系统扫描与
-  extensions_config.json 全局开关。列表与模型索引来自同一次 load_skills。
+  列表与模型索引来自同一次 load_skills。
 - `skills.source = git`：**永不扫盘**。列表来自进程级不可变快照
   （agentkit.skills.catalog.SkillSnapshot），只包含调用者已生效的私有技能；
   私有技能的启用开关持久化在 skills.enabled（键是内部 skill_id）。
@@ -27,10 +27,8 @@ from typing import Any
 from sqlalchemy import text
 
 from agentkit.config import get_app_config
-from agentkit.config.extensions_config import reset_extensions_config_cache
 from agentkit.config.runtime_paths import resolve_path
 from agentkit.config.skills_config import SkillsConfig
-from agentkit.config.skills_prefs import read_user_skill_prefs, write_user_skill_pref
 from agentkit.knowledge.embedding import OpenAICompatibleEmbedder
 from agentkit.persistence.engine import get_session_factory
 from agentkit.skills import search as skill_search
@@ -50,7 +48,6 @@ from agentkit.skills.outbox import (
     SkillIndexOutboxWorker,
     VerifyStats,
 )
-from agentkit.skills.prefs import effective_enabled, global_enabled_map
 from agentkit.skills.prompt import clear_skill_prompt_cache
 from agentkit.skills.projection import MilvusSkillProjection
 from agentkit.skills.search import SkillSearchService
@@ -789,51 +786,30 @@ def skills_config() -> SkillsConfig:
 
 
 def scan_skill_records() -> list[Skill]:
-    """磁盘上扫到的全部技能（含全局禁用的），带全局开关。"""
-    return load_skills(skills_config(), enabled_map=global_enabled_map())
+    """磁盘上扫到的全部技能。"""
+    return load_skills(skills_config())
 
 
-def _legacy_response(
-    skill: Skill, *, user_id: str | None, include_global: bool
-) -> SkillResponse:
-    prefs = read_user_skill_prefs(user_id)
+def _legacy_response(skill: Skill, *, user_id: str | None) -> SkillResponse:
+    del user_id
     return SkillResponse(
         name=skill.name,
         description=skill.description,
         category=skill.category.value,
-        enabled=effective_enabled(skill, prefs),
-        global_enabled=skill.enabled if include_global else None,
+        enabled=skill.enabled,
     )
 
 
-def scan_skills_for_api(*, user_id: str | None, include_global: bool = False) -> list[SkillResponse]:
+def scan_skills_for_api(*, user_id: str | None) -> list[SkillResponse]:
     return [
-        _legacy_response(skill, user_id=user_id, include_global=include_global)
+        _legacy_response(skill, user_id=user_id)
         for skill in sorted(scan_skill_records(), key=lambda item: item.name)
     ]
 
 
-def _legacy_response_for(
-    name: str, *, user_id: str | None, include_global: bool = False
-) -> SkillResponse:
-    for skill in scan_skill_records():
-        if skill.name == name:
-            return _legacy_response(skill, user_id=user_id, include_global=include_global)
-    raise SkillNotFound(f"Skill {name} not found")
-
-
-def set_user_skill_pref(user_id: str | None, name: str, enabled: bool) -> SkillResponse:
-    """Legacy filesystem-only switch; catalog/private skills use skills.enabled."""
-    if name not in {skill.name for skill in scan_skill_records()}:
-        raise SkillNotFound(f"Skill {name} not found")
-    write_user_skill_pref(user_id, name, enabled)
-    return _legacy_response_for(name, user_id=user_id)
-
-
 def reload_skill_caches() -> None:
-    """filesystem 来源：清本进程的 prompt 段落 LRU 与配置缓存。"""
+    """filesystem 来源：清本进程的 prompt 段落 LRU 缓存。"""
     clear_skill_prompt_cache()
-    reset_extensions_config_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +880,6 @@ def _builtin_response(skill: Skill) -> SkillResponse:
         description=skill.description,
         category="builtin",
         enabled=True,
-        global_enabled=None,
         skill_id=None,
         scope="builtin",
         skill_version=None,
@@ -941,7 +916,6 @@ def _catalog_response(skill: Skill, *, user_id: str | None) -> SkillResponse:
         description=skill.description,
         category="custom",
         enabled=bool(skill.enabled),
-        global_enabled=None,
         skill_id=skill.skill_id,
         scope="private",
         skill_version=skill.skill_version,
@@ -967,7 +941,6 @@ async def list_skills_for_api(
     *,
     runtime: SkillRuntime | None,
     user_id: str | None,
-    include_global: bool = False,
 ) -> list[SkillResponse]:
     """GET /api/skills: builtin plus the caller's active private skills.
 
@@ -978,7 +951,7 @@ async def list_skills_for_api(
     builtin = builtin_skill_responses()
     if _skill_source() != GIT_SOURCE:
         catalog = await asyncio.to_thread(
-            scan_skills_for_api, user_id=user_id, include_global=include_global
+            scan_skills_for_api, user_id=user_id
         )
         return merge_builtin_responses(builtin, catalog)
     if runtime is None:
@@ -999,7 +972,9 @@ async def set_skill_preference(
 ) -> SkillResponse:
     """PUT /api/skills/{skill_id}/preference: persist the DB switch for one skill."""
     if _skill_source() != GIT_SOURCE:
-        return await asyncio.to_thread(set_user_skill_pref, user_id, skill_id, enabled)
+        raise SkillConflictAPI(
+            "filesystem skills are read-only; activate a Git skill to manage its switch"
+        )
     if runtime is None:
         raise SkillRuntimeUnavailable("skill runtime is not configured")
     target = next(

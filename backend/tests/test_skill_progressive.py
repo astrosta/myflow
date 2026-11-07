@@ -28,7 +28,7 @@ def _skills(tmp_path):
         body=f"# 说明\n{BODY_MARKER}\n",
     )
     write_skill(tmp_path, "public", "csv-tools", description="处理 CSV")
-    return load_skills(skills_config(tmp_path), enabled_map={})
+    return load_skills(skills_config(tmp_path))
 
 
 def test_l0_holds_no_body_and_no_allowed_tools(tmp_path):

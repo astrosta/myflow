@@ -211,8 +211,6 @@ def _client(
 
 def _configure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **skills_overrides: Any) -> Path:
     monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
-    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(tmp_path / "skills_prefs.json"))
-    monkeypatch.delenv("MYFLOW_EXTENSIONS_CONFIG_PATH", raising=False)
     path = write_app_config(tmp_path, **skills_overrides)
     monkeypatch.setenv("MYFLOW_CONFIG_PATH", str(path))
     return path

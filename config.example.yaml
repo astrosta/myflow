@@ -410,7 +410,7 @@ subagent_runtime:
 # 模型看到的是系统提示词尾部的 <available_skills> 索引（每技能一行，描述截断）；
 # 正文一律按需：要么 read_file 读 SKILL.md，要么 search_and_load_skills 按意图检索加载。
 # 没有"全量注入"模式开关（M7 §3.5）。
-# 个人偏好仍在 skills_prefs.json。技能保存后是草稿，必须安全扫描通过并点击生效才进入运行时与向量索引。
+# 个人开关写 PostgreSQL 的 skills.enabled；技能保存后是草稿，必须安全扫描通过并点击生效才进入运行时与向量索引。
 # ------------------------------------------------------------
 skills:
   # git：生产目录（Git 是唯一内容源，PostgreSQL 拥有身份/版本/扫描/active 指针）。

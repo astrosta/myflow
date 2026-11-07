@@ -283,7 +283,6 @@ class SkillResponse(BaseModel):
     旧客户端只读它认识的字段就不会看到形状变化。
 
     - enabled 是用户开关（Git 私有技能持久化在 skills.enabled）；
-    - global_enabled 仅为旧 filesystem 来源保留；Git 用户技能没有全局开关；
     - owner_user_id 只返回给所有者；
     - container_file 是沙箱路径，私有技能只对所有者（且 provider 支持按用户挂载时）返回。
     """
@@ -292,7 +291,6 @@ class SkillResponse(BaseModel):
     description: str
     category: Literal["public", "custom", "builtin"]
     enabled: bool
-    global_enabled: bool | None = None
     # ---- Git catalog fields (Task 15) ----
     skill_id: str | None = None
     scope: Literal["public", "private", "builtin"] | None = None

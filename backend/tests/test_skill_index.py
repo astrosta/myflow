@@ -17,7 +17,6 @@ from agentkit.skills.catalog import (
     set_skill_snapshot,
 )
 from agentkit.skills.domain import SkillScope
-from agentkit.skills.prefs import effective_enabled
 from agentkit.skills.prompt import (
     SKILL_INDEX_FOOTER,
     SKILL_INDEX_HEADER,
@@ -56,38 +55,6 @@ def _block(section: str) -> list[str]:
 def test_zero_skills_renders_nothing_at_all(tmp_path):
     assert _index(tmp_path) == ""
     assert render_skill_index([], max_description_chars=120) == ""
-
-
-def test_only_enabled_and_whitelisted_skills_are_listed(tmp_path, monkeypatch):
-    extensions = tmp_path / "extensions_config.json"
-    extensions.write_text(
-        json.dumps({"skills": {"switched-off": {"enabled": False}}}), encoding="utf-8"
-    )
-    monkeypatch.setenv("MYFLOW_EXTENSIONS_CONFIG_PATH", str(extensions))
-    write_skill(tmp_path, "public", "switched-on")
-    write_skill(tmp_path, "public", "switched-off")
-    config = skills_config(tmp_path)
-
-    listed = _index(tmp_path)
-
-    assert "- switched-on [" in listed and "- switched-off" not in listed
-    whitelisted = build_skills_section(config=config, available_skills=frozenset({"switched-off"}))
-    assert whitelisted == ""  # 白名单之外的不出现；switched-off 又被全局关掉
-
-
-def test_personal_preference_hides_the_line(tmp_path, monkeypatch):
-    from agentkit.config.skills_prefs import write_user_skill_pref
-
-    prefs = tmp_path / "skills_prefs.json"
-    monkeypatch.setenv("MYFLOW_SKILLS_PREFS_PATH", str(prefs))
-    write_skill(tmp_path, "public", "pdf-processing")
-    config = skills_config(tmp_path)
-    assert "- pdf-processing [" in build_skills_section(config=config, user_id="u1")
-
-    write_user_skill_pref("u1", "pdf-processing", False)
-
-    assert build_skills_section(config=config, user_id="u1") == ""
-    assert "- pdf-processing [" in build_skills_section(config=config, user_id="u2")
 
 
 def test_order_is_stable_regardless_of_scan_order(tmp_path):
@@ -303,26 +270,14 @@ def test_filesystem_source_still_scans_the_disk(tmp_path):
 # --- built-in overlay (always-on, never a preference) -------------------------
 
 
-def test_builtin_is_visible_even_when_user_pref_is_false(tmp_path):
+def test_builtin_is_visible_without_a_file_preference(tmp_path):
     write_skill(tmp_path, "builtin", "demo")
     config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
-    prefs = tmp_path / "skills_prefs.json"
-    prefs.write_text('{"u1": {"demo": false}}', encoding="utf-8")
 
-    registry = SkillRegistry(config=config, user_id="u1", prefs_path=prefs)
+    registry = SkillRegistry(config=config, user_id="u1")
 
     assert [skill.name for skill in registry.visible()] == ["demo"]
     assert registry.visible(include_builtin=False) == []
-
-
-def test_effective_enabled_ignores_preferences_for_a_builtin(tmp_path):
-    write_skill(tmp_path, "builtin", "demo")
-    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
-    skill = load_builtin_skills(config)[0]
-
-    assert effective_enabled(skill, {"demo": False}) is True
-    # 排在全局开关之前：内置技能的开关只有 skills.builtin.enabled。
-    assert effective_enabled(replace(skill, enabled=False), {"demo": False}) is True
 
 
 def test_builtin_wins_a_name_collision(tmp_path):

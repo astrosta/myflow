@@ -410,7 +410,7 @@ def _resolve_user_id(config: RunnableConfig) -> str | None:
 
     走 M9 §2.1 的**同一条**优先级链（context → 请求 ContextVar），
     否则会出现"图构建和中间件落进不同用户桶"——多用户下才现形的那类 bug。
-    都没有时返回 None：M7 的 skills_prefs 用 None 表示 `__default__` 桶。
+    都没有时返回 None：文件系统技能没有个人偏好，None 只表示没有服务端身份。
     """
     context = (config or {}).get("context")
     return resolve_runtime_user_id(context if isinstance(context, Mapping) else None)

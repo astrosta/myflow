@@ -43,7 +43,7 @@ def _tree(tmp_path) -> list:
         description="CSV 导出与编码转换",
         body="# 导出\nExcel 打开 CSV 乱码时转 GBK。\n",
     )
-    return load_skills(skills_config(tmp_path), enabled_map={})
+    return load_skills(skills_config(tmp_path))
 
 
 def _search(tmp_path, *, task_query: str, keywords=(), embedder=None, reranker=None, **overrides):
