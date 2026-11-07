@@ -21,6 +21,8 @@ from agentkit.sandbox.tools import (
 )
 from agentkit.tools.builtin.load_skills import load_skills
 from agentkit.tools.builtin.search_skills import search_skills
+from agentkit.tools.builtin.search_tools import search_tools
+from agentkit.tools.contextforge_metadata import is_contextforge_tool
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
     ("sandbox", grep),
     ("sandbox", bash_tool),
     ("sandbox", run_code),
+    ("tools", search_tools),
 )
 
 
@@ -79,6 +82,9 @@ def get_available_tools(
             continue
         _add_tool(tools, seen, tool)
 
+    for tool in _load_contextforge_tools(resolved):
+        _add_tool(tools, seen, tool)
+
     if include_mcp:
         for tool in _load_mcp_tools(resolved):
             _add_tool(tools, seen, tool)
@@ -109,6 +115,31 @@ def _configured_tools(app_config: AppConfig) -> list[ToolConfig]:
         else:
             configs.append(ToolConfig.model_validate(item))
     return configs
+
+
+def _load_contextforge_tools(app_config: AppConfig) -> list[BaseTool]:
+    if not app_config.contextforge.enabled:
+        return []
+    from agentkit.contextforge.cache import get_contextforge_snapshot
+
+    snapshot = get_contextforge_snapshot()
+    return list(snapshot.tools) if snapshot is not None else []
+
+
+def contextforge_tool_count(tools: list[BaseTool]) -> int:
+    return sum(1 for tool in tools if is_contextforge_tool(tool))
+
+
+def should_defer_contextforge(app_config: AppConfig, tools: list[BaseTool]) -> bool:
+    """Auto/eager/deferred decision for one assembly."""
+    config = app_config.contextforge
+    if not config.enabled or not config.search.enabled:
+        return False
+    if config.tool_loading == "eager":
+        return False
+    if config.tool_loading == "deferred":
+        return True
+    return contextforge_tool_count(tools) > config.deferred_threshold
 
 
 def _load_mcp_tools(app_config: AppConfig) -> list[BaseTool]:
@@ -156,6 +187,8 @@ def _apply_capability_filters(
         if tool.name == "run_code" and not run_code_enabled:
             continue
         if tool.name == "search_skills" and not skill_search_enabled:
+            continue
+        if tool.name == "search_tools" and not getattr(app_config.contextforge, "enabled", False):
             continue
         if tool.name == "view_image" and not vision:
             continue

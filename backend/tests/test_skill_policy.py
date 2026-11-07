@@ -91,6 +91,7 @@ ALL_TOOLS = _tools(
     "load_skills",
     "search_skills",
     "tool_search",
+    "search_tools",
     "mcp_promoted",
 )
 
@@ -109,7 +110,7 @@ def test_slash_dominates_and_reading_another_skill_cannot_widen_it(tmp_path):
 
     visible = _run(middleware, ALL_TOOLS, _state(wide), _context(slash=slash))
 
-    assert visible == ["read_file", "load_skills", "tool_search"]
+    assert visible == ["read_file", "load_skills", "tool_search", "search_tools"]
 
 
 def test_autonomous_skills_union_and_undeclared_ones_contribute_nothing(tmp_path):
@@ -120,7 +121,7 @@ def test_autonomous_skills_union_and_undeclared_ones_contribute_nothing(tmp_path
 
     visible = _run(middleware, ALL_TOOLS, _state(reader, shell, silent), _context())
 
-    assert set(visible) == {"read_file", "bash", "load_skills", "tool_search"}
+    assert set(visible) == {"read_file", "bash", "load_skills", "tool_search", "search_tools"}
 
 
 def test_an_empty_declaration_does_not_dissolve_another_limit(tmp_path):
@@ -130,7 +131,7 @@ def test_an_empty_declaration_does_not_dissolve_another_limit(tmp_path):
 
     visible = _run(middleware, ALL_TOOLS, _state(empty, reader), _context())
 
-    assert set(visible) == {"read_file", "load_skills", "tool_search"}
+    assert set(visible) == {"read_file", "load_skills", "tool_search", "search_tools"}
 
 
 def test_an_empty_declaration_alone_leaves_only_framework_tools(tmp_path):

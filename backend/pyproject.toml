@@ -21,6 +21,10 @@ postgres = [
 knowledge = [
     "agentkit[knowledge]",
 ]
+# ContextForge 工具管理：MCP 加载器 + 工具目录的 Milvus 索引。
+contextforge = [
+    "agentkit[contextforge]",
+]
 observability = [
     "agentkit[observability]",
 ]

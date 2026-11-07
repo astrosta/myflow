@@ -85,7 +85,7 @@ describe("侧栏的最近对话栏", () => {
     expect(view.getByText(/还没有会话/)).toBeTruthy();
   });
 
-  it("功能导航按我的画像、记忆管理、技能中心、知识库排列", () => {
+  it("功能导航按我的画像、记忆管理、技能中心、工具管理、知识库排列", () => {
     const view = render(<Sidebar threads={[]} />);
     const nav = view.getByRole("navigation", { name: "功能导航" });
     const links = Array.from(nav.querySelectorAll("a"));
@@ -94,12 +94,14 @@ describe("侧栏的最近对话栏", () => {
       "我的画像",
       "记忆管理",
       "技能中心",
+      "工具管理",
       "知识库",
     ]);
     expect(links.map((link) => link.getAttribute("href"))).toEqual([
       "/workspace/profile",
       "/workspace/memory",
       "/workspace/skills",
+      "/workspace/tools",
       "/workspace/knowledge",
     ]);
   });
@@ -110,6 +112,14 @@ describe("侧栏的最近对话栏", () => {
     const skills = view.getByRole("link", { name: /技能中心/ });
     expect(skills.getAttribute("href")).toBe("/workspace/skills");
     expect(skills.getAttribute("aria-current")).toBe("page");
+  });
+
+  it("工具入口叫「工具管理」，按当前路由高亮", () => {
+    const view = render(<Sidebar threads={[]} toolsActive />);
+
+    const tools = view.getByRole("link", { name: /工具管理/ });
+    expect(tools.getAttribute("href")).toBe("/workspace/tools");
+    expect(tools.getAttribute("aria-current")).toBe("page");
   });
 
   it("导航里有「记忆管理」，按当前路由高亮", () => {

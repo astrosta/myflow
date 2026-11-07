@@ -26,7 +26,7 @@ from agentkit.skills.types import Skill
 #: load_skills 和 read_file 同级：两者都只是"把某个 SKILL.md 读进上下文"。
 #: search_skills 是 skill-finder 的元数据工具，不属于 always-available。
 ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES = frozenset(
-    {"read_file", "tool_search", "load_skills"}
+    {"read_file", "tool_search", "load_skills", "search_tools"}
 )
 
 DECISION_VERSION = 1

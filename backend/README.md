@@ -422,6 +422,71 @@ OpenViking Session Commit 完成后生成的 skills 走独立导入链路：work
 `source="extracted"` 与 `source_uri`。这些行停在 `unscanned`（页面显示「提炼 · 待扫描」），
 不会自动扫描或生效；用户需要在技能页显式扫描、点击生效。
 
+## ContextForge 工具管理（可选）
+
+ContextForge 是工具的**唯一写入目标**：MyFlow 不建工具表，也不复制 CRUD 语义。
+浏览器只打同源 `/api/tools`，ContextForge 的 admin token 始终留在网关。
+
+部署前提（ContextForge 1.1.0）：
+
+- `MCPGATEWAY_ADMIN_API_ENABLED=true`：`/tools` 与 `GET /admin/events` 才会挂载；
+  `MCPGATEWAY_UI_ENABLED` 可以保持 `false`，本功能不依赖 Admin UI。
+- `admin_token` 需要 `admin.events` 或 `*`；事件订阅只发 `Authorization: Bearer ...`，
+  GET 不要求 CSRF。
+- ContextForge 多 worker 时，跨进程事件需要它自己的 Redis 配置；否则只有处理写操作的那个
+  worker 能看到事件，MyFlow 会退回"管理动作主动刷新 + TTL 到期刷新"。
+- Milvus 复用现有实例，但 collection 固定为 `myflow_tools_catalog`，**绝不写**
+  `myflow_knowledge` / `myflow_skills_active`。不需要数据库迁移。
+
+```bash
+# MCP 加载器 + pymilvus；knowledge / skills 的 extra 不会自动带上它。
+uv sync --all-packages --all-extras
+# 或只装这一组：
+uv sync --package backend --extra contextforge
+```
+
+配置见 `config.example.yaml` 的 `contextforge:`。`enabled: false` 时不发任何请求，
+`/api/tools` 返回 503 `contextforge_disabled`；`tool_loading: auto` 在工具数超过
+`deferred_threshold`（默认 24）时把 ContextForge 工具的 schema 藏起来，模型先看到
+`search_tools`，再按任务检索并提升。`eager` 直接把全部工具放进模型 schema；
+`deferred` 强制延迟。`auto` / `deferred` 都要求 `contextforge.search.enabled=true`。
+
+工具更新有三条路径，都必须知道：
+
+1. **管理页写操作**：`POST/PUT/DELETE /api/tools` 写 ContextForge 后立即返回，网关异步
+   刷新 MCP 快照并 `index.sync()`；`sync.admin_refresh_async=false` 时改成同步等待。
+2. **事件订阅**：启动时连 `GET /admin/events`，对 `tool_added / tool_updated / tool_deleted /
+   tool_activated / tool_deactivated / tool_offline / tool_removed / gateway_*` 做 debounce
+   刷新；断线指数退避重连，状态在 `/api/tools/status` 的 `admin_events` 里可见。
+3. **工具调用纠错**：MCP 返回 not-found 或参数校验错误时，先刷新 ContextForge +
+   `index.sync()`，再重试**一次**；认证失败、超时、429、5xx、网络错误和工具执行错误都不重试。
+
+检索是混合检索：dense embedding + Milvus BM25 稀疏通道，RRF 融合后可选 rerank；
+embedding / Milvus 不可用时保留本地 BM25 降级，并在 `retrieval.warnings` 里说明。
+召回结果必须能在当前 MCP 快照里确认，Milvus 只负责缩小候选集。
+
+`/api/tools` 全部是 `admin` scope。上游错误映射：工具不存在 404 `tool_not_found`、
+凭据/权限 502 `contextforge_auth_failed`、ContextForge 不可达 502
+`contextforge_unavailable`、超时 504 `contextforge_timeout`、参数不合法 422
+`contextforge_validation_error`。详情里的敏感 header 打成 `****`，编辑时原样回传，
+由网关还原真实值；只发 `****` 而没有已存值会被拒绝，不会把掩码当凭据写进 ContextForge。
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| `GET` | `/api/tools` | 分页、`q`、`enabled`、`integration_type` 过滤（`admin`） |
+| `GET` | `/api/tools/status` | ContextForge 可达/鉴权、管理事件、同步、索引与三路通道状态（`admin`） |
+| `POST` | `/api/tools/reindex` | 手动刷新 MCP 快照并重建工具索引（`admin`） |
+| `GET` | `/api/tools/search?q=...` | 检索预览：命中、通道、候选数、是否重排与 warnings（`admin`） |
+| `POST` | `/api/tools` | 新建工具并触发异步刷新（`admin`） |
+| `GET` | `/api/tools/{id}` | 工具详情，敏感 header 掩码（`admin`） |
+| `PUT` | `/api/tools/{id}` | 整份更新并触发异步刷新（`admin`） |
+| `POST` | `/api/tools/{id}/state` | 启用/停用并触发异步刷新（`admin`） |
+| `DELETE` | `/api/tools/{id}` | 删除并触发异步刷新（`admin`） |
+
+前端入口是 `/workspace/tools`（侧栏「工具管理」）。非管理员看到 403 页面；
+认证关闭的单人模式按管理员放行。写操作后状态栏可能短暂显示旧快照——这是异步刷新的
+预期表现，不是数据丢失。
+
 ## 认证（M9 §2）
 
 身份只有一个权威来源：**AuthMiddleware 写的 `request.state.auth`**。
