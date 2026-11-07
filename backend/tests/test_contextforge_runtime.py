@@ -98,6 +98,20 @@ class FakeAdmin:
         self.closed = True
 
 
+class FakeIndex:
+    """The derived Milvus index: watched only through the status surface."""
+
+    def __init__(self) -> None:
+        self.ensured_dimensions: int | None = None
+        self.closed = False
+
+    async def ensure_collection(self, dimensions: int | None = None) -> None:
+        self.ensured_dimensions = dimensions
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class FakeSubscriber:
     def __init__(self, config: ContextForgeConfig, callback: Any) -> None:
         self.config = config
@@ -131,6 +145,7 @@ def _runtime(
     rows: Any = (),
     error: str | None = None,
     daily_delay: Any = None,
+    index: Any = None,
 ) -> tuple[ContextForgeRuntime, FakeSyncService, FakeAdmin, SubscriberFactory]:
     service = FakeSyncService(rows, error=error)
     admin = FakeAdmin()
@@ -139,6 +154,7 @@ def _runtime(
         config or _config(),
         sync=service,
         admin=admin,
+        index=index,
         subscriber_factory=factory,
         daily_delay=daily_delay,
     )
@@ -345,6 +361,64 @@ async def test_status_degrades_when_the_catalog_cannot_be_read() -> None:
     assert status["index"] == "degraded"
     assert status["indexed_tools"] == 0
     assert status["total_tools"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_upstream_abort_reports_the_catalog_unreachable() -> None:
+    runtime, _service, _admin, _factory = _runtime(rows=[_row()], error="mcp_failed")
+
+    await runtime.start()
+    try:
+        status = await runtime.status()
+    finally:
+        await runtime.stop()
+
+    assert status["sync"] == "degraded"
+    assert status["last_error"] == "mcp_failed"
+    # tools/list never came back, so the process cannot claim ContextForge.
+    assert status["reachable"] is False
+    assert status["auth_ok"] is False
+    # The aborted sync kept the previous catalog, and the counts say so.
+    assert status["total_tools"] == 1
+
+
+@pytest.mark.asyncio
+async def test_an_index_only_error_degrades_the_index_not_the_catalog() -> None:
+    index = FakeIndex()
+    runtime, _service, _admin, _factory = _runtime(
+        rows=[_row(), _row(callable_=False)], error="ToolVectorIndexError", index=index
+    )
+
+    await runtime.start()
+    try:
+        status = await runtime.status()
+    finally:
+        await runtime.stop()
+
+    assert status["sync"] == "degraded"
+    assert status["last_error"] == "ToolVectorIndexError"
+    # The database commit succeeded, so the catalog is live: only retrieval is off.
+    assert status["reachable"] is True
+    assert status["index"] == "degraded"
+    assert status["total_tools"] == 2
+    assert index.closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_clean_sync_reports_the_index_ready() -> None:
+    index = FakeIndex()
+    runtime, _service, _admin, _factory = _runtime(rows=[_row()], index=index)
+
+    await runtime.start()
+    try:
+        status = await runtime.status()
+    finally:
+        await runtime.stop()
+
+    assert status["sync"] == "ready"
+    assert status["reachable"] is True
+    assert status["index"] == "ready"
+    assert index.ensured_dimensions == _config().search.embedding.dimensions
 
 
 def test_building_a_disabled_runtime_returns_none() -> None:

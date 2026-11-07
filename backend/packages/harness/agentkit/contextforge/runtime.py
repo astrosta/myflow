@@ -278,6 +278,12 @@ class ContextForgeRuntime:
             self._reachable = False
             self._auth_ok = False
         else:
+            # tools/list and the Admin read both succeeded and the snapshot was
+            # committed; only the derived index failed.  Reporting the catalog as
+            # unreachable here would send an operator to check ContextForge for a
+            # Milvus problem, so reachability follows the upstream reads.
+            self._reachable = True
+            self._auth_ok = True
             self._index_error = stats.error
         return stats
 
