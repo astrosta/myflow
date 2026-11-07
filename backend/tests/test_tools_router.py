@@ -5,9 +5,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from agentkit.config.contextforge_config import ToolSearchConfig
+from agentkit.contextforge.index import ToolVectorHit
 from agentkit.contextforge.models import ContextForgeNotFound, ContextForgeTool, ToolWrite
 from agentkit.contextforge.ownership import owner_from_annotations
+from agentkit.contextforge.store import ContextForgeToolRecord, call_name_for
 from agentkit.contextforge.sync import ContextForgeSyncStats
+from agentkit.tools.search import ContextForgeToolSearchService
 from backend.app.gateway import tools_deps
 from backend.app.gateway.auth.result import AuthKind, AuthResult
 from backend.app.gateway.errors import install_error_handlers
@@ -137,7 +141,11 @@ class FakeRuntime:
             "total_tools": 2 if scoped else 13,
             "last_sync_at": None,
             "last_sync_reason": "startup",
+            "last_sync_duration_ms": 37,
             "last_error": None,
+            "last_retry_at": "2026-11-06T10:05:00+00:00",
+            "last_retry_tool": "gitlab_search",
+            "last_retry_result": "refreshed",
             "channels": {"keyword": "ready", "embedding": "ready", "rerank": "degraded"},
         }
 
@@ -215,8 +223,164 @@ async def test_reindex_without_a_runtime_is_a_coded_503(monkeypatch) -> None:
     assert caught.value.status_code == 503
 
 
+# --------------------------------------------------------------------------- #
+# /api/tools/search: the per-user retrieval preview over DB + Milvus
+# --------------------------------------------------------------------------- #
+
+#: Both recall channels on, so the preview has to report the pair it ran.
+SEARCH_CONFIG = ToolSearchConfig(
+    candidate_k=5,
+    top_k=3,
+    embedding={"base_url": "http://embed", "dimensions": 8},
+    keyword={"enabled": True},
+)
+
+
+class RecordingIndex:
+    """Milvus double: records the owner filter, then answers with its hits."""
+
+    def __init__(self, hits: list[ToolVectorHit]) -> None:
+        self.hits = hits
+        self.calls: list[dict[str, object]] = []
+
+    async def hybrid_search(self, *, vector, query, owner_user_id, limit):
+        self.calls.append(
+            {"vector": vector, "query": query, "owner": owner_user_id, "limit": limit}
+        )
+        return self.hits[:limit]
+
+
+class RecordingEmbedder:
+    async def embed_query(self, text: str) -> list[float]:
+        return [0.0] * 8
+
+
+class ConfirmingStore:
+    """The database half of a search: owner and callable filtered, like the store."""
+
+    def __init__(self, records: list[ContextForgeToolRecord]) -> None:
+        self.by_id = {record.id: record for record in records}
+        self.calls: list[tuple[list[str], str]] = []
+
+    async def get_by_ids(self, ids, owner_user_id):
+        self.calls.append((list(ids), owner_user_id))
+        return [
+            self.by_id[tool_id]
+            for tool_id in ids
+            if tool_id in self.by_id
+            and self.by_id[tool_id].owner_user_id == owner_user_id
+            and self.by_id[tool_id].callable
+        ]
+
+
+def _record(*, owner_user_id: str = "u1") -> ContextForgeToolRecord:
+    """One callable catalog row.  display_name lives in the DB but not on a card."""
+    return ContextForgeToolRecord(
+        id="t1",
+        name="gitlab_search",
+        call_name=call_name_for("gitlab_search"),
+        display_name="GitLab Search",
+        description="搜索 GitLab 项目",
+        tags=("gitlab",),
+        parameters=("q", "per_page"),
+        input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+        owner_user_id=owner_user_id,
+        callable=True,
+    )
+
+
+def _preview_service(index: object, store: object) -> ContextForgeToolSearchService:
+    return ContextForgeToolSearchService(
+        config=SEARCH_CONFIG,
+        index=index,
+        store=store,
+        embedder=RecordingEmbedder(),
+        reranker=None,
+    )
+
+
 @pytest.mark.asyncio
-async def test_search_says_unavailable_instead_of_returning_no_hits() -> None:
+async def test_search_preview_answers_with_the_catalog_row_behind_a_milvus_hit(monkeypatch) -> None:
+    index = RecordingIndex([ToolVectorHit("gitlab_search", 0.9, tool_id="t1")])
+    store = ConfirmingStore([_record()])
+    monkeypatch.setattr(
+        tools_router, "get_tool_search_runtime", lambda: _preview_service(index, store)
+    )
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    response = await tools_router.search_tools_preview(_request(), caller, "搜 GitLab 项目", 3)
+
+    assert response.query == "搜 GitLab 项目"
+    hit = response.results[0]
+    assert (hit.tool_id, hit.tool_name) == ("t1", "gitlab_search")
+    assert hit.call_name == "cf__gitlab_search"
+    # parameters/tags/description only exist in the database row, not in Milvus.
+    assert hit.parameters == ["q", "per_page"]
+    assert hit.tags == ["gitlab"]
+    assert hit.score == 1.0
+    assert response.retrieval.index == "milvus"
+    assert response.retrieval.channels == ["embedding", "keyword"]
+    assert response.retrieval.candidates == 1
+    # Both reads are owner-scoped: the preview is a per-user surface.
+    assert index.calls[0]["owner"] == "u1"
+    assert store.calls == [(["t1"], "u1")]
+    assert hit.schema_truncated is False
+    # No management secret rides along with a search result, and the card carries
+    # no display_name: Milvus stores neither, and the page reads both off the card.
+    assert "headers" not in hit.model_dump()
+    assert "annotations" not in hit.model_dump()
+    assert "display_name" not in hit.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_search_preview_never_answers_with_another_users_tool(monkeypatch) -> None:
+    index = RecordingIndex([ToolVectorHit("gitlab_search", 0.9, tool_id="t1")])
+    store = ConfirmingStore([_record(owner_user_id="u1")])
+    monkeypatch.setattr(
+        tools_router, "get_tool_search_runtime", lambda: _preview_service(index, store)
+    )
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u2", user_role="user")
+
+    response = await tools_router.search_tools_preview(_request(), caller, "gitlab", 5)
+
+    assert response.results == []
+    assert index.calls[0]["owner"] == "u2"
+    assert store.calls == [(["t1"], "u2")]
+
+
+@pytest.mark.asyncio
+async def test_search_preview_never_scans_the_catalog_without_a_resolved_user(monkeypatch) -> None:
+    """The owner filter is mandatory, so an unresolved caller gets no catalog read."""
+    index = RecordingIndex([ToolVectorHit("gitlab_search", 0.9, tool_id="t1")])
+    store = ConfirmingStore([_record()])
+    monkeypatch.setattr(
+        tools_router, "get_tool_search_runtime", lambda: _preview_service(index, store)
+    )
+    caller = RunCaller(kind=CallerKind.HTTP, user_id=None, user_role="admin")
+
+    response = await tools_router.search_tools_preview(_request(), caller, "gitlab", 5)
+
+    assert response.results == []
+    assert index.calls == [] and store.calls == []
+    assert response.retrieval.index == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_search_preview_reports_unavailable_retrieval_instead_of_a_miss(monkeypatch) -> None:
+    service = ContextForgeToolSearchService(config=SEARCH_CONFIG)
+    monkeypatch.setattr(tools_router, "get_tool_search_runtime", lambda: service)
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    response = await tools_router.search_tools_preview(_request(), caller, "github", 5)
+
+    assert response.results == []
+    assert response.retrieval.index == "unavailable"
+    assert "catalog_unavailable" in response.retrieval.warnings
+
+
+@pytest.mark.asyncio
+async def test_search_preview_without_a_service_is_a_coded_503(monkeypatch) -> None:
+    monkeypatch.setattr(tools_router, "get_tool_search_runtime", lambda: None)
     caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
 
     with pytest.raises(tools_router.ToolSearchUnavailable) as caught:
@@ -224,6 +388,19 @@ async def test_search_says_unavailable_instead_of_returning_no_hits() -> None:
 
     assert caught.value.status_code == 503
     assert caught.value.code == "tool_search_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_status_surfaces_the_duration_and_retry_the_runtime_tracks(monkeypatch) -> None:
+    monkeypatch.setattr(tools_router, "get_contextforge_runtime", lambda: FakeRuntime())
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u", user_role="admin")
+
+    response = await tools_router.tool_status(_request(), caller)
+
+    assert response.last_sync_duration_ms == 37
+    assert response.last_retry_at == "2026-11-06T10:05:00+00:00"
+    assert response.last_retry_tool == "gitlab_search"
+    assert response.last_retry_result == "refreshed"
 
 
 def test_the_search_503_reaches_the_client_as_a_coded_error() -> None:
@@ -370,3 +547,40 @@ async def test_claim_assigns_an_unowned_tool(monkeypatch) -> None:
     assert admin.updated is not None
     assert admin.updated.annotations["myflow_owner"] == "u1"
     assert response.owned is True
+
+
+class DeletingAdmin(RecordingOwnedAdmin):
+    def __init__(self) -> None:
+        super().__init__()
+        self.deleted: list[str] = []
+
+    async def delete_tool(self, tool_id: str) -> None:
+        self.deleted.append(tool_id)
+
+
+class RefreshRecorder:
+    def __init__(self) -> None:
+        self.reasons: list[str] = []
+
+    async def request_refresh(self, reason: str) -> None:
+        self.reasons.append(reason)
+
+
+@pytest.mark.asyncio
+async def test_delete_still_proxies_to_contextforge_and_asks_for_a_refresh(monkeypatch) -> None:
+    """The management proxy is unchanged: /api/tools writes ContextForge, not the DB."""
+    monkeypatch.setattr(
+        tools_deps,
+        "get_app_config",
+        lambda: SimpleNamespace(contextforge=SimpleNamespace(enabled=True)),
+    )
+    runtime = RefreshRecorder()
+    monkeypatch.setattr(tools_router, "get_contextforge_runtime", lambda: runtime)
+    admin = DeletingAdmin()
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    response = await tools_router.delete_tool("mine", _request(admin), caller)
+
+    assert response.status_code == 204
+    assert admin.deleted == ["mine"]
+    assert runtime.reasons == ["admin"]

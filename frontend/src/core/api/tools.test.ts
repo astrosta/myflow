@@ -52,13 +52,19 @@ const STATUS = {
   reachable: true,
   auth_ok: true,
   admin_events: "connected",
-  sync: "idle",
-  index: "ready",
+  daily: "running",
+  sync: "ready",
+  index: "degraded",
+  channels: { keyword: "ready", embedding: "ready", rerank: "disabled" },
   indexed_tools: 12,
   total_tools: 13,
   last_sync_at: "2026-11-06T10:00:00Z",
   last_sync_reason: "admin",
+  last_sync_duration_ms: 42,
   last_error: null,
+  last_retry_at: "2026-11-06T10:05:00Z",
+  last_retry_tool: "gitlab_search",
+  last_retry_result: "refreshed",
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -208,7 +214,7 @@ describe("tools API contract", () => {
     expect(init.method).toBe("DELETE");
   });
 
-  it("getToolsStatus surfaces every channel the page badges", async () => {
+  it("getToolsStatus surfaces every field the status bar badges", async () => {
     const fetchMock = stubFetch(jsonResponse(STATUS));
 
     const status = await getToolsStatus();
@@ -218,10 +224,30 @@ describe("tools API contract", () => {
     expect(status).toMatchObject({
       enabled: true,
       admin_events: "connected",
-      sync: "idle",
-      index: "ready",
+      daily: "running",
+      sync: "ready",
+      index: "degraded",
       indexed_tools: 12,
       total_tools: 13,
+      last_sync_duration_ms: 42,
+      last_retry_tool: "gitlab_search",
+    });
+    expect(status.channels).toEqual({ keyword: "ready", embedding: "ready", rerank: "disabled" });
+  });
+
+  it("getToolsStatus defaults the fields a disabled gateway omits", async () => {
+    stubFetch(jsonResponse({ enabled: false }));
+
+    const status = await getToolsStatus();
+
+    expect(status).toMatchObject({
+      daily: "disabled",
+      sync: "disabled",
+      index: "disabled",
+      last_sync_duration_ms: null,
+      last_retry_at: null,
+      last_retry_tool: null,
+      last_retry_result: null,
     });
   });
 
@@ -239,23 +265,25 @@ describe("tools API contract", () => {
     expect(stats.error).toBeNull();
   });
 
-  it("previewToolSearch encodes the query and keeps retrieval warnings", async () => {
+  it("previewToolSearch keeps the catalog fields a search card carries", async () => {
     const fetchMock = stubFetch(
       jsonResponse({
         query: "搜 gitlab 项目",
         results: [
           {
+            tool_id: "tool-1",
             tool_name: "gitlab_search",
-            display_name: "GitLab Search",
+            call_name: "cf__gitlab_search",
             description: "搜索 GitLab 项目",
             tags: ["gitlab"],
-            parameters: ["q"],
+            parameters: ["q", "per_page"],
             score: 0.91,
+            schema_truncated: false,
           },
         ],
         retrieval: {
           index: "milvus",
-          channels: ["dense", "bm25"],
+          channels: ["embedding", "keyword"],
           candidates: 8,
           reranked: true,
           warnings: ["reranker unavailable"],
@@ -269,8 +297,38 @@ describe("tools API contract", () => {
     expect(parsed.pathname).toBe("/api/tools/search");
     expect(parsed.searchParams.get("q")).toBe("搜 gitlab 项目");
     expect(parsed.searchParams.get("limit")).toBe("3");
-    expect(preview.results[0]?.tool_name).toBe("gitlab_search");
-    expect(preview.retrieval.warnings).toEqual(["reranker unavailable"]);
+    expect(preview.results[0]).toEqual({
+      tool_id: "tool-1",
+      tool_name: "gitlab_search",
+      call_name: "cf__gitlab_search",
+      description: "搜索 GitLab 项目",
+      tags: ["gitlab"],
+      parameters: ["q", "per_page"],
+      score: 0.91,
+      schema_truncated: false,
+    });
+    expect(preview.retrieval).toEqual({
+      index: "milvus",
+      channels: ["embedding", "keyword"],
+      candidates: 8,
+      reranked: true,
+      warnings: ["reranker unavailable"],
+    });
+  });
+
+  it("previewToolSearch defaults a retrieval failure instead of hiding it", async () => {
+    stubFetch(jsonResponse({ query: "gitlab" }));
+
+    const preview = await previewToolSearch("gitlab");
+
+    expect(preview.results).toEqual([]);
+    expect(preview.retrieval).toEqual({
+      index: "unavailable",
+      channels: [],
+      candidates: 0,
+      reranked: false,
+      warnings: [],
+    });
   });
 
   it("extracts the first errors[] entry on a 422", async () => {

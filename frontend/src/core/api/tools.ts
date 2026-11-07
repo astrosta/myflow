@@ -60,25 +60,43 @@ export interface ToolStatus {
   auth_ok: boolean;
   /** connected | connecting | reconnecting | disabled | error */
   admin_events: string;
-  /** idle | syncing | disabled | error */
+  /** 本地午夜兜底同步任务：running | stopped | disabled */
+  daily: string;
+  /** ready | syncing | degraded | disabled */
   sync: string;
-  /** ready | building | unavailable | disabled | error */
+  /** ready | degraded | disabled */
   index: string;
   channels: ToolStatusChannels;
   indexed_tools: number;
   total_tools: number;
   last_sync_at: string | null;
   last_sync_reason: string | null;
+  /** 上一轮同步的墙钟耗时（毫秒）；null 表示本次进程还没同步过 */
+  last_sync_duration_ms: number | null;
   last_error: string | null;
+  /** 工具调用出错后的自动刷新：时间、工具名与结论 */
+  last_retry_at: string | null;
+  last_retry_tool: string | null;
+  last_retry_result: string | null;
 }
 
+/**
+ * 一条检索命中：Milvus 召回 id 之后由网关 join 出来的 contextforge_tools 行。
+ *
+ * parameters/tags/description 只存在于数据库行，所以这三个字段有值就说明预览
+ * 真的走了「召回 -> DB 确认」，而不是只看向量距离。
+ */
 export interface ToolSearchHit {
+  tool_id: string;
+  /** ContextForge 原名，只用于展示与日志。 */
   tool_name: string;
-  display_name: string | null;
+  /** 模型与策略看到的 cf__ 前缀名。 */
+  call_name: string;
   description: string;
   tags: string[];
   parameters: string[];
   score: number;
+  schema_truncated: boolean;
 }
 
 export interface ToolSearchRetrieval {
@@ -299,6 +317,7 @@ export async function getToolsStatus(): Promise<ToolStatus> {
     reachable: raw.reachable ?? false,
     auth_ok: raw.auth_ok ?? false,
     admin_events: raw.admin_events ?? "disabled",
+    daily: raw.daily ?? "disabled",
     sync: raw.sync ?? "disabled",
     index: raw.index ?? "disabled",
     channels: {
@@ -310,7 +329,11 @@ export async function getToolsStatus(): Promise<ToolStatus> {
     total_tools: raw.total_tools ?? 0,
     last_sync_at: raw.last_sync_at ?? null,
     last_sync_reason: raw.last_sync_reason ?? null,
+    last_sync_duration_ms: raw.last_sync_duration_ms ?? null,
     last_error: raw.last_error ?? null,
+    last_retry_at: raw.last_retry_at ?? null,
+    last_retry_tool: raw.last_retry_tool ?? null,
+    last_retry_result: raw.last_retry_result ?? null,
   };
 }
 
@@ -336,12 +359,14 @@ export async function previewToolSearch(q: string, limit = 5): Promise<ToolSearc
   return {
     query: raw.query ?? q,
     results: (raw.results ?? []).map((hit) => ({
+      tool_id: hit.tool_id ?? "",
       tool_name: hit.tool_name ?? "",
-      display_name: hit.display_name ?? null,
+      call_name: hit.call_name ?? "",
       description: hit.description ?? "",
       tags: hit.tags ?? [],
       parameters: hit.parameters ?? [],
       score: hit.score ?? 0,
+      schema_truncated: hit.schema_truncated ?? false,
     })),
     retrieval: {
       index: raw.retrieval?.index ?? "unavailable",

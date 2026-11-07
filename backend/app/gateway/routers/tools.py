@@ -23,9 +23,14 @@ from backend.app.gateway.errors import ContextForgeDisabled, InvalidToolHeaderAP
 from backend.app.gateway.tools_deps import get_contextforge_admin_client, require_tools_scope
 from agentkit.contextforge.runtime import get_contextforge_runtime
 
+from agentkit.tools.search import ToolSearchCard, get_tool_search_runtime
+
 from backend.app.gateway.models.tools import (
     ToolDetail,
     ToolListResponse,
+    ToolSearchHit,
+    ToolSearchPreview,
+    ToolSearchRetrieval,
     ToolStateRequest,
     ToolStatusResponse,
     ToolSummary,
@@ -44,12 +49,15 @@ ToolWriter = Annotated[RunCaller, Depends(require_tools_scope("tools:write"))]
 
 
 class ToolSearchUnavailable(ContextForgeError):
-    """The search preview has no service behind it yet (Task 6 wires it).
+    """This build publishes no tool search service at all.
 
-    It subclasses ContextForgeError so the response keeps the shared coded error
-    body: errors.py registers that handler for the base class and Starlette
-    dispatches on the exception's MRO, so this arrives as
-    `{detail, code, trace_id}` with a 503 instead of an unhandled 500.
+    A disabled ContextForge, or a search block with no service behind it, leaves
+    nothing to search with; an empty result list would read as "no tool matches
+    your query", which is indistinguishable from a real miss.  It subclasses
+    ContextForgeError so the response keeps the shared coded error body: errors.py
+    registers that handler for the base class and Starlette dispatches on the
+    exception's MRO, so this arrives as {detail, code, trace_id} with a 503
+    instead of an unhandled 500.
     """
 
     status_code: ClassVar[int] = 503
@@ -229,20 +237,62 @@ async def reindex_tools(
     }
 
 
-@router.get("/search")
+@router.get("/search", response_model=ToolSearchPreview)
 async def search_tools_preview(
     request: Request,
     caller: ToolReader,
     q: str = Query(min_length=1, max_length=4000),
     limit: int = Query(default=5, ge=1, le=20),
-) -> dict[str, object]:
-    # The in-memory tool snapshot this preview used to search is gone with Task 5,
-    # and Task 6 is what wires the new ToolSearchService into the runtime.  Until
-    # then the route says "unavailable" out loud: an empty result list would read
-    # as "no tool matches your query", which is indistinguishable from a real miss.
-    del request, caller, q, limit
-    raise ToolSearchUnavailable(
-        "tool search is not available: no tool search service is wired into this build"
+) -> ToolSearchPreview:
+    """Preview what tool_search would retrieve for this caller.
+
+    The preview runs the built-in tool's retrieval, not a parallel one: the
+    process-global ContextForgeToolSearchService recalls owner-scoped tool ids
+    from Milvus and then confirms each one through contextforge_tools, which
+    re-checks owner and callable and supplies the verbatim schema.  So a card the
+    page shows is a tool the model could actually call, and a candidate the store
+    does not confirm is dropped instead of being looked up outside the owner.
+
+    A retrieval that could not run is reported as index "unavailable" plus the
+    service's warning, never as an empty hit list: "Milvus is down" and "nothing
+    matched" must not look the same on the page.
+    """
+    del request
+    service = get_tool_search_runtime()
+    if service is None:
+        raise ToolSearchUnavailable(
+            "tool search is not available: no tool search service is wired into "
+            "this build"
+        )
+    outcome = await service.search(task_query=q, user_id=caller.user_id)
+    # The process publishes the ContextForge service, whose hits are cards; the
+    # legacy snapshot service is only built by tests (Task 11 deletes it), and its
+    # hits carry no database fields this per-user preview could answer with.
+    cards: list[ToolSearchCard] = [
+        hit for hit in outcome.hits if isinstance(hit, ToolSearchCard)
+    ][:limit]
+    return ToolSearchPreview(
+        query=q,
+        results=[
+            ToolSearchHit(
+                tool_id=card.tool_id,
+                tool_name=card.tool_name,
+                call_name=card.call_name,
+                description=card.description,
+                tags=list(card.tags),
+                parameters=list(card.parameters),
+                score=card.score,
+                schema_truncated=card.schema_truncated,
+            )
+            for card in cards
+        ],
+        retrieval=ToolSearchRetrieval(
+            index=outcome.index_kind,
+            channels=list(outcome.channels),
+            candidates=outcome.candidates,
+            reranked=outcome.reranked,
+            warnings=list(outcome.warnings),
+        ),
     )
 
 
