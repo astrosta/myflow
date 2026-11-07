@@ -8,6 +8,8 @@
 #   openviking   127.0.0.1:1933         配置只来自挂载的 ov.conf
 #   gitea web    0.0.0.0:3001           Web UI（容器内 3000）
 #   gitea ssh    127.0.0.1:2222         SKILLS_GIT_REPOSITORY
+#   contextforge 127.0.0.1:4444         config.yaml contextforge.base_url
+#                容器内用 http://contextforge:4444；管理 API 已打开
 #   opensandbox  127.0.0.1:8080         sandbox.opensandbox.domain，无 API key
 #                allowed_host_paths ← 仓库根 .env 的 SANDBOX_HOST_ROOT
 #   langfuse     0.0.0.0:3050          对外端口（容器内 3000）；NEXTAUTH_URL 用 LANGFUSE_BASE_URL
@@ -183,6 +185,47 @@ services:
       - "127.0.0.1:2222:22"
     volumes:
       - gitea_data:/data
+
+  # ContextForge（IBM mcp-context-forge）。管理 API 打开，UI 打开便于签发 token。
+  # 网关在同一 Docker 网络里用 http://contextforge:4444；宿主机进程用 127.0.0.1:4444。
+  # admin_token 不在这里生成：进 http://127.0.0.1:4444/admin 登录后签发，
+  # 写入 config.yaml 的 contextforge.admin_token（需 admin.events 或 *）。
+  contextforge:
+    image: ghcr.io/ibm/mcp-context-forge:latest
+    container_name: myflow-contextforge
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      HOST: 0.0.0.0
+      PORT: "4444"
+      MCPGATEWAY_UI_ENABLED: "true"
+      MCPGATEWAY_ADMIN_API_ENABLED: "true"
+      DATABASE_URL: sqlite:////data/mcp.db
+      CACHE_TYPE: redis
+      REDIS_URL: redis://myflow:123456@redis:6379/1
+      JWT_SECRET_KEY: ${CONTEXTFORGE_JWT_SECRET:-myflow-contextforge-jwt-secret-32b}
+      AUTH_ENCRYPTION_SECRET: ${CONTEXTFORGE_AUTH_SECRET:-myflow-contextforge-auth-secret-32}
+      PLATFORM_ADMIN_EMAIL: ${CONTEXTFORGE_ADMIN_EMAIL:-admin@example.com}
+      PLATFORM_ADMIN_PASSWORD: ${CONTEXTFORGE_ADMIN_PASSWORD:-changeme}
+      PLATFORM_ADMIN_FULL_NAME: Platform Administrator
+    ports:
+      - "127.0.0.1:4444:4444"
+    volumes:
+      - contextforge_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:4444/health', timeout=5); raise SystemExit(0 if json.load(r).get('status')=='healthy' else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
 
   # 沙箱镜像必须在宿主 Docker 里。OpenSandbox 挂了 docker.sock，本地没有时会在创建沙箱时现拉。
   # 这些服务只负责把镜像拉下来，进程立刻退出；opensandbox 等它们成功后再启动。
@@ -363,6 +406,7 @@ volumes:
   milvus_data:
   openviking_data:
   gitea_data:
+  contextforge_data:
   opensandbox_data:
   langfuse_clickhouse_data:
   langfuse_clickhouse_logs:
