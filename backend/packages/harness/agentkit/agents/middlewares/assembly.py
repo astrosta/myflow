@@ -17,6 +17,9 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.runnables import RunnableConfig
 
 from agentkit.agents.memory.openviking.profile_interrupt import make_profile_interrupt_middleware
+from agentkit.agents.middlewares.contextforge_ownership_middleware import (
+    ContextForgeOwnershipMiddleware,
+)
 from agentkit.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 from agentkit.agents.middlewares.durable_context_middleware import DurableContextMiddleware
 from agentkit.agents.middlewares.dynamic_context_middleware import DynamicContextMiddleware
@@ -121,6 +124,7 @@ def build_runtime_middlewares(
     chain.append(PIIMiddleware(app_config=app_config))
     from agentkit.contextforge.runtime import get_contextforge_runtime
 
+    chain.append(ContextForgeOwnershipMiddleware())
     chain.append(
         ToolRefreshRetryMiddleware(
             enabled=bool(app_config.contextforge.sync.retry_on_tool_error),
