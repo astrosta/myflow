@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import datetime
 import inspect
+import ssl
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
+import anyio
+import httpx
 import pytest
 from mcp import types as mcp_types
 
@@ -252,3 +255,97 @@ async def test_disabled_client_makes_no_network_calls() -> None:
     assert await client.list_tools() == []
     with pytest.raises(ContextForgeUnavailable):
         await client.call_tool("weather_lookup", {"city": "Tokyo"})
+
+
+# --- transport wiring: the SDK's default httpx factory vs. a local one ---------
+
+
+class _RecordedTransport:
+    """Replacement for streamablehttp_client: records its options, yields streams."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    @asynccontextmanager
+    async def __call__(self, url: str, **options: Any) -> AsyncIterator[tuple[Any, Any, Any]]:
+        self.calls.append((url, options))
+        read_send, read_stream = anyio.create_memory_object_stream[Any](0)
+        write_stream, write_receive = anyio.create_memory_object_stream[Any](0)
+        async with read_send, write_receive:
+            yield read_stream, write_stream, lambda: None
+
+
+def _verify_mode(client: httpx.AsyncClient) -> ssl.VerifyMode:
+    """The verify mode of the SSL context the client will actually use."""
+    transport = client._transport
+    assert isinstance(transport, httpx.AsyncHTTPTransport)
+    return transport._pool._ssl_context.verify_mode
+
+
+def test_module_takes_nothing_private_from_the_mcp_sdk() -> None:
+    """A private SDK module may move within mcp 1.x and break every import."""
+    source = inspect.getsource(mcp_client)
+    assert "mcp.shared" not in source
+    assert "_httpx_utils" not in source
+
+
+@pytest.mark.asyncio
+async def test_verify_tls_true_leaves_the_http_client_to_the_sdk_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _RecordedTransport()
+    monkeypatch.setattr(mcp_client, "streamablehttp_client", transport)
+    request = McpSessionRequest(
+        url="https://cf.example.com/servers/srv-1/mcp",
+        headers={"Authorization": "Bearer agent-token"},
+        timeout=7.5,
+        read_timeout=9.0,
+        verify_tls=True,
+    )
+
+    async with mcp_client.open_mcp_session(request) as session:
+        assert isinstance(session, mcp_client.ClientSession)
+
+    assert len(transport.calls) == 1
+    url, options = transport.calls[0]
+    assert url == request.url
+    assert options["headers"] == {"Authorization": "Bearer agent-token"}
+    assert options["timeout"] == 7.5
+    assert options["sse_read_timeout"] == 9.0
+    assert "httpx_client_factory" not in options, "verify the SDK default is used"
+
+
+@pytest.mark.asyncio
+async def test_verify_tls_false_installs_the_local_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _RecordedTransport()
+    monkeypatch.setattr(mcp_client, "streamablehttp_client", transport)
+    request = McpSessionRequest(url="https://cf.example.com/mcp", verify_tls=False)
+
+    async with mcp_client.open_mcp_session(request):
+        pass
+
+    assert len(transport.calls) == 1
+    _, options = transport.calls[0]
+    assert options["httpx_client_factory"] is mcp_client._insecure_http_client_factory
+
+    # The transport calls the factory with its own headers/timeout/auth.
+    client = options["httpx_client_factory"](
+        headers={"Authorization": "Bearer agent-token"},
+        timeout=httpx.Timeout(7.5, read=9.0),
+        auth=None,
+    )
+    async with client:
+        assert client.headers["authorization"] == "Bearer agent-token"
+        assert client.timeout == httpx.Timeout(7.5, read=9.0)
+        assert _verify_mode(client) is ssl.CERT_NONE, "verify_tls=false must skip TLS"
+
+
+def test_local_factory_matches_the_sdk_call_contract() -> None:
+    """No arguments at all still yields the SDK-style timeout, with TLS off."""
+    client = mcp_client._insecure_http_client_factory()
+    assert client.timeout == httpx.Timeout(30.0, read=300.0)
+    assert _verify_mode(client) is ssl.CERT_NONE
+    assert client.follow_redirects is False
+

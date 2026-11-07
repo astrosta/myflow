@@ -22,7 +22,6 @@ from typing import Any, Protocol
 import httpx
 from mcp import ClientSession, types as mcp_types
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.shared._httpx_utils import McpHttpClientFactory, create_mcp_http_client
 
 from agentkit.config.contextforge_config import ContextForgeConfig
 from agentkit.contextforge.models import ContextForgeProtocolError, ContextForgeUnavailable
@@ -66,7 +65,7 @@ async def open_mcp_session(request: McpSessionRequest) -> AsyncIterator[ClientSe
         headers=dict(request.headers),
         timeout=request.timeout,
         sse_read_timeout=max(request.timeout, request.read_timeout),
-        httpx_client_factory=_http_client_factory(request.verify_tls),
+        **_transport_options(request.verify_tls),
     ) as (read_stream, write_stream, _get_session_id):
         async with ClientSession(
             read_stream,
@@ -76,25 +75,36 @@ async def open_mcp_session(request: McpSessionRequest) -> AsyncIterator[ClientSe
             yield session
 
 
-def _http_client_factory(verify_tls: bool) -> McpHttpClientFactory:
-    """Honour contextforge.verify_tls, which the SDK transport cannot express."""
+def _transport_options(verify_tls: bool) -> dict[str, Any]:
+    """Honour contextforge.verify_tls without reaching into the SDK internals.
+
+    Verifying TLS is exactly what the SDK's own default httpx factory does, so
+    the httpx_client_factory argument is omitted in that case and the
+    transport default applies; only verify_tls=false installs a factory here.
+    """
     if verify_tls:
-        return create_mcp_http_client
+        return {}
+    return {"httpx_client_factory": _insecure_http_client_factory}
 
-    def factory(
-        headers: dict[str, str] | None = None,
-        timeout: httpx.Timeout | None = None,
-        auth: httpx.Auth | None = None,
-    ) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            headers=headers,
-            timeout=timeout or httpx.Timeout(30.0, read=300.0),
-            auth=auth,
-            verify=False,
-            follow_redirects=False,
-        )
 
-    return factory
+def _insecure_http_client_factory(
+    headers: dict[str, str] | None = None,
+    timeout: httpx.Timeout | None = None,
+    auth: httpx.Auth | None = None,
+) -> httpx.AsyncClient:
+    """httpx.AsyncClient factory that skips TLS verification.
+
+    The signature matches the callable the streamable-HTTP transport expects
+    (it passes its own headers, timeout and auth through), so this stands in
+    for the SDK's create_mcp_http_client with verification switched off.
+    """
+    return httpx.AsyncClient(
+        headers=headers,
+        timeout=timeout or httpx.Timeout(30.0, read=300.0),
+        auth=auth,
+        verify=False,
+        follow_redirects=False,
+    )
 
 
 class ContextForgeMcpClient:
