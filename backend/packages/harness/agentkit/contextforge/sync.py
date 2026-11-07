@@ -237,8 +237,8 @@ class ContextForgeSyncService:
         return _timed(stats, started, loop)
 
     async def reindex(self) -> ContextForgeSyncStats:
-        """Manual reindex: a full sync, so the derived index is pruned too."""
-        return await self.sync("manual", full=True)
+        """Manual reindex, pruning the derived index when the config allows it."""
+        return await self.sync("manual", full=self._config.sync.gc_on_manual_reindex)
 
     async def _sync_locked(self, *, reason: str, full: bool) -> ContextForgeSyncStats:
         try:
@@ -253,6 +253,31 @@ class ContextForgeSyncService:
             stored_rows = await self._store.list_all(None)
         except Exception as exc:  # noqa: BLE001
             return _aborted(reason, "db_failed", exc)
+
+        # An empty view is not evidence that the catalog was emptied: Admin and
+        # MCP can fail soft (a proxy or token that returns an empty list).  With
+        # stored rows already present, accepting either empty view would retire
+        # the whole catalog, so refuse the snapshot before any write.
+        if stored_rows and not admin_tools:
+            return _aborted(
+                reason,
+                "admin_empty",
+                ContextForgeProtocolError(
+                    "Admin /tools returned no rows while the catalog is populated"
+                ),
+            )
+        if (
+            stored_rows
+            and not mcp_tools
+            and any(bool(getattr(tool, "enabled", False)) for tool in admin_tools)
+        ):
+            return _aborted(
+                reason,
+                "upstream_views_disagree",
+                ContextForgeProtocolError(
+                    "MCP tools/list returned no tools while Admin reports enabled tools"
+                ),
+            )
 
         records, seen_names = self._merge(admin_tools, mcp_tools, stored_rows)
         try:

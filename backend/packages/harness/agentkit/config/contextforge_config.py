@@ -199,15 +199,17 @@ class ContextForgeConfig(BaseModel):
                     "contextforge.search.enabled=true requires vector_store.uri "
                     "(the existing Milvus instance)"
                 )
-            if not self.search.embedding.base_url.strip():
-                raise ValueError(
-                    "contextforge.search.enabled=true requires "
-                    "embedding.base_url"
-                )
-            if not self.search.embedding.model.strip():
-                raise ValueError(
-                    "contextforge.search.enabled=true requires embedding.model"
-                )
+            if self.search.embedding.enabled:
+                if not self.search.embedding.base_url.strip():
+                    raise ValueError(
+                        "contextforge.search.embedding.enabled=true requires "
+                        "embedding.base_url"
+                    )
+                if not self.search.embedding.model.strip():
+                    raise ValueError(
+                        "contextforge.search.embedding.enabled=true requires "
+                        "embedding.model"
+                    )
             if self.search.rerank.enabled:
                 if not self.search.rerank.base_url.strip():
                     raise ValueError(

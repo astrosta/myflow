@@ -183,6 +183,14 @@ class ContextForgeMcpClient:
                 read_timeout_seconds=read_timeout,
             )
 
+    async def aclose(self) -> None:
+        """Release lifecycle state; each request owns its short-lived session.
+
+        There is no pooled client to close today, but the runtime owns this
+        client and closes it with the Admin client so a future transport that
+        does hold a connection has a defined shutdown hook.
+        """
+
 
 __all__ = [
     "ContextForgeMcpClient",

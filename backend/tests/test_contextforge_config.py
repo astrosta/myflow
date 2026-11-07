@@ -95,6 +95,28 @@ def test_search_requires_the_milvus_instance() -> None:
         AppConfig.model_validate(payload)
 
 
+def test_keyword_only_search_does_not_require_an_embedding_service() -> None:
+    cfg = AppConfig.model_validate(
+        {
+            **_base(),
+            "vector_store": {"uri": "http://milvus:19530"},
+            "contextforge": {
+                "enabled": True,
+                "base_url": "http://cf",
+                "search": {
+                    "enabled": True,
+                    "keyword": {"enabled": True},
+                    "embedding": {"enabled": False},
+                },
+            },
+        }
+    )
+
+    assert cfg.contextforge.search.keyword.enabled is True
+    assert cfg.contextforge.search.embedding.enabled is False
+    assert cfg.contextforge.search.embedding.base_url == ""
+
+
 def test_search_requires_at_least_one_recall_channel() -> None:
     with pytest.raises(ValidationError, match="recall channel"):
         AppConfig.model_validate(

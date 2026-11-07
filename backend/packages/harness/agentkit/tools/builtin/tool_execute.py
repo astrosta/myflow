@@ -110,6 +110,7 @@ _RECOVERABLE_ORIGINS = frozenset(
 #: read did not, so "not there" is not something this process knows.
 REREAD_REFRESHED = "refreshed"
 REREAD_NOT_REFRESHED = "not_refreshed"
+REREAD_DISABLED = "disabled"
 REREAD_UNAVAILABLE = "unavailable"
 
 _TIMEOUT_MARKERS = ("timeout", "timed out", "deadline exceeded", "read timeout")
@@ -299,11 +300,16 @@ def _missing_reply(
             message=CATALOG_UNAVAILABLE_MESSAGE,
             record=record,
         )
+    message = (
+        _retry_disabled_message(call_name)
+        if state == REREAD_DISABLED
+        else _not_found_message(call_name, state == REREAD_REFRESHED)
+    )
     return _error_reply(
         tool_call_id,
         call_name=call_name,
         origin=ORIGIN_TOOL_NOT_FOUND,
-        message=_not_found_message(call_name, state == REREAD_REFRESHED),
+        message=message,
         record=record,
     )
 
@@ -497,6 +503,8 @@ async def _reread_after_refresh(
     used to make a database failure back a "refreshed, therefore not found"
     answer.
     """
+    if not _retry_on_tool_error(execution):
+        return None, REREAD_DISABLED
     if not await _refresh_catalog(execution):
         return None, REREAD_NOT_REFRESHED
     try:
@@ -548,6 +556,16 @@ def _refresh_failed(stats: Any) -> bool:
     if not error:
         return False
     return not bool(getattr(stats, "index_failed", False))
+
+
+def _retry_on_tool_error(execution: Any) -> bool:
+    """Whether a failed call may refresh the catalog and retry (sync policy).
+
+    An absent runtime or field keeps the design default (true); only an explicit
+    false turns the fallback off.
+    """
+    sync = getattr(getattr(execution, "config", None), "sync", None)
+    return bool(getattr(sync, "retry_on_tool_error", True))
 
 
 def _refresh_timeout(execution: Any) -> float:
@@ -814,6 +832,15 @@ def _result_text(result: Any) -> str:
 def _artifact(result: Any) -> Any:
     structured = getattr(result, "structuredContent", None)
     return None if structured is None else {"structured_content": structured}
+
+
+def _retry_disabled_message(call_name: str) -> str:
+    return (
+        f"{call_name} is not in the ContextForge catalog for this user, and the "
+        "automatic catalog refresh is disabled by "
+        "contextforge.sync.retry_on_tool_error. Do not repeat this call; search "
+        "again with tool_search or tell the user."
+    )
 
 
 def _not_found_message(call_name: str, refreshed: bool) -> str:

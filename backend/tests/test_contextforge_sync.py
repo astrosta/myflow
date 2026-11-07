@@ -429,40 +429,122 @@ async def test_admin_only_tool_is_stored_but_never_callable(tmp_path: Path) -> N
 async def test_tool_that_leaves_mcp_keeps_its_row_and_loses_callability(
     tmp_path: Path,
 ) -> None:
-    admin = FakeAdmin([_admin_tool()])
-    mcp = FakeMcp([_mcp_tool()])
+    admin = FakeAdmin(
+        [_admin_tool(), _admin_tool(name="other", tool_id="tool-2")]
+    )
+    mcp = FakeMcp([_mcp_tool(), _mcp_tool(name="other")])
     async with harness(tmp_path) as built:
         service = _service(built, admin=admin, mcp=mcp, index=FakeIndex(), embedder=FakeEmbedder())
         await service.sync("startup")
         assert (await _rows(built))["github_search"].callable is True
 
-        # ContextForge still lists the tool in Admin but its MCP endpoint no longer
-        # executes it, so the definition survives and the runtime gate closes.
-        service = _service(built, admin=admin, mcp=FakeMcp([]))
+        # ContextForge still lists both tools in Admin but its MCP endpoint only
+        # executes one, so the missing definition survives and the runtime gate closes.
+        service = _service(built, admin=admin, mcp=FakeMcp([_mcp_tool(name="other")]))
         await service.sync("admin_events")
         stored = await _rows(built)
 
     assert stored["github_search"].callable is False
     assert stored["github_search"].input_schema == VERBATIM_SCHEMA
+    assert stored["other"].callable is True
+
+
+@pytest.mark.asyncio
+async def test_an_empty_admin_view_aborts_instead_of_retiring_the_catalog(
+    tmp_path: Path,
+) -> None:
+    index = FakeIndex()
+    async with harness(tmp_path) as built:
+        service = _service(
+            built,
+            admin=FakeAdmin([_admin_tool()]),
+            mcp=FakeMcp([_mcp_tool()]),
+            index=index,
+            embedder=FakeEmbedder(),
+        )
+        await service.sync("startup")
+
+        # Admin returning zero rows while the catalog is populated is a broken
+        # upstream read, not an empty catalog: no snapshot and no index write.
+        service = _service(
+            built,
+            admin=FakeAdmin([]),
+            mcp=FakeMcp([_mcp_tool()]),
+            index=index,
+            embedder=FakeEmbedder(),
+        )
+        stats = await service.sync("admin_events")
+        stored = await _rows(built)
+
+    assert stats.error == "admin_empty"
+    assert stats.scanned == 0
+    assert stats.index_failed is False
+    assert index.calls == 1
+    assert set(stored) == {"github_search"}
+    assert stored["github_search"].id == "tool-1"
+    assert stored["github_search"].callable is True
+
+
+@pytest.mark.asyncio
+async def test_an_empty_mcp_view_aborts_when_admin_reports_enabled_tools(
+    tmp_path: Path,
+) -> None:
+    index = FakeIndex()
+    async with harness(tmp_path) as built:
+        admin = FakeAdmin([_admin_tool()])
+        service = _service(
+            built,
+            admin=admin,
+            mcp=FakeMcp([_mcp_tool()]),
+            index=index,
+            embedder=FakeEmbedder(),
+        )
+        await service.sync("startup")
+
+        # Admin still reports an enabled tool, but MCP lists nothing at all: the
+        # two views disagree, so the previous catalog is kept untouched.
+        service = _service(
+            built,
+            admin=admin,
+            mcp=FakeMcp([]),
+            index=index,
+            embedder=FakeEmbedder(),
+        )
+        stats = await service.sync("admin_events")
+        stored = await _rows(built)
+
+    assert stats.error == "upstream_views_disagree"
+    assert stats.scanned == 0
+    assert stats.index_failed is False
+    assert index.calls == 1
+    assert stored["github_search"].callable is True
 
 
 @pytest.mark.asyncio
 async def test_mcp_only_tool_is_skipped_without_a_guessed_id(tmp_path: Path) -> None:
-    admin = FakeAdmin([_admin_tool()])
+    # Admin and MCP both keep "other"; only MCP still knows "github_search".  The
+    # snapshot is non-empty, so the guard allows it, and the MCP-only tool has no
+    # Admin id to upsert: nothing is written for it and its stored row retires.
+    admin = FakeAdmin(
+        [_admin_tool(), _admin_tool(name="other", tool_id="tool-2")]
+    )
     async with harness(tmp_path) as built:
-        service = _service(built, admin=admin, mcp=FakeMcp([_mcp_tool()]))
+        service = _service(built, admin=admin, mcp=FakeMcp([_mcp_tool(), _mcp_tool(name="other")]))
         await service.sync("startup")
 
-        # The Admin row is gone but MCP still lists the tool: there is no id to
-        # upsert, so nothing is written for it and the stored row stops being callable.
-        service = _service(built, admin=FakeAdmin([]), mcp=FakeMcp([_mcp_tool()]))
+        service = _service(
+            built,
+            admin=FakeAdmin([_admin_tool(name="other", tool_id="tool-2")]),
+            mcp=FakeMcp([_mcp_tool(name="other"), _mcp_tool()]),
+        )
         stats = await service.sync("admin_events")
         stored = await _rows(built)
 
-    assert stats.scanned == 0
-    assert set(stored) == {"github_search"}
+    assert stats.scanned == 1
+    assert set(stored) == {"github_search", "other"}
     assert stored["github_search"].id == "tool-1"
     assert stored["github_search"].callable is False
+    assert stored["other"].callable is True
 
 
 @pytest.mark.asyncio
@@ -1080,6 +1162,23 @@ async def test_manual_reindex_is_a_full_sync(tmp_path: Path) -> None:
         await service.reindex()
 
     assert index.full_flags == [True]
+
+
+@pytest.mark.asyncio
+async def test_manual_reindex_honours_gc_config(tmp_path: Path) -> None:
+    async with harness(tmp_path) as built:
+        index = FakeIndex()
+        service = ContextForgeSyncService(
+            _config(sync={"gc_on_manual_reindex": False}),
+            admin=FakeAdmin([_admin_tool()]),
+            mcp=FakeMcp([_mcp_tool()]),
+            store=built.store,
+            index=index,
+            embedder=FakeEmbedder(),
+        )
+        await service.reindex()
+
+    assert index.full_flags == [False]
 
 
 @pytest.mark.asyncio

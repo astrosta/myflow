@@ -203,6 +203,7 @@ class FakeExecutionRuntime:
         refresh_error: Exception | None = None,
         refresh_delay: float = 0.0,
         refresh_timeout: float = 1.0,
+        retry_on_tool_error: bool = True,
     ) -> None:
         self.store = store
         self.mcp_client = mcp
@@ -211,7 +212,10 @@ class FakeExecutionRuntime:
             base_url="http://cf",
             admin_token="token",
             search={"enabled": False},
-            sync={"tool_error_refresh_timeout_seconds": refresh_timeout},
+            sync={
+                "tool_error_refresh_timeout_seconds": refresh_timeout,
+                "retry_on_tool_error": retry_on_tool_error,
+            },
         )
         self.refresh_reasons: list[str] = []
         self.retries: list[tuple[str, str]] = []
@@ -529,6 +533,47 @@ async def test_a_missing_tool_is_reported_after_one_refresh(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_retry_on_tool_error_false_does_not_refresh_a_missing_tool(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as store:
+        mcp = FakeMcp()
+        execution = FakeExecutionRuntime(
+            store, mcp, retry_on_tool_error=False
+        )
+
+        message = await _run(execution, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_not_found"
+    assert "retry_on_tool_error" in payload["error"]
+    assert execution.refresh_reasons == []
+    assert execution.retries == []
+    assert mcp.calls == []
+
+
+@pytest.mark.asyncio
+async def test_retry_on_tool_error_false_does_not_refresh_a_validation_failure(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as store:
+        await _store_record(store, _record())
+        mcp = FakeMcp()
+        execution = FakeExecutionRuntime(
+            store, mcp, retry_on_tool_error=False
+        )
+
+        message = await _run(execution, arguments={})
+
+    payload = _payload(message)
+    assert payload["origin"] == "local_validation"
+    assert "input_schema" not in payload
+    assert execution.refresh_reasons == []
+    assert execution.retries == []
+    assert mcp.calls == []
+
+
+@pytest.mark.asyncio
 async def test_upstream_not_found_is_refreshed_and_retried_once(tmp_path: Path) -> None:
     async with catalog(tmp_path) as store:
         await _store_record(store, _record())
@@ -556,6 +601,25 @@ async def test_a_second_not_found_is_not_retried_again(tmp_path: Path) -> None:
     assert len(mcp.calls) == 2
     assert execution.refresh_reasons == ["call_error"], "one refresh, one retry"
     assert execution.retries == [(CALL_NAME, "failed")]
+
+
+@pytest.mark.asyncio
+async def test_retry_on_tool_error_false_does_not_retry_an_upstream_not_found(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as store:
+        await _store_record(store, _record())
+        mcp = FakeMcp(_error("tool not found: github_search"))
+        execution = FakeExecutionRuntime(
+            store, mcp, retry_on_tool_error=False
+        )
+
+        message = await _run(execution, arguments={"query": "pytest"})
+
+    assert _payload(message)["origin"] == "tool_not_found"
+    assert len(mcp.calls) == 1, "the upstream call is never repeated"
+    assert execution.refresh_reasons == []
+    assert execution.retries == []
 
 
 @pytest.mark.asyncio

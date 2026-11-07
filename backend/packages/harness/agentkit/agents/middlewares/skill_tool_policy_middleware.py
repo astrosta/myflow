@@ -134,6 +134,13 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
         index = self._index(runtime)
         activated = [skill for path in paths if (skill := index.get(path)) is not None]
         slash_skill = index.get(slash_path) if slash_path else None
+        if slash_path and slash_skill is None:
+            # 用户显式 slash 的技能解析不出来时，不能把它丢掉再去求别的技能并集：
+            # 那等于让一个模型自选读到的技能扩大 slash 的范围（§3.6/§3.9）。
+            logger.warning(
+                "The slash skill %r did not resolve; failing closed", slash_path
+            )
+            return framework_only_decision(reason="unresolved_slash")
         if paths and not activated:
             # 激活集非空但 0 个能解析：fail-closed 到框架工具（§3.9 失败语义）
             logger.warning("No activated skill resolved (%s); failing closed", list(paths))

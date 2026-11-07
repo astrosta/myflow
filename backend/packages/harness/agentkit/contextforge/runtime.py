@@ -152,7 +152,7 @@ class ContextForgeRuntime:
 
     async def stop(self) -> None:
         """Cancel the tasks, stop the subscriber, and release the clients."""
-        if not self._started:
+        if not self.config.enabled:
             return
         self._started = False
         self._stop.set()
@@ -170,8 +170,18 @@ class ContextForgeRuntime:
         if self._index is not None:
             with suppress(Exception):
                 await self._index.aclose()
+        if self._mcp is not None:
+            close = getattr(self._mcp, "aclose", None)
+            if callable(close):
+                with suppress(Exception):
+                    await close()
         with suppress(Exception):
             await self.admin.aclose()
+        # Only retire the process-global handles if this runtime still owns them:
+        # stopping an old runtime must not clear a newer one that replaced it.
+        if get_contextforge_runtime() is self:
+            reset_contextforge_runtime()
+            _set_tool_search_runtime(None)
 
     async def _cancel_daily_task(self) -> None:
         task, self._daily_task = self._daily_task, None
@@ -208,10 +218,12 @@ class ContextForgeRuntime:
             )
 
     async def reindex(self) -> ContextForgeSyncStats:
-        """Manual reindex: a full sync, so the derived index is pruned too."""
+        """Manual reindex, pruning the derived index when the config allows it."""
         if not self.config.enabled:
             return ContextForgeSyncStats()
-        return await self._sync_once("manual", full=True)
+        return await self._sync_once(
+            "manual", full=bool(self.config.sync.gc_on_manual_reindex)
+        )
 
     async def refresh_now(self, reason: str = "tool_error") -> ContextForgeSyncStats:
         """One awaited sync, whatever `sync.admin_refresh_async` says.
@@ -369,7 +381,7 @@ class ContextForgeRuntime:
                     # Only the catalog-wide read is remembered: caching a scoped
                     # count would leak it to the next caller.
                     self._last_counts = (callable_count, total)
-        return {
+        status = {
             "enabled": self.config.enabled,
             "reachable": self._reachable,
             "auth_ok": self._auth_ok,
@@ -383,15 +395,24 @@ class ContextForgeRuntime:
             "last_sync_reason": self._last_sync_reason,
             "last_error": self._last_error,
             "last_sync_duration_ms": self._last_sync_duration_ms,
-            "last_retry_at": self._last_retry_at,
-            "last_retry_tool": self._last_retry_tool,
-            "last_retry_result": self._last_retry_result,
             "channels": {
                 "keyword": "ready" if self.config.search.keyword.enabled else "disabled",
                 "embedding": "ready" if self._embedder is not None else "disabled",
                 "rerank": "ready" if self.reranker is not None else "disabled",
             },
         }
+        if owner_user_id is None:
+            # The retry record is process-global (the last tool-error fallback),
+            # so it belongs on the catalog-wide admin view only.  A scoped caller
+            # must not learn which tool another user's retry touched.
+            status.update(
+                {
+                    "last_retry_at": self._last_retry_at,
+                    "last_retry_tool": self._last_retry_tool,
+                    "last_retry_result": self._last_retry_result,
+                }
+            )
+        return status
 
     def _daily_state(self) -> str:
         if not self.config.enabled:
@@ -489,6 +510,10 @@ def build_contextforge_runtime(
     have one.
     """
     if not config.enabled:
+        # A disabled build must remove the previous process runtime as well as
+        # the retrieval service; otherwise tool_execute keeps calling the old
+        # catalog after the operator turned ContextForge off.
+        configure_contextforge_runtime(None)
         _set_tool_search_runtime(None)
         return None
     factory = session_factory if session_factory is not None else get_session_factory()
@@ -497,6 +522,7 @@ def build_contextforge_runtime(
             "ContextForge runtime needs the persistent catalog; no database session "
             "factory is configured"
         )
+        configure_contextforge_runtime(None)
         _set_tool_search_runtime(None)
         return None
     admin = ContextForgeAdminClient(config)

@@ -26,11 +26,17 @@ from agentkit.config.contextforge_config import ContextForgeConfig
 from agentkit.contextforge.runtime import (
     ContextForgeRuntime,
     build_contextforge_runtime,
+    configure_contextforge_runtime,
     get_contextforge_runtime,
     reset_contextforge_runtime,
 )
 from agentkit.contextforge.sync import ContextForgeSyncStats
 from agentkit.persistence.schema import Base
+from agentkit.tools.search.service import (
+    get_tool_search_runtime,
+    reset_tool_search_runtime,
+    set_tool_search_runtime,
+)
 
 LOCAL = ZoneInfo("Asia/Shanghai")
 
@@ -122,6 +128,14 @@ class RaisingSyncService(FakeSyncService):
 
 
 class FakeAdmin:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FakeMcp:
     def __init__(self) -> None:
         self.closed = False
 
@@ -281,6 +295,33 @@ async def test_stop_cancels_the_midnight_task_and_the_subscriber() -> None:
     assert service.calls == [("startup", False)]
 
 
+@pytest.mark.asyncio
+async def test_stop_closes_the_mcp_client_and_clears_the_process_handles() -> None:
+    service = FakeSyncService(rows=[_row()])
+    admin = FakeAdmin()
+    mcp = FakeMcp()
+    runtime = ContextForgeRuntime(
+        _config(),
+        sync=service,
+        admin=admin,
+        mcp=mcp,
+        subscriber_factory=SubscriberFactory(),
+        daily_delay=lambda: 3600.0,
+    )
+    configure_contextforge_runtime(runtime)
+    set_tool_search_runtime(object())  # type: ignore[arg-type]
+    try:
+        await runtime.start()
+        await runtime.stop()
+
+        assert mcp.closed is True
+        assert get_contextforge_runtime() is None
+        assert get_tool_search_runtime() is None
+    finally:
+        reset_contextforge_runtime()
+        reset_tool_search_runtime()
+
+
 # --------------------------------------------------------------------------- #
 # Refresh triggers
 # --------------------------------------------------------------------------- #
@@ -365,6 +406,19 @@ async def test_reindex_runs_a_full_sync() -> None:
     assert stats.error is None
     # /api/tools/reindex reports this; it must be a real measurement.
     assert stats.duration_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_reindex_honours_gc_on_manual_reindex() -> None:
+    runtime, service, _admin, _factory = _runtime(
+        _config(sync={"startup_sync": False, "gc_on_manual_reindex": False})
+    )
+
+    await runtime.reindex()
+
+    assert service.calls == [("manual", False)], (
+        "gc_on_manual_reindex=false must not ask the sync to prune the index"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -512,6 +566,21 @@ async def test_status_counts_are_scoped_to_the_caller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_scoped_status_omits_the_process_global_retry() -> None:
+    runtime, _service, _admin, _factory = _runtime(rows=[_row(owner="u1")])
+    runtime.record_retry(tool_name="cf__gitlab_search", result="success")
+
+    scoped = await runtime.status(owner_user_id="u1")
+    catalog_wide = await runtime.status()
+
+    assert "last_retry_at" not in scoped
+    assert "last_retry_tool" not in scoped
+    assert "last_retry_result" not in scoped
+    assert catalog_wide["last_retry_tool"] == "cf__gitlab_search"
+    assert catalog_wide["last_retry_result"] == "success"
+
+
+@pytest.mark.asyncio
 async def test_a_scoped_status_never_reuses_the_catalog_wide_counts() -> None:
     runtime, service, _admin, _factory = _runtime(
         rows=[_row(owner="u1"), _row(owner="u2")]
@@ -546,6 +615,19 @@ async def test_a_clean_sync_reports_the_index_ready() -> None:
 
 def test_building_a_disabled_runtime_returns_none() -> None:
     assert build_contextforge_runtime(ContextForgeConfig()) is None
+
+
+def test_a_disabled_build_clears_the_previous_process_handles() -> None:
+    previous, _service, _admin, _factory = _runtime()
+    configure_contextforge_runtime(previous)
+    set_tool_search_runtime(object())  # type: ignore[arg-type]
+    try:
+        assert build_contextforge_runtime(ContextForgeConfig()) is None
+        assert get_contextforge_runtime() is None
+        assert get_tool_search_runtime() is None
+    finally:
+        reset_contextforge_runtime()
+        reset_tool_search_runtime()
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 from agentkit.agents.middlewares.skill_tool_policy_middleware import SkillToolPolicyMiddleware
+from agentkit.runtime.secret_context import SLASH_SKILL_SOURCE_CONTEXT_KEY, write_secret_context
 from fakes.skill_tree import skills_config, write_skill
 
 TOKEN = "contextforge-policy-token"
@@ -160,6 +161,33 @@ def test_a_declared_cf_tool_reaches_tool_execute(tmp_path):
 
     assert result == "ran"
     assert called == ["ran"]
+
+
+def test_an_unresolved_slash_path_fails_closed_even_when_another_skill_resolves(
+    tmp_path,
+):
+    searcher = _write(tmp_path, "searcher", allowed="[cf__github_search]")
+    state = _state(searcher)
+    context = _context()
+    write_secret_context(
+        context,
+        SLASH_SKILL_SOURCE_CONTEXT_KEY,
+        "/mnt/skills/public/missing/SKILL.md",
+        token=TOKEN,
+    )
+    middleware = _middleware(tmp_path)
+    _prime(middleware, context, state)
+    called: list[str] = []
+
+    result = middleware.wrap_tool_call(
+        _tool_call("tool_execute", context, state, {"tool_name": "cf__github_search"}),
+        lambda request: called.append("ran") or "ran",
+    )
+
+    assert called == []
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "cf__github_search" in result.content
 
 
 def test_tool_search_filters_command_cards_and_retrieved_names(tmp_path):
