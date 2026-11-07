@@ -12,6 +12,7 @@ from agentkit.contextforge.models import (
 )
 from agentkit.contextforge.ownership import (
     can_call,
+    can_claim,
     can_manage,
     can_view,
     strip_owner,
@@ -54,7 +55,7 @@ def _flags(tool: ContextForgeTool, caller: RunCaller) -> tuple[bool, bool, bool]
         return True, False, True
     owned = tool.owner is not None and tool.owner == caller.user_id
     claimable = tool.owner is None
-    return owned, claimable, owned or claimable
+    return owned, claimable, owned
 
 
 def _summary(tool: ContextForgeTool, caller: RunCaller) -> ToolSummary:
@@ -95,6 +96,11 @@ def _visible(tool: ContextForgeTool, caller: RunCaller) -> None:
 
 def _manageable(tool: ContextForgeTool, caller: RunCaller) -> None:
     if not can_manage(tool.owner, caller.user_id):
+        raise ContextForgeNotFound("tool not found")
+
+
+def _claimable(tool: ContextForgeTool, caller: RunCaller) -> None:
+    if not can_claim(tool.owner, caller.user_id):
         raise ContextForgeNotFound("tool not found")
 
 
@@ -323,7 +329,7 @@ async def claim_tool(
 ) -> ToolDetail:
     client = get_contextforge_admin_client(request)
     current = await client.get_tool(tool_id)
-    _manageable(current, caller)
+    _claimable(current, caller)
     tool = current
     if current.owner is None and caller.user_id is not None:
         tool = await _rewrite_annotations(
@@ -345,12 +351,6 @@ async def set_tool_state(
     client = get_contextforge_admin_client(request)
     current = await client.get_tool(tool_id)
     _manageable(current, caller)
-    if current.owner is None and caller.user_id is not None:
-        current = await _rewrite_annotations(
-            client,
-            current,
-            with_owner(current.annotations, caller.user_id),
-        )
     tool = await client.set_tool_state(tool_id, body.enabled)
     await _request_refresh(request)
     return _detail(tool, caller)

@@ -42,7 +42,16 @@ def can_view(owner: str | None, user_id: str | None) -> bool:
 
 
 def can_manage(owner: str | None, user_id: str | None) -> bool:
-    return user_id is None or owner is None or owner == user_id
+    """Only the owner may edit/delete/enable a tool; unowned tools are claim-only."""
+    if user_id is None:
+        return True
+    return owner == user_id
+
+
+def can_claim(owner: str | None, user_id: str | None) -> bool:
+    if user_id is None:
+        return True
+    return owner is None or owner == user_id
 
 
 def can_call(owner: str | None, user_id: str | None) -> bool:
@@ -55,6 +64,7 @@ def can_call(owner: str | None, user_id: str | None) -> bool:
 __all__ = [
     "OWNER_ANNOTATION",
     "can_call",
+    "can_claim",
     "can_manage",
     "can_view",
     "owner_from_annotations",

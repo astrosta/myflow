@@ -179,7 +179,7 @@ async def test_list_hides_other_users_tools_and_marks_unowned_claimable(monkeypa
     assert set(by_name) == {"mine", "shared"}
     assert by_name["mine"].owned is True
     assert by_name["shared"].claimable is True
-    assert by_name["shared"].can_edit is True
+    assert by_name["shared"].can_edit is False
 
 
 @pytest.mark.asyncio

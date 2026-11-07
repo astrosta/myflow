@@ -227,7 +227,7 @@ describe("工具管理页", () => {
 
   it("未归属工具可以认领", async () => {
     mockedList.mockResolvedValue({
-      tools: [makeTool({ owned: false, claimable: true, can_edit: true })],
+      tools: [makeTool({ owned: false, claimable: true, can_edit: false })],
       count: 1,
       next_cursor: null,
     });
