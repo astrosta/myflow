@@ -11,6 +11,10 @@
 > 范围：`contextforge` 配置段、`/api/tools` 管理代理、`/workspace/tools` 管理页、
 > `agentkit.contextforge` 运行时、内置 `search_tools` 与延迟工具提升。
 > 实现计划：[2026-11-06-contextforge-tool-management.md](../plans/2026-11-06-contextforge-tool-management.md)。
+>
+> 实现更新（后续）：`extensions_config.json` 的普通 `mcpServers` 工具来源已删除，
+> ContextForge 成为 MCP 工具的唯一来源；`/api/mcp/config`、`/api/mcp/cache/reset`
+> 和 `agentkit.mcp` 已移除。下文 §1.1 / §1.2 保留为设计时的现状记录。
 
 ## 1. 现状
 
