@@ -4,7 +4,8 @@ import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
 
-from agentkit.contextforge.models import ContextForgeTool
+from agentkit.contextforge.models import ContextForgeNotFound, ContextForgeTool, ToolWrite
+from agentkit.contextforge.ownership import owner_from_annotations
 from backend.app.gateway import tools_deps
 from backend.app.gateway.auth.result import AuthKind, AuthResult
 from backend.app.gateway.run_models import CallerKind, RunCaller
@@ -38,9 +39,25 @@ class FakeAdmin:
         )
 
 
-def _request() -> Request:
+class OwnedFakeAdmin(FakeAdmin):
+    async def list_tools(self, *, limit: int, skip: int, include_inactive: bool):
+        del limit, skip, include_inactive
+        return [
+            ContextForgeTool(id="mine", name="mine", owner="u1", annotations={"myflow_owner": "u1"}),
+            ContextForgeTool(id="other", name="other", owner="u2", annotations={"myflow_owner": "u2"}),
+            ContextForgeTool(id="shared", name="shared"),
+        ]
+
+    async def get_tool(self, tool_id: str):
+        for tool in await self.list_tools(limit=50, skip=0, include_inactive=True):
+            if tool.id == tool_id:
+                return tool
+        raise AssertionError(tool_id)
+
+
+def _request(admin: object | None = None) -> Request:
     app = FastAPI()
-    app.state.contextforge_admin_client = FakeAdmin()
+    app.state.contextforge_admin_client = admin or FakeAdmin()
     return Request(
         {
             "type": "http",
@@ -138,3 +155,102 @@ def test_pat_without_tools_scope_is_denied() -> None:
 
     with pytest.raises(RunPermissionDenied):
         tools_deps.require_tools_scope("tools:read")(request)
+
+@pytest.mark.asyncio
+async def test_list_hides_other_users_tools_and_marks_unowned_claimable(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tools_deps,
+        "get_app_config",
+        lambda: SimpleNamespace(contextforge=SimpleNamespace(enabled=True)),
+    )
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    response = await tools_router.list_tools(
+        _request(OwnedFakeAdmin()),
+        caller,
+        None,
+        50,
+        None,
+        None,
+        None,
+    )
+
+    by_name = {tool.name: tool for tool in response.tools}
+    assert set(by_name) == {"mine", "shared"}
+    assert by_name["mine"].owned is True
+    assert by_name["shared"].claimable is True
+    assert by_name["shared"].can_edit is True
+
+
+@pytest.mark.asyncio
+async def test_get_another_users_tool_is_not_found(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tools_deps,
+        "get_app_config",
+        lambda: SimpleNamespace(contextforge=SimpleNamespace(enabled=True)),
+    )
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    with pytest.raises(ContextForgeNotFound):
+        await tools_router.get_tool("other", _request(OwnedFakeAdmin()), caller)
+
+class RecordingOwnedAdmin(OwnedFakeAdmin):
+    def __init__(self) -> None:
+        self.created: ToolWrite | None = None
+        self.updated: ToolWrite | None = None
+
+    async def create_tool(self, data: ToolWrite):
+        self.created = data
+        return ContextForgeTool(
+            id="new",
+            name=data.name,
+            annotations=data.annotations,
+            owner=owner_from_annotations(data.annotations),
+        )
+
+    async def update_tool(self, tool_id: str, data: ToolWrite):
+        self.updated = data
+        return ContextForgeTool(
+            id=tool_id,
+            name=data.name,
+            annotations=data.annotations,
+            owner=owner_from_annotations(data.annotations),
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_stamps_the_calling_user_as_owner(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tools_deps,
+        "get_app_config",
+        lambda: SimpleNamespace(contextforge=SimpleNamespace(enabled=True)),
+    )
+    admin = RecordingOwnedAdmin()
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    response = await tools_router.create_tool(
+        ToolWrite(name="new_tool", description="d"),
+        _request(admin),
+        caller,
+    )
+
+    assert admin.created is not None
+    assert admin.created.annotations["myflow_owner"] == "u1"
+    assert response.owned is True
+
+
+@pytest.mark.asyncio
+async def test_claim_assigns_an_unowned_tool(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tools_deps,
+        "get_app_config",
+        lambda: SimpleNamespace(contextforge=SimpleNamespace(enabled=True)),
+    )
+    admin = RecordingOwnedAdmin()
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    response = await tools_router.claim_tool("shared", _request(admin), caller)
+
+    assert admin.updated is not None
+    assert admin.updated.annotations["myflow_owner"] == "u1"
+    assert response.owned is True

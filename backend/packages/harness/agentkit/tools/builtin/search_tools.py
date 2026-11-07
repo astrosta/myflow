@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Annotated
+from collections.abc import Mapping
+from typing import Annotated, Any
 
+from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from agentkit.runtime.user_context import resolve_runtime_user_id
 from agentkit.tools.search.service import get_tool_search_runtime
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,7 @@ class SearchToolsInput(BaseModel):
 async def search_tools(
     task_query: str,
     domain_keywords: list[str] | None = None,
+    runtime: ToolRuntime[Any, Any] = None,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """Find tools for a task and make the hits available on the next model call.
@@ -62,8 +66,14 @@ async def search_tools(
             _payload([], _retrieval([], 0, False, ["catalog_unavailable"], "unavailable"),
                      "Tool retrieval is unavailable in this deployment. Do not retry."),
         )
+    context = getattr(runtime, "context", None)
+    user_id = resolve_runtime_user_id(context if isinstance(context, Mapping) else {})
     try:
-        outcome = await service.search(task_query=query, domain_keywords=keywords)
+        outcome = await service.search(
+            task_query=query,
+            domain_keywords=keywords,
+            user_id=user_id,
+        )
     except Exception as exc:  # noqa: BLE001 - a tool result, not a run failure
         logger.warning("search_tools failed: %s", type(exc).__name__)
         return _command(

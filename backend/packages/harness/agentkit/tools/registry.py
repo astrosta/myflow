@@ -22,7 +22,10 @@ from agentkit.sandbox.tools import (
 from agentkit.tools.builtin.load_skills import load_skills
 from agentkit.tools.builtin.search_skills import search_skills
 from agentkit.tools.builtin.search_tools import search_tools
-from agentkit.tools.contextforge_metadata import is_contextforge_tool
+from agentkit.tools.contextforge_metadata import (
+    contextforge_owner,
+    is_contextforge_tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,7 @@ def get_available_tools(
     subagent_enabled: bool = False,
     *,
     app_config: AppConfig | None = None,
+    user_id: str | None = None,
 ) -> list[BaseTool]:
     """Config tools, then builtins, then MCP. Duplicate ``tool.name`` values are skipped."""
     resolved = app_config if app_config is not None else get_app_config()
@@ -82,7 +86,7 @@ def get_available_tools(
             continue
         _add_tool(tools, seen, tool)
 
-    for tool in _load_contextforge_tools(resolved):
+    for tool in _load_contextforge_tools(resolved, user_id=user_id):
         _add_tool(tools, seen, tool)
 
     if include_mcp:
@@ -117,13 +121,21 @@ def _configured_tools(app_config: AppConfig) -> list[ToolConfig]:
     return configs
 
 
-def _load_contextforge_tools(app_config: AppConfig) -> list[BaseTool]:
+def _load_contextforge_tools(
+    app_config: AppConfig, *, user_id: str | None = None
+) -> list[BaseTool]:
     if not app_config.contextforge.enabled:
         return []
     from agentkit.contextforge.cache import get_contextforge_snapshot
 
     snapshot = get_contextforge_snapshot()
-    return list(snapshot.tools) if snapshot is not None else []
+    if snapshot is None:
+        return []
+    if user_id is None:
+        # Authentication disabled / internal single-user mode: the process has
+        # exactly one owner, so the whole snapshot belongs to it.
+        return list(snapshot.tools)
+    return [tool for tool in snapshot.tools if contextforge_owner(tool) == user_id]
 
 
 def contextforge_tool_count(tools: list[BaseTool]) -> int:

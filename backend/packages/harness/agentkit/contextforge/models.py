@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agentkit.contextforge.ownership import owner_from_annotations
+
 
 class ContextForgeError(RuntimeError):
     """Base error for ContextForge integration failures."""
@@ -67,6 +69,7 @@ class ContextForgeTool:
     headers: dict[str, str] = field(default_factory=dict)
     input_schema: dict[str, Any] = field(default_factory=dict)
     annotations: dict[str, Any] = field(default_factory=dict)
+    owner: str | None = None
     tags: tuple[str, ...] = ()
     visibility: str | None = None
     created_at: str | None = None
@@ -199,6 +202,7 @@ def tool_from_wire(data: dict[str, Any]) -> ContextForgeTool:
     name = data.get("name")
     if not isinstance(tool_id, str) or not tool_id or not isinstance(name, str) or not name:
         raise ContextForgeProtocolError("tool response is missing id or name")
+    annotations = data.get("annotations") if isinstance(data.get("annotations"), dict) else {}
     return ContextForgeTool(
         id=tool_id,
         name=name,
@@ -211,7 +215,8 @@ def tool_from_wire(data: dict[str, Any]) -> ContextForgeTool:
         request_type=str(data.get("request_type") or data.get("requestType") or "SSE"),
         headers=normalize_headers(data.get("headers")),
         input_schema=normalize_input_schema(data.get("input_schema", data.get("inputSchema"))),
-        annotations=data.get("annotations") if isinstance(data.get("annotations"), dict) else {},
+        annotations=annotations,
+        owner=owner_from_annotations(annotations),
         tags=normalize_tags(data.get("tags")),
         visibility=_text_or_none(data.get("visibility")),
         created_at=_text_or_none(data.get("created_at") or data.get("createdAt")),

@@ -56,6 +56,7 @@ EXPECTED_ROUTES = {
     ("GET", "/api/tools/{tool_id}"),
     ("PUT", "/api/tools/{tool_id}"),
     ("DELETE", "/api/tools/{tool_id}"),
+    ("POST", "/api/tools/{tool_id}/claim"),
     ("POST", "/api/tools/{tool_id}/state"),
     # M7 §2.4：MCP 配置与技能目录（没有 PUT /config：整份替换属"创建"，M7 不注册）
     ("GET", "/api/mcp/config"),

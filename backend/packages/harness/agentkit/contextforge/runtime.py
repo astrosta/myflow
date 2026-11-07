@@ -19,6 +19,10 @@ from agentkit.contextforge.cache import (
 from agentkit.contextforge.catalog import build_entries
 from agentkit.contextforge.index import ToolIndexSyncStats, ToolVectorIndex
 from agentkit.contextforge.loader import load_contextforge_tools
+from agentkit.tools.contextforge_metadata import (
+    contextforge_original_name,
+    tag_contextforge_tool,
+)
 from agentkit.tools.search.service import (
     ToolSearchService,
     reset_tool_search_runtime,
@@ -183,6 +187,14 @@ class ContextForgeRuntime:
         del reason
         tools = await load_contextforge_tools(self.config)
         enrichment = await self._enrichment(tools)
+        for tool in tools:
+            extra = enrichment.get(str(getattr(tool, "name", "")), {})
+            tag_contextforge_tool(
+                tool,
+                original_name=contextforge_original_name(tool)
+                or str(getattr(tool, "name", "")),
+                owner=extra.get("owner") if isinstance(extra, dict) else None,
+            )
         entries = build_entries(
             tools,
             enrichment=enrichment,
@@ -204,6 +216,7 @@ class ContextForgeRuntime:
             tool.name: {
                 "display_name": tool.display_name,
                 "tags": list(tool.tags),
+                "owner": tool.owner,
             }
             for tool in remote
         }

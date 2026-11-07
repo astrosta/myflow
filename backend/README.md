@@ -466,8 +466,10 @@ embedding / Milvus 不可用时保留本地 BM25 降级，并在 `retrieval.warn
 召回结果必须能在当前 MCP 快照里确认，Milvus 只负责缩小候选集。
 
 `/api/tools` 对**所有已登录用户**开放；ContextForge 的 admin token 只由网关持有，
-浏览器永远拿不到。工具目录是共享的：任何登录用户都能看到并维护同一份工具，
-不会按 MyFlow 账号隔离。上游错误映射：工具不存在 404 `tool_not_found`、
+浏览器永远拿不到。工具按 MyFlow 用户隔离：普通用户只看到、修改和调用自己创建的工具；
+没有 `myflow_owner` 注释的历史工具显示为「未归属」，可由第一个认领者接管。
+归属信息存在 ContextForge 的 `annotations.myflow_owner`（存储用户 ID），在 API 响应和
+编辑器里会被剥掉。上游错误映射：工具不存在 404 `tool_not_found`、
 凭据/权限 502 `contextforge_auth_failed`、ContextForge 不可达 502
 `contextforge_unavailable`、超时 504 `contextforge_timeout`、参数不合法 422
 `contextforge_validation_error`。详情里的敏感 header 打成 `****`，编辑时原样回传，
@@ -475,14 +477,15 @@ embedding / Milvus 不可用时保留本地 BM25 降级，并在 `retrieval.warn
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| `GET` | `/api/tools` | 分页、`q`、`enabled`、`integration_type` 过滤（登录用户） |
+| `GET` | `/api/tools` | 自己的工具 + 未归属工具（可认领），支持分页与过滤 |
 | `GET` | `/api/tools/status` | ContextForge 可达/鉴权、管理事件、同步、索引与三路通道状态（登录用户） |
 | `POST` | `/api/tools/reindex` | 手动刷新 MCP 快照并重建工具索引（登录用户） |
 | `GET` | `/api/tools/search?q=...` | 检索预览：命中、通道、候选数、是否重排与 warnings（登录用户） |
 | `POST` | `/api/tools` | 新建工具并触发异步刷新（登录用户） |
-| `GET` | `/api/tools/{id}` | 工具详情，敏感 header 掩码（登录用户） |
-| `PUT` | `/api/tools/{id}` | 整份更新并触发异步刷新（登录用户） |
-| `POST` | `/api/tools/{id}/state` | 启用/停用并触发异步刷新（登录用户） |
+| `GET` | `/api/tools/{id}` | 自己的或未归属工具详情，敏感 header 掩码 |
+| `PUT` | `/api/tools/{id}` | 整份更新；未归属工具会先认领 |
+| `POST` | `/api/tools/{id}/claim` | 认领未归属的历史工具（登录用户） |
+| `POST` | `/api/tools/{id}/state` | 启用/停用并触发异步刷新（登录用户；未归属工具会先认领） |
 | `DELETE` | `/api/tools/{id}` | 删除并触发异步刷新（登录用户） |
 
 前端入口是 `/workspace/tools`（侧栏「工具管理」），所有登录用户都能打开；认证关闭的
@@ -732,11 +735,3 @@ FAQ 384/0，API 768/0；硬上界 1024 token。FAQ 只对问题做 embedding，�
 和文档状态轮询。
 
 清洗在通用文本规范化后，确定性删除目录页、前言、版权声明、免责声明、修订记录和
-重复块；原始上传文件保留。该版本的 Milvus schema 新增 `parent_id` 和
-`{collection}_parents`；旧 collection 不兼容，必须删除现有知识库数据后重新入库。
-
-`security` 与 `legal` 是两种东西：前者是**内部**安全/合规要求与控制项，后者是**外部**
-法规原文；`legal_clause` 策略按 `第X条（之N）/ Article N / § N / 条款 N` 切分，
-一条一个分片，条号写进 `section`，引用能直接落到“《XX 办法》第十二条”。
-
-Agent 通过内置子代理 `knowledge-researcher` 使用只读 `knowledge_search`（lead 不再直接持有它；

@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  claimTool,
   createTool,
   deleteTool,
   getToolsStatus,
@@ -26,6 +27,7 @@ vi.mock("@/core/api/tools", async (importOriginal) => {
   return {
     ...actual,
     listTools: vi.fn(),
+    claimTool: vi.fn(),
     createTool: vi.fn(),
     updateTool: vi.fn(),
     deleteTool: vi.fn(),
@@ -38,6 +40,7 @@ vi.mock("@/core/api/tools", async (importOriginal) => {
 
 const mockedList = vi.mocked(listTools);
 const mockedStatus = vi.mocked(getToolsStatus);
+const mockedClaim = vi.mocked(claimTool);
 const mockedCreate = vi.mocked(createTool);
 const mockedDelete = vi.mocked(deleteTool);
 const mockedSetEnabled = vi.mocked(setToolEnabled);
@@ -61,6 +64,9 @@ function makeTool(overrides: Partial<ContextForgeTool> = {}): ContextForgeTool {
     updated_at: "2026-11-02T00:00:00Z",
     shadowed_by: null,
     index_status: "indexed",
+    owned: true,
+    claimable: false,
+    can_edit: true,
     ...overrides,
   };
 }
@@ -97,6 +103,7 @@ function renderPage() {
 beforeEach(() => {
   mockedList.mockResolvedValue({ tools: [makeTool()], count: 1, next_cursor: null });
   mockedStatus.mockResolvedValue(makeStatus());
+  mockedClaim.mockResolvedValue({ ...makeTool(), headers: {}, input_schema: {}, annotations: {} });
   mockedCreate.mockResolvedValue({ ...makeTool({ id: "tool-2", name: "new_tool" }), headers: {}, input_schema: {}, annotations: {} });
   mockedDelete.mockResolvedValue(undefined);
   mockedSetEnabled.mockResolvedValue({ ...makeTool({ enabled: false }), headers: {}, input_schema: {}, annotations: {} });
@@ -150,7 +157,7 @@ describe("工具管理页", () => {
 
     renderPage();
 
-    expect(await screen.findByText("还没有工具")).toBeTruthy();
+    expect(await screen.findByText("还没有自己的工具")).toBeTruthy();
     expect(screen.getAllByRole("button", { name: "新建工具" }).length).toBeGreaterThan(0);
   });
 
@@ -216,6 +223,22 @@ describe("工具管理页", () => {
     });
     await waitFor(() => expect(mockedList.mock.calls.length).toBeGreaterThan(1));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "新建工具" })).toBeNull());
+  });
+
+  it("未归属工具可以认领", async () => {
+    mockedList.mockResolvedValue({
+      tools: [makeTool({ owned: false, claimable: true, can_edit: true })],
+      count: 1,
+      next_cursor: null,
+    });
+
+    renderPage();
+
+    const row = await screen.findByRole("article", { name: "gitlab_search" });
+    expect(within(row).getByText("未归属")).toBeTruthy();
+    fireEvent.click(within(row).getByRole("button", { name: "认领工具" }));
+
+    await waitFor(() => expect(mockedClaim).toHaveBeenCalledWith("tool-1"));
   });
 
   it("启用开关调用 setToolEnabled", async () => {

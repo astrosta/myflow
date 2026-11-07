@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { WrenchIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  claimTool,
   deleteTool,
   getToolsStatus,
   listTools,
@@ -122,6 +123,20 @@ export function ToolManagementPage() {
     }
   };
 
+  const claim = async (tool: ContextForgeTool) => {
+    if (busyId) return;
+    setBusyId(tool.id);
+    setActionError(null);
+    try {
+      await claimTool(tool.id);
+      await queryClient.invalidateQueries({ queryKey: ["tools"] });
+    } catch (cause) {
+      setActionError(readableError(cause));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const confirmDelete = async () => {
     if (!deleting || busyId) return;
     setBusyId(deleting.id);
@@ -147,7 +162,7 @@ export function ToolManagementPage() {
               <h1 className="text-xl font-semibold tracking-tight text-neutral-900">工具管理</h1>
             </div>
             <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-              所有登录用户都可以维护 ContextForge 工具；管理凭据由网关统一持有，MyFlow 异步同步到运行时与 Milvus。
+              只显示你自己创建的工具。未归属的历史工具可以认领；管理凭据由网关统一持有，MyFlow 异步同步到运行时与 Milvus。
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -322,9 +337,9 @@ export function ToolManagementPage() {
         {empty ? (
           <div className="mt-8 rounded-lg border border-dashed border-neutral-300 bg-neutral-50/60 px-6 py-12 text-center">
             <WrenchIcon className="mx-auto text-neutral-300" size={28} />
-            <p className="mt-3 text-sm font-medium text-neutral-700">还没有工具</p>
+            <p className="mt-3 text-sm font-medium text-neutral-700">还没有自己的工具</p>
             <p className="mt-1 text-xs text-neutral-500">
-              在 ContextForge 里注册工具，或在这里新建一个 REST 工具。
+              新建一个工具，或认领列表里未归属的历史工具。
             </p>
             <Button
               className="mt-4"
@@ -344,6 +359,7 @@ export function ToolManagementPage() {
               <li key={tool.id}>
                 <ToolRow
                   busy={busyId === tool.id}
+                  onClaim={() => void claim(tool)}
                   onDelete={() => setDeleting(tool)}
                   onEdit={() => setEditor({ toolId: tool.id, tool })}
                   onToggle={() => void toggle(tool)}
@@ -467,13 +483,14 @@ function ToolStatusBar({ adminEvents, error, loading, status }: ToolStatusBarPro
 
 interface ToolRowProps {
   busy: boolean;
+  onClaim: () => void;
   onDelete: () => void;
   onEdit: () => void;
   onToggle: () => void;
   tool: ContextForgeTool;
 }
 
-function ToolRow({ busy, onDelete, onEdit, onToggle, tool }: ToolRowProps) {
+function ToolRow({ busy, onClaim, onDelete, onEdit, onToggle, tool }: ToolRowProps) {
   return (
     <article
       aria-label={tool.name}
@@ -492,46 +509,62 @@ function ToolRow({ busy, onDelete, onEdit, onToggle, tool }: ToolRowProps) {
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <Button
-            aria-label="编辑工具"
-            disabled={busy}
-            onClick={onEdit}
-            size="sm"
-            type="button"
-            variant="ghost"
-          >
-            编辑
-          </Button>
-          <Button
-            aria-label="删除工具"
-            disabled={busy}
-            onClick={onDelete}
-            size="sm"
-            type="button"
-            variant="danger"
-          >
-            删除
-          </Button>
-          <button
-            aria-checked={tool.enabled}
-            aria-label={tool.enabled ? "停用工具" : "启用工具"}
-            className={cn(
-              "relative h-5 w-9 shrink-0 rounded-full transition-colors",
-              tool.enabled ? "bg-emerald-500" : "bg-neutral-300",
-              busy && "opacity-50",
-            )}
-            disabled={busy}
-            onClick={onToggle}
-            role="switch"
-            type="button"
-          >
-            <span
-              className={cn(
-                "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform",
-                tool.enabled ? "translate-x-4" : "translate-x-0.5",
-              )}
-            />
-          </button>
+          {tool.claimable ? (
+            <Button
+              aria-label="认领工具"
+              disabled={busy}
+              onClick={onClaim}
+              size="sm"
+              type="button"
+              variant="secondary"
+            >
+              认领
+            </Button>
+          ) : null}
+          {tool.can_edit ? (
+            <>
+              <Button
+                aria-label="编辑工具"
+                disabled={busy}
+                onClick={onEdit}
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                编辑
+              </Button>
+              <Button
+                aria-label="删除工具"
+                disabled={busy}
+                onClick={onDelete}
+                size="sm"
+                type="button"
+                variant="danger"
+              >
+                删除
+              </Button>
+              <button
+                aria-checked={tool.enabled}
+                aria-label={tool.enabled ? "停用工具" : "启用工具"}
+                className={cn(
+                  "relative h-5 w-9 shrink-0 rounded-full transition-colors",
+                  tool.enabled ? "bg-emerald-500" : "bg-neutral-300",
+                  busy && "opacity-50",
+                )}
+                disabled={busy}
+                onClick={onToggle}
+                role="switch"
+                type="button"
+              >
+                <span
+                  className={cn(
+                    "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform",
+                    tool.enabled ? "translate-x-4" : "translate-x-0.5",
+                  )}
+                />
+              </button>
+            </>
+          ) : null}
         </div>
       </div>
 
@@ -542,6 +575,7 @@ function ToolRow({ busy, onDelete, onEdit, onToggle, tool }: ToolRowProps) {
         <Badge variant={tool.reachable ? "success" : "danger"}>
           {tool.reachable ? "可达" : "不可达"}
         </Badge>
+        {tool.claimable ? <Badge variant="warning">未归属</Badge> : null}
         <Badge variant="outline">索引 {tool.index_status}</Badge>
         <Badge variant="outline">{tool.integration_type}</Badge>
         {tool.visibility ? <Badge variant="outline">{tool.visibility}</Badge> : null}

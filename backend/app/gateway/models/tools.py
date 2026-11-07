@@ -23,6 +23,9 @@ class ToolSummary(BaseModel):
     updated_at: str | None = None
     shadowed_by: str | None = None
     index_status: str = "unknown"
+    owned: bool = False
+    claimable: bool = False
+    can_edit: bool = False
 
 
 class ToolDetail(ToolSummary):

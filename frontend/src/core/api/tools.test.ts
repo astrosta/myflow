@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ToolApiError,
+  claimTool,
   createTool,
   deleteTool,
   getTool,
@@ -34,6 +35,9 @@ const TOOL = {
   updated_at: "2026-11-02T00:00:00Z",
   shadowed_by: null,
   index_status: "indexed",
+  owned: true,
+  claimable: false,
+  can_edit: true,
 };
 
 const DETAIL = {
@@ -169,6 +173,17 @@ describe("tools API contract", () => {
     expect(url).toBe("/api/tools/tool-1");
     expect(init.method).toBe("PUT");
     expect(JSON.parse(String(init.body)).headers).toEqual({ Authorization: "****" });
+  });
+
+  it("claimTool posts to the claim route", async () => {
+    const fetchMock = stubFetch(jsonResponse(DETAIL));
+
+    const tool = await claimTool("tool-1");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/tools/tool-1/claim");
+    expect(init.method).toBe("POST");
+    expect(tool.owned).toBe(true);
   });
 
   it("setToolEnabled posts to the state route", async () => {

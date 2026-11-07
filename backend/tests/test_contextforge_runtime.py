@@ -5,7 +5,12 @@ import pytest
 from langchain_core.tools import StructuredTool
 
 from agentkit.config.contextforge_config import ContextForgeConfig
-from agentkit.contextforge.cache import invalidate_contextforge_cache
+from agentkit.contextforge.cache import (
+    get_contextforge_snapshot,
+    invalidate_contextforge_cache,
+)
+from agentkit.contextforge.models import ContextForgeTool
+from agentkit.tools.contextforge_metadata import contextforge_owner
 from agentkit.contextforge.runtime import ContextForgeRuntime
 
 
@@ -127,4 +132,39 @@ async def test_synchronous_admin_refresh_keeps_the_successful_write(monkeypatch)
     await runtime.request_refresh("admin")
     assert runtime.status()["sync"] == "degraded"
     assert runtime.status()["last_error"] == "RuntimeError"
+    await runtime.stop()
+
+@pytest.mark.asyncio
+async def test_refresh_tags_tools_and_entries_with_their_owner(monkeypatch) -> None:
+    invalidate_contextforge_cache("owner-test")
+    config = ContextForgeConfig(
+        enabled=True,
+        base_url="http://cf",
+        admin_token="adm",
+        tool_loading="eager",
+        search={"enabled": False},
+    )
+
+    class OwnerAdmin(FakeAdmin):
+        async def list_tools(self, **kwargs):
+            return [
+                ContextForgeTool(
+                    id="t1",
+                    name="demo",
+                    annotations={"myflow_owner": "u1"},
+                    owner="u1",
+                )
+            ]
+
+    runtime = ContextForgeRuntime(config, admin=OwnerAdmin(), index=None)
+
+    async def fake_load(config):
+        return [_tool()]
+
+    monkeypatch.setattr("agentkit.contextforge.runtime.load_contextforge_tools", fake_load)
+    await runtime.refresh_and_sync(reason="test")
+    snapshot = get_contextforge_snapshot()
+    assert snapshot is not None
+    assert contextforge_owner(snapshot.tools[0]) == "u1"
+    assert snapshot.entries[0].owner == "u1"
     await runtime.stop()

@@ -6,7 +6,7 @@ from agentkit.contextforge.index import ToolVectorHit
 from agentkit.tools.search.service import ToolSearchService
 
 
-def _entry(name: str, description: str) -> ToolCatalogEntry:
+def _entry(name: str, description: str, owner: str | None = None) -> ToolCatalogEntry:
     content = f"{name}\n{name}\n{description}"
     return ToolCatalogEntry(
         name=name,
@@ -18,6 +18,7 @@ def _entry(name: str, description: str) -> ToolCatalogEntry:
         content=content,
         content_hash=name + "-hash",
         updated_at=1,
+        owner=owner,
     )
 
 
@@ -97,3 +98,25 @@ async def test_empty_query_returns_empty() -> None:
         snapshot_provider=lambda: (),
     )
     assert (await service.search(task_query=" ")).hits == ()
+
+@pytest.mark.asyncio
+async def test_search_only_confirms_the_callers_own_tools() -> None:
+    entries = (
+        _entry("github_search", "search github code", "u1"),
+        _entry("gitlab_search", "search gitlab code", "u2"),
+    )
+    service = ToolSearchService(
+        index=FakeIndex(),
+        embedder=FakeEmbedder(),
+        reranker=None,
+        config=ToolSearchConfig(
+            candidate_k=5,
+            top_k=5,
+            embedding={"base_url": "http://embed", "dimensions": 8},
+        ),
+        snapshot_provider=lambda: entries,
+    )
+
+    outcome = await service.search(task_query="github gitlab", user_id="u1")
+
+    assert [hit.entry.name for hit in outcome.hits] == ["github_search"]

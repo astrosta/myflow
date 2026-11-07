@@ -30,6 +30,9 @@ export interface ContextForgeTool {
   updated_at: string | null;
   shadowed_by: string | null;
   index_status: ToolIndexStatus;
+  owned: boolean;
+  claimable: boolean;
+  can_edit: boolean;
 }
 
 export interface ContextForgeToolDetail extends ContextForgeTool {
@@ -204,6 +207,9 @@ function toTool(raw: WireTool): ContextForgeTool {
     updated_at: raw.updated_at ?? null,
     shadowed_by: raw.shadowed_by ?? null,
     index_status: raw.index_status ?? "unknown",
+    owned: raw.owned ?? false,
+    claimable: raw.claimable ?? false,
+    can_edit: raw.can_edit ?? false,
   };
 }
 
@@ -264,6 +270,14 @@ export async function updateTool(
 
 export async function deleteTool(toolId: string): Promise<void> {
   await request<void>(toolPath(toolId), { method: "DELETE" });
+}
+
+export async function claimTool(toolId: string): Promise<ContextForgeToolDetail> {
+  return toDetail(
+    await request<WireTool & Partial<ContextForgeToolDetail>>(toolPath(toolId) + "/claim", {
+      method: "POST",
+    }),
+  );
 }
 
 export async function setToolEnabled(

@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from agentkit.config.contextforge_config import ToolSearchConfig
 from agentkit.contextforge.catalog import ToolCatalogEntry
+from agentkit.contextforge.ownership import can_call
 from agentkit.retrieval.bm25 import Bm25Document, bm25_scores
 from agentkit.retrieval.tokenize import tokenize
 
@@ -65,9 +66,12 @@ class ToolSearchService:
         *,
         task_query: str,
         domain_keywords: Sequence[str] = (),
+        user_id: str | None = None,
     ) -> ToolSearchOutcome:
         query = (task_query or "").strip()
-        entries = list(self._snapshot_provider())
+        entries = [
+            entry for entry in self._snapshot_provider() if can_call(entry.owner, user_id)
+        ]
         if not query or not entries:
             return ToolSearchOutcome(channels=self._channels())
         warnings: list[str] = []

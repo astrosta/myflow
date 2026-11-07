@@ -31,7 +31,11 @@ def _entry():
 
 
 class FakeService:
-    async def search(self, *, task_query, domain_keywords=()):
+    def __init__(self) -> None:
+        self.last_user_id = None
+
+    async def search(self, *, task_query, domain_keywords=(), user_id=None):
+        self.last_user_id = user_id
         return ToolSearchOutcome(
             hits=(ToolSearchHit(entry=_entry(), score=0.9),),
             channels=("embedding", "keyword"),
@@ -72,3 +76,18 @@ async def test_search_tools_without_runtime_returns_unavailable() -> None:
     payload = json.loads(result.update["messages"][0].content)
     assert payload["tools"] == []
     assert payload["retrieval"]["warnings"] == ["catalog_unavailable"]
+
+@pytest.mark.asyncio
+async def test_search_tools_passes_the_runtime_user_to_the_catalog() -> None:
+    service = FakeService()
+    set_tool_search_runtime(service)
+    try:
+        await search_tools.coroutine(
+            task_query="github code",
+            domain_keywords=[],
+            runtime=type("Runtime", (), {"context": {"user_id": "u1"}})(),
+            tool_call_id="call-1",
+        )
+    finally:
+        reset_tool_search_runtime()
+    assert service.last_user_id == "u1"

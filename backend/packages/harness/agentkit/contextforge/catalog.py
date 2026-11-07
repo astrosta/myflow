@@ -21,6 +21,7 @@ class ToolCatalogEntry:
     content: str
     content_hash: str
     updated_at: int
+    owner: str | None = None
 
 
 def build_entry(
@@ -30,6 +31,7 @@ def build_entry(
     display_name: str | None = None,
     max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS,
     updated_at: int = 0,
+    owner: str | None = None,
 ) -> ToolCatalogEntry:
     name = str(getattr(tool, "name", "") or "").strip()
     description = str(getattr(tool, "description", "") or "").strip()
@@ -54,6 +56,7 @@ def build_entry(
         content=content,
         content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
         updated_at=updated_at,
+        owner=owner,
     )
 
 
@@ -69,12 +72,14 @@ def build_entries(
         extra = enrichment.get(name, {}) if enrichment else {}
         tags = extra.get("tags") if isinstance(extra, dict) else ()
         display = extra.get("display_name") if isinstance(extra, dict) else None
+        owner = extra.get("owner") if isinstance(extra, dict) else None
         entries.append(
             build_entry(
                 tool,
                 tags=tuple(tags or ()),
                 display_name=display if isinstance(display, str) else None,
                 max_document_chars=max_document_chars,
+                owner=owner if isinstance(owner, str) and owner else None,
             )
         )
     return entries

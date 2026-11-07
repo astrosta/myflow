@@ -176,6 +176,7 @@ def assemble_agent(
         model_name=model_name,
         subagent_enabled=subagent_enabled,
         app_config=resolved_config,
+        user_id=user_id,
     )
     delegation_active = bool(subagent_enabled and policy is not None and policy.enabled)
     available_subagents = (

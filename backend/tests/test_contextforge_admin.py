@@ -108,3 +108,16 @@ async def test_create_and_update_payloads_use_upstream_names() -> None:
     assert seen[1]["displayName"] == "Demo"
     await admin.aclose()
     await http.aclose()
+
+def test_tool_from_wire_reads_owner_annotation() -> None:
+    from agentkit.contextforge.models import tool_from_wire
+
+    tool = tool_from_wire(
+        {
+            "id": "t1",
+            "name": "mine",
+            "annotations": {"myflow_owner": "u1", "readOnlyHint": True},
+        }
+    )
+    assert tool.owner == "u1"
+    assert tool.annotations["readOnlyHint"] is True
