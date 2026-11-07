@@ -66,8 +66,8 @@ def _raise_errno(code: int):
 
 
 def test_concurrent_rmw_does_not_lose_updates(tmp_path, monkeypatch):
-    """技能 PATCH 和 MCP PUT 打的是同一个文件：一把锁，两边都不能丢。"""
-    path = _seed(tmp_path, monkeypatch, {"mcpServers": {}, "skills": {}})
+    """两个更新者打同一个文件：一把锁，两边都不能丢。"""
+    path = _seed(tmp_path, monkeypatch, {"skills": {}})
     rounds = 12
 
     def churn_skills() -> None:
@@ -79,20 +79,16 @@ def test_concurrent_rmw_does_not_lose_updates(tmp_path, monkeypatch):
 
             update_extensions_config(mutate)
 
-    def churn_servers() -> None:
+    def churn_legacy() -> None:
         for index in range(rounds):
-            name = f"server-{index}"
+            name = f"legacy-{index}"
 
             def mutate(data: dict, name: str = name) -> None:
-                data.setdefault("mcpServers", {})[name] = {
-                    "enabled": True,
-                    "type": "stdio",
-                    "command": "npx",
-                }
+                data.setdefault("legacy", {})[name] = {"enabled": True}
 
             update_extensions_config(mutate)
 
-    threads = [threading.Thread(target=churn_skills), threading.Thread(target=churn_servers)]
+    threads = [threading.Thread(target=churn_skills), threading.Thread(target=churn_legacy)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -101,7 +97,7 @@ def test_concurrent_rmw_does_not_lose_updates(tmp_path, monkeypatch):
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert set(data["skills"]) == {f"skill-{index}" for index in range(rounds)}
-    assert set(data["mcpServers"]) == {f"server-{index}" for index in range(rounds)}
+    assert set(data["legacy"]) == {f"legacy-{index}" for index in range(rounds)}
 
 
 def test_the_file_lock_excludes_another_process(tmp_path):

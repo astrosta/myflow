@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 
 from agentkit.persistence.thread_meta.memory import MemoryThreadMetaStore
@@ -27,8 +27,8 @@ from backend.app.gateway.auth.routers import router as auth_router
 from backend.app.gateway.auth.service import AuthService
 from backend.app.gateway.auth.session_cookie import ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, SessionCookiePolicy
 from backend.app.gateway.auth.store import MemoryUserStore
-from backend.app.gateway.deps import caller_from_request, get_run_services
-from backend.app.gateway.routers import mcp, thread_runs, threads
+from backend.app.gateway.deps import caller_from_request, get_run_services, require_scope
+from backend.app.gateway.routers import thread_runs, threads
 
 #: ≥32 字节：Settings.validate_for_startup 会拒绝更短的（RFC 7518 §3.2）。
 TEST_SECRET = "test-secret-0123456789abcdef0123456789abcdef"
@@ -297,10 +297,16 @@ def make_auth_app(
     application.state.run_services = services
     application.include_router(auth_router, prefix="/api")
     # 管理类路由（`require_scope("admin")`）也要在场：PAT 永不带 admin（§2.15）靠它验证。
-    application.include_router(mcp.router, prefix="/api")
     if business_routes:
         application.include_router(threads.router, prefix="/api")
         application.include_router(thread_runs.router, prefix="/api")
+
+    @application.get("/api/admin-probe")
+    def admin_probe(
+        caller: Annotated[Any, Depends(require_scope("admin"))],
+    ) -> dict[str, bool]:
+        del caller
+        return {"ok": True}
 
     @application.get("/api/probe")
     def probe(request: Request) -> dict[str, Any]:

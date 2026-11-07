@@ -16,8 +16,6 @@ from agentkit.config.database_config import DatabaseConfig
 from agentkit.config.extensions_config import (
     EXTENSIONS_CONFIG_FILENAME,
     ExtensionsConfig,
-    McpServerConfig,
-    McpUserAuthConfig,
     SkillToggleConfig,
     atomic_write_extensions_config,
     extensions_config_file_lock,
@@ -103,8 +101,6 @@ __all__ = [
     "ExtensionsConfig",
     "KnowledgeBaseConfig",
     "LlmCallConfig",
-    "McpServerConfig",
-    "McpUserAuthConfig",
     "SkillToggleConfig",
     "MemoryConfig",
     "LangfuseConfig",

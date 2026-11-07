@@ -54,7 +54,6 @@ _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
 
 def get_available_tools(
     groups: list[str] | None = None,
-    include_mcp: bool = True,
     model_name: str | None = None,
     subagent_enabled: bool = False,
     *,
@@ -88,10 +87,6 @@ def get_available_tools(
 
     for tool in _load_contextforge_tools(resolved, user_id=user_id):
         _add_tool(tools, seen, tool)
-
-    if include_mcp:
-        for tool in _load_mcp_tools(resolved):
-            _add_tool(tools, seen, tool)
 
     return apply_tool_authorization(
         _apply_capability_filters(
@@ -152,18 +147,6 @@ def should_defer_contextforge(app_config: AppConfig, tools: list[BaseTool]) -> b
     if config.tool_loading == "deferred":
         return True
     return contextforge_tool_count(tools) > config.deferred_threshold
-
-
-def _load_mcp_tools(app_config: AppConfig) -> list[BaseTool]:
-    """第三源：MCP（配置工具 → 内置 → MCP，按 tool.name 去重，先到先得）。"""
-    del app_config  # MCP 服务器列表在 extensions_config.json，不在 AppConfig 里
-    from agentkit.mcp.cache import get_cached_mcp_tools
-
-    try:
-        return list(get_cached_mcp_tools())
-    except Exception:
-        logger.exception("MCP tools are unavailable; continuing without them")
-        return []
 
 
 def _add_tool(tools: list[BaseTool], seen: set[str], tool: BaseTool) -> None:

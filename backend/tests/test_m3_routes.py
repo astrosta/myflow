@@ -58,10 +58,7 @@ EXPECTED_ROUTES = {
     ("DELETE", "/api/tools/{tool_id}"),
     ("POST", "/api/tools/{tool_id}/claim"),
     ("POST", "/api/tools/{tool_id}/state"),
-    # M7 §2.4：MCP 配置与技能目录（没有 PUT /config：整份替换属"创建"，M7 不注册）
-    ("GET", "/api/mcp/config"),
-    ("PATCH", "/api/mcp/config"),
-    ("POST", "/api/mcp/cache/reset"),
+    # 技能目录（没有 PUT /config：整份替换属"创建"，M7 不注册）
     ("GET", "/api/skills"),
     ("POST", "/api/skills/reload"),
     # M11 task 15: the path parameter is the internal skill_id, not the display

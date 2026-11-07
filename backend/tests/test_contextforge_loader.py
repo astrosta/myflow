@@ -15,12 +15,12 @@ def _tool() -> StructuredTool:
 
 @pytest.mark.asyncio
 async def test_loader_tags_tools_from_the_contextforge_server(monkeypatch) -> None:
-    async def fake_load(server, params, **kwargs):
-        assert server == "contextforge"
-        assert params["url"] == "http://cf/mcp"
+    async def fake_load(session, **kwargs):
+        assert session is None
+        assert kwargs["connection"]["url"] == "http://cf/mcp"
         return [_tool()]
 
-    monkeypatch.setattr("agentkit.mcp.tools.load_server_tools", fake_load)
+    monkeypatch.setattr("agentkit.contextforge.loader.load_mcp_tools", fake_load)
     config = ContextForgeConfig(
         enabled=True,
         base_url="http://cf",

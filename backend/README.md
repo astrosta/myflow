@@ -290,11 +290,11 @@ checkpoint 或日志；进程重启后旧 handle 不可解析，工具必须 fai
 - **tool result 不在本策略保证范围内**：`ToolMessage` 中的敏感信息由工具自身负责；
 - 多模态、上传文件和 artifact 内容暂不覆盖，由对应工具/上传层负责。
 
-**MCP 与技能走第二份文件**：`extensions_config.json`（模板 `extensions_config.example.json`，已 gitignored）。
+**技能开关走第二份文件**：`extensions_config.json`（模板 `extensions_config.example.json`，已 gitignored）。
 它**由 API 读写**，所以整份 `config.yaml` 不能变成 API 可写。路径优先级和 `config.yaml` 一样，环境变量是
 `MYFLOW_EXTENSIONS_CONFIG_PATH`：显式路径或环境变量指向的文件不存在会直接报错，
 只有"项目根下搜不到"才算没配扩展。所有读-改-写走 `agentkit.config.update_extensions_config()`：
-进程内 `threading.Lock` + 跨进程文件咨询锁 + 原子写，技能路由和 MCP 路由共用同一把锁。
+进程内 `threading.Lock` + 跨进程文件咨询锁 + 原子写。`mcpServers` 已下线，历史键在读取时忽略。
 
 ### Langfuse 可观测性（远程自建）
 
@@ -325,107 +325,11 @@ observability:
 回滚：`enabled: false` 并重启。服务端 trace 保留期/采样由远程 Langfuse 管理；`sample_rate` 是 head sampling，
 降采样会同时丢掉一部分错误 trace。
 
-### MCP 服务器
-
-`extensions_config.json` 的 `mcpServers` 是 M2 工具列表的**第三源**（配置工具 → 内置 → MCP，按 `tool.name` 去重）。
-适配器是可选依赖：`uv sync --extra mcp`（或 `uv pip install langchain-mcp-adapters`），没装时 MCP 一台都不加载，
-其余功能照常。工具**懒加载**：第一次 `collect_tools` 时连一次，之后按 `extensions_config.json` 的
-内容签名失效；`POST /api/mcp/cache/reset` 可以强制本进程重来。
-
-| 配置键 | 作用 |
-|---|---|
-| `type` / `transport` | `stdio`（默认）· `sse` · `http`；两个都写时 `type` 赢 |
-| `command` / `args` / `env` | stdio 用。**API 启停时只接受 `{npx, uvx}` 这样的裸可执行名**（§5.7，纵深防御） |
-| `url` / `headers` | sse / http 用。静态 header 出现两种拼写会被拒 |
-| `tool_name_prefix` | 默认 true：工具名加上 `<server>_`，源路由仍然只看 metadata |
-| `session_init_timeout` / `tool_call_timeout` | 默认 60s；`session_init_timeout: null` = 不限 |
-
-凭据四层（**先注册的在外层，后注册的赢**）：静态 `headers` < `oauth` < `user_auth` < `headers_from_context`
-（`context.secrets` 里的键 → header）。**fail-closed 是默认**：映射里没有当前用户就报错，只点名缺失的键；
-想放行缺值要显式写 `on_missing: passthrough`。stdio 上这三层跳过（用 `env`）。
-`mcpInterceptors`（运维文件专属，会 import 代码）永远最靠近传输层。
-
-stdio 服务器是**有状态子进程**：会话按 `(server, user_id:thread_id)` 池化，池满 LRU 驱逐；
-明确的 `Connection closed` 只驱逐那一个会话，**失败绝不自动重放**。停止/启用某台服务器后，
-打一次 `POST /api/mcp/cache/reset` 让本进程立刻换掉旧会话。
-
-`skills.source=filesystem` 仅用于测试/本地调试，默认扫描项目根下的
-`skills/{public,custom}/<name>/SKILL.md`（`config.yaml` 的 `skills.path` 可改）。
-生产使用 `skills.source=git`：用户技能只属于创建者。保存会 commit/push Git 并记录
-不可变版本；安全扫描通过并点击生效后才进入运行时与向量索引。
-模型看到的是系统提示词尾部的 `<available_skills>` 索引（每技能一行 `name [category]: 截断描述`，
-描述截断到 `index_description_max_chars`；根目录 `skills.container_path` 与"目录名即技能名、
-SOP 固定 `SKILL.md`"的约定在块前说一次，路径可推），
-正文一律按需：`read_file` 读 SKILL.md、委派内置子代理 `skill-finder`（内部调
-`search_skills`，只回候选 skill_id/name/description）后由 lead 用系统内置的
-`load_skills(skill_id)` 读正文，或 `/skill-name` 注入 —— 没有"全量注入"模式开关。
-已激活的技能由 `<active_skills>`（在 `<durable_context_data>` 里）投影：名字、描述、目录，
-外加**核心 SOP 正文**。正文不进 state，每次投影按 `skill_context` 台账里的 path 现读，
-预算见 `skills.active_context`；正文还在消息里时默认不重复写（压缩之后它才是唯一副本）。
-技能发现与加载是**两段式**：`search_skills` 只属于 `skill-finder`（本地 BM25 召回
-`skills.search.candidate_k` → 可选精排 `top_k`），只回元数据、不计数、也不留给 lead；
-`load_skills` 是系统内置工具，委派与直连都在 lead 上，按 `skill_id` 返回正文并累加使用次数。
-默认只有本地通道；`skills.search.embedding` / `rerank` 不填地址就不发请求，
-地址和模型默认取顶层 `embedding` / `rerank`（section 里的同名字段可覆盖），失败也只降级
-（退回 BM25 / 融合顺序）并在 `retrieval.warnings` 里说明。加载即激活：
-结果里的 `path` 和 `read_file` 读 SKILL.md 走同一本 `skill_context` 台账。
-
-使用次数是 **PostgreSQL 权威 + Redis 排序**：每次成功 `load_skills` 写
-`skills.load_count`（DB）与 ZSET `<skills.usage.key_prefix>:<user_id>`（member = skill_id），
-两者不要求原子；进程启动时从 DB 异步 `ZADD ... GT` 播种，绝不把新值改小。
-提示词构建是同步的，所以每用户另有一份 top-K 缓存（启动播种、加载后、`refresh_seconds` 周期刷新）。
-私有技能不超过 `skills.usage.prompt_top_k`（默认 10）时全列，超过时按 Redis top-K 选，
-缺口用 DB `load_count` 补齐并按名字稳定排序；内置技能永远在索引里且不占配额。
-技能 Git 写入使用 **pygit2/libgit2**，运行时不依赖系统 `git` 可执行文件；仓库镜像、
-树/commit/push 都在进程内完成。SSH 认证使用 `skills.git.ssh_key`，值是 **base64 编码的
-OpenSSH 私钥内容**（通常从 `.env` 的 `SKILLS_GIT_SSH_KEY` 展开）；不会生成临时私钥文件。
-libgit2 的 SSH transport 是构建期特性：如果当前 pygit2 wheel 没有 libssh2 支持，服务会在
-初始化 Git 仓库时明确拒绝 SSH URL；此时需要换带 SSH 的 pygit2 构建，或改用 HTTPS 仓库。
-
-Git 来源没有公共技能，也没有全局技能开关。每个用户在 `skills_prefs.json` 里维护
-自己的开关：`{user_id: {skill_id: bool}}`（键是内部 `skill_id`）。保存写 Git 草稿
-提交与 `skill_versions`；扫描针对不可变 commit；用户点击生效后才写 active 指针、
-刷新提示词/挂载快照并写 Milvus 索引 outbox。
-
-安全扫描同时运行**规则分析**（static / bytecode / pipeline / correlation）和 **LLM
-语义分析**；LLM 复用 `agents.default_model`（未配置时取 `models[0]`）的
-`model / base_url / api_key`，没有默认模型时扫描返回 503，不会静默退化成纯规则扫描。
-LLM 阶段会把该版本的技能内容发送给模型提供方。
-
-**内置技能是例外**（`skills.builtin`，默认 `skills/builtin`）：随项目发布、只读，
-不进 Git、不进 PostgreSQL，也不需要数据库迁移。`skills/builtin/<name>/SKILL.md`
-放进去就被扫描进索引（按 SKILL.md 的 mtime/size 做目录指纹缓存，
-`POST /api/skills/reload` 可显式失效）；`enabled` 与 `path` 都是 **startup-only**：
-只读挂载在 Sandbox provider 构造时固定，改完要重启进程。`enabled: false` 时完全不扫描、
-不索引、不挂载；目录缺失或读不了只在首次读取时 warning 一次，进程照常起来。
-`POST /api/skills/reload` 会清空这个去重标记，重载后如果目录仍不可用会重新告警一次。
-它们**没有个人开关，也没有管理员全局开关**：`skills_prefs.json` 的同名 false 与
-`extensions_config.json` 的同名条目都不生效，部署级开关只有 `skills.builtin.enabled`；
-`subagents.custom_agents.<name>.skills` 白名单仍然生效（`subagents.agents.<name>` 只覆盖超时/轮次/
-模型/token 预算，不含 skills），`/name` 与 `read_file` 照常解析，同名时内置优先、同名的 catalog
-行被隐藏并 warning（同名冲突告警也是进程级 warn-once，reload 时重置；新建草稿会拒绝内置保留名）。
-加载只有渐进式两条：索引行（方括号标 `[builtin]`）→ `read_file` 读
-`<container_path>/builtin/<name>/SKILL.md`，或 `/name` 激活；**内置技能不参与
-`search_skills` / `load_skills`，也不计入使用次数**（filesystem 分支检索
-`visible(include_builtin=False)`，Git 分支的检索服务从不接收内置技能），
-关键词通道开着也不会命中它。
-沙箱里 `<container_path>/builtin` 是宿主 `skills.builtin.path` 的**只读**映射，
-文件工具写不进去，`sandbox.mounts` 也不能覆盖 `<container_path>` 下的路径
-（宿主 bash 仍是已知的非隔离边界）。`GET /api/skills` 的内置行排在最前
-（`scope` / `category` / `status` 都是 `builtin`，`skill_id`、版本、commit、path 为 null）；
-Git runtime 缺失时 catalog 那一半照旧 fail-closed，内置行照样返回；
-`/api/skills/mine` 不含内置技能，技能页把它们放在只读的「内置技能」区块：
-没有编辑按钮、没有开关，也不跳编辑器。
-
-OpenViking Session Commit 完成后生成的 skills 走独立导入链路：worker 读取任务结果
-`session_skill_uris`，把每个 `SKILL.md` 导入当前用户的私有技能草稿，返回行带
-`source="extracted"` 与 `source_uri`。这些行停在 `unscanned`（页面显示「提炼 · 待扫描」），
-不会自动扫描或生效；用户需要在技能页显式扫描、点击生效。
-
 ## ContextForge 工具管理（可选）
 
-ContextForge 是工具的**唯一写入目标**：MyFlow 不建工具表，也不复制 CRUD 语义。
-浏览器只打同源 `/api/tools`，ContextForge 的 admin token 始终留在网关。
+ContextForge 是 MCP 工具的**唯一来源和写入目标**：`extensions_config.json` 的普通
+`mcpServers` 来源已下线；MyFlow 不建工具表，也不复制 CRUD 语义。浏览器只打同源
+`/api/tools`，ContextForge 的 admin token 始终留在网关。
 
 部署前提（ContextForge 1.1.0）：
 
@@ -434,7 +338,7 @@ ContextForge 是工具的**唯一写入目标**：MyFlow 不建工具表，也�
 - `admin_token` 需要 `admin.events` 或 `*`；事件订阅只发 `Authorization: Bearer ...`，
   GET 不要求 CSRF。
 - ContextForge 多 worker 时，跨进程事件需要它自己的 Redis 配置；否则只有处理写操作的那个
-  worker 能看到事件，MyFlow 会退回"管理动作主动刷新 + TTL 到期刷新"。
+  worker 能看到事件，MyFlow 会退回"管理动作主动刷新 + 工具调用纠错刷新"。
 - Milvus 复用现有实例，但 collection 固定为 `myflow_tools_catalog`，**绝不写**
   `myflow_knowledge` / `myflow_skills_active`。不需要数据库迁移。
 
@@ -466,7 +370,7 @@ embedding / Milvus 不可用时保留本地 BM25 降级，并在 `retrieval.warn
 召回结果必须能在当前 MCP 快照里确认，Milvus 只负责缩小候选集。
 
 `/api/tools` 对**所有已登录用户**开放；ContextForge 的 admin token 只由网关持有，
-浏览器永远拿不到。工具按 MyFlow 用户隔离：普通用户只看到、修改和调用自己创建的工具；
+浏览器永远拿不到。工具按 MyFlow 用户隔离：每个用户只看到、修改和调用自己创建的工具；
 没有 `myflow_owner` 注释的历史工具显示为「未归属」，可由第一个认领者接管。
 归属信息存在 ContextForge 的 `annotations.myflow_owner`（存储用户 ID），在 API 响应和
 编辑器里会被剥掉。上游错误映射：工具不存在 404 `tool_not_found`、
@@ -665,8 +569,6 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `GET` | `/api/models/{model_name}` | 单个模型（`models:read`） |
 | `POST` | `/api/threads/{id}/uploads` | 上传 |
 | `GET` | `/api/threads/{id}/artifacts/...` | 产物 |
-| `GET`/`PATCH` | `/api/mcp/config` | 读 MCP 配置（打码成 `****`）/ 启停一台已有服务器（`admin`） |
-| `POST` | `/api/mcp/cache/reset` | 清本进程的 MCP 工具缓存（`admin`） |
 | `GET` | `/api/skills` | 内置技能 + 当前用户已生效的私有技能（`skills:read`）；没有公共目录 |
 | `GET` | `/api/skills/mine` | 当前用户全部私有技能（含草稿、提炼来源与扫描状态，`skills:read`） |
 | `POST` | `/api/skills` | 新建私有草稿（`skills:write`） |
@@ -687,7 +589,6 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `PATCH` | `/api/v1/auth/me` | 改**自己**的用户名（body `{"username": ...}` → `UserResponse`；**仅会话**）。不动令牌、不换桶 |
 | `POST` | `/api/v1/auth/change-password` | 改密 = 撤销所有会话（**仅会话**） |
 
-MCP **没有创建类路由**：`PUT /api/mcp/config`（整份替换 = 新建 + 删除）返回 404/405。
 技能创作、安全扫描与生效路由见上表（`POST /api/skills`、`/api/skills/mine`、
 `/api/skills/{id}/scan`、`/api/skills/{id}/activate`）。
 
@@ -716,7 +617,7 @@ MinerU 的**接口路径也是配置**：本地 `parse.local.file_parse_path`（
 服务端临时地址，不配置。
 
 ```bash
-# 只在启用知识库时需要；同时保留 postgres/mcp 等其它 extra。
+# 只在启用知识库时需要；同时保留 postgres 等其它 extra。
 # knowledge extra 只含 pymilvus，不再安装 transformers。
 uv sync --all-packages --all-extras
 ```

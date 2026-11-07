@@ -340,7 +340,7 @@ def test_admin_capability_is_off_for_pats() -> None:
     plain, _row = _pat(harness, admin["id"], scopes=["skills:read"])
     bearer = {"Authorization": f"Bearer {plain}"}
 
-    denied = harness.client.get("/api/mcp/config", headers=bearer)
+    denied = harness.client.get("/api/admin-probe", headers=bearer)
 
     assert denied.status_code == 403
     assert denied.json()["code"] == "permission_denied"

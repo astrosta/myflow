@@ -53,7 +53,6 @@ from backend.app.gateway.routers import (
     artifacts,
     knowledge,
     memory_items,
-    mcp,
     models,
     openviking_admin,
     openviking_profile,
@@ -447,7 +446,6 @@ def create_app(*, use_openviking_memory: bool | None = None) -> FastAPI:
     application.include_router(uploads.router, prefix="/api")
     application.include_router(artifacts.router, prefix="/api")
     # M7 §2.4：两个 router 各自 prefix，/api 加在这里。
-    application.include_router(mcp.router, prefix="/api")
     # Git-backed author API. Must be registered before the generic skills router:
     # /api/skills/mine has to win over any /skills/{skill_id} route.
     application.include_router(skill_drafts.router, prefix="/api")

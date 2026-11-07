@@ -47,9 +47,6 @@ e2b = [
 knowledge = [
     { name = "pymilvus" },
 ]
-mcp = [
-    { name = "langchain-mcp-adapters" },
-]
 observability = [
     { name = "langfuse" },
 ]
@@ -84,7 +81,6 @@ requires-dist = [
     { name = "langchain-core", specifier = ">=1.6.3" },
     { name = "langchain-deepseek", specifier = ">=1.1.1" },
     { name = "langchain-mcp-adapters", marker = "extra == 'contextforge'", specifier = ">=0.3" },
-    { name = "langchain-mcp-adapters", marker = "extra == 'mcp'", specifier = ">=0.3" },
     { name = "langchain-openai", specifier = ">=1.6.2" },
     { name = "langfuse", marker = "extra == 'observability'", specifier = ">=5.1,<6" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.1.2" },
@@ -101,7 +97,7 @@ requires-dist = [
     { name = "redis", marker = "extra == 'redis'", specifier = ">=5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3.0" },
 ]
-provides-extras = ["postgres", "mcp", "knowledge", "contextforge", "observability", "skills", "redis", "e2b", "opensandbox", "openviking"]
+provides-extras = ["postgres", "knowledge", "contextforge", "observability", "skills", "redis", "e2b", "opensandbox", "openviking"]
 
 [[package]]
 name = "aiohappyeyeballs"

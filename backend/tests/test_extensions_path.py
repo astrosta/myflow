@@ -46,7 +46,7 @@ def test_search_mode_without_a_file_is_unconfigured(tmp_path, monkeypatch):
     monkeypatch.setenv("MYFLOW_PROJECT_ROOT", str(tmp_path))
 
     assert resolve_extensions_config_path() is None
-    assert ExtensionsConfig.from_file().mcp_servers == {}
+    assert ExtensionsConfig.from_file().skills == {}
     assert writable_extensions_config_path() == tmp_path / "extensions_config.json"
 
 
@@ -60,12 +60,12 @@ def test_search_mode_finds_the_project_root_file(tmp_path, monkeypatch):
     assert config.skills["pdf-processing"].enabled is False
 
 
-def test_from_file_keeps_chinese_and_ops_keys(tmp_path):
+def test_from_file_keeps_skills_and_ignores_retired_mcp_keys(tmp_path):
     path = tmp_path / "extensions_config.json"
     path.write_text(
         json.dumps(
             {
-                "mcpServers": {"github": {"type": "stdio", "command": "npx", "args": ["-y", "x"]}},
+                "mcpServers": {"legacy": {"type": "stdio", "command": "npx"}},
                 "skills": {"中文技能": {"enabled": True}},
                 "mcpInterceptors": ["ops.Interceptor"],
             },
@@ -77,9 +77,8 @@ def test_from_file_keeps_chinese_and_ops_keys(tmp_path):
     config = ExtensionsConfig.from_file(path)
 
     assert config.skills["中文技能"].enabled is True
-    assert config.mcp_servers["github"].command == "npx"
-    # mcpInterceptors 是运维文件专属：读得进、原样写回，但 API 不提供写它的接口。
-    assert config.to_file_dict()["mcpInterceptors"] == ["ops.Interceptor"]
+    assert "mcpServers" not in config.model_dump(by_alias=True)
+    assert "mcpInterceptors" not in config.model_dump(by_alias=True)
 
 def test_an_empty_file_is_unconfigured(tmp_path, monkeypatch):
     """空文件和只有空白的文件当"没配"，不让刚 cp 完模板的人撞 500。"""
@@ -88,7 +87,7 @@ def test_an_empty_file_is_unconfigured(tmp_path, monkeypatch):
     monkeypatch.setenv("MYFLOW_EXTENSIONS_CONFIG_PATH", str(path))
 
     assert read_extensions_config_file(path) == {}
-    assert ExtensionsConfig.from_file(path).mcp_servers == {}
+    assert ExtensionsConfig.from_file(path).skills == {}
 
 
 def test_a_write_never_recreates_a_vanished_explicit_path(tmp_path, monkeypatch):

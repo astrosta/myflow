@@ -49,7 +49,7 @@ def test_l0_is_the_only_place_the_index_appears(tmp_path):
     names = {
         tool.name
         for tool in get_available_tools(
-            include_mcp=False, app_config=AppConfig(skills=skills_config(tmp_path))
+            app_config=AppConfig(skills=skills_config(tmp_path))
         )
     }
 

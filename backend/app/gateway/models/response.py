@@ -313,17 +313,6 @@ class SkillReloadResponse(BaseModel):
     reloaded: bool = True  # 只表示这个 worker
 
 
-class McpCacheResetResponse(BaseModel):
-    reset: bool = True  # 只表示这个 worker
-
-
-class McpConfigResponse(BaseModel):
-    """GET/PUT/PATCH /api/mcp/config 的形状。值已经打码，函数里没有原始凭据。"""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    mcp_servers: dict[str, dict[str, Any]] = Field(alias="mcpServers")
-
 # ---------------------------------------------------------------------------
 # Knowledge base
 # ---------------------------------------------------------------------------

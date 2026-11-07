@@ -21,7 +21,7 @@ def _config_file(tmp_path, monkeypatch) -> Path:
     for name in EXTENSIONS_CONFIG_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     path = tmp_path / "extensions_config.json"
-    path.write_text(json.dumps({"mcpServers": {}, "skills": {}}), encoding="utf-8")
+    path.write_text(json.dumps({"skills": {}}), encoding="utf-8")
     monkeypatch.setenv("MYFLOW_EXTENSIONS_CONFIG_PATH", str(path))
     return path
 
@@ -94,4 +94,4 @@ def test_a_raising_mutator_writes_nothing(_config_file):
     with pytest.raises(RuntimeError):
         update_extensions_config(mutate)
 
-    assert json.loads(_config_file.read_text(encoding="utf-8")) == {"mcpServers": {}, "skills": {}}
+    assert json.loads(_config_file.read_text(encoding="utf-8")) == {"skills": {}}

@@ -144,13 +144,6 @@ class SummarizationFailed(Exception):
     code: ClassVar[str] = "summarization_failed"
 
 
-class McpServerNotFound(Exception):
-    """PATCH /api/mcp/config 的 name 不在 extensions_config.json 里（M7 §2.4）。"""
-
-    status_code: ClassVar[int] = 404
-    code: ClassVar[str] = "mcp_server_not_found"
-
-
 class ContextForgeDisabled(Exception):
     """The contextforge block is disabled in this deployment."""
 
@@ -198,23 +191,6 @@ class SkillConflictAPI(Exception):
 
     status_code: ClassVar[int] = 409
     code: ClassVar[str] = "skill_conflict"
-
-
-class StdioCommandRejected(Exception):
-    """API 注册/启用的 stdio command 不在允许列表（M7 §5.7）。
-
-    detail 里只说允许的裸名字集合，不回显被拒绝的命令行。
-    """
-
-    status_code: ClassVar[int] = 422
-    code: ClassVar[str] = "stdio_command_rejected"
-
-
-class InvalidExtensionsConfig(Exception):
-    """打码串没有原值可还原，或写入校验失败（且不是命令允许列表）。"""
-
-    status_code: ClassVar[int] = 422
-    code: ClassVar[str] = "invalid_extensions_config"
 
 
 class MemoryConflictAPI(Exception):
@@ -292,7 +268,6 @@ def install_error_handlers(app: FastAPI) -> None:
         InvalidStateUpdate,
         CompactionDisabled,
         SummarizationFailed,
-        McpServerNotFound,
         ContextForgeDisabled,
         InvalidToolHeaderAPI,
         ContextForgeError,
@@ -308,8 +283,6 @@ def install_error_handlers(app: FastAPI) -> None:
         SkillScannerUnavailable,
         SkillPackageInvalid,
         SkillConflictAPI,
-        StdioCommandRejected,
-        InvalidExtensionsConfig,
         MemoryConflictAPI,
         ProfileConflictAPI,
         InvalidMemory,

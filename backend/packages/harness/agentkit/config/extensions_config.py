@@ -1,7 +1,8 @@
 """extensions_config.json 的读写地基（M7 §2.1–§2.3）。
 
-MCP 服务器列表和技能的启用状态都存在这一个 JSON 里，它**同时被 Gateway API 和运行时
-读写**——用户在网页上点一下"启用某技能"就是一次读-改-写。所以：
+技能的启用状态存在这个 JSON 里，它**同时被 Gateway API 和运行时读写**——用户在网页上
+点一下"启用某技能"就是一次读-改-写。MCP 服务器来源已下线，历史 mcpServers 键在读取时
+忽略，不再参与工具组装。所以：
 
 * 所有读-改-写走 update_extensions_config()：双锁（进程内 threading.Lock +
   跨进程文件咨询锁）覆盖 from_file → merge → atomic_write → reload 整个循环（§2.2）。
@@ -9,8 +10,7 @@ MCP 服务器列表和技能的启用状态都存在这一个 JSON 里，它**�
   只有 Docker 单文件挂载的 EBUSY 才退化为就地覆写（那条路径不原子），其它 errno 一律抛。
 * 缓存失效比"解析后的路径 + 内容签名"，不做 mtime 大小比较（§2.3）。
 
-JSON **不允许**列 Python 扩展路径去 import（那是 config.yaml 的 plugins:）；
-mcpInterceptors 会 import 代码，是运维文件专属，Gateway API 不提供写入它的接口。
+JSON **不允许**列 Python 扩展路径去 import（那是 config.yaml 的 plugins:）。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import threading
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -47,82 +47,6 @@ extensions_config_write_lock = threading.Lock()
 # --------------------------------------------------------------------------
 
 
-class McpUserAuthConfig(BaseModel):
-    """per-user 凭据层（§5.5）。users 的值可以写 $ENV；GET 时整层打码。"""
-
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
-
-    users: dict[str, dict[str, str]] = Field(default_factory=dict)
-    on_missing: Literal["fail_closed", "passthrough"] = "fail_closed"
-
-
-class McpOAuthConfig(BaseModel):
-    """OAuth token 端点（§5.5 层 ①）。client_secret / refresh_token 是凭据：GET 时打码。"""
-
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
-
-    type: Literal["client_credentials", "refresh_token"] = "client_credentials"
-    token_url: str | None = None
-    client_id: str | None = None
-    client_secret: str | None = None
-    scope: str | None = None
-    refresh_token: str | None = None
-    header: str = "Authorization"
-    expiry_margin_seconds: float = 30.0
-
-
-class McpServerConfig(BaseModel):
-    """一台 MCP 服务器。读路径宽松（extra=allow），写路径由 Gateway 的 McpServerWrite 收紧。"""
-
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
-
-    enabled: bool = True
-    type: str = "stdio"
-    command: str | None = None
-    args: list[str] = Field(default_factory=list)
-    env: dict[str, str] = Field(default_factory=dict)
-    headers: dict[str, str] = Field(default_factory=dict)
-    url: str | None = None
-    tool_name_prefix: bool = True
-    session_init_timeout: float | None = 60
-    tool_call_timeout: float | None = 60
-    headers_from_context: dict[str, str] = Field(default_factory=dict)
-    user_auth: McpUserAuthConfig | None = None
-    oauth: McpOAuthConfig | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _apply_transport_alias(cls, data: Any) -> Any:
-        """transport 是 MCP 规范的别名；两个都写时 type 赢（§2.1）。别名不写回文件。"""
-        if not isinstance(data, Mapping):
-            return data
-        raw = dict(data)
-        transport = raw.pop("transport", None)
-        if raw.get("type") is None and transport is not None:
-            raw["type"] = transport
-        return raw
-
-    @property
-    def transport_kind(self) -> str:
-        """规范化 transport 名（小写、中划线换下划线），给 MCP 客户端选 transport 用。"""
-        return str(self.type).strip().lower().replace("-", "_")
-
-    @property
-    def is_stdio(self) -> bool:
-        return self.transport_kind == "stdio"
-
-    def to_file_dict(self) -> dict[str, Any]:
-        data = self.model_dump(by_alias=True, exclude_none=True)
-        for key in ("args", "env", "headers", "headers_from_context"):
-            if not data.get(key):
-                data.pop(key, None)
-        for key in ("session_init_timeout", "tool_call_timeout"):
-            value = data.get(key)
-            if isinstance(value, float) and value.is_integer():
-                data[key] = int(value)
-        return data
-
-
 class SkillToggleConfig(BaseModel):
     """JSON 里的技能启用状态。缺省 true：扫描到的新技能默认开（§3.2）。"""
 
@@ -132,14 +56,23 @@ class SkillToggleConfig(BaseModel):
 
 
 class ExtensionsConfig(BaseModel):
-    """整份 extensions_config.json。mcpInterceptors 这类运维键原样保留在 model_extra。"""
+    """整份 extensions_config.json；MCP servers 已下线，只保留技能开关和运维扩展。"""
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
-    mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict, alias="mcpServers")
     skills: dict[str, SkillToggleConfig] = Field(default_factory=dict)
-    #: 运维文件专属：它会 import 代码，所以 Gateway 不提供写它的 API（§2.4/§11）。
-    mcp_interceptors: list[str] = Field(default_factory=list, alias="mcpInterceptors")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_mcp_keys(cls, data: Any) -> Any:
+        """Ignore legacy mcpServers / mcpInterceptors instead of reviving them."""
+        if isinstance(data, dict):
+            return {
+                key: value
+                for key, value in data.items()
+                if key not in {"mcpServers", "mcpInterceptors"}
+            }
+        return data
 
     @classmethod
     def resolve_config_path(cls, config_path: str | Path | None = None) -> Path | None:
@@ -154,18 +87,12 @@ class ExtensionsConfig(BaseModel):
         return cls.model_validate(read_extensions_config_file(path))
 
     def to_file_dict(self) -> dict[str, Any]:
-        """写回文件用的形状：by_alias（mcpServers），不包括内存字段名 mcp_servers。"""
-        data: dict[str, Any] = {
-            "mcpServers": {
-                name: server.to_file_dict() for name, server in self.mcp_servers.items()
-            }
-        }
+        """写回文件用的形状：只保留技能开关和未知运维键。"""
+        data: dict[str, Any] = {}
         if self.skills:
             data["skills"] = {
                 name: {"enabled": skill.enabled} for name, skill in self.skills.items()
             }
-        if self.mcp_interceptors:
-            data["mcpInterceptors"] = list(self.mcp_interceptors)
         for key, value in (self.model_extra or {}).items():
             data.setdefault(key, value)
         return data
@@ -248,8 +175,9 @@ def atomic_write_extensions_config(path: Path, data: Mapping[str, Any]) -> None:
 def update_extensions_config(mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
     """完整 RMW：读原始 JSON → merge → atomic_write → reload，全程持双锁（§2.2）。
 
-    读的是原始 JSON 而不是 from_file 的结果：运维写在文件里的 mcpInterceptors 之类的键
-    要原样保留。reload_extensions_config() 仍然走 from_file，所以坏配置在写完就报错。
+    读的是原始 JSON 而不是 from_file 的结果：未知运维键要原样保留。已下线的
+    mcpServers / mcpInterceptors 在写回前显式删除。reload_extensions_config() 仍然走
+    from_file，所以坏配置在写完就报错。
 
     mutate 拿到磁盘上的原始 JSON；它抛异常就不写文件。锁在**执行 RMW 的这个线程里**
     获取，调用方必须把整段放进 asyncio.to_thread —— 包在 await 外面时 task 一取消锁
@@ -261,6 +189,8 @@ def update_extensions_config(mutate: Callable[[dict[str, Any]], None]) -> dict[s
             # 显式/环境变量断言的路径中途消失要大声失败，不能悄悄写出一份新的空配置。
             data = read_extensions_config_file(path, missing_ok=may_create)
             mutate(data)
+            data.pop("mcpServers", None)
+            data.pop("mcpInterceptors", None)
             atomic_write_extensions_config(path, data)
             reload_extensions_config()
     return data

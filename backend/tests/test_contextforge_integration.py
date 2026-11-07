@@ -58,7 +58,7 @@ async def test_admin_events_returns_sse_or_reports_why_not() -> None:
 async def test_mcp_tools_list_matches_admin_catalog() -> None:
     """MCP is the runtime source of truth; the admin catalog must not drift."""
     try:
-        from agentkit.mcp.tools import load_server_tools
+        from langchain_mcp_adapters.tools import load_mcp_tools
     except ImportError:
         pytest.skip("langchain-mcp-adapters is not installed")
 
@@ -73,11 +73,11 @@ async def test_mcp_tools_list_matches_admin_catalog() -> None:
         "timeout": 20.0,
     }
     try:
-        tools = await load_server_tools(
-            "contextforge-integration",
-            params,
-            prefix_enabled=False,
-            tool_call_timeout=20.0,
+        tools = await load_mcp_tools(
+            None,
+            connection=params,
+            server_name="contextforge-integration",
+            tool_name_prefix=False,
         )
     except Exception as exc:  # noqa: BLE001 - opt-in smoke test reports the cause
         pytest.skip(f"MCP endpoint is not reachable: {type(exc).__name__}: {exc}")
