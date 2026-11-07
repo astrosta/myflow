@@ -13,11 +13,24 @@ from langchain_core.messages import ToolMessage
 from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
-from agentkit.contextforge.retry import RefreshableToolError, classify_tool_error
+from agentkit.contextforge.retry import (
+    RefreshableToolError,
+    classify_tool_error,
+    owns_retry_fallback,
+)
 
 
 class ToolRefreshRetryMiddleware(AgentMiddleware[AgentState]):
-    """One retry for the two error classes that can indicate a stale catalog."""
+    """One retry for the two error classes that can indicate a stale catalog.
+
+    The middleware only serves *plain* tools.  tool_execute runs the design 9.1
+    fallback itself: it refreshes, retries a missing tool exactly once, and
+    answers every failure with its own origin.  Its reply text still matches the
+    not-found and invalid-argument vocabulary, so classifying it like an ordinary
+    tool error would refresh a second time and re-run tools/call for the same
+    request - duplicate upstream execution, which 9.1 C.6 forbids.  The guard is
+    by tool name, because the name is available even when the call raises.
+    """
 
     def __init__(
         self,
@@ -81,7 +94,7 @@ class ToolRefreshRetryMiddleware(AgentMiddleware[AgentState]):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Any]],
     ) -> ToolMessage | Any:
-        if not self._enabled:
+        if not self._enabled or owns_retry_fallback(self._name(request)):
             return await handler(request)
         retried = False
         try:
@@ -117,7 +130,7 @@ class ToolRefreshRetryMiddleware(AgentMiddleware[AgentState]):
         return retry_result
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Callable) -> ToolMessage | Any:
-        if not self._enabled:
+        if not self._enabled or owns_retry_fallback(self._name(request)):
             return handler(request)
         try:
             result = handler(request)

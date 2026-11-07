@@ -11,12 +11,22 @@ upstream.  A second refresh-and-retry on top of that would run a fallback that
 already ran (and, for a tool that is also invalid upstream, execute it again), so
 the marker is classified as not refreshable - it outranks the generic
 "invalid arguments" wording of the message it carries.
+
+The marker is not enough on its own, because tool_execute reports *every* failure
+in that vocabulary: ``schema_mismatch`` and ``invalid_arguments`` carry the generic
+wording too.  ``owns_retry_fallback`` is the caller-side guard: a tool that runs
+the 9.1 fallback inside its own call must never be refreshed or retried again on
+top of its reply, whatever that reply says.
 """
 
 from __future__ import annotations
 
 from enum import Enum
 from typing import Any
+
+#: Tools that run the refresh/retry fallback of design 9.1 inside their own call
+#: and report its outcome themselves, so no middleware may repeat it.
+SELF_HEALING_TOOLS = frozenset({"tool_execute"})
 
 
 class RefreshableToolError(Enum):
@@ -84,6 +94,17 @@ def classify_tool_error(value: Any) -> RefreshableToolError:
     return RefreshableToolError.NONE
 
 
+def owns_retry_fallback(tool_name: Any) -> bool:
+    """Does this tool own the fallback, so nobody may refresh or retry for it?
+
+    tool_execute refreshes on its own and - only for a missing tool - retries
+    once (design 9.1 B).  Its replies name the origin, the retryable flag and
+    often the new schema; a middleware that treated one as an ordinary tool error
+    would refresh a second time and re-run tools/call, which 9.1 C.6 forbids.
+    """
+    return str(tool_name or "").strip().casefold() in SELF_HEALING_TOOLS
+
+
 def _text(value: Any) -> str:
     content = getattr(value, "content", value)
     if isinstance(content, str):
@@ -101,4 +122,9 @@ def _text(value: Any) -> str:
     return str(content or "")
 
 
-__all__ = ["RefreshableToolError", "classify_tool_error"]
+__all__ = [
+    "RefreshableToolError",
+    "SELF_HEALING_TOOLS",
+    "classify_tool_error",
+    "owns_retry_fallback",
+]

@@ -9,13 +9,19 @@ the tool, and it runs it through ContextForge MCP tools/call with the original
   ``ThreadState.retrieved_tool_names`` for this run, and the row must be
   owner-scoped *and* callable in ``contextforge_tools``;
 * local validation with Draft202012Validator, with remote $ref retrieval disabled
-  so a stored schema can never make the gateway fetch a URL;
+  so a stored schema can never make the gateway fetch a URL - and, because the
+  check cannot be skipped, a schema that will not compile or resolve is refused
+  instead of deferred to ContextForge (design 9.3: fail closed);
 * the failure fallback of design 9.1: a local validation failure and an upstream
   invalid-params/schema-mismatch refresh the catalog and answer with the new
   schema but never retry, a stale or missing tool refreshes and retries exactly
   once, and a timeout/5xx/transport error neither refreshes nor retries;
 * the reply is a ToolMessage that carries the inner name, tool_id and call name
-  in ``myflow_tool_meta``, so an audit sees the tool that ran, not tool_execute.
+  in ``myflow_tool_meta``, so an audit sees the tool that ran, not tool_execute;
+* a refresh that completed but whose catalog re-read then raised is
+  ``contextforge_unavailable``, never a refreshed ``tool_not_found``: the third
+  outcome exists because "the row is gone" and "I could not look" are different
+  facts, and only one of them tells the model to stop calling the tool.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ from langchain_core.messages import ToolMessage
 from mcp import types as mcp_types
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+import agentkit.tools.builtin.tool_execute as executor_module
 from agentkit.agents.middlewares.tool_result_meta import TOOL_META_KEY
 from agentkit.config.contextforge_config import ContextForgeConfig
 from agentkit.contextforge.mcp_client import ContextForgeMcpClient
@@ -159,6 +166,29 @@ class FakeMcp:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class UnreadableStore:
+    """The real store, whose catalog read starts failing after ``after`` reads.
+
+    A database that disappears mid-call is not evidence that the row is gone:
+    the sync completed and the read did not.  That third outcome is what these
+    tests drive, because reporting it as tool_not_found tells the model to stop
+    calling a tool that is probably still there.
+    """
+
+    def __init__(self, store: ContextForgeToolStore, *, after: int = 1) -> None:
+        self._store = store
+        self._after = after
+        self.reads = 0
+
+    async def get_by_call_name(
+        self, call_name: str, owner_user_id: str
+    ) -> ContextForgeToolRecord | None:
+        self.reads += 1
+        if self.reads > self._after:
+            raise RuntimeError("database connection lost")
+        return await self._store.get_by_call_name(call_name, owner_user_id)
 
 
 class FakeExecutionRuntime:
@@ -468,6 +498,10 @@ async def test_a_missing_tool_is_reported_after_one_refresh(tmp_path: Path) -> N
     assert payload["origin"] == "tool_not_found"
     assert CALL_NAME in payload["error"]
     assert "tool_search" in payload["error"]
+    assert payload["retryable"] is False, (
+        "the refresh already ran and the reply says do not repeat this call"
+    )
+    assert "Do not repeat this call" in payload["error"]
     assert execution.refresh_reasons == ["call_error"], "exactly one refresh"
     assert mcp.calls == []
 
@@ -556,6 +590,61 @@ async def test_an_index_only_refresh_failure_still_uses_the_committed_snapshot(
     assert message.status == "success"
     assert execution.refresh_reasons == ["call_error"]
     assert execution.retries == [(CALL_NAME, "success")]
+
+
+# --------------------------------------------------------------------------- #
+# The third state: the sync worked and the catalog read then failed
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_re_read_that_raises_is_unavailable_not_a_refreshed_not_found(
+    tmp_path: Path,
+) -> None:
+    """(None, True) used to turn a DB failure into "refreshed, so not found".
+
+    Nothing is known about the row here: the refresh completed and the read that
+    follows it raised.  The model must not be told the tool is gone.
+    """
+    async with catalog(tmp_path) as store:
+        unreadable = UnreadableStore(store, after=1)
+        mcp = FakeMcp()
+        execution = FakeExecutionRuntime(unreadable, mcp)
+
+        message = await _run(execution, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "contextforge_unavailable"
+    assert payload["retryable"] is False
+    assert "tool_not_found" not in payload["origin"]
+    assert "refreshed" not in payload["error"].casefold()
+    assert "not found" not in payload["error"].casefold()
+    assert "could not be read" in payload["error"]
+    assert unreadable.reads == 2, "one lookup, one re-read after the refresh"
+    assert execution.refresh_reasons == ["call_error"]
+    assert mcp.calls == [], "an unreadable catalog never reaches ContextForge"
+    assert _meta(message)["origin"] == "contextforge_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_an_upstream_not_found_whose_re_read_raises_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    """ContextForge said not found, then the re-read raised: still not a retry."""
+    async with catalog(tmp_path) as store:
+        await _store_record(store, _record())
+        unreadable = UnreadableStore(store, after=1)
+        mcp = FakeMcp(_error("tool not found: github_search"))
+        execution = FakeExecutionRuntime(unreadable, mcp)
+
+        message = await _run(execution, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "contextforge_unavailable"
+    assert payload["retryable"] is False
+    assert "refreshed" not in payload["error"].casefold()
+    assert len(mcp.calls) == 1, "no retry without a catalog read that succeeded"
+    assert execution.retries == []
 
 
 # --------------------------------------------------------------------------- #
@@ -768,11 +857,20 @@ async def test_the_built_runtime_hands_the_executor_its_store_and_mcp_client(
         await engine.dispose()
 
 
+# --------------------------------------------------------------------------- #
+# Fail closed: a schema this process cannot check (design 9.3)
+# --------------------------------------------------------------------------- #
+
+
 @pytest.mark.asyncio
-async def test_a_schema_that_cannot_resolve_remotely_defers_to_contextforge(
+async def test_a_schema_that_cannot_resolve_remotely_is_refused(
     tmp_path: Path,
 ) -> None:
-    """A remote $ref is never fetched: validation gives up and MCP decides."""
+    """A remote $ref is never fetched (9.3): the tool is refused, not deferred.
+
+    Fetching it would make an upstream tool author's schema trigger a request from
+    the gateway (SSRF); skipping validation would send arguments nothing checked.
+    """
     schema = {
         "type": "object",
         "properties": {"query": {"$ref": "https://example.com/args.json"}},
@@ -780,6 +878,47 @@ async def test_a_schema_that_cannot_resolve_remotely_defers_to_contextforge(
     }
     async with catalog(tmp_path) as store:
         await _store_record(store, _record(schema=schema))
+        mcp = FakeMcp()
+        execution = FakeExecutionRuntime(store, mcp)
+
+        message = await _run(execution, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "schema_unresolved"
+    assert payload["retryable"] is False
+    assert "example.com" in payload["error"], "the reason is reported, not swallowed"
+    assert mcp.calls == [], "unvalidated arguments never leave the process"
+    assert execution.refresh_reasons == []
+    assert _meta(message)["origin"] == "schema_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_a_schema_that_does_not_compile_is_refused(tmp_path: Path) -> None:
+    """The same rule for a schema jsonschema itself rejects."""
+    schema = {
+        "type": "object",
+        "properties": {"query": {"type": "nonsense"}},
+        "required": ["query"],
+    }
+    async with catalog(tmp_path) as store:
+        await _store_record(store, _record(schema=schema))
+        mcp = FakeMcp()
+        execution = FakeExecutionRuntime(store, mcp)
+
+        message = await _run(execution, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "schema_unresolved"
+    assert "UnknownType" in payload["error"]
+    assert mcp.calls == []
+    assert execution.refresh_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_a_stored_schema_that_is_missing_still_defers(tmp_path: Path) -> None:
+    """No schema is not a broken schema: with nothing to check, MCP decides."""
+    async with catalog(tmp_path) as store:
+        await _store_record(store, _record(schema={}))
         mcp = FakeMcp(_ok(_text("ok")))
         execution = FakeExecutionRuntime(store, mcp)
 
@@ -787,4 +926,48 @@ async def test_a_schema_that_cannot_resolve_remotely_defers_to_contextforge(
 
     assert message.status == "success"
     assert len(mcp.calls) == 1
-    assert execution.refresh_reasons == []
+
+
+# --------------------------------------------------------------------------- #
+# The retryable flag, pinned for every origin the executor can report
+# --------------------------------------------------------------------------- #
+
+#: The decision, per origin.  False is the default for anything that already had
+#: its one fallback: tool_not_found was refreshed and retried once and its own
+#: wording says "do not repeat this call" (9.1 B.4), so a True there would
+#: contradict the message the model reads.
+RETRYABLE_BY_ORIGIN: dict[str, bool] = {
+    executor_module.ORIGIN_NOT_RETRIEVED: True,
+    executor_module.ORIGIN_LOCAL_VALIDATION: True,
+    executor_module.ORIGIN_SCHEMA_MISMATCH: True,
+    executor_module.ORIGIN_INVALID_ARGUMENTS: True,
+    executor_module.ORIGIN_TOOL_NOT_FOUND: False,
+    executor_module.ORIGIN_TRANSPORT_ERROR: False,
+    executor_module.ORIGIN_TIMEOUT: False,
+    executor_module.ORIGIN_TOOL_ERROR: False,
+    executor_module.ORIGIN_UNAVAILABLE: False,
+    executor_module.ORIGIN_SCHEMA_UNRESOLVED: False,
+}
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"), sorted(RETRYABLE_BY_ORIGIN.items())
+)
+def test_the_retryable_flag_is_pinned_per_origin(
+    origin: str, expected: bool
+) -> None:
+    reply = executor_module._error_reply(
+        "call-1", call_name=CALL_NAME, origin=origin, message="boom"
+    )
+    assert _payload(reply)["retryable"] is expected
+
+
+def test_every_origin_the_executor_reports_has_a_retryable_decision() -> None:
+    reported = {
+        value
+        for name, value in vars(executor_module).items()
+        if name.startswith("ORIGIN_") and isinstance(value, str)
+    }
+    assert reported == set(RETRYABLE_BY_ORIGIN), (
+        "a new origin needs an explicit retryable decision, not a default"
+    )

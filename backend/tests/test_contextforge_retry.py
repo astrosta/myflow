@@ -7,16 +7,25 @@ use runtime doubles with the real shape - an async refresh, no `refresh_and_sync
 - so a call to a deleted method fails here instead of silently swallowing an
 AttributeError and skipping the retry.
 
-The classifier is also the vocabulary tool_execute reports failures in, so the
-last two tests pin its one exception: an error that already carries
+The classifier is also the vocabulary tool_execute reports failures in, so part
+of this file pins its one exception: an error that already carries
 ``origin=local_validation`` was handled by the executor's own fallback, and must
 not be classified as refreshable even though its wording says "invalid
 arguments" - a middleware retry would refresh a second time and re-run the call.
+
+The marker alone is not enough while ``ToolRefreshRetryMiddleware`` is still
+registered (it is deleted in Task 8, not before): tool_execute reports
+``schema_mismatch`` and ``invalid_arguments`` in the same vocabulary, so the
+middleware also skips the executor by name through
+``retry.owns_retry_fallback``.  Those guards, and the signatures the executor
+actually calls on the real ``ContextForgeRuntime``, are pinned below.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -25,7 +34,14 @@ import pytest
 from langchain_core.messages import ToolMessage
 
 from agentkit.agents.middlewares.tool_refresh_retry_middleware import ToolRefreshRetryMiddleware
-from agentkit.contextforge.retry import RefreshableToolError, classify_tool_error
+from agentkit.config.contextforge_config import ContextForgeSyncConfig
+from agentkit.contextforge.retry import (
+    RefreshableToolError,
+    classify_tool_error,
+    owns_retry_fallback,
+)
+from agentkit.contextforge.runtime import ContextForgeRuntime
+from agentkit.contextforge.sync import ContextForgeSyncStats
 
 
 class FakeRuntime:
@@ -253,3 +269,171 @@ def test_sync_path_timeout_is_not_retried() -> None:
         _middleware(runtime).wrap_tool_call(_request(), handler)
     assert calls["n"] == 1
     assert runtime.synced == []
+
+# --------------------------------------------------------------------------- #
+# The executor owns its fallback: the middleware must not repeat it
+# --------------------------------------------------------------------------- #
+
+
+def _reply(origin: str, error: str, *, name: str = "tool_execute") -> ToolMessage:
+    """A tool_execute-shaped failure reply: origin, retryable flag, error text."""
+    payload = {
+        "error": error,
+        "origin": origin,
+        "retryable": True,
+    }
+    return ToolMessage(
+        content=json.dumps(payload),
+        tool_call_id="call-1",
+        name=name,
+        status="error",
+    )
+
+
+def test_only_the_executor_is_a_self_healing_tool() -> None:
+    assert owns_retry_fallback("tool_execute")
+    assert owns_retry_fallback(" Tool_Execute "), "the check is normalized"
+    assert not owns_retry_fallback("cf__github_search")
+    assert not owns_retry_fallback("tool_search")
+    assert not owns_retry_fallback(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin", "error"),
+    [
+        ("schema_mismatch", "invalid params: schema validation failed"),
+        ("invalid_arguments", "invalid arguments for tool"),
+        ("tool_not_found", "tool not found: github_search"),
+        ("local_validation", "arguments do not match the stored input_schema"),
+    ],
+)
+async def test_a_tool_execute_reply_is_never_refreshed_or_retried(
+    origin: str, error: str
+) -> None:
+    """Every executor origin is final: it already ran the 9.1 fallback."""
+    runtime = FakeRuntime()
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        return _reply(origin, error)
+
+    result = await _middleware(runtime).awrap_tool_call(
+        _request("tool_execute"), handler
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert calls["n"] == 1, "a second handler call is a duplicate upstream call"
+    assert runtime.synced == [], "no second refresh"
+    assert runtime.retries == []
+
+
+@pytest.mark.asyncio
+async def test_a_tool_execute_exception_is_never_refreshed_or_retried() -> None:
+    """The name is known before the call, so a raised error is guarded too."""
+    runtime = FakeRuntime()
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        raise RuntimeError("tool not found")
+
+    with pytest.raises(RuntimeError, match="tool not found"):
+        await _middleware(runtime).awrap_tool_call(_request("tool_execute"), handler)
+
+    assert calls["n"] == 1
+    assert runtime.synced == []
+
+
+def test_the_sync_path_skips_tool_execute_too() -> None:
+    runtime = FakeRuntime()
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return _reply("schema_mismatch", "invalid params: schema validation failed")
+
+    result = _middleware(runtime).wrap_tool_call(_request("tool_execute"), handler)
+
+    assert isinstance(result, ToolMessage)
+    assert calls["n"] == 1
+    assert runtime.synced == []
+    assert runtime.retries == []
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_tool_with_the_same_wording_is_still_retried() -> None:
+    """The guard is the tool name: plain tools keep their one refresh and retry."""
+    runtime = FakeRuntime()
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _reply(
+                "invalid_arguments",
+                "invalid arguments for tool",
+                name="cf__github_search",
+            )
+        return ToolMessage(content="ok", tool_call_id="call-1")
+
+    result = await _middleware(runtime).awrap_tool_call(
+        _request("cf__github_search"), handler
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert calls["n"] == 2
+    assert runtime.synced == ["tool_error"]
+    assert runtime.retries == [("cf__github_search", "success")]
+
+
+# --------------------------------------------------------------------------- #
+# The real runtime, not a double: the executor's calls must keep existing
+# --------------------------------------------------------------------------- #
+
+
+def test_the_real_runtime_exposes_the_signatures_the_executor_calls() -> None:
+    """tool_execute and this middleware call ContextForgeRuntime by name.
+
+    A double cannot drift; the production class can.  These assertions read the
+    real class, so renaming ``refresh_now``, losing the ``store``/``mcp_client``
+    properties or making ``record_retry`` positional fails here instead of turning
+    into a silent getattr fallback at runtime.
+    """
+    refresh = inspect.signature(ContextForgeRuntime.refresh_now).parameters
+    assert asyncio.iscoroutinefunction(ContextForgeRuntime.refresh_now)
+    assert list(refresh) == ["self", "reason"]
+    assert (
+        refresh["reason"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ), "the executor passes the reason positionally: refresh_now(REFRESH_REASON)"
+
+    request = inspect.signature(ContextForgeRuntime.request_refresh).parameters
+    assert asyncio.iscoroutinefunction(ContextForgeRuntime.request_refresh)
+    assert list(request) == ["self", "reason"], (
+        "request_refresh is the documented fallback, called positionally too"
+    )
+    assert request["reason"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+    retry = inspect.signature(ContextForgeRuntime.record_retry).parameters
+    assert list(retry) == ["self", "tool_name", "result"]
+    assert retry["tool_name"].kind is inspect.Parameter.KEYWORD_ONLY, (
+        "the executor calls record_retry(tool_name=..., result=...)"
+    )
+    assert retry["result"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    for attribute in ("store", "mcp_client"):
+        holder = inspect.getattr_static(ContextForgeRuntime, attribute, None)
+        assert isinstance(holder, property), (
+            f"tool_execute reads runtime.{attribute}; it must stay a property"
+        )
+
+    fields = {field.name for field in dataclasses.fields(ContextForgeSyncStats)}
+    assert {"error", "index_failed"} <= fields, (
+        "the executor decides whether a refresh replaced the snapshot from these"
+    )
+
+    timeout_field = "tool_error_refresh_timeout_seconds"
+    assert timeout_field in ContextForgeSyncConfig.model_fields, (
+        "the refresh budget the executor reads from config.sync must exist"
+    )

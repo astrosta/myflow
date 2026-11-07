@@ -30,6 +30,14 @@ The local-validation branch also carries origin=local_validation in the reply an
 myflow_tool_meta, and contextforge.retry.classify_tool_error treats that marker as
 not refreshable: the fallback above already ran, so a middleware must not refresh
 a second time and re-run the call.
+
+Two rules come from 9.3 and from the difference between "not there" and "could not
+look".  A stored schema this process cannot compile or resolve is refused
+outright: validation is the gate between the model's arguments and ContextForge,
+so a schema that cannot be checked must not be waved through (a remote $ref would
+otherwise make the gateway fetch an author-chosen URL).  And a re-read that
+*raises* after a successful sync is origin=contextforge_unavailable, never a
+refreshed not-found: the row may well exist, we simply could not see it.
 """
 
 from __future__ import annotations
@@ -81,19 +89,28 @@ ORIGIN_TRANSPORT_ERROR = "transport_error"
 ORIGIN_TIMEOUT = "timeout"
 ORIGIN_TOOL_ERROR = "tool_error"
 ORIGIN_UNAVAILABLE = "contextforge_unavailable"
+ORIGIN_SCHEMA_UNRESOLVED = "schema_unresolved"
 
 #: Origins where a corrected call can succeed, so the model should adjust and
-#: try again. A timeout/5xx/transport failure is not one of them: the tool may
-#: already have run.
+#: try again. Everything else is final for this call: a timeout/5xx/transport
+#: failure may already have run upstream, a missing tool is reported with "do not
+#: repeat" (design 9.1 B.4 - it was refreshed already), an unreadable catalog or
+#: an unusable stored schema cannot be fixed by re-sending the same request.
 _RECOVERABLE_ORIGINS = frozenset(
     {
         ORIGIN_NOT_RETRIEVED,
         ORIGIN_LOCAL_VALIDATION,
-        ORIGIN_TOOL_NOT_FOUND,
         ORIGIN_SCHEMA_MISMATCH,
         ORIGIN_INVALID_ARGUMENTS,
     }
 )
+
+#: What the refresh + re-read pair produced.  REREAD_UNAVAILABLE is the state
+#: that must never be reported as tool_not_found: the sync completed, the catalog
+#: read did not, so "not there" is not something this process knows.
+REREAD_REFRESHED = "refreshed"
+REREAD_NOT_REFRESHED = "not_refreshed"
+REREAD_UNAVAILABLE = "unavailable"
 
 _TIMEOUT_MARKERS = ("timeout", "timed out", "deadline exceeded", "read timeout")
 
@@ -107,6 +124,11 @@ UNAVAILABLE_MESSAGE = (
 )
 CATALOG_UNAVAILABLE_MESSAGE = (
     "The ContextForge tool catalog could not be read. Do not retry; tell the user."
+)
+SCHEMA_UNUSABLE_MESSAGE = (
+    "The stored input_schema for this tool cannot be compiled or resolved here, "
+    "so the arguments cannot be validated and the tool was not run. Do not retry "
+    "with different arguments; tell the user the tool definition is broken."
 )
 EMPTY_RESULT = "The tool returned no content."
 
@@ -187,24 +209,39 @@ async def tool_execute(
             message=CATALOG_UNAVAILABLE_MESSAGE,
         )
 
-    record, retried = await _resolved_record(execution, store, record, call_name, owner)
+    # The row came from the post-refresh re-read: that run is what record_retry
+    # reports on, and a plain hit has nothing to book.
+    recovered_from_refresh = record is None
+    record, reread = await _resolved_record(
+        execution, store, record, call_name, owner
+    )
     if record is None:
+        return _missing_reply(tool_call_id, call_name=call_name, state=reread)
+
+    check = _validate_arguments(record, args)
+    if check.unusable is not None:
+        # Design 9.3: fail closed.  An unverifiable schema is not a licence to
+        # skip the gate - and a remote $ref must never be fetched to fix it.
+        logger.warning(
+            "refusing %s: its stored input_schema is unusable (%s)",
+            record.call_name,
+            check.unusable,
+        )
         return _error_reply(
             tool_call_id,
             call_name=call_name,
-            origin=ORIGIN_TOOL_NOT_FOUND,
-            message=_not_found_message(call_name, retried),
+            origin=ORIGIN_SCHEMA_UNRESOLVED,
+            message=f"{SCHEMA_UNUSABLE_MESSAGE} ({check.unusable})",
+            record=record,
         )
-
-    problem = _validation_problem(record, args)
-    if problem is not None:
+    if check.problem is not None:
         return await _validation_reply(
-            execution, store, owner, call_name, record, problem, tool_call_id
+            execution, store, owner, call_name, record, check.problem, tool_call_id
         )
 
     outcome = await _call_tool(mcp, record, args)
     if outcome.origin is not None:
-        if retried:
+        if recovered_from_refresh:
             _record_retry(execution, call_name, False)
         return _error_reply(
             tool_call_id,
@@ -217,7 +254,7 @@ async def tool_execute(
         return await _upstream_error_reply(
             execution, store, mcp, owner, call_name, record, args, outcome, tool_call_id
         )
-    if retried:
+    if recovered_from_refresh:
         _record_retry(execution, call_name, True)
     return _success_reply(tool_call_id, record, outcome.result)
 
@@ -228,12 +265,42 @@ async def _resolved_record(
     record: ContextForgeToolRecord | None,
     call_name: str,
     owner: str | None,
-) -> tuple[ContextForgeToolRecord | None, bool]:
+) -> tuple[ContextForgeToolRecord | None, str]:
     """The row if it exists, else one refresh and a single re-read (design 9.1 B)."""
     if record is not None:
-        return record, False
-    fresh, refreshed = await _reread_after_refresh(execution, store, call_name, owner)
-    return fresh, refreshed
+        return record, REREAD_REFRESHED
+    return await _reread_after_refresh(execution, store, call_name, owner)
+
+
+def _missing_reply(
+    tool_call_id: str,
+    *,
+    call_name: str,
+    state: str,
+    record: ContextForgeToolRecord | None = None,
+) -> ToolMessage:
+    """A row we could not produce: absent (refreshed or not) or unreadable.
+
+    REREAD_UNAVAILABLE is the case the caller must not fold into tool_not_found.
+    The sync succeeded and the catalog read then raised, so this process has no
+    idea whether the tool exists; claiming "not found" would tell the model to
+    stop calling a tool that is probably still there.
+    """
+    if state == REREAD_UNAVAILABLE:
+        return _error_reply(
+            tool_call_id,
+            call_name=call_name,
+            origin=ORIGIN_UNAVAILABLE,
+            message=CATALOG_UNAVAILABLE_MESSAGE,
+            record=record,
+        )
+    return _error_reply(
+        tool_call_id,
+        call_name=call_name,
+        origin=ORIGIN_TOOL_NOT_FOUND,
+        message=_not_found_message(call_name, state == REREAD_REFRESHED),
+        record=record,
+    )
 
 
 async def _validation_reply(
@@ -246,7 +313,7 @@ async def _validation_reply(
     tool_call_id: str,
 ) -> ToolMessage:
     """Design 9.1 A: refresh, then answer with the new schema - no retry, no MCP."""
-    fresh, _refreshed = await _reread_after_refresh(execution, store, call_name, owner)
+    fresh, _state = await _reread_after_refresh(execution, store, call_name, owner)
     if fresh is not None and _schema_changed(record, fresh):
         return _error_reply(
             tool_call_id,
@@ -280,16 +347,10 @@ async def _upstream_error_reply(
     text = _result_text(outcome.result)
     kind = classify_tool_error(text)
     if kind is RefreshableToolError.NOT_FOUND:
-        fresh, refreshed = await _reread_after_refresh(
-            execution, store, call_name, owner
-        )
+        fresh, state = await _reread_after_refresh(execution, store, call_name, owner)
         if fresh is None:
-            return _error_reply(
-                tool_call_id,
-                call_name=call_name,
-                origin=ORIGIN_TOOL_NOT_FOUND,
-                message=_not_found_message(call_name, refreshed),
-                record=record,
+            return _missing_reply(
+                tool_call_id, call_name=call_name, state=state, record=record
             )
         retry = await _call_tool(mcp, fresh, args)
         if retry.origin is not None:
@@ -315,7 +376,7 @@ async def _upstream_error_reply(
         return _success_reply(tool_call_id, fresh, retry.result)
 
     if kind is RefreshableToolError.INVALID_ARGUMENTS:
-        fresh, _refreshed = await _reread_after_refresh(
+        fresh, _state = await _reread_after_refresh(
             execution, store, call_name, owner
         )
         if fresh is not None and _schema_changed(record, fresh):
@@ -422,14 +483,22 @@ async def _reread_after_refresh(
     store: Any,
     call_name: str,
     owner: str | None,
-) -> tuple[ContextForgeToolRecord | None, bool]:
+) -> tuple[ContextForgeToolRecord | None, str]:
+    """One refresh and the single re-read that follows it.
+
+    The state is not a "refreshed" boolean.  A re-read that *raises* is a third
+    outcome: the sync succeeded and the catalog read failed afterwards, so we
+    know neither that the row exists nor that it does not.  Returning True there
+    used to make a database failure back a "refreshed, therefore not found"
+    answer.
+    """
     if not await _refresh_catalog(execution):
-        return None, False
+        return None, REREAD_NOT_REFRESHED
     try:
-        return await store.get_by_call_name(call_name, owner), True
-    except Exception:  # noqa: BLE001 - the caller keeps its original error
+        return await store.get_by_call_name(call_name, owner), REREAD_REFRESHED
+    except Exception:  # noqa: BLE001 - reported as unavailable, never as not found
         logger.warning("ContextForge catalog re-read failed", exc_info=True)
-        return None, True
+        return None, REREAD_UNAVAILABLE
 
 
 async def _refresh_catalog(execution: Any) -> bool:
@@ -512,18 +581,28 @@ def _record_retry(execution: Any, call_name: str, ok: bool) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _validation_problem(
-    record: ContextForgeToolRecord, args: dict[str, Any]
-) -> str | None:
-    """The local argument/schema mismatch, or None when we cannot decide.
+@dataclass(frozen=True, slots=True)
+class _ValidationCheck:
+    """What the local schema check found: a mismatch, or a schema it cannot use.
 
-    A schema we cannot compile, or one whose $ref cannot be resolved without
-    fetching a URL, is not the model's fault: it is handed to ContextForge,
-    which validates the same arguments on its side anyway.
+    ``unusable`` is the fail-closed outcome of design 9.3.  "I could not compile
+    or resolve this schema" is not "the arguments are fine": validation is the
+    only thing standing between the model's arguments and ContextForge, so the
+    executor refuses instead of forwarding the call unvalidated.
     """
+
+    problem: str | None = None
+    unusable: str | None = None
+
+
+def _validate_arguments(
+    record: ContextForgeToolRecord, args: dict[str, Any]
+) -> _ValidationCheck:
+    """The local argument/schema mismatch, a schema we cannot use, or neither."""
     schema = record.input_schema if isinstance(record.input_schema, dict) else {}
     if not schema:
-        return None
+        # No schema at all is not a broken schema: ContextForge is authoritative.
+        return _ValidationCheck()
     try:
         validator = (
             Draft202012Validator(schema, registry=_EMPTY_REGISTRY)
@@ -531,16 +610,12 @@ def _validation_problem(
             else Draft202012Validator(schema)
         )
         errors = sorted(validator.iter_errors(args), key=_error_sort_key)
-    except Exception as exc:  # noqa: BLE001 - defer to ContextForge's validation
-        logger.info(
-            "cannot validate %s locally (%s); deferring to ContextForge",
-            record.call_name,
-            type(exc).__name__,
-        )
-        return None
+    except Exception as exc:  # noqa: BLE001 - design 9.3: fail closed, never fetch
+        detail = (str(exc).splitlines() or [""])[0][:200]
+        return _ValidationCheck(unusable=f"{type(exc).__name__}: {detail}".strip(": "))
     if not errors:
-        return None
-    return _describe_errors(errors)
+        return _ValidationCheck()
+    return _ValidationCheck(problem=_describe_errors(errors))
 
 
 def _error_sort_key(error: Any) -> list[str]:
