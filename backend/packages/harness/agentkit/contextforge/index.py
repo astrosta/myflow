@@ -235,6 +235,30 @@ class ToolVectorIndex:
         )
         return self._to_hits(rows)
 
+    async def keyword_search(
+        self,
+        *,
+        query: str,
+        owner_user_id: str | None,
+        limit: int,
+    ) -> list[ToolVectorHit]:
+        """BM25-only recall: the sparse channel alone, still owner-scoped.
+
+        This is the path a deployment with ``search.embedding.enabled=false``
+        runs: the stored sparse vector needs no query embedding, so keyword
+        retrieval keeps working when no embedding service is available.  The
+        owner filter is the same expression the other two searches use - it is
+        applied per request here as well, never post-hoc.
+        """
+        expression = _owner_expression(owner_user_id)
+        text = (query or "").strip()
+        if not text or int(limit) <= 0:
+            return []
+        rows = await asyncio.to_thread(
+            self._keyword_search_sync, text, expression, int(limit)
+        )
+        return self._to_hits(rows)
+
     async def sync(
         self,
         records: Sequence[ContextForgeToolRecord],
@@ -573,6 +597,29 @@ class ToolVectorIndex:
         except Exception as exc:  # noqa: BLE001
             raise ToolIndexUnavailable(
                 f"Milvus tool dense search failed: {type(exc).__name__}"
+            ) from exc
+
+    def _keyword_search_sync(
+        self, query: str, expression: str, limit: int
+    ) -> list[dict[str, Any]]:
+        client = self._client_instance()
+        self._ensure_collection_sync()
+        try:
+            return _first_rows(
+                client.search(
+                    collection_name=self._collection,
+                    data=[query],
+                    anns_field=_SPARSE_FIELD,
+                    search_params={"metric_type": "BM25", "params": {}},
+                    limit=limit,
+                    filter=expression,
+                    output_fields=OUTPUT_FIELDS,
+                    consistency_level=self._config.consistency_level,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ToolIndexUnavailable(
+                f"Milvus tool keyword search failed: {type(exc).__name__}"
             ) from exc
 
     def _to_hits(self, rows: list[dict[str, Any]]) -> list[ToolVectorHit]:

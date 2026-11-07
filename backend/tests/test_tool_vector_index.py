@@ -209,6 +209,13 @@ class FakeMilvus:
         return [[{"entity": dict(self.entity), "distance": 0.8}]]
 
 
+class FakeUnsearchableMilvus(FakeMilvus):
+    """Every search fails at the Milvus boundary."""
+
+    def search(self, collection_name: str, **kwargs):
+        raise RuntimeError("milvus down")
+
+
 class FakeEmptyMilvus(FakeMilvus):
     """A Milvus instance that does not have the collection yet."""
 
@@ -372,6 +379,73 @@ async def test_dense_search_is_owner_scoped() -> None:
     assert call["filter"] == 'owner_user_id == "u1"'
     assert call["anns_field"] == "embedding"
     assert call["output_fields"] == OUTPUT_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_is_sparse_only_and_owner_scoped() -> None:
+    fake = FakeMilvus()
+    index = _index(fake)
+
+    hits = await index.keyword_search(query="github code", owner_user_id="u1", limit=3)
+
+    assert hits[0].tool_id == "tool-1"
+    assert hits[0].tool_name == "github_search"
+    assert hits[0].call_name == "cf__github_search"
+    assert hits[0].score == 0.7
+    call = fake.searches[0]
+    # The whole point of the sparse channel: no query vector is involved.
+    assert call["anns_field"] == "sparse"
+    assert call["data"] == ["github code"]
+    assert call["search_params"]["metric_type"] == "BM25"
+    assert call["filter"] == 'owner_user_id == "u1"'
+    assert call["limit"] == 3
+    assert call["output_fields"] == OUTPUT_FIELDS
+    assert fake.hybrid_searches == []
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_quotes_the_owner_like_the_other_channels() -> None:
+    fake = FakeMilvus()
+    index = _index(fake)
+    owner = 'u1" or owner_user_id != "u2'
+
+    await index.keyword_search(query="github", owner_user_id=owner, limit=5)
+
+    expression = fake.searches[0]["filter"]
+    assert expression == "owner_user_id == " + json.dumps(owner, ensure_ascii=False)
+    assert json.loads(expression.split(" == ", 1)[1]) == owner
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_requires_an_owner_scope() -> None:
+    fake = FakeMilvus()
+    index = _index(fake)
+
+    with pytest.raises(TypeError):
+        await index.keyword_search(query="github", limit=5)
+    with pytest.raises(ValueError, match="owner_user_id"):
+        await index.keyword_search(query="github", owner_user_id="  ", limit=5)
+
+    assert fake.searches == []
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_skips_milvus_for_a_blank_query_or_zero_limit() -> None:
+    fake = FakeMilvus()
+    index = _index(fake)
+
+    assert await index.keyword_search(query="   ", owner_user_id="u1", limit=5) == []
+    assert await index.keyword_search(query="github", owner_user_id="u1", limit=0) == []
+
+    assert fake.searches == []
+
+
+@pytest.mark.asyncio
+async def test_a_keyword_search_failure_is_reported_as_tool_index_unavailable() -> None:
+    index = _index(FakeUnsearchableMilvus())
+
+    with pytest.raises(ToolIndexUnavailable, match="keyword search"):
+        await index.keyword_search(query="github", owner_user_id="u1", limit=5)
 
 
 @pytest.mark.asyncio

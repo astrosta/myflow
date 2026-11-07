@@ -191,6 +191,19 @@ class JoinedIndex:
             raise self._error
         return self._hits[:limit]
 
+    async def keyword_search(self, *, query, owner_user_id, limit):
+        self.calls.append(
+            {
+                "channel": "keyword",
+                "query": query,
+                "owner": owner_user_id,
+                "limit": limit,
+            }
+        )
+        if self._error is not None:
+            raise self._error
+        return self._hits[:limit]
+
 
 class JoinedStore:
     """Stands in for ContextForgeToolStore.get_by_ids: owner + callable only."""
@@ -228,6 +241,10 @@ class BrokenReranker:
         raise RuntimeError("rerank down")
 
 
+#: "leave the embedder as the fake one"; None means "no embedder at all".
+_DEFAULT_EMBEDDER = object()
+
+
 def _joined_service(
     *,
     index: Any,
@@ -236,18 +253,20 @@ def _joined_service(
     top_k: int = 5,
     min_score: float | None = None,
     keyword: bool = True,
+    embedding: bool = True,
+    embedder: Any = _DEFAULT_EMBEDDER,
 ) -> ContextForgeToolSearchService:
     return ContextForgeToolSearchService(
         config=ToolSearchConfig(
             candidate_k=max(top_k, 10),
             top_k=top_k,
             min_score=min_score,
-            embedding=EMBEDDING,
+            embedding=EMBEDDING if embedding else {"enabled": False},
             keyword={"enabled": keyword},
         ),
         index=index,
         store=store,
-        embedder=JoinedEmbedder(),
+        embedder=JoinedEmbedder() if embedder is _DEFAULT_EMBEDDER else embedder,
         reranker=reranker,
     )
 
@@ -446,6 +465,111 @@ async def test_a_large_schema_keeps_the_semantic_keys() -> None:
     assert "description" not in json.dumps(card.input_schema)
     assert "examples" not in card.input_schema
     assert set(card.input_schema["required"]) <= set(card.input_schema["properties"])
+
+
+@pytest.mark.asyncio
+async def test_embedding_only_config_runs_the_dense_channel() -> None:
+    record = _record()
+    index = JoinedIndex(_hits((record, 0.9)))
+    store = JoinedStore([record])
+
+    outcome = await _joined_service(
+        index=index, store=store, keyword=False
+    ).search(task_query="github code", user_id="u1")
+
+    assert [call["channel"] for call in index.calls] == ["dense"]
+    assert outcome.channels == ("embedding",)
+    assert [hit.tool_name for hit in outcome.hits] == ["github_search"]
+    assert outcome.index_kind == "milvus"
+
+
+@pytest.mark.asyncio
+async def test_keyword_only_config_runs_the_sparse_channel_without_an_embedder() -> None:
+    record = _record()
+    index = JoinedIndex(_hits((record, 0.9)))
+    store = JoinedStore([record])
+
+    outcome = await _joined_service(
+        index=index, store=store, embedding=False, embedder=None
+    ).search(task_query="github code", domain_keywords=["github"], user_id="u1")
+
+    assert [call["channel"] for call in index.calls] == ["keyword"]
+    assert index.calls[0]["owner"] == "u1"
+    assert index.calls[0]["query"] == "github code github"
+    assert outcome.channels == ("keyword",)
+    assert [hit.tool_name for hit in outcome.hits] == ["github_search"]
+    assert store.calls == [([record.id], "u1")]
+
+
+@pytest.mark.asyncio
+async def test_an_index_without_a_sparse_channel_is_unavailable() -> None:
+    class DenseOnlyIndex:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def dense_search(self, *, vector, owner_user_id, limit):  # pragma: no cover
+            self.calls.append("dense")
+            raise AssertionError("embedding is disabled")
+
+        async def hybrid_search(self, *, vector, query, owner_user_id, limit):  # pragma: no cover
+            self.calls.append("hybrid")
+            raise AssertionError("embedding is disabled")
+
+    store = JoinedStore([_record()])
+    index = DenseOnlyIndex()
+
+    outcome = await _joined_service(
+        index=index, store=store, embedding=False, embedder=None
+    ).search(task_query="github code", user_id="u1")
+
+    assert index.calls == []
+    assert store.calls == []
+    assert outcome.hits == ()
+    assert outcome.warnings == (CATALOG_UNAVAILABLE,)
+    assert outcome.index_kind == "unavailable"
+    assert outcome.channels == ("keyword",)
+
+
+@pytest.mark.asyncio
+async def test_an_embedding_search_without_an_embedder_is_unavailable() -> None:
+    record = _record()
+    index = JoinedIndex(_hits((record, 0.9)))
+    store = JoinedStore([record])
+
+    outcome = await _joined_service(
+        index=index, store=store, embedder=None
+    ).search(task_query="github code", user_id="u1")
+
+    assert index.calls == []
+    assert store.calls == []
+    assert outcome.hits == ()
+    assert outcome.warnings == (CATALOG_UNAVAILABLE,)
+    assert outcome.channels == ("embedding", "keyword")
+
+
+@pytest.mark.asyncio
+async def test_a_config_with_no_recall_channel_is_unavailable() -> None:
+    """The config model refuses this; a hand-built service must still say so."""
+    record = _record()
+    index = JoinedIndex(_hits((record, 0.9)))
+    store = JoinedStore([record])
+    config = ToolSearchConfig(
+        candidate_k=10, top_k=5, embedding=EMBEDDING, keyword={"enabled": True}
+    )
+    config.keyword.enabled = False
+    config.embedding.enabled = False
+    service = ContextForgeToolSearchService(
+        config=config, index=index, store=store, embedder=JoinedEmbedder()
+    )
+
+    outcome = await service.search(task_query="github code", user_id="u1")
+
+    assert index.calls == []
+    assert store.calls == []
+    assert outcome.hits == ()
+    assert outcome.warnings == (CATALOG_UNAVAILABLE,)
+    assert outcome.index_kind == "unavailable"
+    assert outcome.channels == ()
 
 
 @pytest.mark.asyncio

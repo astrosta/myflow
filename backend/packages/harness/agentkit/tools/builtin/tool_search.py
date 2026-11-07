@@ -29,6 +29,7 @@ from agentkit.tools.search.service import (
     MAX_KEYWORDS,
     MAX_RESULT_CHARS,
     MAX_RETRIEVED_TOOLS,
+    UNAVAILABLE_INDEX_KIND,
     get_tool_search_runtime,
 )
 
@@ -38,7 +39,8 @@ TOOL_NAME = "tool_search"
 
 UNAVAILABLE_MESSAGE = (
     "Tool retrieval is unavailable in this deployment. Do not retry; use the "
-    "tools you already have or tell the user."
+    "tools you already have - including any tool_search cards retrieved earlier "
+    "in this run, which tool_execute still accepts - or tell the user."
 )
 BLANK_QUERY_MESSAGE = (
     "task_query must not be empty; rewrite it as one self-contained task "
@@ -78,16 +80,18 @@ async def tool_search(
         return _reply(
             tool_call_id,
             [],
-            _retrieval([], 0, False, [], "unavailable"),
+            _retrieval([], 0, False, [], UNAVAILABLE_INDEX_KIND),
             BLANK_QUERY_MESSAGE,
+            write_names=False,
         )
     service = get_tool_search_runtime()
     if service is None:
         return _reply(
             tool_call_id,
             [],
-            _retrieval([], 0, False, [CATALOG_UNAVAILABLE], "unavailable"),
+            _retrieval([], 0, False, [CATALOG_UNAVAILABLE], UNAVAILABLE_INDEX_KIND),
             UNAVAILABLE_MESSAGE,
+            write_names=False,
         )
     context = getattr(runtime, "context", None)
     user_id = resolve_runtime_user_id(
@@ -104,12 +108,10 @@ async def tool_search(
         return _reply(
             tool_call_id,
             [],
-            _retrieval([], 0, False, [CATALOG_UNAVAILABLE], "unavailable"),
+            _retrieval([], 0, False, [CATALOG_UNAVAILABLE], UNAVAILABLE_INDEX_KIND),
             UNAVAILABLE_MESSAGE,
+            write_names=False,
         )
-    # The five-card ceiling is the tool's contract, not the service's: a service
-    # that returns more is capped here so no reply can exceed it.
-    cards = [_card(hit) for hit in outcome.hits[:MAX_RETRIEVED_TOOLS]]
     retrieval = _retrieval(
         list(outcome.channels),
         outcome.candidates,
@@ -117,9 +119,45 @@ async def tool_search(
         list(outcome.warnings),
         outcome.index_kind,
     )
+    if not _retrieval_answered(outcome):
+        # A service that reports catalog_unavailable did not search, so this is
+        # an unavailable answer - not "no matching tool" - and it must not write
+        # state.
+        return _reply(
+            tool_call_id,
+            [],
+            retrieval,
+            UNAVAILABLE_MESSAGE,
+            write_names=False,
+        )
+    # The five-card ceiling is the tool's contract, not the service's: a service
+    # that returns more is capped here so no reply can exceed it.
+    cards = [_card(hit) for hit in outcome.hits[:MAX_RETRIEVED_TOOLS]]
     budget = getattr(service, "max_result_chars", MAX_RESULT_CHARS)
     payload, tools = _fit_result_budget(cards, retrieval, int(budget))
-    return _reply(tool_call_id, tools, retrieval, payload["message"])
+    return _reply(
+        tool_call_id,
+        tools,
+        retrieval,
+        payload["message"],
+        write_names=True,
+    )
+
+
+def _retrieval_answered(outcome: Any) -> bool:
+    """Did the service answer, or did it report retrieval unavailable?
+
+    An unavailable outcome is a failure report, not a search result: nothing was
+    recalled, so writing the empty list would clear the names the model has
+    already seen and `tool_execute` still accepts (design 13: "Milvus
+    unavailable -> tool_search returns catalog_unavailable; tool_execute still
+    runs on the names retrieved so far").  Only a real answer writes state, and
+    a real empty answer still clears it.
+    """
+    return (
+        str(getattr(outcome, "index_kind", "")) != UNAVAILABLE_INDEX_KIND
+        and CATALOG_UNAVAILABLE not in tuple(getattr(outcome, "warnings", ()) or ())
+    )
 
 
 def _fit_result_budget(
@@ -143,16 +181,43 @@ def _fit_result_budget(
 
 
 def _card(hit: Any) -> dict[str, Any]:
+    """One card per hit, for either hit shape.
+
+    tool_search reads the same process-global service that `search_tools` reads,
+    and the two services answer with different hits: the ContextForge service
+    returns a `ToolSearchCard` carrying the fields directly, while the legacy
+    snapshot service returns `ToolSearchHit(entry=ToolCatalogEntry, score)`.
+    Reading `hit.tool_id` unconditionally raised AttributeError *outside* the
+    search try/except, so installing a snapshot service turned every call into a
+    run failure.  Both shapes are read here.  A snapshot entry has no
+    ContextForge id and no schema, so its card reports an empty id and the
+    permissive object schema rather than inventing either; no app path installs
+    that service any more, and this keeps the tool total.
+    """
+    entry = getattr(hit, "entry", None)
+    if entry is not None:
+        name = str(getattr(entry, "name", "") or "")
+        return {
+            "tool_id": "",
+            "tool_name": name,
+            "call_name": name,
+            "description": str(getattr(entry, "description", "") or ""),
+            "tags": list(getattr(entry, "tags", ()) or ()),
+            "parameters": list(getattr(entry, "parameters", ()) or ()),
+            "input_schema": {"type": "object"},
+            "schema_truncated": False,
+            "score": float(getattr(hit, "score", 0.0) or 0.0),
+        }
     return {
-        "tool_id": hit.tool_id,
-        "tool_name": hit.tool_name,
-        "call_name": hit.call_name,
-        "description": hit.description,
-        "tags": list(hit.tags),
-        "parameters": list(hit.parameters),
-        "input_schema": hit.input_schema,
-        "schema_truncated": bool(hit.schema_truncated),
-        "score": hit.score,
+        "tool_id": getattr(hit, "tool_id", ""),
+        "tool_name": getattr(hit, "tool_name", ""),
+        "call_name": getattr(hit, "call_name", ""),
+        "description": getattr(hit, "description", ""),
+        "tags": list(getattr(hit, "tags", ()) or ()),
+        "parameters": list(getattr(hit, "parameters", ()) or ()),
+        "input_schema": getattr(hit, "input_schema", {}) or {},
+        "schema_truncated": bool(getattr(hit, "schema_truncated", False)),
+        "score": float(getattr(hit, "score", 0.0) or 0.0),
     }
 
 
@@ -161,23 +226,33 @@ def _reply(
     tools: list[dict[str, Any]],
     retrieval: dict[str, Any],
     message: str,
+    *,
+    write_names: bool,
 ) -> Command:
+    """The tool message, plus retrieved_tool_names only when a search answered.
+
+    The key is omitted - not written as [] - whenever retrieval did not happen
+    (blank query, no service, a service exception, an unavailable outcome).
+    Omitting it leaves the reducer untouched, so the names of an earlier
+    successful search survive a retrieval failure and tool_execute keeps
+    accepting them.  After a real answer the list is always written, including
+    the empty one: an empty result has to clear the previous set, or
+    tool_execute would keep accepting stale call names.
+    """
     payload = _payload(tools, retrieval, message)
-    # Always written, including the empty list: an empty search has to clear the
-    # previous result, or tool_execute would keep accepting stale call names.
-    names = [tool["call_name"] for tool in tools if tool.get("call_name")]
-    return Command(
-        update={
-            "messages": [
-                ToolMessage(
-                    content=_serialize(payload),
-                    tool_call_id=tool_call_id or "missing_tool_call_id",
-                    name=TOOL_NAME,
-                )
-            ],
-            "retrieved_tool_names": names[:MAX_RETRIEVED_TOOLS],
-        }
-    )
+    update: dict[str, Any] = {
+        "messages": [
+            ToolMessage(
+                content=_serialize(payload),
+                tool_call_id=tool_call_id or "missing_tool_call_id",
+                name=TOOL_NAME,
+            )
+        ]
+    }
+    if write_names:
+        names = [tool["call_name"] for tool in tools if tool.get("call_name")]
+        update["retrieved_tool_names"] = names[:MAX_RETRIEVED_TOOLS]
+    return Command(update=update)
 
 
 def _payload(

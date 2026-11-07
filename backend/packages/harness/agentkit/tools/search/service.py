@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 VECTOR_UNAVAILABLE = "vector_unavailable"
 RERANK_UNAVAILABLE = "rerank_unavailable"
 CATALOG_UNAVAILABLE = "catalog_unavailable"
+#: index_kind of an outcome that reports a failure instead of a result.  Callers
+#: use it to tell "nothing matched" (a real, empty answer) from "retrieval did not
+#: run" - the two must never be confused when writing retrieval state.
+UNAVAILABLE_INDEX_KIND = "unavailable"
 
 
 class Embedder(Protocol):
@@ -341,6 +345,12 @@ class ContextForgeToolSearchService:
     database is unavailable the result is empty with a catalog_unavailable
     warning: v1 has no full-table scan fallback, because scanning the catalog to
     answer one query is exactly the leak the owner filter exists to prevent.
+
+    The recall channel follows the configuration, not a hardcoded pair:
+    embedding + keyword fuse through Milvus hybrid search, embedding alone runs
+    the dense channel, and keyword alone runs BM25 over the stored sparse vector
+    (`keyword_search`), which needs no query embedding.  The reported
+    `channels` are the ones the search actually used.
     """
 
     def __init__(
@@ -389,32 +399,52 @@ class ContextForgeToolSearchService:
             # The owner filter is mandatory (index and store both refuse an
             # unscoped read), so an unresolved user is an empty answer, not an
             # unscoped one.
-            return ToolSearchOutcome(channels=channels, index_kind="unavailable")
-        if self._index is None or self._embedder is None or self._store is None:
+            return ToolSearchOutcome(
+                channels=channels, index_kind=UNAVAILABLE_INDEX_KIND
+            )
+        if not channels:
+            # The config validator refuses a search block with both recall
+            # channels off, so this only guards a service built by hand: saying
+            # "unavailable" beats inventing a channel it cannot run.
+            return self._unavailable(channels)
+        embedding = bool(self._config.embedding.enabled)
+        keyword = bool(self._config.keyword.enabled)
+        if self._index is None or self._store is None:
+            return self._unavailable(channels)
+        # The embedder is only a prerequisite of the dense half: a keyword-only
+        # deployment must keep answering when no embedding service is wired.
+        if embedding and self._embedder is None:
             return self._unavailable(channels)
         warnings: list[str] = []
-        try:
-            vector = await self._embedder.embed_query(query)
-        except Exception as exc:  # noqa: BLE001 - a tool result, not a run failure
-            logger.warning("Tool query embedding failed: %s", type(exc).__name__)
-            return self._unavailable(channels)
+        vector: list[float] | None = None
+        if embedding:
+            try:
+                vector = await self._embedder.embed_query(query)
+            except Exception as exc:  # noqa: BLE001 - a tool result, not a run failure
+                logger.warning("Tool query embedding failed: %s", type(exc).__name__)
+                return self._unavailable(channels)
         text = _keyword_text(query, domain_keywords)
         try:
-            if self._config.keyword.enabled:
+            if embedding and keyword:
                 hits = await self._index.hybrid_search(
                     vector=vector,
                     query=text,
                     owner_user_id=owner,
                     limit=self._config.candidate_k,
                 )
-                channels = ("embedding", "keyword")
-            else:
+            elif embedding:
                 hits = await self._index.dense_search(
                     vector=vector,
                     owner_user_id=owner,
                     limit=self._config.candidate_k,
                 )
-                channels = ("embedding",)
+            else:
+                # Sparse-only: BM25 over the stored vector, no query embedding.
+                hits = await self._index.keyword_search(
+                    query=text,
+                    owner_user_id=owner,
+                    limit=self._config.candidate_k,
+                )
         except Exception as exc:  # noqa: BLE001 - no full-scan fallback (design 8)
             logger.warning("Tool vector search failed: %s", type(exc).__name__)
             return self._unavailable(channels)
@@ -513,15 +543,20 @@ class ContextForgeToolSearchService:
         return ToolSearchOutcome(
             channels=tuple(channels),
             warnings=(CATALOG_UNAVAILABLE,),
-            index_kind="unavailable",
+            index_kind=UNAVAILABLE_INDEX_KIND,
         )
 
     def _channels(self) -> tuple[str, ...]:
+        """The recall channels this config enables, in payload order.
+
+        Read from both flags, so the channels an outcome reports are the ones
+        the search could actually run; an empty tuple means there are none.
+        """
         channels: list[str] = []
-        if self._config.keyword.enabled:
-            channels.append("keyword")
         if self._config.embedding.enabled:
             channels.append("embedding")
+        if self._config.keyword.enabled:
+            channels.append("keyword")
         return tuple(channels)
 
 
@@ -648,6 +683,7 @@ __all__ = [
     "ToolSearchRuntime",
     "ToolSearchService",
     "ToolStore",
+    "UNAVAILABLE_INDEX_KIND",
     "VECTOR_UNAVAILABLE",
     "get_tool_search_runtime",
     "reset_tool_search_runtime",
