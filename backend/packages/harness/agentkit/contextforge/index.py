@@ -1,7 +1,17 @@
-"""Milvus retrieval index for ContextForge tool documents.
+"""Milvus retrieval index for the ContextForge tool catalog.
 
-The collection is a derived view: Milvus narrows candidates, while the current
-MCP snapshot is the authority used by the search service to confirm hits.
+``contextforge_tools`` is the authoritative catalog; this collection is a
+derived view rebuilt from ``ContextForgeToolRecord`` rows and keyed by
+ContextForge's own tool id.  Two rules shape this module:
+
+* the index stores only what hybrid retrieval needs.  ``content`` is the BM25
+  and embedding text, and the verbatim ``input_schema`` stays in the database,
+  so a search hit carries a ``tool_id`` back to the store instead of a schema
+  snapshot that may already be stale;
+* every search is owner-scoped.  ``MilvusClient.hybrid_search`` has no
+  top-level ``filter``, so the expression rides on both AnnSearchRequests:
+  filtering only the dense channel would let RRFRanker fuse another user's tools
+  into the result.
 """
 
 from __future__ import annotations
@@ -14,30 +24,46 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agentkit.config.contextforge_config import (
-    TOOLS_COLLECTION,
-    ToolKeywordConfig,
-    ToolVectorStoreConfig,
-)
-from agentkit.contextforge.models import ContextForgeTool
+from agentkit.config.contextforge_config import ToolKeywordConfig, ToolVectorStoreConfig
+from agentkit.contextforge.store import ContextForgeToolRecord, content_hash_for
 
 logger = logging.getLogger(__name__)
 
+#: Fixed by the design: the derived tool index never shares the knowledge or
+#: skill collections.  There is no historical data to migrate, so a schema
+#: change is a drop and rebuild.
+COLLECTION_NAME = "myflow_contextforge_tools"
+
+#: What a hit needs to be joined back to ``contextforge_tools`` and displayed.
+#: The full ``input_schema`` is deliberately absent: it lives in the database.
 OUTPUT_FIELDS = [
-    "pk",
+    "tool_id",
     "tool_name",
-    "display_name",
+    "call_name",
     "description",
-    "content",
     "tags",
     "parameters",
-    "server",
+    "content",
     "content_hash",
-    "updated_at",
 ]
+_OWNER_FIELD = "owner_user_id"
 _VECTOR_FIELD = "embedding"
 _SPARSE_FIELD = "sparse"
+#: Fields whose absence means the collection predates this schema.
+_SCALAR_FIELDS = (
+    "tool_id",
+    "owner_user_id",
+    "tool_name",
+    "call_name",
+    "description",
+    "tags",
+    "parameters",
+    "content",
+    "content_hash",
+)
 _QUERY_LIMIT = 16384
+_WRITE_BATCH = 64
+_DELETE_BATCH = 500
 
 
 class ToolIndexUnavailable(RuntimeError):
@@ -50,13 +76,21 @@ class Embedder(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ToolVectorHit:
+    """One recalled tool row.
+
+    ``tool_name``/``score`` keep their historical position so name-based
+    ranking code stays valid; ``tool_id`` and ``call_name`` are the join keys
+    the database row behind the hit is confirmed with.
+    """
+
     tool_name: str
     score: float
-    display_name: str = ""
+    tool_id: str = ""
+    call_name: str = ""
     description: str = ""
-    content: str = ""
     tags: tuple[str, ...] = ()
     parameters: tuple[str, ...] = ()
+    content: str = ""
     content_hash: str = ""
 
 
@@ -68,21 +102,6 @@ class ToolIndexSyncStats:
     deleted: int = 0
     duration_ms: int = 0
     error: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ToolCatalogDocument:
-    """Projection of ToolCatalogEntry used by the index without a circular import."""
-
-    name: str
-    display_name: str
-    description: str
-    tags: tuple[str, ...]
-    parameters: tuple[str, ...]
-    server: str
-    content: str
-    content_hash: str
-    updated_at: int
 
 
 class ToolVectorIndex:
@@ -101,7 +120,9 @@ class ToolVectorIndex:
             raise ValueError("rrf_k must be positive")
         self._config = config
         self._dimensions = int(dimensions)
-        self._collection = TOOLS_COLLECTION
+        # Pinned here rather than read from config: the tool index is this one
+        # collection, whatever a stale config block still says.
+        self._collection = COLLECTION_NAME
         self._client = client
         self._keyword = keyword or ToolKeywordConfig()
         self._rrf_k = int(rrf_k)
@@ -128,97 +149,135 @@ class ToolVectorIndex:
             self._dimensions = int(dimensions)
         await asyncio.to_thread(self._ensure_collection_sync)
 
-    async def query_hashes(self, names: Sequence[str]) -> dict[str, str]:
-        values = [name for name in dict.fromkeys(names) if name]
-        if not values:
-            return {}
+    async def query_hashes(self, tool_ids: Sequence[str]) -> dict[str, str]:
+        """Stored content_hash per tool id; missing tools are simply absent."""
+        values = [str(tool_id) for tool_id in dict.fromkeys(tool_ids) if _text(tool_id)]
         existing: dict[str, str] = {}
-        for start in range(0, len(values), 500):
-            batch = values[start : start + 500]
+        for start in range(0, len(values), _DELETE_BATCH):
+            batch = values[start : start + _DELETE_BATCH]
             rows = await asyncio.to_thread(self._query_hashes_sync, batch)
             for row in rows:
-                name = str(row.get("tool_name") or "")
-                if name:
-                    existing[name] = str(row.get("content_hash") or "")
+                tool_id = _text(row.get("tool_id"))
+                if tool_id:
+                    existing[tool_id] = _text(row.get("content_hash"))
         return existing
 
     async def upsert(
         self,
-        documents: Sequence[ToolCatalogDocument],
+        records: Sequence[ContextForgeToolRecord],
         vectors: Sequence[Sequence[float]],
     ) -> int:
-        if len(documents) != len(vectors):
-            raise ValueError("documents and vectors must have the same length")
-        if not documents:
+        if len(records) != len(vectors):
+            raise ValueError("records and vectors must have the same length")
+        if not records:
             return 0
-        await asyncio.to_thread(self._upsert_sync, list(documents), [list(v) for v in vectors])
-        return len(documents)
+        await asyncio.to_thread(
+            self._upsert_sync, list(records), [list(vector) for vector in vectors]
+        )
+        return len(records)
 
-    async def delete_not_in(self, names: Sequence[str]) -> int:
-        keep = set(names)
-        rows = await asyncio.to_thread(self._all_keys_sync)
-        stale = [str(row.get("pk") or "") for row in rows if str(row.get("pk") or "") not in keep]
-        stale = [name for name in stale if name]
-        if not stale:
-            return 0
-        for start in range(0, len(stale), 500):
-            await asyncio.to_thread(self._delete_names_sync, stale[start : start + 500])
-        return len(stale)
+    async def delete_by_ids(self, tool_ids: Sequence[str]) -> int:
+        """Delete the given tool ids; the count is what the caller asked to drop."""
+        values = [str(tool_id) for tool_id in dict.fromkeys(tool_ids) if _text(tool_id)]
+        deleted = 0
+        for start in range(0, len(values), _DELETE_BATCH):
+            batch = values[start : start + _DELETE_BATCH]
+            await asyncio.to_thread(self._delete_ids_sync, batch)
+            deleted += len(batch)
+        return deleted
+
+    async def delete_not_in(self, tool_ids: Sequence[str]) -> int:
+        """Delete every stored row whose tool id is absent from ``tool_ids``."""
+        keep = {str(tool_id) for tool_id in tool_ids if _text(tool_id)}
+        stored = await asyncio.to_thread(self._all_tool_ids_sync)
+        stale = [tool_id for tool_id in stored if tool_id not in keep]
+        return await self.delete_by_ids(stale) if stale else 0
 
     async def hybrid_search(
         self,
         *,
         vector: Sequence[float],
         query: str,
+        owner_user_id: str | None,
         limit: int,
     ) -> list[ToolVectorHit]:
+        expression = _owner_expression(owner_user_id)
         values = list(vector)
         if len(values) != self._dimensions:
             raise ToolIndexUnavailable(
                 f"query vector dimension mismatch: expected {self._dimensions}"
             )
-        if not query.strip() or limit <= 0:
+        text = (query or "").strip()
+        if not text or int(limit) <= 0:
             return []
-        rows = await asyncio.to_thread(self._hybrid_search_sync, values, query, int(limit))
+        rows = await asyncio.to_thread(
+            self._hybrid_search_sync, values, text, expression, int(limit)
+        )
         return self._to_hits(rows)
 
     async def dense_search(
         self,
         *,
         vector: Sequence[float],
+        owner_user_id: str | None,
         limit: int,
     ) -> list[ToolVectorHit]:
+        expression = _owner_expression(owner_user_id)
         values = list(vector)
         if len(values) != self._dimensions:
             raise ToolIndexUnavailable(
                 f"query vector dimension mismatch: expected {self._dimensions}"
             )
-        rows = await asyncio.to_thread(self._dense_search_sync, values, int(limit))
+        if int(limit) <= 0:
+            return []
+        rows = await asyncio.to_thread(
+            self._dense_search_sync, values, expression, int(limit)
+        )
         return self._to_hits(rows)
 
     async def sync(
         self,
-        documents: Sequence[ToolCatalogDocument],
+        records: Sequence[ContextForgeToolRecord],
         *,
         embedder: Embedder,
         full: bool = False,
     ) -> ToolIndexSyncStats:
+        """Bring the collection in line with ``records``, embedding only what changed.
+
+        Deletion follows the tool id in both modes: a ``full`` sync drops every
+        stored row the snapshot no longer indexes, and an incremental one drops
+        the rows of the records it was handed that stopped being indexable (a
+        tool that stopped being callable, lost its owner, was disabled or became
+        unreachable).  Tools the sync service decides to retire are removed
+        through ``delete_by_ids``.
+        """
         started = time.monotonic()
         try:
             await self.ensure_collection(self._dimensions)
-            existing = await self.query_hashes([document.name for document in documents])
+            indexable = [record for record in records if _is_indexable(record)]
+            keep = {str(record.id) for record in indexable}
+            stored = await self.query_hashes(
+                [str(record.id) for record in records if _text(getattr(record, "id", ""))]
+            )
             changed = [
-                document
-                for document in documents
-                if existing.get(document.name) != document.content_hash
+                record
+                for record in indexable
+                if stored.get(str(record.id)) != _content_hash(record)
             ]
             upserted = 0
             if changed:
-                vectors = await embedder.embed_documents([document.content for document in changed])
+                vectors = await embedder.embed_documents(
+                    [str(record.content or "") for record in changed]
+                )
                 upserted = await self.upsert(changed, vectors)
-            deleted = await self.delete_not_in([document.name for document in documents]) if full else 0
+            if full:
+                deleted = await self.delete_not_in(keep)
+            else:
+                deleted = await self.delete_by_ids(
+                    [tool_id for tool_id in stored if tool_id not in keep]
+                )
             return ToolIndexSyncStats(
-                scanned=len(documents),
+                scanned=len(records),
                 changed=len(changed),
                 upserted=upserted,
                 deleted=deleted,
@@ -227,7 +286,7 @@ class ToolVectorIndex:
         except Exception as exc:  # noqa: BLE001 - surfaced as status, never a crash
             logger.warning("Tool index sync failed: %s", type(exc).__name__)
             return ToolIndexSyncStats(
-                scanned=len(documents),
+                scanned=len(records),
                 duration_ms=int((time.monotonic() - started) * 1000),
                 error=type(exc).__name__,
             )
@@ -272,9 +331,12 @@ class ToolVectorIndex:
             return
         fields = description.get("fields", []) if isinstance(description, dict) else []
         names = {field.get("name") for field in fields if isinstance(field, dict)}
-        if _SPARSE_FIELD not in names:
+        missing = [name for name in (*_SCALAR_FIELDS, _SPARSE_FIELD) if name not in names]
+        if missing:
             raise ToolIndexUnavailable(
-                "Milvus tool collection has no BM25 sparse field; recreate it"
+                "Milvus tool collection is missing "
+                + ", ".join(missing)
+                + "; drop and recreate it"
             )
         for field in fields:
             if not isinstance(field, dict) or field.get("name") != _VECTOR_FIELD:
@@ -293,10 +355,14 @@ class ToolVectorIndex:
             raise ToolIndexUnavailable("pymilvus is not installed") from exc
         try:
             schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
-            schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=255)
+            schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=64)
+            schema.add_field("tool_id", DataType.VARCHAR, max_length=64)
+            schema.add_field(_OWNER_FIELD, DataType.VARCHAR, max_length=64)
             schema.add_field("tool_name", DataType.VARCHAR, max_length=255)
-            schema.add_field("display_name", DataType.VARCHAR, max_length=512)
+            schema.add_field("call_name", DataType.VARCHAR, max_length=255)
             schema.add_field("description", DataType.VARCHAR, max_length=65535)
+            schema.add_field("tags", DataType.VARCHAR, max_length=2048)
+            schema.add_field("parameters", DataType.VARCHAR, max_length=2048)
             schema.add_field(
                 "content",
                 DataType.VARCHAR,
@@ -304,11 +370,7 @@ class ToolVectorIndex:
                 enable_analyzer=True,
                 analyzer_params={"type": self._keyword.analyzer},
             )
-            schema.add_field("tags", DataType.VARCHAR, max_length=2048)
-            schema.add_field("parameters", DataType.VARCHAR, max_length=2048)
-            schema.add_field("server", DataType.VARCHAR, max_length=128)
             schema.add_field("content_hash", DataType.VARCHAR, max_length=64)
-            schema.add_field("updated_at", DataType.INT64)
             schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self._dimensions)
             schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)
             schema.add_function(
@@ -349,18 +411,18 @@ class ToolVectorIndex:
                 f"Milvus tool collection creation failed: {type(exc).__name__}"
             ) from exc
 
-    def _query_hashes_sync(self, names: list[str]) -> list[dict[str, Any]]:
+    def _query_hashes_sync(self, tool_ids: list[str]) -> list[dict[str, Any]]:
         client = self._client_instance()
         if not client.has_collection(self._collection):
             return []
-        expression = "tool_name in " + json.dumps(names)
+        expression = "tool_id in " + json.dumps(tool_ids)
         try:
             return list(
                 client.query(
                     collection_name=self._collection,
                     filter=expression,
-                    output_fields=["tool_name", "content_hash"],
-                    limit=len(names),
+                    output_fields=["tool_id", "content_hash"],
+                    limit=len(tool_ids),
                     consistency_level=self._config.consistency_level,
                 )
             )
@@ -369,46 +431,44 @@ class ToolVectorIndex:
                 f"Milvus tool hash query failed: {type(exc).__name__}"
             ) from exc
 
-    def _upsert_sync(self, documents: list[ToolCatalogDocument], vectors: list[list[float]]) -> None:
+    def _upsert_sync(
+        self, records: list[ContextForgeToolRecord], vectors: list[list[float]]
+    ) -> None:
         client = self._client_instance()
         self._ensure_collection_sync()
-        records = [
-            {
-                "pk": document.name,
-                "tool_name": document.name,
-                "display_name": document.display_name[:512],
-                "description": document.description[:65535],
-                "content": document.content[:65535],
-                "tags": json.dumps(list(document.tags), ensure_ascii=False)[:2048],
-                "parameters": json.dumps(list(document.parameters), ensure_ascii=False)[:2048],
-                "server": document.server[:128],
-                "content_hash": document.content_hash,
-                "updated_at": document.updated_at,
-                "embedding": vector,
-            }
-            for document, vector in zip(documents, vectors, strict=True)
+        rows = [
+            _row(record, vector)
+            for record, vector in zip(records, vectors, strict=True)
         ]
         try:
-            for start in range(0, len(records), 64):
-                client.upsert(collection_name=self._collection, data=records[start : start + 64])
+            for start in range(0, len(rows), _WRITE_BATCH):
+                client.upsert(
+                    collection_name=self._collection, data=rows[start : start + _WRITE_BATCH]
+                )
         except Exception as exc:  # noqa: BLE001
             raise ToolIndexUnavailable(
                 f"Milvus tool upsert failed: {type(exc).__name__}"
             ) from exc
 
-    def _all_keys_sync(self) -> list[dict[str, Any]]:
+    def _all_tool_ids_sync(self) -> list[str]:
         client = self._client_instance()
         if not client.has_collection(self._collection):
             return []
         make_iterator = getattr(client, "query_iterator", None)
         if not callable(make_iterator):
-            return list(client.query(collection_name=self._collection, filter="", output_fields=["pk"], limit=_QUERY_LIMIT))
+            rows = client.query(
+                collection_name=self._collection,
+                filter="",
+                output_fields=["tool_id"],
+                limit=_QUERY_LIMIT,
+            )
+            return [tool_id for tool_id in (_text(row.get("tool_id")) for row in rows) if tool_id]
         iterator = make_iterator(
             collection_name=self._collection,
             batch_size=1000,
             limit=-1,
             filter="",
-            output_fields=["pk"],
+            output_fields=["tool_id"],
         )
         rows: list[dict[str, Any]] = []
         try:
@@ -421,16 +481,23 @@ class ToolVectorIndex:
             close = getattr(iterator, "close", None)
             if callable(close):
                 close()
-        return rows
+        return [tool_id for tool_id in (_text(row.get("tool_id")) for row in rows) if tool_id]
 
-    def _delete_names_sync(self, names: list[str]) -> None:
+    def _delete_ids_sync(self, tool_ids: list[str]) -> None:
         client = self._client_instance()
         if not client.has_collection(self._collection):
             return
-        expression = "pk in " + json.dumps(names)
-        client.delete(collection_name=self._collection, filter=expression)
+        expression = "tool_id in " + json.dumps(tool_ids)
+        try:
+            client.delete(collection_name=self._collection, filter=expression)
+        except Exception as exc:  # noqa: BLE001
+            raise ToolIndexUnavailable(
+                f"Milvus tool delete failed: {type(exc).__name__}"
+            ) from exc
 
-    def _hybrid_search_sync(self, vector: list[float], query: str, limit: int) -> list[dict[str, Any]]:
+    def _hybrid_search_sync(
+        self, vector: list[float], query: str, expression: str, limit: int
+    ) -> list[dict[str, Any]]:
         client = self._client_instance()
         self._ensure_collection_sync()
         try:
@@ -443,12 +510,14 @@ class ToolVectorIndex:
                 anns_field=_VECTOR_FIELD,
                 param={"metric_type": self._config.metric_type, "params": {}},
                 limit=limit,
+                expr=expression,
             ),
             AnnSearchRequest(
                 data=[query],
                 anns_field=_SPARSE_FIELD,
                 param={"metric_type": "BM25", "params": {}},
                 limit=limit,
+                expr=expression,
             ),
         ]
         try:
@@ -467,7 +536,9 @@ class ToolVectorIndex:
                 f"Milvus tool hybrid search failed: {type(exc).__name__}"
             ) from exc
 
-    def _dense_search_sync(self, vector: list[float], limit: int) -> list[dict[str, Any]]:
+    def _dense_search_sync(
+        self, vector: list[float], expression: str, limit: int
+    ) -> list[dict[str, Any]]:
         client = self._client_instance()
         self._ensure_collection_sync()
         try:
@@ -478,6 +549,7 @@ class ToolVectorIndex:
                     anns_field=_VECTOR_FIELD,
                     search_params={"metric_type": self._config.metric_type, "params": {}},
                     limit=limit,
+                    filter=expression,
                     output_fields=OUTPUT_FIELDS,
                     consistency_level=self._config.consistency_level,
                 )
@@ -493,22 +565,114 @@ class ToolVectorIndex:
             entity = row.get("entity") if isinstance(row, dict) else None
             if not isinstance(entity, dict):
                 entity = row if isinstance(row, dict) else {}
-            name = str(entity.get("tool_name") or "")
-            if not name:
+            tool_id = _text(entity.get("tool_id"))
+            tool_name = _text(entity.get("tool_name"))
+            if not tool_id and not tool_name:
                 continue
             hits.append(
                 ToolVectorHit(
-                    tool_name=name,
+                    tool_name=tool_name,
                     score=float(row.get("distance", row.get("score", 0.0)) or 0.0),
-                    display_name=str(entity.get("display_name") or ""),
+                    tool_id=tool_id,
+                    call_name=_text(entity.get("call_name")),
                     description=str(entity.get("description") or ""),
+                    tags=_json_tuple(entity.get("tags")),
+                    parameters=_json_tuple(entity.get("parameters")),
                     content=str(entity.get("content") or ""),
-                    tags=tuple(json.loads(str(entity.get("tags") or "[]"))),
-                    parameters=tuple(json.loads(str(entity.get("parameters") or "[]"))),
-                    content_hash=str(entity.get("content_hash") or ""),
+                    content_hash=_text(entity.get("content_hash")),
                 )
             )
         return hits
+
+
+def _row(record: ContextForgeToolRecord, vector: Sequence[float]) -> dict[str, Any]:
+    """The stored shape of one record: retrieval fields only, never the schema."""
+    tool_id = _text(record.id)
+    return {
+        "pk": tool_id,
+        "tool_id": tool_id,
+        "owner_user_id": _text(record.owner_user_id),
+        "tool_name": _text(record.name)[:255],
+        "call_name": _text(record.call_name)[:255],
+        "description": str(record.description or "")[:65535],
+        "tags": _json_list(record.tags)[:2048],
+        "parameters": _json_list(record.parameters)[:2048],
+        "content": str(record.content or "")[:65535],
+        "content_hash": _content_hash(record),
+        "embedding": list(vector),
+    }
+
+
+def _owner_expression(owner_user_id: str | None) -> str:
+    """The owner filter every search carries; an unscoped read is a bug.
+
+    The owner is quoted as a JSON string literal, so a user id can never append
+    a second predicate to the expression.
+    """
+    owner = _text(owner_user_id)
+    if not owner:
+        raise ValueError(
+            "owner_user_id is required: tool retrieval is always owner-scoped"
+        )
+    return f"{_OWNER_FIELD} == {json.dumps(owner, ensure_ascii=False)}"
+
+
+def _is_indexable(record: Any) -> bool:
+    """Only owner-scoped, callable tools are retrievable.
+
+    ``callable`` is the store's derived runtime gate, so it already folds in
+    enabled/reachable/owner/name rules; the explicit checks here keep the index
+    safe when it is handed a record that never went through the store.  A row
+    that stops qualifying is removed through ``delete_by_ids`` (or a full sync),
+    and the database join behind tool_search discards anything Milvus still
+    remembers.
+    """
+    return bool(
+        _text(getattr(record, "id", ""))
+        and _text(getattr(record, "call_name", ""))
+        and _text(getattr(record, "owner_user_id", ""))
+        and getattr(record, "callable", False)
+        and getattr(record, "enabled", True)
+        and getattr(record, "reachable", True)
+    )
+
+
+def _content_hash(record: Any) -> str:
+    """The diff key: sha256(content + owner + call_name), recomputed if absent.
+
+    The owner and call_name are inside the hash, so moving a tool between users
+    re-embeds it even when its text is unchanged.
+    """
+    stored = _text(getattr(record, "content_hash", ""))
+    if stored:
+        return stored
+    return content_hash_for(
+        str(getattr(record, "content", "") or ""),
+        _text(getattr(record, "owner_user_id", "")) or None,
+        str(getattr(record, "call_name", "") or ""),
+    )
+
+
+def _json_list(values: Sequence[str] | None) -> str:
+    return json.dumps(list(values or ()), ensure_ascii=False)
+
+
+def _json_tuple(value: Any) -> tuple[str, ...]:
+    if not value:
+        return ()
+    try:
+        parsed = json.loads(str(value))
+    except ValueError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item) for item in parsed)
+
+
+def _text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def _first_rows(result: Any) -> list[dict[str, Any]]:
@@ -521,8 +685,9 @@ def _first_rows(result: Any) -> list[dict[str, Any]]:
 
 
 __all__ = [
+    "COLLECTION_NAME",
     "Embedder",
-    "ToolCatalogDocument",
+    "OUTPUT_FIELDS",
     "ToolIndexSyncStats",
     "ToolIndexUnavailable",
     "ToolVectorHit",
