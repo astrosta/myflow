@@ -1,9 +1,11 @@
 # ContextForge 工具管理与工具检索设计
 
-> 状态：已确认（2026-11-06，rev.6）
+> 状态：已确认（2026-11-06，rev.6）；2026-11-07 先后修订为 rev.7、rev.8。
+> **最新设计：rev.9 改回 ContextForge，保留 tool_search/tool_execute，见
+> [rev.9 设计](2026-11-07-contextforge-tool-search-execute-design.md)。**
 > 部署前提已确认：ContextForge 会设置 `MCPGATEWAY_ADMIN_API_ENABLED=true`，`admin_token`
 > 具备 `admin.events`（或 `*`）权限。
-> 本版按反馈调整：工具从 ContextForge MCP 端点加载后写入 **Milvus 向量库**（复用现有实例），
+> rev.6 摘要（已被下方 rev.7 取代）：工具从 ContextForge MCP 端点加载后写入 **Milvus 向量库**，
 > 检索走向量库；工具更新有三条路径：MyFlow 前端写操作异步刷新、订阅 ContextForge
 > `GET /admin/events`、工具调用错误后刷新 + `index.sync()` + 重试一次；前端导航增加“工具管理”。
 > 已核对 ContextForge 1.1.0 源码：`/admin/events` 是管理 API（不是 Admin UI），默认未挂载，
@@ -15,6 +17,19 @@
 > 实现更新（后续）：`extensions_config.json` 的普通 `mcpServers` 工具来源已删除，
 > ContextForge 成为 MCP 工具的唯一来源；`/api/mcp/config`、`/api/mcp/cache/reset`
 > 和 `agentkit.mcp` 已移除。下文 §1.1 / §1.2 保留为设计时的现状记录。
+>
+> **rev.7 重要变更（2026-11-07）：**
+> 1. 新增 MyFlow 数据库工具目录 `contextforge_tools`，保存工具元数据与完整参数 JSON Schema；
+> 2. Milvus 只保留 `tool_id`、`owner_user_id`、BM25 必需的最小 `search_text`、同步哈希和向量，
+>    不再保存描述、标签、参数名等完整检索文档；
+> 3. ContextForge → 数据库 → Milvus 由同步任务单向写入；数据库是派生只读视图，
+>    **不是第二份可写事实源**；管理写操作仍只写 ContextForge；
+> 4. agent 不再预绑定 ContextForge 工具；`search_tools` 检索后把工具 schema 注入模型上下文，
+>    模型通过通用 `call_contextforge_tool` 调用 ContextForge MCP；
+> 5. 不需要动态 ToolNode 注入；现有数据尚未部署，可直接重建表与 collection。
+>
+> §2–§8、§10.1、§12–§15 中与本修订冲突的描述，以 [rev.9 设计](2026-11-07-contextforge-tool-search-execute-design.md) 为准；
+> §1、§6、§9、§11 中未被 rev.9 明确修改的部分仍然有效。
 
 ## 1. 现状
 
@@ -54,7 +69,7 @@ MCP 服务器管理仍然不是工具管理；ContextForge 的工具 CRUD 走独
 ContextForge API 客户端。管理员身份可从 `/api/v1/auth/me` 的 `system_role` 得到；
 `auth.enabled=false` 时后端固定 `admin` 角色，但前端 session probe 是 `disabled` 状态。
 
-## 2. 目标与非目标
+## 2. 目标与非目标（rev.6；rev.7 见新设计文档）
 
 ### 2.1 目标
 
@@ -99,7 +114,7 @@ ContextForge API 客户端。管理员身份可从 `/api/v1/auth/me` 的 `system
 - [ ] 侧栏出现“工具管理”；非管理员看不到入口或看到明确的 403 页面。
 - [ ] 现有技能检索、MCP 加载、沙箱与鉴权测试不回归。
 
-## 3. 关键决策与假设
+## 3. 关键决策与假设（rev.6；rev.7 见新设计文档）
 
 | 决策 | 选择 | 理由 |
 |---|---|---|
@@ -212,7 +227,7 @@ MyFlow 前端不直接连 ContextForge：浏览器 EventSource 不能带 Authori
 仍然有效。
 
 
-## 4. 总体架构
+## 4. 总体架构（rev.6 旧架构；已被 2026-11-07 修订取代）
 
 ```text
 ┌──────────────────────────────┐
@@ -274,7 +289,7 @@ MyFlow 前端不直接连 ContextForge：浏览器 EventSource 不能带 Authori
 **MyFlow 没有工具元数据表。** 不新增 SQLAlchemy 模型、不写 Alembic migration。工具的管理事实
 在 ContextForge；检索事实在 Milvus；进程内只有可重建的 MCP 工具缓存与目录快照。
 
-## 5. 配置
+## 5. 配置（rev.6 旧配置；rev.7 见新设计文档）
 
 ```yaml
 contextforge:
@@ -555,7 +570,7 @@ GET    /api/tools/search?q=&limit=5
 `sync.admin_refresh_async=false`，则请求等待本次 `index.sync()`，失败时在响应里带
 `index_status: degraded`。
 
-## 7. ContextForge 运行时与三种同步触发
+## 7. ContextForge 运行时与三种同步触发（rev.6 旧架构；已被 2026-11-07 修订取代）
 
 ### 7.1 进程级运行时
 
@@ -859,7 +874,7 @@ awrap_tool_call(request, handler):
 | embedding 不可用 | 无法更新向量索引；本地 BM25 仍可检索；`vector_unavailable` |
 | 单个工具名非法 | 丢弃该工具并 warning，不影响其它工具 |
 
-## 8. 向量索引与工具检索
+## 8. 向量索引与工具检索（rev.6 旧架构；已被 2026-11-07 修订取代）
 
 ### 8.1 Milvus collection（复用现有实例）
 
@@ -1220,7 +1235,7 @@ TanStack Query key：
   `vector_unavailable` / `rerank_unavailable` / `catalog_unavailable`。
 - 不新增 Prometheus 指标，沿用现有 observability；Langfuse trace 只记工具名/结果数量，不记凭据。
 
-## 12. 测试策略
+## 12. 测试策略（rev.6；rev.7 见新设计文档）
 
 ### 12.1 后端
 
@@ -1290,7 +1305,7 @@ MILVUS_TEST_URI=http://127.0.0.1:19530 \
 uv run pytest tests/test_contextforge_integration.py -q
 ```
 
-## 13. 实施切片
+## 13. 实施切片（rev.6；rev.7 见新设计文档）
 
 | 切片 | 内容 | 依赖 |
 |---|---|---|
@@ -1304,7 +1319,7 @@ uv run pytest tests/test_contextforge_integration.py -q
 
 B 与 C 可并行；D 依赖两者；E/F 依赖 D；G 最后接。
 
-## 14. 文件清单（预计）
+## 14. 文件清单（预计；rev.7 见新设计文档）
 
 新增：
 
@@ -1365,7 +1380,7 @@ frontend/src/app/workspace/sidebar-container.tsx
 frontend/src/components/ui/icons.tsx    # WrenchIcon
 ```
 
-## 15. 风险与待确认
+## 15. 风险与待确认（rev.6；rev.7 见新设计文档）
 
 ### 15.1 风险
 
