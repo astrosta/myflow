@@ -118,7 +118,7 @@ class ToolVectorStoreConfig(MilvusConfig):
 
 
 class ToolSearchConfig(BaseModel):
-    """search_tools retrieval policy."""
+    """tool_search retrieval and output-budget policy."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -129,7 +129,11 @@ class ToolSearchConfig(BaseModel):
     min_score: float | None = Field(default=None, ge=0.0, le=1.0)
     max_document_chars: int = Field(default=4000, ge=200, le=100000)
     max_description_chars: int = Field(default=500, ge=20, le=10000)
-    max_result_chars: int = Field(default=6000, ge=200, le=100000)
+    #: One tool card's schema budget.  5 x 3000 stays inside max_result_chars,
+    #: so a full five-card answer never has to be cut for a single fat schema.
+    max_schema_chars: int = Field(default=3000, ge=200, le=100000)
+    #: The whole tool_search ToolMessage: five cards plus their metadata.
+    max_result_chars: int = Field(default=16000, ge=200, le=100000)
     keyword: ToolKeywordConfig = Field(default_factory=ToolKeywordConfig)
     embedding: ToolEmbeddingConfig = Field(default_factory=ToolEmbeddingConfig)
     rerank: ToolRerankConfig = Field(default_factory=ToolRerankConfig)

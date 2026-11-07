@@ -410,6 +410,49 @@ def reset_contextforge_runtime() -> None:
     _runtime_config = None
 
 
+# -- tool_search ---------------------------------------------------------- #
+
+
+def _set_tool_search_runtime(service: Any | None) -> None:
+    # Imported lazily: contextforge.runtime is the lower layer, and only the
+    # startup hook may pull the tool package in.
+    from agentkit.tools.search.service import set_tool_search_runtime
+
+    set_tool_search_runtime(service)
+
+
+def _install_tool_search(
+    config: ContextForgeConfig,
+    *,
+    index: Any | None,
+    store: ContextForgeToolStore | None,
+    embedder: Any | None,
+    reranker: Any | None,
+) -> None:
+    """Publish the built-in tool_search service for this process.
+
+    The built-in reads one process-global service, so construction happens where
+    the authoritative store and the derived index are built; a tool function
+    cannot reach the runtime.  Disabled search publishes None rather than a
+    service with no channels: the tool then reports catalog_unavailable instead
+    of promising a retrieval path this process does not have.
+    """
+    if not config.search.enabled:
+        _set_tool_search_runtime(None)
+        return
+    from agentkit.tools.search.service import ContextForgeToolSearchService
+
+    _set_tool_search_runtime(
+        ContextForgeToolSearchService(
+            config=config.search,
+            index=index,
+            store=store,
+            embedder=embedder,
+            reranker=reranker,
+        )
+    )
+
+
 def build_contextforge_runtime(
     config: ContextForgeConfig,
     *,
@@ -422,6 +465,7 @@ def build_contextforge_runtime(
     have one.
     """
     if not config.enabled:
+        _set_tool_search_runtime(None)
         return None
     factory = session_factory if session_factory is not None else get_session_factory()
     if factory is None:
@@ -429,6 +473,7 @@ def build_contextforge_runtime(
             "ContextForge runtime needs the persistent catalog; no database session "
             "factory is configured"
         )
+        _set_tool_search_runtime(None)
         return None
     admin = ContextForgeAdminClient(config)
     mcp = ContextForgeMcpClient(config)
@@ -468,6 +513,13 @@ def build_contextforge_runtime(
         store=store,
     )
     configure_contextforge_runtime(runtime)
+    _install_tool_search(
+        config,
+        index=index,
+        store=store,
+        embedder=embedder,
+        reranker=reranker,
+    )
     return runtime
 
 

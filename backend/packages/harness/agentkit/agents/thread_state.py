@@ -130,6 +130,26 @@ def merge_promoted(existing, new):
     return merged[-PROMOTED_MAX_ENTRIES:]
 
 
+#: tool_search returns at most five cards, so the run-scoped retrieval set the
+#: executor checks cannot grow past five either (design 8).
+RETRIEVED_TOOL_NAMES_MAX_ENTRIES = 5
+
+
+def merge_retrieved_tool_names(existing, new):
+    """Replace, never merge: one search result is the whole current set.
+
+    A node that does not search leaves the field alone (None), an explicit
+    list replaces it - including [], which is how an empty search clears the
+    previous result - and the list is deduped and capped at five, keeping the
+    highest-ranked names.  Resetting at run start belongs to the run-scope
+    middleware, not to this reducer.
+    """
+    if new is None:
+        return list(existing or [])
+    names = dict.fromkeys(str(name) for name in new if name)
+    return list(names)[:RETRIEVED_TOOL_NAMES_MAX_ENTRIES]
+
+
 def merge_todos(existing, new):
     """None means untouched. A list, including [], is an explicit replacement."""
     return existing if new is None else new
@@ -208,6 +228,7 @@ THREAD_STATE_REDUCER_FIELDS = frozenset({
     "delegations",
     "skill_context",
     "promoted",
+    "retrieved_tool_names",
 })
 
 
@@ -221,6 +242,7 @@ class ThreadState(AgentState):
     delegations: Annotated[list[DelegationEntry], merge_delegations]
     skill_context: Annotated[list[SkillEntry], merge_skill_context]
     promoted: Annotated[list[str], merge_promoted]
+    retrieved_tool_names: Annotated[list[str], merge_retrieved_tool_names]
 
     thread_data: NotRequired[ThreadDataState | None]
     task_context: NotRequired[TaskContext | None]
