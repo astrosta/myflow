@@ -5,8 +5,13 @@ cannot accidentally publish something the model would then try to call:
 
 * a row is ``callable`` only when the tool was actually reloaded by this
   snapshot, is enabled, reachable, owned by a MyFlow user and carries a safe
-  ``cf__<name>``; a row that stops qualifying is kept (the definition is data)
-  but silently drops out of tool_search/tool_execute;
+  ``cf__<name>``; callability is derived by the store, never taken from the
+  caller's record, so a sync service cannot publish a tool the upstream state
+  forbids.  A row that stops qualifying is kept (the definition is data) but
+  silently drops out of tool_search/tool_execute;
+* ``last_seen_at`` only moves when the snapshot actually saw the tool in
+  tools/list; a row that survives because it is still stored keeps its last real
+  sighting;
 * ``content_hash`` always covers content + owner + call_name, so moving a tool
   between users re-embeds it even when the text is unchanged;
 * ``schema_hash`` always covers the canonical input_schema, so a schema-only
@@ -68,7 +73,12 @@ def schema_hash_for(input_schema: Any) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ContextForgeToolRecord:
-    """One tool row, detached from the session that produced it."""
+    """One tool row, detached from the session that produced it.
+
+    ``callable`` mirrors the stored runtime gate when a record is read; the
+    store derives it from the snapshot and the fields above and ignores the
+    value supplied by a writer.
+    """
 
     id: str
     name: str
@@ -98,8 +108,10 @@ class ContextForgeSnapshotStats:
     updated: int = 0
     unchanged: int = 0
     disabled: int = 0
-    #: Ids whose stored shape moved, in write order (the Milvus upsert set).
-    changed_ids: tuple[str, ...] = ()
+    #: Changed callable ids, in write order: the Milvus upsert set.
+    upsert_ids: tuple[str, ...] = ()
+    #: Rows that stopped being callable, in write order: the Milvus delete set.
+    delete_ids: tuple[str, ...] = ()
 
 
 def _now() -> datetime:
@@ -144,10 +156,14 @@ def _is_callable(
     call_name: str,
     seen_upstream: bool,
 ) -> bool:
-    """The runtime gate. Everything that cannot be called safely fails here."""
+    """The runtime gate. Everything that cannot be called safely fails here.
+
+    Callability is derived from the snapshot and the record's fields; the
+    caller-supplied ``record.callable`` is an output flag, not an input, so a
+    sync service cannot promote a tool the upstream state forbids.
+    """
     return bool(
-        record.callable
-        and seen_upstream
+        seen_upstream
         and record.enabled
         and record.reachable
         and record.owner_user_id
@@ -162,7 +178,7 @@ def _columns(
     name: str,
     call_name: str,
     callable_: bool,
-    stamp: datetime,
+    last_seen_at: datetime,
 ) -> dict[str, Any]:
     """The stored shape of one record. Hashes are recomputed, never trusted."""
     return {
@@ -181,12 +197,23 @@ def _columns(
         "content": record.content or "",
         "content_hash": content_hash_for(record.content, record.owner_user_id, call_name),
         "schema_hash": schema_hash_for(record.input_schema),
-        "last_seen_at": _utc(record.last_seen_at) or stamp,
+        "last_seen_at": last_seen_at,
     }
 
 
-#: Everything a snapshot rewrites; last_seen_at is excluded because every reload
-#: stamps it and would otherwise mark the whole catalog as changed.
+def _require_owner(owner_user_id: str | None) -> str:
+    """Runtime reads are always owner-scoped; ``None`` is a programming error."""
+    owner = str(owner_user_id).strip() if owner_user_id else ""
+    if not owner:
+        raise ValueError(
+            "owner_user_id is required for runtime reads; use list_all for admin access"
+        )
+    return owner
+
+
+#: Everything a snapshot rewrites; last_seen_at is excluded because a sighting
+#: stamp is not a definition change and would otherwise mark the whole catalog
+#: as changed.
 _COMPARED_COLUMNS = (
     "name",
     "call_name",
@@ -206,6 +233,28 @@ _COMPARED_COLUMNS = (
 )
 
 
+def _last_seen_at(
+    record: ContextForgeToolRecord,
+    row: ContextForgeToolRow | None,
+    *,
+    seen_upstream: bool,
+    stamp: datetime,
+) -> datetime:
+    """The last real appearance of the tool in ContextForge tools/list.
+
+    A record in this snapshot was just observed, so its timestamp moves.  An
+    unseen record (Admin-only, or a stored row this snapshot did not cover) is
+    persisted without pretending it appeared upstream: an existing row keeps the
+    timestamp of its last real sighting, and a new row is stamped on first
+    discovery only.
+    """
+    if seen_upstream:
+        return _utc(record.last_seen_at) or stamp
+    if row is not None and row.last_seen_at is not None:
+        return _utc(row.last_seen_at) or stamp
+    return _utc(record.last_seen_at) or stamp
+
+
 class ContextForgeToolStore:
     """Reads and writes for ``contextforge_tools``."""
 
@@ -217,27 +266,31 @@ class ContextForgeToolStore:
     async def upsert_snapshot(
         self,
         records: Sequence[ContextForgeToolRecord],
-        seen_names: Collection[str] | None = None,
+        seen_names: Collection[str],
     ) -> ContextForgeSnapshotStats:
         """Write a full ContextForge snapshot, then retire what it did not see.
 
-        ``seen_names`` is the set of names this snapshot actually reloaded from
-        ContextForge; ``None`` defaults to the record names, while an explicit
-        empty collection means nothing was seen and nothing becomes callable.  A
-        stored row outside it is no longer observed upstream, so it stops being
-        callable but keeps its definition.  Records are matched by id first (a
-        rename keeps the row) and by name second, so a tool that disappears and
-        comes back reuses its row.
+        ``seen_names`` is required: it is the set of names this snapshot
+        actually reloaded from ContextForge tools/list, and callability is
+        derived from it.  It may be empty (nothing was seen, so nothing becomes
+        callable) but it may not be omitted or ``None``; a caller that forgot it
+        would otherwise publish Admin-only tools.  A stored row outside it is no
+        longer observed upstream, so it stops being callable but keeps its
+        definition.  Records are matched by id first (a rename keeps the row)
+        and by name second, so a tool that disappears and comes back reuses its
+        row.
         """
+        if seen_names is None:
+            raise ValueError(
+                "seen_names is required: callability depends on what the snapshot saw"
+            )
         stamp = _now()
         incoming = [record for record in records if str(record.name or "").strip()]
         covered_names = {str(record.name).strip() for record in incoming}
-        if seen_names is None:
-            effective_seen = covered_names
-        else:
-            effective_seen = {str(name) for name in seen_names if name}
+        effective_seen = {str(name) for name in seen_names if name}
         inserted = updated = unchanged = disabled = 0
-        changed_ids: list[str] = []
+        upsert_ids: list[str] = []
+        delete_ids: list[str] = []
 
         async with self._sf() as session:
             rows = list((await session.scalars(select(ContextForgeToolRow))).all())
@@ -247,29 +300,38 @@ class ContextForgeToolStore:
             for record in incoming:
                 name = str(record.name).strip()
                 call_name = str(record.call_name or "").strip() or call_name_for(name)
+                row = by_id.get(record.id) if record.id else None
+                if row is None:
+                    row = by_name.get(name)
+                seen_upstream = name in effective_seen
+                callable_ = _is_callable(
+                    record,
+                    name=name,
+                    call_name=call_name,
+                    seen_upstream=seen_upstream,
+                )
                 values = _columns(
                     record,
                     name=name,
                     call_name=call_name,
-                    callable_=_is_callable(
+                    callable_=callable_,
+                    last_seen_at=_last_seen_at(
                         record,
-                        name=name,
-                        call_name=call_name,
-                        seen_upstream=name in effective_seen,
+                        row,
+                        seen_upstream=seen_upstream,
+                        stamp=stamp,
                     ),
-                    stamp=stamp,
                 )
-                row = by_id.get(record.id) if record.id else None
-                if row is None:
-                    row = by_name.get(name)
                 if row is None:
                     row = ContextForgeToolRow(id=record.id or uuid4().hex, **values)
                     session.add(row)
                     by_id[row.id] = row
                     by_name[name] = row
                     inserted += 1
-                    changed_ids.append(row.id)
+                    if callable_:
+                        upsert_ids.append(row.id)
                     continue
+                was_callable = bool(row.callable)
                 changed = any(
                     getattr(row, column) != values[column] for column in _COMPARED_COLUMNS
                 )
@@ -277,7 +339,10 @@ class ContextForgeToolStore:
                     setattr(row, column, value)
                 if changed:
                     updated += 1
-                    changed_ids.append(row.id)
+                    if callable_:
+                        upsert_ids.append(row.id)
+                    elif was_callable:
+                        delete_ids.append(row.id)
                 else:
                     unchanged += 1
 
@@ -286,7 +351,7 @@ class ContextForgeToolStore:
                     continue
                 row.callable = False
                 disabled += 1
-                changed_ids.append(row.id)
+                delete_ids.append(row.id)
 
             await session.commit()
 
@@ -296,15 +361,21 @@ class ContextForgeToolStore:
             updated=updated,
             unchanged=unchanged,
             disabled=disabled,
-            changed_ids=tuple(changed_ids),
+            upsert_ids=tuple(upsert_ids),
+            delete_ids=tuple(delete_ids),
         )
 
     # -- reads ------------------------------------------------------------- #
 
     async def get_by_ids(
-        self, ids: Sequence[str], owner_user_id: str | None
+        self, ids: Sequence[str], owner_user_id: str
     ) -> list[ContextForgeToolRecord]:
-        """Callable tools for the given ids, in the order given (Milvus rank)."""
+        """Callable tools for the given ids, in the order given (Milvus rank).
+
+        ``owner_user_id`` is required: this is the DB join behind tool_search,
+        and an unscoped read would return another user's callable row.
+        """
+        owner = _require_owner(owner_user_id)
         wanted: list[str] = []
         for item in ids:
             if item and str(item) not in wanted:
@@ -314,36 +385,43 @@ class ContextForgeToolStore:
         stmt = select(ContextForgeToolRow).where(
             ContextForgeToolRow.id.in_(wanted),
             ContextForgeToolRow.callable.is_(True),
+            ContextForgeToolRow.owner_user_id == owner,
         )
-        if owner_user_id is not None:
-            stmt = stmt.where(ContextForgeToolRow.owner_user_id == owner_user_id)
         async with self._sf() as session:
             rows = (await session.scalars(stmt)).all()
         found = {row.id: _record(row) for row in rows}
         return [found[tool_id] for tool_id in wanted if tool_id in found]
 
     async def get_by_call_name(
-        self, call_name: str, owner_user_id: str | None
+        self, call_name: str, owner_user_id: str
     ) -> ContextForgeToolRecord | None:
-        """The runtime lookup tool_execute performs: owner + callable + call_name."""
+        """The runtime lookup tool_execute performs: owner + callable + call_name.
+
+        ``owner_user_id`` is required so tool_execute can never resolve another
+        user's tool by guessing its call_name.
+        """
+        owner = _require_owner(owner_user_id)
         if not call_name:
             return None
         stmt = select(ContextForgeToolRow).where(
             ContextForgeToolRow.call_name == call_name,
             ContextForgeToolRow.callable.is_(True),
+            ContextForgeToolRow.owner_user_id == owner,
         )
-        if owner_user_id is not None:
-            stmt = stmt.where(ContextForgeToolRow.owner_user_id == owner_user_id)
         async with self._sf() as session:
             row = (await session.scalars(stmt)).first()
         return _record(row) if row is not None else None
 
-    async def list_callable(self, owner_user_id: str | None) -> list[ContextForgeToolRecord]:
-        """Every tool the runtime may offer, optionally scoped to one user."""
-        return await self._list(owner_user_id, callable_only=True)
+    async def list_callable(self, owner_user_id: str) -> list[ContextForgeToolRecord]:
+        """Every tool the runtime may offer to one owner; the owner is required."""
+        return await self._list(_require_owner(owner_user_id), callable_only=True)
 
     async def list_all(self, owner_user_id: str | None) -> list[ContextForgeToolRecord]:
-        """Every stored tool, including the ones the runtime refuses."""
+        """Every stored tool, including the ones the runtime refuses.
+
+        This is the admin surface: ``None`` deliberately lists every owner, so
+        management views can inspect the whole catalog.
+        """
         return await self._list(owner_user_id, callable_only=False)
 
     async def _list(

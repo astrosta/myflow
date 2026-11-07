@@ -369,6 +369,43 @@ def test_upsert_snapshot_stores_verbatim_schema_and_hashes(harness: Harness) -> 
     assert _utc(found.last_seen_at).tzinfo is not None
 
 
+def test_upsert_snapshot_derives_callable_instead_of_trusting_the_record(
+    harness: Harness,
+) -> None:
+    async def scenario() -> dict[str, ContextForgeToolRecord]:
+        await harness.store.upsert_snapshot(
+            [
+                _record("derived", callable=False),
+                _record("blocked", enabled=False, callable=True),
+            ],
+            ["derived", "blocked"],
+        )
+        rows = await harness.store.list_all(None)
+        return {row.name: row for row in rows}
+
+    rows = harness.run(scenario)
+
+    # A valid tool is callable even when the caller leaves callable at its
+    # default False: the store owns the gate, not the sync service.
+    assert rows["derived"].callable is True
+    # callable=True cannot promote a tool the upstream state forbids.
+    assert rows["blocked"].callable is False
+
+
+def test_upsert_snapshot_requires_seen_names(harness: Harness) -> None:
+    async def scenario() -> list[ContextForgeToolRecord]:
+        with pytest.raises(TypeError):
+            await harness.store.upsert_snapshot([_record()])  # type: ignore[call-arg]
+        with pytest.raises(ValueError):
+            await harness.store.upsert_snapshot([_record()], None)  # type: ignore[arg-type]
+        return await harness.store.list_all(None)
+
+    rows = harness.run(scenario)
+
+    # Omitting the snapshot observation must not silently publish the records.
+    assert rows == []
+
+
 async def _row_timestamps(harness: Harness) -> tuple[datetime, datetime]:
     """The store's record has no timestamps; read the row to prove it is reused."""
     async with harness.session_factory() as session:
@@ -448,36 +485,48 @@ def test_upsert_snapshot_marks_missing_tools_not_callable(harness: Harness) -> N
     assert callable_names == ["github_search"]
     assert stats.disabled == 1
     assert stats.seen == 1
+    # Retiring jira is a Milvus delete; the unchanged github row is not re-upserted.
+    assert stats.upsert_ids == ()
+    assert stats.delete_ids == ("tool-jira_search",)
 
 
 def test_upsert_snapshot_revives_a_tool_that_comes_back(harness: Harness) -> None:
-    async def scenario() -> tuple[ContextForgeToolRecord, ContextForgeToolRecord]:
+    async def scenario() -> tuple[
+        ContextForgeToolRecord,
+        ContextForgeToolRecord,
+        ContextForgeSnapshotStats,
+        ContextForgeSnapshotStats,
+    ]:
         await harness.store.upsert_snapshot([_record("github_search")], ["github_search"])
         gone = await harness.store.upsert_snapshot([], [])
         assert gone.disabled == 1
         dropped = await harness.store.list_all("user-1")
         assert dropped[0].callable is False
-        await harness.store.upsert_snapshot(
+        revived_stats = await harness.store.upsert_snapshot(
             [_record("github_search", input_schema={"type": "object", "properties": {}})],
             ["github_search"],
         )
         rows = await harness.store.list_all("user-1")
         assert len(rows) == 1
-        return dropped[0], rows[0]
+        return dropped[0], rows[0], gone, revived_stats
 
-    dropped, revived = harness.run(scenario)
+    dropped, revived, gone, revived_stats = harness.run(scenario)
 
     assert revived.id == dropped.id
     assert revived.callable is True
     assert revived.input_schema == {"type": "object", "properties": {}}
     assert revived.schema_hash == schema_hash_for({"type": "object", "properties": {}})
+    assert gone.upsert_ids == ()
+    assert gone.delete_ids == ("tool-github_search",)
+    assert revived_stats.upsert_ids == ("tool-github_search",)
+    assert revived_stats.delete_ids == ()
 
 
 def test_upsert_snapshot_keeps_unowned_disabled_and_unsafe_tools_uncallable(
     harness: Harness,
 ) -> None:
-    async def scenario() -> dict[str, ContextForgeToolRecord]:
-        await harness.store.upsert_snapshot(
+    async def scenario() -> tuple[dict[str, ContextForgeToolRecord], ContextForgeSnapshotStats]:
+        stats = await harness.store.upsert_snapshot(
             [
                 _record("unowned", owner_user_id=None),
                 _record("disabled", enabled=False),
@@ -488,9 +537,9 @@ def test_upsert_snapshot_keeps_unowned_disabled_and_unsafe_tools_uncallable(
             ["unowned", "disabled", "down", "bad call_name"],
         )
         rows = await harness.store.list_all(None)
-        return {row.name: row for row in rows}
+        return {row.name: row for row in rows}, stats
 
-    rows = harness.run(scenario)
+    rows, stats = harness.run(scenario)
 
     # Every row is persisted (the definition is not lost) but none is runtime-visible.
     assert set(rows) == {"unowned", "disabled", "down", "bad call_name", "not_seen"}
@@ -502,6 +551,9 @@ def test_upsert_snapshot_keeps_unowned_disabled_and_unsafe_tools_uncallable(
     assert rows["bad call_name"].call_name == "cf__renamed"
     # A record outside seen_names was not actually observed upstream.
     assert rows["not_seen"].callable is False
+    # Non-callable inserts never reach the vector index in either direction.
+    assert stats.upsert_ids == ()
+    assert stats.delete_ids == ()
 
 
 def test_upsert_snapshot_explicit_empty_seen_names_disables_everything(
@@ -541,10 +593,12 @@ def test_upsert_snapshot_reports_insert_update_and_unchanged(harness: Harness) -
         0,
         0,
     )
-    # A new row must reach the vector index too, so it counts as changed.
-    assert first.changed_ids == ("tool-github_search", "tool-jira_search")
+    # New callable rows are the Milvus upsert set; nothing is retired.
+    assert first.upsert_ids == ("tool-github_search", "tool-jira_search")
+    assert first.delete_ids == ()
     assert (second.seen, second.inserted, second.updated, second.unchanged) == (2, 0, 1, 1)
-    assert second.changed_ids == ("tool-jira_search",)
+    assert second.upsert_ids == ("tool-jira_search",)
+    assert second.delete_ids == ()
 
 
 def test_upsert_snapshot_honours_last_seen_at_from_the_record(harness: Harness) -> None:
@@ -567,6 +621,68 @@ def test_upsert_snapshot_honours_last_seen_at_from_the_record(harness: Harness) 
     assert _utc(refreshed.last_seen_at) > older
 
 
+def test_upsert_snapshot_preserves_last_seen_at_for_unseen_records(
+    harness: Harness,
+) -> None:
+    first_seen = datetime(2026, 1, 1, tzinfo=UTC)
+    later = datetime(2027, 1, 1, tzinfo=UTC)
+
+    async def scenario() -> tuple[ContextForgeToolRecord, ContextForgeToolRecord]:
+        await harness.store.upsert_snapshot(
+            [_record(last_seen_at=first_seen)], ["github_search"]
+        )
+        before = (await harness.store.list_all("user-1"))[0]
+        # Admin knows this tool, but it was not reloaded from tools/list, so it
+        # must not look freshly seen (and callability stays false).
+        await harness.store.upsert_snapshot([_record(last_seen_at=later)], [])
+        after = (await harness.store.list_all("user-1"))[0]
+        return before, after
+
+    before, after = harness.run(scenario)
+
+    assert _utc(before.last_seen_at) == first_seen
+    assert _utc(after.last_seen_at) == first_seen
+    assert after.callable is False
+
+
+def test_upsert_snapshot_splits_index_upserts_from_deletes(harness: Harness) -> None:
+    async def scenario() -> tuple[
+        ContextForgeSnapshotStats,
+        ContextForgeSnapshotStats,
+        ContextForgeSnapshotStats,
+    ]:
+        first = await harness.store.upsert_snapshot(
+            [_record("github_search"), _record("jira_search")],
+            ["github_search", "jira_search"],
+        )
+        second = await harness.store.upsert_snapshot(
+            [
+                _record("github_search", description="changed"),
+                _record("jira_search", enabled=False),
+            ],
+            ["github_search", "jira_search"],
+        )
+        third = await harness.store.upsert_snapshot(
+            [
+                _record("github_search", description="changed"),
+                _record("jira_search"),
+            ],
+            ["github_search", "jira_search"],
+        )
+        return first, second, third
+
+    first, second, third = harness.run(scenario)
+
+    assert first.upsert_ids == ("tool-github_search", "tool-jira_search")
+    assert first.delete_ids == ()
+    # A changed callable definition is upserted; a tool that becomes disabled is
+    # deleted, never upserted with callable=false.
+    assert second.upsert_ids == ("tool-github_search",)
+    assert second.delete_ids == ("tool-jira_search",)
+    assert third.upsert_ids == ("tool-jira_search",)
+    assert third.delete_ids == ()
+
+
 # --------------------------------------------------------------------------- #
 # Reads
 # --------------------------------------------------------------------------- #
@@ -584,26 +700,23 @@ def _seed_two_owners() -> list[ContextForgeToolRecord]:
 def test_get_by_ids_preserves_order_and_filters_owner_and_callable(
     harness: Harness,
 ) -> None:
-    async def scenario() -> tuple[list[str], list[str], list[str]]:
+    async def scenario() -> tuple[list[str], list[str]]:
         records = _seed_two_owners()
         await harness.store.upsert_snapshot(
             records, [record.name for record in records]
         )
         ids = ["tool-jira_search", "tool-github_search", "tool-owned_by_other", "missing"]
         mine = await harness.store.get_by_ids(ids, "user-1")
-        unscoped = await harness.store.get_by_ids(ids, None)
         empty = await harness.store.get_by_ids([], "user-1")
         return (
             [record.call_name for record in mine],
-            [record.call_name for record in unscoped],
             [record.call_name for record in empty],
         )
 
-    mine, unscoped, empty = harness.run(scenario)
+    mine, empty = harness.run(scenario)
 
     # Milvus rank order is preserved; foreign / unknown / non-callable ids drop out.
     assert mine == ["cf__jira_search", "cf__github_search"]
-    assert unscoped == ["cf__jira_search", "cf__github_search", "cf__owned_by_other"]
     assert empty == []
 
 
@@ -632,16 +745,25 @@ def test_get_by_call_name_requires_owner_and_callable(harness: Harness) -> None:
     assert unowned is None
 
 
-def test_get_by_call_name_without_owner_skips_the_owner_filter(harness: Harness) -> None:
-    async def scenario() -> object:
+def test_runtime_reads_require_an_owner(harness: Harness) -> None:
+    async def scenario() -> list[str]:
         records = _seed_two_owners()
         await harness.store.upsert_snapshot(records, [record.name for record in records])
-        return await harness.store.get_by_call_name("cf__github_search", None)
+        for read in (
+            lambda: harness.store.get_by_ids(["tool-github_search"], None),
+            lambda: harness.store.get_by_call_name("cf__github_search", None),
+            lambda: harness.store.list_callable(None),
+        ):
+            with pytest.raises(ValueError):
+                await read()
+        with pytest.raises(ValueError):
+            await harness.store.get_by_call_name("cf__github_search", "")
+        # The admin surface retains the only unscoped read.
+        return [record.name for record in await harness.store.list_all(None)]
 
-    found = harness.run(scenario)
+    names = harness.run(scenario)
 
-    assert found is not None
-    assert found.call_name == "cf__github_search"
+    assert set(names) == {"github_search", "jira_search", "owned_by_other", "unowned"}
 
 
 def test_list_callable_and_list_all(harness: Harness) -> None:
