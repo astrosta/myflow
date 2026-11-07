@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, ClassVar
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from agentkit.contextforge.models import (
+    ContextForgeError,
     ContextForgeNotFound,
     ContextForgeTool,
     ToolWrite,
 )
 from agentkit.contextforge.ownership import (
-    can_call,
     can_claim,
     can_manage,
     can_view,
@@ -22,7 +22,6 @@ from agentkit.contextforge.ownership import (
 from backend.app.gateway.errors import ContextForgeDisabled, InvalidToolHeaderAPI
 from backend.app.gateway.tools_deps import get_contextforge_admin_client, require_tools_scope
 from agentkit.contextforge.runtime import get_contextforge_runtime
-from agentkit.tools.search.service import get_tool_search_runtime
 
 from backend.app.gateway.models.tools import (
     ToolDetail,
@@ -42,6 +41,19 @@ router = APIRouter(prefix="/tools", tags=["tools"])
 
 ToolReader = Annotated[RunCaller, Depends(require_tools_scope("tools:read"))]
 ToolWriter = Annotated[RunCaller, Depends(require_tools_scope("tools:write"))]
+
+
+class ToolSearchUnavailable(ContextForgeError):
+    """The search preview has no service behind it yet (Task 6 wires it).
+
+    It subclasses ContextForgeError so the response keeps the shared coded error
+    body: errors.py registers that handler for the base class and Starlette
+    dispatches on the exception's MRO, so this arrives as
+    `{detail, code, trace_id}` with a 503 instead of an unhandled 500.
+    """
+
+    status_code: ClassVar[int] = 503
+    code: ClassVar[str] = "tool_search_unavailable"
 
 
 async def _request_refresh(request: Request, reason: str = "admin") -> None:
@@ -190,12 +202,10 @@ async def tool_status(
     runtime = get_contextforge_runtime()
     if runtime is None:
         return ToolStatusResponse(enabled=False)
-    status = dict(runtime.status())
-    snapshot = runtime.snapshot() if hasattr(runtime, "snapshot") else None
-    if caller.user_id is not None and snapshot is not None:
-        own = [entry for entry in snapshot.entries if can_call(entry.owner, caller.user_id)]
-        status["indexed_tools"] = len(own)
-        status["total_tools"] = len(own)
+    # status() reads the authoritative store, so it is async; the counts are
+    # scoped to the caller - /api/tools is a per-user surface, and a plain user
+    # must not read the catalog-wide totals.
+    status = await runtime.status(owner_user_id=caller.user_id)
     return ToolStatusResponse.model_validate(status)
 
 
@@ -226,32 +236,14 @@ async def search_tools_preview(
     q: str = Query(min_length=1, max_length=4000),
     limit: int = Query(default=5, ge=1, le=20),
 ) -> dict[str, object]:
-    del request
-    service = get_tool_search_runtime()
-    if service is None:
-        return {"query": q, "results": [], "retrieval": {"index": "unavailable"}}
-    outcome = await service.search(task_query=q, user_id=caller.user_id)
-    return {
-        "query": q,
-        "results": [
-            {
-                "tool_name": hit.entry.name,
-                "display_name": hit.entry.display_name,
-                "description": hit.entry.description,
-                "tags": list(hit.entry.tags),
-                "parameters": list(hit.entry.parameters),
-                "score": hit.score,
-            }
-            for hit in outcome.hits[:limit]
-        ],
-        "retrieval": {
-            "index": outcome.index_kind,
-            "channels": list(outcome.channels),
-            "candidates": outcome.candidates,
-            "reranked": outcome.reranked,
-            "warnings": list(outcome.warnings),
-        },
-    }
+    # The in-memory tool snapshot this preview used to search is gone with Task 5,
+    # and Task 6 is what wires the new ToolSearchService into the runtime.  Until
+    # then the route says "unavailable" out loud: an empty result list would read
+    # as "no tool matches your query", which is indistinguishable from a real miss.
+    del request, caller, q, limit
+    raise ToolSearchUnavailable(
+        "tool search is not available: no tool search service is wired into this build"
+    )
 
 
 @router.get("/{tool_id}", response_model=ToolDetail)

@@ -37,15 +37,24 @@ class ToolRefreshRetryMiddleware(AgentMiddleware[AgentState]):
         return str(name or "unknown_tool")
 
     async def _refresh(self) -> bool:
+        """Refresh the catalog before the retry, bounded by the configured timeout.
+
+        `refresh_now` is the runtime's awaited sync; it is required here because
+        `request_refresh` honours `sync.admin_refresh_async` and would let the
+        retry race the refresh it depends on.  `request_refresh` stays the
+        fallback for a runtime that predates it.
+        """
         runtime = self._runtime_provider()
         if runtime is None:
             return False
         try:
-            await runtime.refresh_and_sync(
-                reason="tool_error",
-                force=True,
-                timeout=self._timeout,
+            refresh = getattr(runtime, "refresh_now", None)
+            call = (
+                refresh("tool_error")
+                if refresh is not None
+                else runtime.request_refresh("tool_error")
             )
+            await asyncio.wait_for(call, timeout=self._timeout)
         except Exception:  # noqa: BLE001 - caller keeps the original error
             return False
         return True

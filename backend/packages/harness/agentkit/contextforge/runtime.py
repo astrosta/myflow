@@ -44,13 +44,6 @@ from agentkit.persistence.engine import get_session_factory
 
 logger = logging.getLogger(__name__)
 
-#: sync() error codes that mean the snapshot was not replaced at all because
-#: ContextForge or the database failed.  Any other error came from the derived
-#: index, which degrades retrieval but leaves the catalog in place.
-_UPSTREAM_ABORT_CODES = frozenset(
-    {"mcp_failed", "admin_failed", "db_failed", "lock_failed"}
-)
-
 SubscriberFactory = Callable[[ContextForgeConfig, Any], AdminEventSubscriber]
 DailyDelay = Callable[[], float]
 
@@ -196,6 +189,17 @@ class ContextForgeRuntime:
             return ContextForgeSyncStats()
         return await self._sync_once("manual", full=True)
 
+    async def refresh_now(self, reason: str = "tool_error") -> ContextForgeSyncStats:
+        """One awaited sync, whatever `sync.admin_refresh_async` says.
+
+        The tool-error retry has to see the refreshed catalog *before* it retries,
+        so it cannot go through `request_refresh` when that is configured to hand
+        the sync to the debounced worker - it would race its own retry.
+        """
+        if not self.config.enabled:
+            return ContextForgeSyncStats()
+        return await self._sync_once(reason)
+
     async def _on_admin_event(self, event: ContextForgeAdminEvent) -> None:
         """An event is a signal only; never a tool definition."""
         if not should_refresh_tool_event(event.type):
@@ -256,12 +260,30 @@ class ContextForgeRuntime:
         """Run exactly one sync through the service and record what it did."""
         loop = asyncio.get_running_loop()
         started = loop.time()
+        timeout = float(self.config.sync.sync_timeout_seconds)
         self._sync_status = "syncing"
         try:
-            stats = await self._sync.sync(reason, full=full)
+            # sync_timeout_seconds is the budget for one pass: startup and a
+            # management write must not hang on a slow ContextForge.  Cancelling
+            # is safe - the service releases its per-loop lock on cancellation,
+            # so the next trigger starts a clean pass.
+            stats = await asyncio.wait_for(
+                self._sync.sync(reason, full=full), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "ContextForge sync(%s) exceeded its %.1fs budget", reason, timeout
+            )
+            stats = ContextForgeSyncStats(
+                error="sync_timeout",
+                duration_ms=int((loop.time() - started) * 1000),
+            )
         except Exception as exc:  # noqa: BLE001 - the service documents no raise
             logger.warning("ContextForge sync(%s) raised: %s", reason, type(exc).__name__)
-            stats = ContextForgeSyncStats(error=type(exc).__name__)
+            stats = ContextForgeSyncStats(
+                error=type(exc).__name__,
+                duration_ms=int((loop.time() - started) * 1000),
+            )
         finished = loop.time()
         self._last_sync_at = datetime.now(UTC).isoformat()
         self._last_sync_reason = reason
@@ -273,29 +295,42 @@ class ContextForgeRuntime:
             self._reachable = True
             self._auth_ok = True
             self._index_error = None
-        elif stats.error in _UPSTREAM_ABORT_CODES:
-            # The snapshot was not replaced: ContextForge or the database failed.
-            self._reachable = False
-            self._auth_ok = False
-        else:
+        elif stats.index_failed:
             # tools/list and the Admin read both succeeded and the snapshot was
             # committed; only the derived index failed.  Reporting the catalog as
             # unreachable here would send an operator to check ContextForge for a
-            # Milvus problem, so reachability follows the upstream reads.
+            # Milvus problem, so reachability follows the committed catalog.
             self._reachable = True
             self._auth_ok = True
             self._index_error = stats.error
+        else:
+            # Anything else - an upstream abort, a database failure, the sync
+            # budget ran out, or an exception the service did not classify - means
+            # the snapshot was not replaced.  Unclassified is *not* index-only:
+            # claiming reachability there would hide a broken catalog.
+            self._reachable = False
+            self._auth_ok = False
         return stats
 
     # -- status ------------------------------------------------------------ #
 
-    async def status(self) -> dict[str, Any]:
-        """The management surface: store counts, never a stale snapshot."""
-        callable_count, total = self._last_counts
+    async def status(self, owner_user_id: str | None = None) -> dict[str, Any]:
+        """The management surface: store counts, never a stale snapshot.
+
+        /api/tools is a per-user surface, so the counts are scoped to what the
+        caller may use: `owner_user_id` filters the store read to that owner's
+        rows, and `None` is the catalog-wide admin read.
+        """
+        # The remembered counts are catalog-wide, so they can only stand in for
+        # the catalog-wide read; a scoped caller starts from zero rather than
+        # reading the previous caller's numbers.
+        callable_count, total = (
+            (0, 0) if owner_user_id is not None else self._last_counts
+        )
         catalog_state = "ready"
         if self._store is not None:
             try:
-                rows = await self._store.list_all(None)
+                rows = await self._store.list_all(owner_user_id)
             except Exception as exc:  # noqa: BLE001 - status must still answer
                 catalog_state = "degraded"
                 logger.warning(
@@ -306,7 +341,10 @@ class ContextForgeRuntime:
                 callable_count = sum(
                     1 for row in rows if bool(getattr(row, "callable", False))
                 )
-                self._last_counts = (callable_count, total)
+                if owner_user_id is None:
+                    # Only the catalog-wide read is remembered: caching a scoped
+                    # count would leak it to the next caller.
+                    self._last_counts = (callable_count, total)
         return {
             "enabled": self.config.enabled,
             "reachable": self._reachable,

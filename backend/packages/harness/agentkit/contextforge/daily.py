@@ -21,11 +21,28 @@ from datetime import datetime, time, timedelta, tzinfo
 LOCAL_TIMEZONE = "local"
 
 
+def local_zone() -> tzinfo:
+    """The host's local zone, resolved through tzlocal.
+
+    `datetime.now().astimezone().tzinfo` is a *fixed* UTC offset, not a zone: on
+    a host that observes DST the offset it reports today is wrong for tomorrow's
+    run, so the nightly pass that follows a transition would fire an hour off.
+    tzlocal reads the platform's zone database (`/etc/localtime`, `TZ`, the
+    Windows registry) and hands back a real, DST-aware zone.
+    """
+    from tzlocal import get_localzone
+
+    zone = get_localzone()
+    if zone is None:  # pragma: no cover - tzlocal falls back to UTC, never None
+        raise ValueError("the host reports no local timezone")
+    return zone
+
+
 def resolve_timezone(value: str | tzinfo | None) -> tzinfo:
     """The tzinfo for contextforge.sync.timezone.
 
-    "local" (the default) resolves to the host's current local zone.  An IANA
-    name resolves through zoneinfo, which keeps DST transitions honest; an
+    "local" (the default) resolves to the host's zone through tzlocal, so local
+    DST transitions are honoured.  An IANA name resolves through zoneinfo; an
     unknown name is a configuration error and raises instead of silently falling
     back to UTC.
     """
@@ -33,10 +50,7 @@ def resolve_timezone(value: str | tzinfo | None) -> tzinfo:
         return value
     text = str(value or "").strip()
     if not text or text.casefold() == LOCAL_TIMEZONE:
-        local = datetime.now().astimezone().tzinfo
-        if local is None:  # pragma: no cover - every platform defines a local zone
-            raise ValueError("the host reports no local timezone")
-        return local
+        return local_zone()
     try:
         from zoneinfo import ZoneInfo
 
@@ -106,6 +120,7 @@ def daily_delay(
 __all__ = [
     "LOCAL_TIMEZONE",
     "daily_delay",
+    "local_zone",
     "next_daily_run",
     "next_local_midnight",
     "parse_daily_at",

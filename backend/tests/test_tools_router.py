@@ -2,12 +2,15 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from agentkit.contextforge.models import ContextForgeNotFound, ContextForgeTool, ToolWrite
 from agentkit.contextforge.ownership import owner_from_annotations
+from agentkit.contextforge.sync import ContextForgeSyncStats
 from backend.app.gateway import tools_deps
 from backend.app.gateway.auth.result import AuthKind, AuthResult
+from backend.app.gateway.errors import install_error_handlers
 from backend.app.gateway.run_models import CallerKind, RunCaller
 from backend.app.gateway.routers import tools as tools_router
 
@@ -104,28 +107,141 @@ async def test_get_tool_masks_headers(monkeypatch) -> None:
     assert response.headers["Authorization"] == "****"
     assert response.input_schema == {"type": "object"}
 
+class FakeRuntime:
+    """The runtime double, with the real shape: `status` is async and scoped.
+
+    `status` reads the authoritative store in Task 5, so a synchronous double
+    would hide the bug the route had (a coroutine handed to
+    `model_validate`), and an unscoped double would hide the owner leak.
+    """
+
+    def __init__(self, *, stats: ContextForgeSyncStats | None = None) -> None:
+        self.owners: list[str | None] = []
+        self.reindexed = 0
+        self.stats = stats or ContextForgeSyncStats(
+            scanned=3, changed=1, upserted=1, deleted=0, duration_ms=42
+        )
+
+    async def status(self, owner_user_id: str | None = None) -> dict[str, object]:
+        self.owners.append(owner_user_id)
+        scoped = owner_user_id is not None
+        return {
+            "enabled": True,
+            "reachable": True,
+            "auth_ok": True,
+            "admin_events": "connected",
+            "daily": "running",
+            "sync": "ready",
+            "index": "ready",
+            "indexed_tools": 2 if scoped else 12,
+            "total_tools": 2 if scoped else 13,
+            "last_sync_at": None,
+            "last_sync_reason": "startup",
+            "last_error": None,
+            "channels": {"keyword": "ready", "embedding": "ready", "rerank": "degraded"},
+        }
+
+    async def reindex(self) -> ContextForgeSyncStats:
+        self.reindexed += 1
+        return self.stats
+
+
 @pytest.mark.asyncio
 async def test_status_keeps_channels_for_the_management_page(monkeypatch) -> None:
-    class FakeRuntime:
-        def status(self):
-            return {
-                "enabled": True,
-                "reachable": True,
-                "auth_ok": True,
-                "admin_events": "connected",
-                "sync": "ready",
-                "index": "ready",
-                "indexed_tools": 12,
-                "total_tools": 13,
-                "channels": {"keyword": "ready", "embedding": "ready", "rerank": "degraded"},
-            }
-
     monkeypatch.setattr(tools_router, "get_contextforge_runtime", lambda: FakeRuntime())
     caller = RunCaller(kind=CallerKind.HTTP, user_id="u", user_role="admin")
+
     response = await tools_router.tool_status(_request(), caller)
-    assert response.indexed_tools == 12
+
     assert response.channels.keyword == "ready"
     assert response.channels.rerank == "degraded"
+    # The midnight task state is part of the response now, not a dropped key.
+    assert response.daily == "running"
+
+
+@pytest.mark.asyncio
+async def test_status_counts_are_scoped_to_the_caller(monkeypatch) -> None:
+    runtime = FakeRuntime()
+    monkeypatch.setattr(tools_router, "get_contextforge_runtime", lambda: runtime)
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    response = await tools_router.tool_status(_request(), caller)
+
+    assert runtime.owners == ["u1"], "status must be asked for the caller's rows"
+    assert (response.indexed_tools, response.total_tools) == (2, 2)
+
+
+@pytest.mark.asyncio
+async def test_status_without_a_runtime_reports_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(tools_router, "get_contextforge_runtime", lambda: None)
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    response = await tools_router.tool_status(_request(), caller)
+
+    assert response.enabled is False
+    assert response.daily == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_reindex_reports_the_duration_the_sync_measured(monkeypatch) -> None:
+    runtime = FakeRuntime(
+        stats=ContextForgeSyncStats(scanned=4, changed=2, upserted=2, duration_ms=37)
+    )
+    monkeypatch.setattr(tools_router, "get_contextforge_runtime", lambda: runtime)
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u", user_role="admin")
+
+    body = await tools_router.reindex_tools(_request(), caller)
+
+    assert body == {
+        "scanned": 4,
+        "changed": 2,
+        "upserted": 2,
+        "deleted": 0,
+        "duration_ms": 37,
+        "error": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reindex_without_a_runtime_is_a_coded_503(monkeypatch) -> None:
+    from backend.app.gateway.errors import ContextForgeDisabled
+
+    monkeypatch.setattr(tools_router, "get_contextforge_runtime", lambda: None)
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u", user_role="admin")
+
+    with pytest.raises(ContextForgeDisabled) as caught:
+        await tools_router.reindex_tools(_request(), caller)
+
+    assert caught.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_search_says_unavailable_instead_of_returning_no_hits() -> None:
+    caller = RunCaller(kind=CallerKind.HTTP, user_id="u1", user_role="user")
+
+    with pytest.raises(tools_router.ToolSearchUnavailable) as caught:
+        await tools_router.search_tools_preview(_request(), caller, "github", 5)
+
+    assert caught.value.status_code == 503
+    assert caught.value.code == "tool_search_unavailable"
+
+
+def test_the_search_503_reaches_the_client_as_a_coded_error() -> None:
+    """The route raises; the registered handler produces the shared error body."""
+    app = FastAPI()
+    install_error_handlers(app)
+
+    @app.get("/api/tools/search")
+    async def probe() -> dict[str, object]:
+        raise tools_router.ToolSearchUnavailable("tool search is not available")
+
+    response = TestClient(app).get("/api/tools/search")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["code"] == "tool_search_unavailable"
+    assert body["detail"]
+    assert body["trace_id"]
 
 def test_regular_authenticated_user_can_use_the_tools_proxy() -> None:
     request = _request()

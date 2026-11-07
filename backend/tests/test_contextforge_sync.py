@@ -716,6 +716,9 @@ async def test_mcp_failure_keeps_the_last_good_catalog(tmp_path: Path) -> None:
 
     assert stats.error == "mcp_failed"
     assert stats.scanned == 0
+    # The snapshot was not replaced, so this is *not* an index-only failure: the
+    # runtime reports the catalog unreachable on this flag.
+    assert stats.index_failed is False
     assert stored["github_search"].callable is True
     assert index.calls == 1  # the failed sync never reached Milvus
 
@@ -811,7 +814,24 @@ async def test_index_failure_is_degraded_not_fatal(tmp_path: Path) -> None:
         stored = await _rows(built)
 
     assert stats.error == "ToolIndexUnavailable"
+    # The DB snapshot is committed: only retrieval is degraded.
+    assert stats.index_failed is True
     assert stored["github_search"].callable is True
+
+
+@pytest.mark.asyncio
+async def test_a_clean_sync_reports_how_long_it_took(tmp_path: Path) -> None:
+    async with harness(tmp_path) as built:
+        service = _service(
+            built, admin=FakeAdmin([_admin_tool()]), mcp=FakeMcp([_mcp_tool()])
+        )
+        stats = await service.sync("startup")
+
+    assert stats.error is None
+    assert stats.index_failed is False
+    # Both fake upstreams sleep 10ms, so the reported duration is a measurement of
+    # the whole pass (/api/tools/reindex shows it) rather than a hard-coded zero.
+    assert stats.duration_ms >= 15
 
 
 @pytest.mark.asyncio

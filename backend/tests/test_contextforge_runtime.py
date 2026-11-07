@@ -12,12 +12,13 @@ real task that stop() cancels, and status comes from the authoritative store.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+import tzlocal
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import agentkit.contextforge.daily as daily
@@ -52,32 +53,52 @@ def _config(**overrides: Any) -> ContextForgeConfig:
     return ContextForgeConfig(**base)
 
 
-def _row(*, callable_: bool = True) -> SimpleNamespace:
-    return SimpleNamespace(name="demo", callable=callable_)
+def _row(*, callable_: bool = True, owner: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(name="demo", callable=callable_, owner=owner)
 
 
 class FakeStore:
-    """The authoritative catalog reader status() uses; never an in-process snapshot."""
+    """The authoritative catalog reader status() uses; never an in-process snapshot.
+
+    It honours the owner filter, because status() is asked for one caller's rows
+    on /api/tools/status and for every owner on the admin read.
+    """
 
     def __init__(self, rows: Any = (), *, error: Exception | None = None) -> None:
         self.rows = list(rows)
         self.error = error
         self.reads = 0
+        self.owners: list[str | None] = []
 
     async def list_all(self, owner_user_id: str | None) -> list[Any]:
-        assert owner_user_id is None, "status is the admin read: it lists every owner"
         self.reads += 1
+        self.owners.append(owner_user_id)
         if self.error is not None:
             raise self.error
-        return list(self.rows)
+        if owner_user_id is None:
+            return list(self.rows)
+        return [row for row in self.rows if getattr(row, "owner", None) == owner_user_id]
 
 
 class FakeSyncService:
-    """Stands in for the Task 4 service: records triggers, never raises."""
+    """Stands in for the Task 4 service: records triggers, never raises.
 
-    def __init__(self, rows: Any = (), *, error: str | None = None) -> None:
+    `index_failed` mirrors the service's own classification: True means the DB
+    snapshot was committed and only the derived index failed.
+    """
+
+    def __init__(
+        self,
+        rows: Any = (),
+        *,
+        error: str | None = None,
+        index_failed: bool = False,
+        delay: float = 0.0,
+    ) -> None:
         self.store = FakeStore(rows)
         self.error = error
+        self.index_failed = index_failed
+        self.delay = delay
         self.calls: list[tuple[str, bool]] = []
         self.started = asyncio.Event()
         self.gate: asyncio.Event | None = None
@@ -85,9 +106,24 @@ class FakeSyncService:
     async def sync(self, reason: str = "manual", full: bool = False) -> ContextForgeSyncStats:
         self.calls.append((reason, full))
         self.started.set()
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.gate is not None:
             await self.gate.wait()
-        return ContextForgeSyncStats(scanned=len(self.store.rows), error=self.error)
+        return ContextForgeSyncStats(
+            scanned=len(self.store.rows),
+            error=self.error,
+            index_failed=self.index_failed and self.error is not None,
+            duration_ms=1,
+        )
+
+
+class RaisingSyncService(FakeSyncService):
+    """The service contract says `sync` never raises; this one breaks it."""
+
+    async def sync(self, reason: str = "manual", full: bool = False) -> ContextForgeSyncStats:
+        self.calls.append((reason, full))
+        raise RuntimeError("unexpected sync failure")
 
 
 class FakeAdmin:
@@ -144,10 +180,12 @@ def _runtime(
     *,
     rows: Any = (),
     error: str | None = None,
+    index_failed: bool = False,
     daily_delay: Any = None,
     index: Any = None,
+    service: FakeSyncService | None = None,
 ) -> tuple[ContextForgeRuntime, FakeSyncService, FakeAdmin, SubscriberFactory]:
-    service = FakeSyncService(rows, error=error)
+    service = service or FakeSyncService(rows, error=error, index_failed=index_failed)
     admin = FakeAdmin()
     factory = SubscriberFactory()
     runtime = ContextForgeRuntime(
@@ -330,6 +368,8 @@ async def test_reindex_runs_a_full_sync() -> None:
 
     assert service.calls == [("manual", True)]
     assert stats.error is None
+    # /api/tools/reindex reports this; it must be a real measurement.
+    assert stats.duration_ms >= 0
 
 
 # --------------------------------------------------------------------------- #
@@ -386,7 +426,10 @@ async def test_an_upstream_abort_reports_the_catalog_unreachable() -> None:
 async def test_an_index_only_error_degrades_the_index_not_the_catalog() -> None:
     index = FakeIndex()
     runtime, _service, _admin, _factory = _runtime(
-        rows=[_row(), _row(callable_=False)], error="ToolVectorIndexError", index=index
+        rows=[_row(), _row(callable_=False)],
+        error="ToolVectorIndexError",
+        index_failed=True,
+        index=index,
     )
 
     await runtime.start()
@@ -402,6 +445,93 @@ async def test_an_index_only_error_degrades_the_index_not_the_catalog() -> None:
     assert status["index"] == "degraded"
     assert status["total_tools"] == 2
     assert index.closed is True
+
+
+@pytest.mark.asyncio
+async def test_an_unclassified_sync_error_is_not_reported_as_index_only() -> None:
+    # The service sets index_failed itself; an error it did not classify (or a
+    # code this runtime has never heard of) means the snapshot was not replaced.
+    runtime, _service, _admin, _factory = _runtime(
+        rows=[_row()], error="UnexpectedFailure"
+    )
+
+    await runtime.start()
+    try:
+        status = await runtime.status()
+    finally:
+        await runtime.stop()
+
+    assert status["last_error"] == "UnexpectedFailure"
+    assert status["reachable"] is False
+    assert status["auth_ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_sync_that_raises_is_unreachable_instead_of_raising() -> None:
+    runtime, _service, _admin, _factory = _runtime(service=RaisingSyncService(rows=[_row()]))
+
+    await runtime.start()
+    try:
+        status = await runtime.status()
+    finally:
+        await runtime.stop()
+
+    assert status["last_error"] == "RuntimeError"
+    assert status["sync"] == "degraded"
+    assert status["reachable"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_sync_that_exceeds_its_budget_reports_a_timeout() -> None:
+    config = _config(sync={"startup_sync": True, "sync_timeout_seconds": 0.05})
+    runtime, _service, _admin, _factory = _runtime(
+        config, service=FakeSyncService(rows=[_row()], delay=5.0)
+    )
+
+    # start() must honour the budget instead of blocking on the slow pass.
+    await asyncio.wait_for(runtime.start(), timeout=2)
+    try:
+        status = await runtime.status()
+    finally:
+        await runtime.stop()
+
+    assert status["last_error"] == "sync_timeout"
+    assert status["sync"] == "degraded"
+    assert status["reachable"] is False, "a timed-out pass did not replace the snapshot"
+
+
+@pytest.mark.asyncio
+async def test_status_counts_are_scoped_to_the_caller() -> None:
+    runtime, service, _admin, _factory = _runtime(
+        rows=[
+            _row(owner="u1"),
+            _row(owner="u1", callable_=False),
+            _row(owner="u2"),
+        ]
+    )
+
+    scoped = await runtime.status(owner_user_id="u1")
+    catalog_wide = await runtime.status()
+
+    assert service.store.owners == ["u1", None]
+    assert (scoped["indexed_tools"], scoped["total_tools"]) == (1, 2)
+    assert (catalog_wide["indexed_tools"], catalog_wide["total_tools"]) == (2, 3)
+
+
+@pytest.mark.asyncio
+async def test_a_scoped_status_never_reuses_the_catalog_wide_counts() -> None:
+    runtime, service, _admin, _factory = _runtime(
+        rows=[_row(owner="u1"), _row(owner="u2")]
+    )
+    await runtime.status()  # one catalog-wide read, remembered for the fallback
+
+    service.store.error = RuntimeError("db down")
+    scoped = await runtime.status(owner_user_id="u1")
+
+    assert scoped["index"] == "degraded"
+    assert (scoped["indexed_tools"], scoped["total_tools"]) == (0, 0), (
+        "a scoped caller must not read the cached catalog-wide numbers"
+    )
 
 
 @pytest.mark.asyncio
@@ -496,3 +626,30 @@ def test_daily_delay_adds_bounded_jitter() -> None:
     assert daily.daily_delay(
         now, timezone="UTC", jitter_seconds=60, rand=lambda: 0.5
     ) == 3630.0
+
+
+def test_the_local_sentinel_resolves_a_dst_aware_zone(monkeypatch) -> None:
+    """`timezone: local` is the host *zone*, not today's fixed UTC offset."""
+    new_york = ZoneInfo("America/New_York")
+    monkeypatch.setattr(tzlocal, "get_localzone", lambda: new_york)
+
+    assert daily.resolve_timezone("local") is new_york
+
+    before = daily.next_local_midnight(
+        datetime(2026, 3, 7, 12, 0, tzinfo=new_york), "local"
+    )
+    after = daily.next_local_midnight(
+        datetime(2026, 3, 8, 12, 0, tzinfo=new_york), "local"
+    )
+
+    assert before == datetime(2026, 3, 8, 0, 0, tzinfo=new_york)
+    assert after == datetime(2026, 3, 9, 0, 0, tzinfo=new_york)
+    # The night of the spring-forward transition: midnight is EST, the next one
+    # is EDT.  A fixed offset (the old `datetime.now().astimezone()` behaviour)
+    # would report the same offset on both, and fire the fallback an hour off.
+    assert before.utcoffset() == timedelta(hours=-5)
+    assert after.utcoffset() == timedelta(hours=-4)
+
+
+def test_the_local_sentinel_is_the_host_zone_by_default() -> None:
+    assert daily.resolve_timezone("local") == tzlocal.get_localzone()

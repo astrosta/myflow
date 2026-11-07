@@ -18,6 +18,10 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0,<3.0",
     "httpx>=0.27",
     "pygit2>=1.20,<2",
+    # contextforge.sync.timezone="local" 要在配置加载时就解析成本机时区，而默认值
+    # 就是这个哨兵，所以它在核心依赖里：datetime.now().astimezone() 只给固定偏移，
+    # 冬夏令时切换当天午夜会错一小时；tzlocal 读平台时区库，给出真正的 DST zone。
+    "tzlocal>=5.0,<6",
 ]
 
 [project.optional-dependencies]

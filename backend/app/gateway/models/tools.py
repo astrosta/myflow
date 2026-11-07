@@ -55,6 +55,8 @@ class ToolStatusResponse(BaseModel):
     reachable: bool = False
     auth_ok: bool = False
     admin_events: str = "disabled"
+    #: State of the local-midnight fallback sync task: running | stopped | disabled.
+    daily: str = "disabled"
     sync: str = "disabled"
     index: str = "disabled"
     channels: ToolChannelsStatus = Field(default_factory=ToolChannelsStatus)

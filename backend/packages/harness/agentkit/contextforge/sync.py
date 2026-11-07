@@ -50,7 +50,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 from weakref import WeakKeyDictionary
 
@@ -94,6 +94,16 @@ class ContextForgeSyncStats:
     `upserted`/`deleted` are the Milvus operations that followed the commit
     (both zero when retrieval is disabled), and `error` is set when the snapshot
     was not replaced - the previous catalog is still in place.
+
+    `duration_ms` is how long the whole sync took, so the management surface can
+    report it (`/api/tools/reindex`) instead of inventing it.
+
+    `index_failed` says *where* an `error` came from: True means the DB snapshot
+    was committed and only the derived Milvus index failed, so the catalog is
+    live and only retrieval is degraded.  False alongside an `error` means the
+    snapshot itself was not replaced (upstream, database, lock, or an exception
+    the service could not classify), and the caller must not report the catalog
+    as reachable.
     """
 
     scanned: int = 0
@@ -101,6 +111,8 @@ class ContextForgeSyncStats:
     upserted: int = 0
     deleted: int = 0
     error: str | None = None
+    duration_ms: int = 0
+    index_failed: bool = False
 
 
 #: One lock per event loop that ever ran a sync.  A lock holds a strong reference
@@ -214,12 +226,15 @@ class ContextForgeSyncService:
         """
         if not self._config.enabled:
             return ContextForgeSyncStats()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         try:
             lock = sync_lock()
         except Exception as exc:  # noqa: BLE001 - sync must not raise at the caller
-            return _aborted(reason, "lock_failed", exc)
+            return _timed(_aborted(reason, "lock_failed", exc), started, loop)
         async with lock:
-            return await self._sync_locked(reason=reason, full=full)
+            stats = await self._sync_locked(reason=reason, full=full)
+        return _timed(stats, started, loop)
 
     async def reindex(self) -> ContextForgeSyncStats:
         """Manual reindex: a full sync, so the derived index is pruned too."""
@@ -252,6 +267,10 @@ class ContextForgeSyncService:
             upserted=index_stats.upserted,
             deleted=index_stats.deleted,
             error=index_stats.error,
+            # The snapshot is committed at this point, so an index error degrades
+            # retrieval only.  The runtime reads this flag instead of guessing
+            # from the error code.
+            index_failed=index_stats.error is not None,
         )
         logger.info(
             "ContextForge sync(%s): %d tools, %d changed, %d indexed, %d pruned%s",
@@ -443,6 +462,13 @@ class ContextForgeSyncService:
         except Exception as exc:  # noqa: BLE001 - the catalog is already committed
             logger.warning("ContextForge tool index sync failed: %s", type(exc).__name__)
             return ToolIndexSyncStats(scanned=len(rows), error=type(exc).__name__)
+
+
+def _timed(
+    stats: ContextForgeSyncStats, started: float, loop: asyncio.AbstractEventLoop
+) -> ContextForgeSyncStats:
+    """Stamp how long the sync took; the caller reports it (0 on same-millisecond runs)."""
+    return replace(stats, duration_ms=max(0, int((loop.time() - started) * 1000)))
 
 
 def _aborted(
