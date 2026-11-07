@@ -210,7 +210,6 @@ class FakeExecutionRuntime:
             enabled=True,
             base_url="http://cf",
             admin_token="token",
-            tool_loading="eager",
             search={"enabled": False},
             sync={"tool_error_refresh_timeout_seconds": refresh_timeout},
         )
@@ -370,6 +369,29 @@ async def test_without_state_nothing_is_retrieved(tmp_path: Path) -> None:
         message = await _run(execution, retrieved=())
 
     assert _payload(message)["origin"] == "not_retrieved"
+
+
+@pytest.mark.asyncio
+async def test_require_retrieved_false_skips_the_gate_but_not_the_schema(
+    tmp_path: Path,
+) -> None:
+    """contextforge.search.require_retrieved is the switch; safety still applies.
+
+    With the gate deliberately loosened, an unretrieved call name reaches the
+    owner-scoped store and the stored schema, so the arguments are still
+    validated before anything runs upstream.
+    """
+    async with catalog(tmp_path) as store:
+        await _store_record(store, _record())
+        mcp = FakeMcp()
+        execution = FakeExecutionRuntime(store, mcp)
+        execution.config.search.require_retrieved = False
+
+        message = await _run(execution, retrieved=())
+
+    payload = _payload(message)
+    assert payload["origin"] == "local_validation"
+    assert mcp.calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -842,7 +864,6 @@ async def test_the_built_runtime_hands_the_executor_its_store_and_mcp_client(
             enabled=True,
             base_url="http://cf",
             admin_token="token",
-            tool_loading="eager",
             search={"enabled": False},
         ),
         session_factory=factory,

@@ -265,12 +265,10 @@ async def search_tools_preview(
             "this build"
         )
     outcome = await service.search(task_query=q, user_id=caller.user_id)
-    # The process publishes the ContextForge service, whose hits are cards; the
-    # legacy snapshot service is only built by tests (Task 11 deletes it), and its
-    # hits carry no database fields this per-user preview could answer with.
-    cards: list[ToolSearchCard] = [
-        hit for hit in outcome.hits if isinstance(hit, ToolSearchCard)
-    ][:limit]
+    # The process publishes one service, whose hits are always cards: the page
+    # shows exactly the tools the model could call, so there is no other shape to
+    # filter out here.
+    cards: list[ToolSearchCard] = list(outcome.hits[:limit])
     return ToolSearchPreview(
         query=q,
         results=[

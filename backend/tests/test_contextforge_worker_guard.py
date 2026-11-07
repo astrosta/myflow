@@ -21,7 +21,6 @@ def _enabled() -> ContextForgeConfig:
         enabled=True,
         base_url="http://cf",
         admin_token="adm",
-        tool_loading="eager",
         search={"enabled": False},
     )
 

@@ -34,7 +34,6 @@ ALL_TOOLS = [
         "search_skills",
         "tool_search",
         "tool_execute",
-        "search_tools",
     )
 ]
 

@@ -13,7 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agentkit.knowledge.config import EmbeddingConfig, MilvusConfig, RerankConfig
 
-TOOLS_COLLECTION = "myflow_tools_catalog"
+#: The one Milvus collection that holds the derived tool documents.  The
+#: authoritative catalog is the contextforge_tools table, so this collection is a
+#: rebuildable projection and never shares the knowledge or skills collections.
+TOOL_COLLECTION = "myflow_contextforge_tools"
 
 
 class ContextForgeSyncConfig(BaseModel):
@@ -101,20 +104,20 @@ class ToolVectorStoreConfig(MilvusConfig):
     """One collection in the existing Milvus instance."""
 
     collection: str = Field(
-        default=TOOLS_COLLECTION,
+        default=TOOL_COLLECTION,
         description="Tool catalog collection; never the knowledge or skills collection.",
     )
 
     @field_validator("collection")
     @classmethod
     def _pin_tools_collection(cls, value: str) -> str:
-        if value != TOOLS_COLLECTION:
+        if value != TOOL_COLLECTION:
             raise ValueError(
                 "contextforge.search.vector_store.collection must be "
-                f"{TOOLS_COLLECTION!r}: tool documents never share the knowledge "
+                f"{TOOL_COLLECTION!r}: tool documents never share the knowledge "
                 "or skills collection."
             )
-        return TOOLS_COLLECTION
+        return TOOL_COLLECTION
 
 
 class ToolSearchConfig(BaseModel):
@@ -134,6 +137,12 @@ class ToolSearchConfig(BaseModel):
     max_schema_chars: int = Field(default=3000, ge=200, le=100000)
     #: The whole tool_search ToolMessage: five cards plus their metadata.
     max_result_chars: int = Field(default=16000, ge=200, le=100000)
+    #: tool_execute refuses a call_name this run did not retrieve.  The design
+    #: default is on; turning it off is a deliberate loosening of the gate.
+    require_retrieved: bool = True
+    #: How many call names one run may hold callable.  The design caps it at five
+    #: so a retrieved set stays a shortlist, never a second tool table.
+    max_retrieved_tools: int = Field(default=5, ge=1, le=5)
     keyword: ToolKeywordConfig = Field(default_factory=ToolKeywordConfig)
     embedding: ToolEmbeddingConfig = Field(default_factory=ToolEmbeddingConfig)
     rerank: ToolRerankConfig = Field(default_factory=ToolRerankConfig)
@@ -166,8 +175,6 @@ class ContextForgeConfig(BaseModel):
     request_timeout_seconds: float = Field(default=15.0, gt=0)
     connect_timeout_seconds: float = Field(default=5.0, gt=0)
     tool_name_prefix: bool = False
-    tool_loading: Literal["auto", "eager", "deferred"] = "auto"
-    deferred_threshold: int = Field(default=24, ge=0)
     sync: ContextForgeSyncConfig = Field(default_factory=ContextForgeSyncConfig)
     admin_events: AdminEventsConfig = Field(default_factory=AdminEventsConfig)
     search: ToolSearchConfig = Field(default_factory=ToolSearchConfig)
@@ -186,11 +193,6 @@ class ContextForgeConfig(BaseModel):
     def _coherent(self) -> Self:
         if self.enabled and not self.base_url:
             raise ValueError("contextforge.enabled=true requires base_url")
-        if self.tool_loading != "eager" and not self.search.enabled:
-            raise ValueError(
-                "contextforge.tool_loading="
-                f"{self.tool_loading!r} requires contextforge.search.enabled=true"
-            )
         if self.search.enabled and self.enabled:
             if not self.search.vector_store.uri.strip():
                 raise ValueError(
@@ -250,7 +252,7 @@ __all__ = [
     "AdminEventsConfig",
     "ContextForgeConfig",
     "ContextForgeSyncConfig",
-    "TOOLS_COLLECTION",
+    "TOOL_COLLECTION",
     "ToolEmbeddingConfig",
     "ToolKeywordConfig",
     "ToolRerankConfig",

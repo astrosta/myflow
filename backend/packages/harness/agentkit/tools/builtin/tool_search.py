@@ -130,9 +130,11 @@ async def tool_search(
             UNAVAILABLE_MESSAGE,
             write_names=False,
         )
-    # The five-card ceiling is the tool's contract, not the service's: a service
-    # that returns more is capped here so no reply can exceed it.
-    cards = [_card(hit) for hit in outcome.hits[:MAX_RETRIEVED_TOOLS]]
+    # The card ceiling is the tool's contract, not the service's: contextforge
+    # search.max_retrieved_tools follows top_k and is capped at five, so a service
+    # that returns more is truncated here and no reply can exceed it.
+    max_cards = int(getattr(service, "max_cards", MAX_RETRIEVED_TOOLS))
+    cards = [_card(hit) for hit in outcome.hits[:max_cards]]
     budget = getattr(service, "max_result_chars", MAX_RESULT_CHARS)
     payload, tools = _fit_result_budget(cards, retrieval, int(budget))
     return _reply(
@@ -141,6 +143,7 @@ async def tool_search(
         retrieval,
         payload["message"],
         write_names=True,
+        max_names=max_cards,
     )
 
 
@@ -181,33 +184,14 @@ def _fit_result_budget(
 
 
 def _card(hit: Any) -> dict[str, Any]:
-    """One card per hit, for either hit shape.
+    """Serialize one :class:`ToolSearchCard` into the model-facing payload.
 
-    tool_search reads the same process-global service that `search_tools` reads,
-    and the two services answer with different hits: the ContextForge service
-    returns a `ToolSearchCard` carrying the fields directly, while the legacy
-    snapshot service returns `ToolSearchHit(entry=ToolCatalogEntry, score)`.
-    Reading `hit.tool_id` unconditionally raised AttributeError *outside* the
-    search try/except, so installing a snapshot service turned every call into a
-    run failure.  Both shapes are read here.  A snapshot entry has no
-    ContextForge id and no schema, so its card reports an empty id and the
-    permissive object schema rather than inventing either; no app path installs
-    that service any more, and this keeps the tool total.
+    The only producer is :class:`ContextForgeToolSearchService`, so every field
+    here comes from the card the database row produced: the tool id, the call
+    name tool_execute will accept, and the schema already fitted to the card
+    budget.  Attributes are read defensively because tests install duck-typed
+    services, not because a second hit shape exists.
     """
-    entry = getattr(hit, "entry", None)
-    if entry is not None:
-        name = str(getattr(entry, "name", "") or "")
-        return {
-            "tool_id": "",
-            "tool_name": name,
-            "call_name": name,
-            "description": str(getattr(entry, "description", "") or ""),
-            "tags": list(getattr(entry, "tags", ()) or ()),
-            "parameters": list(getattr(entry, "parameters", ()) or ()),
-            "input_schema": {"type": "object"},
-            "schema_truncated": False,
-            "score": float(getattr(hit, "score", 0.0) or 0.0),
-        }
     return {
         "tool_id": getattr(hit, "tool_id", ""),
         "tool_name": getattr(hit, "tool_name", ""),
@@ -228,6 +212,7 @@ def _reply(
     message: str,
     *,
     write_names: bool,
+    max_names: int = MAX_RETRIEVED_TOOLS,
 ) -> Command:
     """The tool message, plus retrieved_tool_names only when a search answered.
 
@@ -251,7 +236,7 @@ def _reply(
     }
     if write_names:
         names = [tool["call_name"] for tool in tools if tool.get("call_name")]
-        update["retrieved_tool_names"] = names[:MAX_RETRIEVED_TOOLS]
+        update["retrieved_tool_names"] = names[: max(1, int(max_names))]
     return Command(update=update)
 
 

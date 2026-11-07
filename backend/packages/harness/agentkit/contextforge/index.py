@@ -24,15 +24,21 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agentkit.config.contextforge_config import ToolKeywordConfig, ToolVectorStoreConfig
+from agentkit.config.contextforge_config import (
+    TOOL_COLLECTION,
+    ToolKeywordConfig,
+    ToolVectorStoreConfig,
+)
 from agentkit.contextforge.store import ContextForgeToolRecord, content_hash_for
 
 logger = logging.getLogger(__name__)
 
 #: Fixed by the design: the derived tool index never shares the knowledge or
 #: skill collections.  There is no historical data to migrate, so a schema
-#: change is a drop and rebuild.
-COLLECTION_NAME = "myflow_contextforge_tools"
+#: change is a drop and rebuild.  The name is defined once, in the config module
+#: that pins it, so the config a deployment writes and the collection the index
+#: uses can never disagree.
+COLLECTION_NAME = TOOL_COLLECTION
 
 #: What a hit needs to be joined back to ``contextforge_tools`` and displayed.
 #: The full ``input_schema`` is deliberately absent: it lives in the database.

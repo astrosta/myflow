@@ -91,7 +91,6 @@ def _config() -> ContextForgeConfig:
         enabled=True,
         base_url="http://cf",
         admin_token="adm",
-        tool_loading="eager",
         search={"enabled": False},
         sync={"startup_sync": False},
         admin_events={"enabled": True, "debounce_ms": 0},

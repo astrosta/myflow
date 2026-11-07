@@ -49,7 +49,6 @@ def _config(**overrides: Any) -> ContextForgeConfig:
         "base_url": "https://cf.example.com",
         "admin_token": "admin-token",
         "agent_token": "agent-token",
-        "tool_loading": "eager",
         "search": {"enabled": False},
     }
     return ContextForgeConfig(**{**base, **overrides})

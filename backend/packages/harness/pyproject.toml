@@ -34,11 +34,10 @@ knowledge = [
     "pymilvus>=2.5",
 ]
 # ContextForge：原生 MCP 客户端（tools/list + tools/call）+ 工具目录的 Milvus
-# collection + tool_execute 的本地 schema 校验。mcp 必须显式声明：同步和执行都直接
-# 用 mcp SDK（ClientSession / streamablehttp_client），不经过 langchain-mcp-adapters。
+# collection + tool_execute 的本地 schema 校验。同步和执行都直接用 mcp SDK
+# （ClientSession / streamablehttp_client），所以 mcp 必须显式声明。
 contextforge = [
     "mcp>=1.30,<2",
-    "langchain-mcp-adapters>=0.3",
     "pymilvus>=2.5",
     "jsonschema>=4.23,<5",
     "cryptography>=43,<51",

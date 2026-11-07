@@ -28,7 +28,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.thread_state import merge_retrieved_tool_names
 from agentkit.config.contextforge_config import ContextForgeConfig
-from agentkit.contextforge.catalog import ToolCatalogEntry
 from agentkit.contextforge.index import ToolVectorHit
 from agentkit.contextforge.runtime import (
     build_contextforge_runtime,
@@ -41,7 +40,6 @@ from agentkit.contextforge.store import (
 )
 from agentkit.persistence.schema import Base
 from agentkit.runtime.user_context import reset_current_user, set_current_user
-from agentkit.tools.builtin.search_tools import search_tools as snapshot_search_tools
 from agentkit.tools.builtin.tool_search import TOOL_NAME, tool_search
 from agentkit.tools.search.service import (
     CATALOG_UNAVAILABLE,
@@ -49,7 +47,6 @@ from agentkit.tools.search.service import (
     MAX_RETRIEVED_TOOLS,
     ContextForgeToolSearchService,
     ToolSearchCard,
-    ToolSearchHit,
     ToolSearchOutcome,
     get_tool_search_runtime,
     reset_tool_search_runtime,
@@ -645,54 +642,11 @@ async def test_a_keyword_only_config_without_keyword_search_is_unavailable(
     assert _payload(update)["retrieval"]["warnings"] == [CATALOG_UNAVAILABLE]
 
 
-@pytest.mark.asyncio
-async def test_a_snapshot_catalog_hit_does_not_crash_tool_search() -> None:
-    """The legacy snapshot service answers with ToolSearchHit(entry=...).
-
-    Reading hit.tool_id unconditionally raised AttributeError outside the search
-    try/except, so a snapshot service turned every call into a run failure.
-    """
-    entry = ToolCatalogEntry(
-        name="github_search",
-        display_name="github_search",
-        description="Search GitHub code",
-        tags=("github", "code"),
-        parameters=("query",),
-        server="contextforge",
-        content="github_search Search GitHub code",
-        content_hash="hash-1",
-        updated_at=1,
-        owner="u1",
-    )
-    service = RecordingService(
-        ToolSearchOutcome(
-            hits=(ToolSearchHit(entry=entry, score=0.5),),
-            channels=("keyword",),
-            candidates=1,
-            index_kind="local_bm25",
-        )
-    )
-
-    update = await _run(service)
-
-    card = _payload(update)["tools"][0]
-    assert card["tool_name"] == "github_search"
-    assert card["call_name"] == "github_search"
-    assert card["description"] == "Search GitHub code"
-    assert card["tags"] == ["github", "code"]
-    # A snapshot entry carries neither a ContextForge id nor a schema.
-    assert card["tool_id"] == ""
-    assert card["input_schema"] == {"type": "object"}
-    assert card["score"] == 0.5
-    assert update["retrieved_tool_names"] == ["github_search"]
-
-
 def _enabled_config() -> ContextForgeConfig:
     return ContextForgeConfig(
         enabled=True,
         base_url="http://cf",
         admin_token="adm",
-        tool_loading="eager",
         search={
             "enabled": True,
             "embedding": EMBEDDING,
@@ -741,50 +695,3 @@ def test_a_disabled_runtime_clears_the_tool_search_service() -> None:
 
     assert build_contextforge_runtime(ContextForgeConfig()) is None
     assert get_tool_search_runtime() is None
-
-
-@pytest.mark.asyncio
-async def test_the_snapshot_search_tool_reads_contextforge_cards() -> None:
-    # Task 6 installs a card-shaped service into the process-global runtime that
-    # search_tools reads too, and the snapshot tool used to crash with
-    # AttributeError on hit.entry as soon as ContextForge search was enabled.
-    card = ToolSearchCard(
-        tool_id="tool-github_search",
-        tool_name="github_search",
-        call_name=call_name_for("github_search"),
-        description="Search GitHub code",
-        tags=("github", "code"),
-        parameters=("query",),
-        input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
-        score=1.0,
-    )
-    service = RecordingService(
-        ToolSearchOutcome(
-            hits=(card,),
-            channels=("embedding", "keyword"),
-            candidates=1,
-            index_kind="milvus",
-        )
-    )
-    set_tool_search_runtime(service)  # type: ignore[arg-type]
-    try:
-        result = await snapshot_search_tools.coroutine(
-            task_query="search github code",
-            domain_keywords=[],
-            runtime=_runtime(),
-            tool_call_id="call-1",
-        )
-    finally:
-        reset_tool_search_runtime()
-
-    update = result.update
-    message = update["messages"][0]
-    assert isinstance(message, ToolMessage)
-    assert message.name == "search_tools"
-    row = json.loads(message.content)["tools"][0]
-    assert row["tool_name"] == "github_search"
-    assert row["display_name"] == "github_search"
-    assert row["description"] == "Search GitHub code"
-    assert row["tags"] == ["github", "code"]
-    assert row["parameters"] == ["query"]
-    assert update["promoted"] == ["github_search"]

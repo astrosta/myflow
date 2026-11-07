@@ -23,10 +23,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import agentkit.contextforge.daily as daily
 from agentkit.config.contextforge_config import ContextForgeConfig
-from agentkit.contextforge.cache import (
-    get_contextforge_snapshot,
-    invalidate_contextforge_cache,
-)
 from agentkit.contextforge.runtime import (
     ContextForgeRuntime,
     build_contextforge_runtime,
@@ -44,7 +40,6 @@ def _config(**overrides: Any) -> ContextForgeConfig:
         "enabled": True,
         "base_url": "http://cf",
         "admin_token": "adm",
-        "tool_loading": "eager",
         "search": {"enabled": False},
         "sync": {"startup_sync": True},
         "admin_events": {"enabled": True, "debounce_ms": 0},
@@ -379,7 +374,6 @@ async def test_reindex_runs_a_full_sync() -> None:
 
 @pytest.mark.asyncio
 async def test_status_counts_come_from_the_store_not_an_in_memory_snapshot() -> None:
-    invalidate_contextforge_cache("test")
     runtime, _service, _admin, _factory = _runtime(
         rows=[_row(), _row(callable_=False), _row()]
     )
@@ -388,7 +382,6 @@ async def test_status_counts_come_from_the_store_not_an_in_memory_snapshot() -> 
 
     assert status["indexed_tools"] == 2
     assert status["total_tools"] == 3
-    assert get_contextforge_snapshot() is None, "the old in-memory snapshot is gone"
 
 
 @pytest.mark.asyncio

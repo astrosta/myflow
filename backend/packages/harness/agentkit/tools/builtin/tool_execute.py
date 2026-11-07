@@ -175,7 +175,13 @@ async def tool_execute(
     """
     call_name = (tool_name or "").strip()
     args = dict(arguments) if isinstance(arguments, Mapping) else {}
-    if call_name not in _retrieved_names(runtime):
+    execution = get_contextforge_runtime()
+    # contextforge.search.require_retrieved (default true) is the gate the design
+    # puts in front of every call: retrieval is what makes a name callable, so a
+    # name this run never saw never reaches the store or the MCP endpoint.  The
+    # default when no runtime is configured is still true - an unconfigured
+    # process has no basis to accept a name either.
+    if _require_retrieved(execution) and call_name not in _retrieved_names(runtime):
         return _error_reply(
             tool_call_id,
             call_name=call_name,
@@ -186,7 +192,6 @@ async def tool_execute(
             ),
         )
 
-    execution = get_contextforge_runtime()
     store = getattr(execution, "store", None) if execution is not None else None
     mcp = getattr(execution, "mcp_client", None) if execution is not None else None
     if execution is None or store is None or mcp is None:
@@ -830,6 +835,17 @@ def _inner_name(call_name: str) -> str:
     if call_name.startswith(CALL_NAME_PREFIX):
         return call_name[len(CALL_NAME_PREFIX) :]
     return call_name
+
+
+def _require_retrieved(execution: Any) -> bool:
+    """Whether this process gates execution on the run's retrieval set.
+
+    The policy lives in `contextforge.search.require_retrieved` so a deployment
+    can loosen it deliberately; an absent runtime or an absent field keeps the
+    design default (true), because an unreadable policy is not permission.
+    """
+    search = getattr(getattr(execution, "config", None), "search", None)
+    return bool(getattr(search, "require_retrieved", True))
 
 
 def _retrieved_names(runtime: Any) -> frozenset[str]:
