@@ -6,11 +6,18 @@ retry, and be bounded by `sync.tool_error_refresh_timeout_seconds`.  These tests
 use runtime doubles with the real shape - an async refresh, no `refresh_and_sync`
 - so a call to a deleted method fails here instead of silently swallowing an
 AttributeError and skipping the retry.
+
+The classifier is also the vocabulary tool_execute reports failures in, so the
+last two tests pin its one exception: an error that already carries
+``origin=local_validation`` was handled by the executor's own fallback, and must
+not be classified as refreshable even though its wording says "invalid
+arguments" - a middleware retry would refresh a second time and re-run the call.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -79,6 +86,21 @@ def _middleware(runtime: Any, *, timeout: float = 1) -> ToolRefreshRetryMiddlewa
     )
 
 
+def _local_validation_message() -> ToolMessage:
+    """The reply tool_execute produces for a locally invalid argument set."""
+    payload = {
+        "error": "arguments do not match the stored input_schema: invalid arguments",
+        "origin": "local_validation",
+        "retryable": True,
+    }
+    return ToolMessage(
+        content=json.dumps(payload),
+        tool_call_id="call-1",
+        name="tool_execute",
+        status="error",
+    )
+
+
 def _request(name: str = "github_search"):
     return SimpleNamespace(tool_call={"name": name, "id": "call-1", "args": {}})
 
@@ -89,6 +111,30 @@ def test_classifier_only_retries_not_found_and_invalid_args() -> None:
     assert classify_tool_error(RuntimeError("request timeout")) is RefreshableToolError.NONE
     assert classify_tool_error(RuntimeError("unauthorized")) is RefreshableToolError.NONE
     assert classify_tool_error(ToolMessage(content="参数校验失败", tool_call_id="c")) is RefreshableToolError.INVALID_ARGUMENTS
+
+
+def test_a_local_validation_error_is_not_refreshable() -> None:
+    assert (
+        classify_tool_error(_local_validation_message()) is RefreshableToolError.NONE
+    ), "the executor already ran its fallback; a second refresh is not a fix"
+    assert classify_tool_error("invalid arguments") is RefreshableToolError.INVALID_ARGUMENTS
+
+
+@pytest.mark.asyncio
+async def test_a_local_validation_result_is_not_retried() -> None:
+    runtime = FakeRuntime()
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        return _local_validation_message()
+
+    result = await _middleware(runtime).awrap_tool_call(_request("cf__github_search"), handler)
+
+    assert isinstance(result, ToolMessage)
+    assert calls["n"] == 1, "no retry: tool_execute owns this fallback"
+    assert runtime.synced == []
+    assert runtime.retries == []
 
 
 @pytest.mark.asyncio

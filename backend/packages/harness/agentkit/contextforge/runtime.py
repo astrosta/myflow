@@ -57,6 +57,7 @@ class ContextForgeRuntime:
         *,
         sync: ContextForgeSyncService,
         admin: ContextForgeAdminClient,
+        mcp: ContextForgeMcpClient | None = None,
         index: Any | None = None,
         embedder: Any | None = None,
         reranker: Any | None = None,
@@ -68,6 +69,7 @@ class ContextForgeRuntime:
         self.admin = admin
         self.reranker = reranker
         self._sync = sync
+        self._mcp = mcp if mcp is not None else getattr(sync, "mcp", None)
         self._store = store if store is not None else getattr(sync, "store", None)
         self._index = index if index is not None else getattr(sync, "index", None)
         self._embedder = (
@@ -97,6 +99,28 @@ class ContextForgeRuntime:
         self._last_retry_at: str | None = None
         self._last_retry_tool: str | None = None
         self._last_retry_result: str | None = None
+
+    # -- tool_execute's inputs --------------------------------------------- #
+
+    @property
+    def store(self) -> ContextForgeToolStore | None:
+        """The authoritative catalog tool_execute reads owner + callable from.
+
+        The tool cannot reach the runtime any other way: a tool function gets
+        no dependency injection, and the store is process-global state that
+        belongs to the runtime that built it.
+        """
+        return self._store
+
+    @property
+    def mcp_client(self) -> ContextForgeMcpClient | None:
+        """The one MCP client tool_execute calls tools/call on.
+
+        ContextForge remains the execution endpoint (design 6.2); this exposes
+        the client the runtime already owns instead of letting a tool build a
+        second one from config.
+        """
+        return self._mcp
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -507,6 +531,7 @@ def build_contextforge_runtime(
         config,
         sync=service,
         admin=admin,
+        mcp=mcp,
         index=index,
         embedder=embedder,
         reranker=reranker,

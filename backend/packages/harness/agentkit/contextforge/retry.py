@@ -1,4 +1,17 @@
-"""Strict classification for tool errors that may be fixed by a refresh."""
+"""Strict classification for tool errors that may be fixed by a refresh.
+
+Two callers share this vocabulary.  The tool-error retry middleware uses it to
+decide whether an error may be worth one catalog refresh and one retry;
+``tool_execute`` uses the same classes to pick its own fallback (design 9.1).
+
+That is why ``origin=local_validation`` is here.  When tool_execute's own local
+jsonschema check fails, it has *already* refreshed and answered with the new
+schema, and the model has to reorganise the arguments before anything is sent
+upstream.  A second refresh-and-retry on top of that would run a fallback that
+already ran (and, for a tool that is also invalid upstream, execute it again), so
+the marker is classified as not refreshable - it outranks the generic
+"invalid arguments" wording of the message it carries.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +45,12 @@ _INVALID_ARGUMENT_MARKERS = (
     "缺少必填参数",
     "-32602",
 )
+#: An error tool_execute produced and already handled: the executor owns its
+#: fallback, so a middleware must not refresh or retry on top of it.
+_LOCAL_VALIDATION_MARKERS = (
+    "local_validation",
+    "origin=local_validation",
+)
 _NEVER_RETRY_MARKERS = (
     "unauthorized",
     "forbidden",
@@ -55,6 +74,8 @@ def classify_tool_error(value: Any) -> RefreshableToolError:
     if not text:
         return RefreshableToolError.NONE
     if any(marker in text for marker in _NEVER_RETRY_MARKERS):
+        return RefreshableToolError.NONE
+    if any(marker in text for marker in _LOCAL_VALIDATION_MARKERS):
         return RefreshableToolError.NONE
     if any(marker in text for marker in _NOT_FOUND_MARKERS):
         return RefreshableToolError.NOT_FOUND
