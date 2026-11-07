@@ -4,14 +4,16 @@ The service is the only place that turns the two ContextForge views into
 ``contextforge_tools`` rows plus the derived Milvus index.  These tests pin
 the design's merge rules (name is the join key, the MCP inputSchema wins, Admin
 owns id/owner/tags/enabled/reachable), the safety rules (a tool is only indexed
-when it is callable, an MCP-only tool never gets a guessed id, an ambiguous
-record is dropped instead of being persisted) and the ordering guarantee (the
-database commits before Milvus is touched).
+when it is callable, an MCP-only tool never gets a guessed id, an invalid or
+ambiguous record is persisted non-callable instead of disappearing from the
+catalog), the ordering guarantee (the database commits before Milvus is touched,
+and a refused commit never reaches it) and the sync lock's loop safety.
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ import pytest
 from mcp import types as mcp_types
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import agentkit.contextforge.sync as sync_module
 from agentkit.config.contextforge_config import ContextForgeConfig
 from agentkit.contextforge.index import ToolIndexSyncStats
 from agentkit.contextforge.models import ContextForgeTool, ContextForgeUnavailable
@@ -31,7 +34,11 @@ from agentkit.contextforge.store import (
     content_hash_for,
     schema_hash_for,
 )
-from agentkit.contextforge.sync import ContextForgeSyncService, ContextForgeSyncStats
+from agentkit.contextforge.sync import (
+    ContextForgeSyncService,
+    ContextForgeSyncStats,
+    sync_lock,
+)
 from agentkit.persistence.schema import Base
 
 #: A schema with every shape a Pydantic round-trip would rewrite: it must be
@@ -266,6 +273,33 @@ class SpyStore(ContextForgeToolStore):
         return await super().upsert_snapshot(records, list(seen_names))
 
 
+class FailingStore(ContextForgeToolStore):
+    """The real store, except the snapshot commit fails (spec 6.2: DB fails)."""
+
+    async def upsert_snapshot(  # type: ignore[override]
+        self,
+        records: Sequence[ContextForgeToolRecord],
+        seen_names: Sequence[str],
+    ) -> Any:
+        raise RuntimeError("the catalog database is down")
+
+
+class EndlessAdmin:
+    """Admin REST /tools double that never returns a short page."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def list_tools(
+        self, *, limit: int = 100, skip: int = 0, include_inactive: bool = True
+    ) -> list[ContextForgeTool]:
+        self.calls += 1
+        return [
+            _admin_tool(name=f"tool{skip + index}", tool_id=f"id{skip + index}")
+            for index in range(limit)
+        ]
+
+
 @dataclass
 class Harness:
     store: ContextForgeToolStore
@@ -369,12 +403,13 @@ async def test_owner_is_read_from_annotations(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_admin_only_tool_is_stored_but_never_callable(tmp_path: Path) -> None:
+    index = FakeIndex()
     async with harness(tmp_path) as built:
         service = _service(
             built,
             admin=FakeAdmin([_admin_tool(name="ghost", tool_id="tool-2")]),
             mcp=FakeMcp([]),
-            index=FakeIndex(),
+            index=index,
             embedder=FakeEmbedder(),
         )
         stats = await service.sync("startup")
@@ -386,6 +421,9 @@ async def test_admin_only_tool_is_stored_but_never_callable(tmp_path: Path) -> N
     assert record.id == "tool-2"
     assert record.enabled is True
     assert record.callable is False
+    # A tool MCP never listed must not reach Milvus, not even as a stale id.
+    assert stats.upserted == 0
+    assert index.stored == {}
 
 
 @pytest.mark.asyncio
@@ -429,34 +467,94 @@ async def test_mcp_only_tool_is_skipped_without_a_guessed_id(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_mcp_tool_is_omitted(tmp_path: Path) -> None:
-    # Two tools claim one name: which schema would be stored is a guess, so the
-    # snapshot drops it instead of persisting an arbitrary non-callable row.
+async def test_ambiguous_mcp_tool_is_stored_but_never_callable(tmp_path: Path) -> None:
+    # Two different MCP tools claim one name: which schema would be stored is a
+    # guess, so the row keeps no definition and can never be callable (§6.1).
     first = _mcp_tool(schema={"type": "object", "properties": {"a": {}}})
     second = _mcp_tool(schema={"type": "object", "properties": {"b": {}}})
-    async with harness(tmp_path) as built:
-        service = _service(built, admin=FakeAdmin([_admin_tool()]), mcp=FakeMcp([first, second]))
-        stats = await service.sync("startup")
-        stored = await _rows(built)
-
-    assert stats.error is None
-    assert stats.scanned == 0
-    assert stored == {}
-
-
-@pytest.mark.asyncio
-async def test_unparsable_schema_is_omitted(tmp_path: Path) -> None:
+    index = FakeIndex()
     async with harness(tmp_path) as built:
         service = _service(
             built,
             admin=FakeAdmin([_admin_tool()]),
-            mcp=FakeMcp([ScriptedMcpTool("github_search", 5)]),
+            mcp=FakeMcp([first, second]),
+            index=index,
+            embedder=FakeEmbedder(),
         )
         stats = await service.sync("startup")
         stored = await _rows(built)
 
     assert stats.error is None
-    assert stored == {}
+    assert stats.scanned == 1
+    record = stored["github_search"]
+    assert record.id == "tool-1"
+    assert record.input_schema == {}
+    assert record.enabled is True
+    assert record.callable is False
+    assert index.stored == {}
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_mcp_tool_keeps_the_last_good_definition(tmp_path: Path) -> None:
+    conflict_a = _mcp_tool(schema={"type": "object", "properties": {"a": {}}})
+    conflict_b = _mcp_tool(schema={"type": "object", "properties": {"b": {}}})
+    async with harness(tmp_path) as built:
+        service = _service(built, admin=FakeAdmin([_admin_tool()]), mcp=FakeMcp([_mcp_tool()]))
+        await service.sync("startup")
+        assert (await _rows(built))["github_search"].callable is True
+
+        # The name is now ambiguous: neither schema can be trusted, so the row
+        # keeps the definition it was last known to have and stops being callable.
+        ambiguous = _service(
+            built, admin=FakeAdmin([_admin_tool()]), mcp=FakeMcp([conflict_a, conflict_b])
+        )
+        stats = await ambiguous.sync("admin_events")
+        stored = await _rows(built)
+
+    assert stats.error is None
+    assert stored["github_search"].input_schema == VERBATIM_SCHEMA
+    assert stored["github_search"].callable is False
+
+
+@pytest.mark.asyncio
+async def test_unparsable_schema_is_stored_but_never_callable(tmp_path: Path) -> None:
+    index = FakeIndex()
+    async with harness(tmp_path) as built:
+        service = _service(
+            built,
+            admin=FakeAdmin([_admin_tool()]),
+            mcp=FakeMcp([ScriptedMcpTool("github_search", 5)]),
+            index=index,
+            embedder=FakeEmbedder(),
+        )
+        stats = await service.sync("startup")
+        stored = await _rows(built)
+
+    assert stats.error is None
+    assert stats.scanned == 1
+    assert stored["github_search"].input_schema == {}
+    assert stored["github_search"].callable is False
+    assert index.stored == {}
+
+
+@pytest.mark.asyncio
+async def test_unparsable_schema_keeps_the_last_good_definition(tmp_path: Path) -> None:
+    async with harness(tmp_path) as built:
+        service = _service(built, admin=FakeAdmin([_admin_tool()]), mcp=FakeMcp([_mcp_tool()]))
+        await service.sync("startup")
+        assert (await _rows(built))["github_search"].input_schema == VERBATIM_SCHEMA
+
+        broken = _service(
+            built,
+            admin=FakeAdmin([_admin_tool()]),
+            mcp=FakeMcp([ScriptedMcpTool("github_search", "not json")]),
+        )
+        stats = await broken.sync("admin_events")
+        stored = await _rows(built)
+
+    assert stats.error is None
+    assert stored["github_search"].input_schema == VERBATIM_SCHEMA
+    assert stored["github_search"].callable is False
 
 
 @pytest.mark.asyncio
@@ -497,6 +595,76 @@ async def test_callability_is_derived_from_admin_state(
     assert record.reachable is reachable
     assert record.owner_user_id == owner
     assert record.callable is (enabled and reachable and owner is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_listed_twice_by_a_racing_page_stays_callable(tmp_path: Path) -> None:
+    # A paginated read that races a concurrent Admin write can return the same
+    # row on two pages, and tools/list can repeat an entry the same way.  Repeat
+    # rows of one tool are one tool, not an ambiguous name: retiring it here
+    # would drop a healthy tool out of tool_search until the next sync.
+    async with harness(tmp_path) as built:
+        index = FakeIndex(store=built.store)
+        healthy = _service(
+            built, admin=FakeAdmin([_admin_tool()]), mcp=FakeMcp([_mcp_tool()]),
+            index=index, embedder=FakeEmbedder(),
+        )
+        first = await healthy.sync("startup")
+
+        racing = _service(
+            built,
+            admin=FakeAdmin([_admin_tool(), _admin_tool()]),
+            mcp=FakeMcp([_mcp_tool(), _mcp_tool()]),
+            index=index,
+            embedder=FakeEmbedder(),
+        )
+        second = await racing.sync("admin_events")
+        stored = await _rows(built)
+
+    assert first.scanned == 1
+    assert second.scanned == 1
+    assert second.error is None
+    assert second.changed == 0  # the duplicate changed nothing
+    assert second.upserted == 0
+    assert set(stored) == {"github_search"}
+    assert stored["github_search"].callable is True
+    assert index.stored  # the row never left Milvus
+
+
+@pytest.mark.asyncio
+async def test_two_admin_ids_for_one_name_keep_one_non_callable_row(tmp_path: Path) -> None:
+    # Two ids cannot both own one call_name, so the name is a conflict (§6.1).
+    # One row is kept - deterministically - with callable=false and a warning.
+    older = _admin_tool(tool_id="tool-a")
+    newer = _admin_tool(tool_id="tool-b")
+    index = FakeIndex()
+    async with harness(tmp_path) as built:
+        service = _service(
+            built, admin=FakeAdmin([older, newer]), mcp=FakeMcp([_mcp_tool()]),
+            index=index, embedder=FakeEmbedder(),
+        )
+        stats = await service.sync("startup")
+        stored = await _rows(built)
+
+        # The winner does not depend on the order Admin returned the rows in,
+        # so a repeated sync does not rewrite the row.
+        again = _service(
+            built, admin=FakeAdmin([newer, older]), mcp=FakeMcp([_mcp_tool()]),
+            index=index, embedder=FakeEmbedder(),
+        )
+        repeat = await again.sync("admin_events")
+        after = await _rows(built)
+
+    assert stats.error is None
+    assert stats.scanned == 1
+    record = stored["github_search"]
+    assert record.id == "tool-a"  # the smallest id: stable across syncs
+    assert record.enabled is True
+    assert record.callable is False
+    assert stats.upserted == 0
+    assert index.stored == {}
+    assert after["github_search"].id == "tool-a"
+    assert repeat.changed == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -578,6 +746,55 @@ async def test_admin_failure_keeps_the_last_good_catalog(tmp_path: Path) -> None
     assert stored["github_search"].callable is True
     assert stored["github_search"].owner_user_id == "u1"
     assert index.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_commit_never_reaches_milvus(tmp_path: Path) -> None:
+    # §6.2: the DB is the runtime authority, so a failed snapshot commit must
+    # leave Milvus exactly as it was - no upserts, no prunes.
+    log: list[str] = []
+    async with harness(tmp_path, log=log) as built:
+        index = FakeIndex(store=built.store, log=log)
+        service = ContextForgeSyncService(
+            _config(),
+            admin=FakeAdmin([_admin_tool()]),
+            mcp=FakeMcp([_mcp_tool()]),
+            store=FailingStore(built.session_factory),
+            index=index,
+            embedder=FakeEmbedder(),
+        )
+        stats = await service.sync("admin_events")
+        stored = await _rows(built)
+
+    assert stats.error == "db_failed"
+    assert stats.scanned == 1  # the merge succeeded, the transaction did not
+    assert index.calls == 0
+    assert index.stored == {}
+    assert log == []  # no "db" marker, and no "index" marker after it
+    assert stored == {}
+
+
+@pytest.mark.asyncio
+async def test_a_never_ending_admin_catalog_aborts_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A broken skip/limit loop must not spin forever or half-write the catalog.
+    monkeypatch.setattr(sync_module, "_MAX_ADMIN_PAGES", 3)
+    admin = EndlessAdmin()
+    index = FakeIndex()
+    async with harness(tmp_path) as built:
+        service = _service(
+            built, admin=admin, mcp=FakeMcp([_mcp_tool()]),
+            index=index, embedder=FakeEmbedder(), page_size=2,
+        )
+        stats = await service.sync("startup")
+        stored = await _rows(built)
+
+    assert admin.calls == 3
+    assert stats.error == "admin_failed"
+    assert stats.scanned == 0
+    assert index.calls == 0
+    assert stored == {}
 
 
 @pytest.mark.asyncio
@@ -742,6 +959,97 @@ async def test_concurrent_syncs_are_serialized_by_one_lock(tmp_path: Path) -> No
     assert admin.calls  # both runs read ContextForge
 
 
+def test_the_process_lock_is_scoped_to_the_running_loop() -> None:
+    # asyncio.Lock binds to the loop it first runs in; one module-global lock
+    # would raise RuntimeError for any second loop instead of serialising.
+    async def grab() -> tuple[asyncio.Lock, asyncio.Lock]:
+        return sync_lock(), sync_lock()
+
+    first = asyncio.run(grab())
+    second = asyncio.run(grab())
+
+    assert first[0] is first[1]  # one lock per loop: every trigger shares it
+    assert first[0] is not second[0]
+
+
+def test_concurrent_syncs_on_a_second_event_loop_do_not_raise(tmp_path: Path) -> None:
+    # Two overlapping syncs make the lock contended, which is the only path that
+    # binds an asyncio.Lock to its loop: a shared lock would raise here.
+    def run(name: str) -> list[ContextForgeSyncStats]:
+        async def go() -> list[ContextForgeSyncStats]:
+            folder = tmp_path / name
+            folder.mkdir()
+            async with harness(folder) as built:
+                service = _service(
+                    built, admin=FakeAdmin([_admin_tool()]), mcp=FakeMcp([_mcp_tool()]),
+                    index=FakeIndex(), embedder=FakeEmbedder(),
+                )
+                return list(
+                    await asyncio.gather(
+                        service.sync("admin_events"),
+                        service.sync("call_error"),
+                    )
+                )
+
+        return asyncio.run(go())
+
+    first = run("loop-a")
+    second = run("loop-b")
+
+    assert [stats.error for stats in first] == [None, None]
+    assert [stats.error for stats in second] == [None, None]
+    assert [stats.upserted for stats in first] == [1, 0]  # the second pass reused it
+    assert [stats.upserted for stats in second] == [1, 0]
+
+
+def test_two_live_event_loops_sync_at_the_same_time(tmp_path: Path) -> None:
+    results: dict[str, ContextForgeSyncStats] = {}
+
+    def run(name: str) -> None:
+        async def go() -> ContextForgeSyncStats:
+            folder = tmp_path / name
+            folder.mkdir()
+            async with harness(folder) as built:
+                service = _service(
+                    built, admin=FakeAdmin([_admin_tool()]), mcp=FakeMcp([_mcp_tool()]),
+                    index=FakeIndex(), embedder=FakeEmbedder(),
+                )
+                return await service.sync("startup")
+
+        results[name] = asyncio.run(go())
+
+    threads = [threading.Thread(target=run, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert set(results) == {"a", "b"}
+    assert [stats.error for stats in results.values()] == [None, None]
+    assert [stats.scanned for stats in results.values()] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_lock_failure_is_reported_instead_of_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable() -> asyncio.Lock:
+        raise RuntimeError("no sync lock on this event loop")
+
+    admin = FakeAdmin([_admin_tool()])
+    mcp = FakeMcp([_mcp_tool()])
+    async with harness(tmp_path) as built:
+        service = _service(built, admin=admin, mcp=mcp)
+        monkeypatch.setattr(sync_module, "sync_lock", unavailable)
+        stats = await service.sync("startup")
+        stored = await _rows(built)
+
+    assert stats.error == "lock_failed"
+    assert admin.calls == []
+    assert mcp.calls == 0
+    assert stored == {}
+
+
 @pytest.mark.asyncio
 async def test_manual_reindex_is_a_full_sync(tmp_path: Path) -> None:
     async with harness(tmp_path) as built:
@@ -767,6 +1075,26 @@ async def test_disabled_config_never_touches_contextforge(tmp_path: Path) -> Non
         stored = await _rows(built)
 
     assert stats == ContextForgeSyncStats()
+    assert admin.calls == []
+    assert mcp.calls == 0
+    assert stored == {}
+
+
+@pytest.mark.asyncio
+async def test_a_service_without_both_contextforge_views_is_refused(tmp_path: Path) -> None:
+    # Without one of the two views an empty listing is indistinguishable from a
+    # missing client, and the sync would rewrite the whole catalog non-callable.
+    # The refusal happens at construction, before any read or write.
+    admin = FakeAdmin([_admin_tool()])
+    mcp = FakeMcp([_mcp_tool()])
+    async with harness(tmp_path) as built:
+        for missing in ("admin", "mcp", "store"):
+            kwargs: dict[str, Any] = {"admin": admin, "mcp": mcp, "store": built.store}
+            kwargs[missing] = None
+            with pytest.raises(ValueError):
+                ContextForgeSyncService(_config(), **kwargs)
+        stored = await _rows(built)
+
     assert admin.calls == []
     assert mcp.calls == 0
     assert stored == {}
