@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from langchain.agents import AgentState
@@ -20,6 +22,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.types import Command
 
 from agentkit.agents.middlewares.tool_result_meta import normalize_tool_result
 from agentkit.config.skills_config import SkillsConfig
@@ -44,6 +47,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 POLICY_HINT = "请改用其他工具，或者请用户激活一个声明了该工具的技能。"
+
+#: The model-facing ContextForge inner names.  The outer tools are framework
+#: tools, but the names inside their arguments/results are business tools and
+#: must obey the active skill just like a directly declared tool would.
+TOOL_SEARCH_NAME = "tool_search"
+TOOL_EXECUTE_NAME = "tool_execute"
+INNER_CALL_NAME_KEYS = ("tool_name", "call_name")
+
+#: A tool_search reply whose every card was filtered by the skill policy.  The
+#: card list itself is empty; this replaces the "call tool_execute" hint so the
+#: model is not told to execute something that is no longer present.
+FILTERED_EMPTY_MESSAGE = (
+    "当前激活的技能策略不允许本次检索返回的任何 ContextForge 工具。"
+    "请改用其他工具，或者请用户激活一个声明了目标 cf__ 工具的技能。"
+)
 
 
 class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
@@ -126,15 +144,91 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
         self, *, state: Mapping | None, runtime, baseline: frozenset[str]
     ) -> ToolPolicyDecision:
         paths, slash_path = self._activation_paths(state, runtime)
-        context = getattr(runtime, "context", None)
-        stored = parse_decision(
-            read_secret_context(
-                context, SKILL_TOOL_POLICY_DECISION_CONTEXT_KEY, token=self._owner_token
-            )
-        )
+        stored = self._stored_decision(runtime)
         if stored is not None and stored.activated_paths == tuple(sorted(paths)):
             return stored
         return self._compute(paths, slash_path, baseline=baseline, runtime=runtime)
+
+    def _stored_decision(self, runtime) -> ToolPolicyDecision | None:
+        """The decision written by this middleware for the current model call.
+
+        No fallback to a fresh computation: inner cf__ names are only safe to
+        allow when the exact decision that hid the outer tool table is present.
+        """
+        return parse_decision(
+            read_secret_context(
+                getattr(runtime, "context", None),
+                SKILL_TOOL_POLICY_DECISION_CONTEXT_KEY,
+                token=self._owner_token,
+            )
+        )
+
+    def _tool_call_refusal(self, request: ToolCallRequest) -> ToolMessage | None:
+        """The outer-tool check, plus tool_execute's inner call_name check."""
+        decision = self._decision(
+            state=getattr(request, "state", None),
+            runtime=request.runtime,
+            baseline=frozenset(),
+        )
+        name = _tool_call_name(request)
+        if not decision.is_allowed(name):
+            return _policy_error_tool_message(request, decision)
+        if name != TOOL_EXECUTE_NAME:
+            return None
+        inner_name = _inner_tool_name(request)
+        stored = self._stored_decision(request.runtime)
+        if stored is None:
+            return _inner_policy_error_tool_message(
+                request, inner_name=inner_name, decision=None
+            )
+        if not stored.is_allowed(inner_name):
+            return _inner_policy_error_tool_message(
+                request, inner_name=inner_name, decision=stored
+            )
+        return None
+
+    def _filter_tool_search_result(self, request: ToolCallRequest, result: Any) -> Any:
+        """Drop cards the active skill may not execute from a tool_search reply.
+
+        The result is a Command carrying a ToolMessage and the run-scoped
+        retrieved names.  Both have to be filtered together, otherwise a name
+        removed from the model-visible cards could still pass tool_execute's
+        retrieval gate.  A missing decision filters everything: fail closed.
+        """
+        decision = self._stored_decision(request.runtime)
+        if decision is not None and decision.unlimited:
+            return result
+        if isinstance(result, ToolMessage):
+            return _filter_tool_search_summary(result, decision)
+        if not isinstance(result, Command):
+            return result
+        update = result.update
+        if not isinstance(update, Mapping):
+            return result
+
+        new_update = dict(update)
+        changed = False
+        messages = update.get("messages")
+        if isinstance(messages, Sequence) and not isinstance(messages, (str, bytes)):
+            filtered_messages = []
+            messages_changed = False
+            for message in messages:
+                filtered = _filter_tool_search_summary(message, decision)
+                if filtered is not message:
+                    messages_changed = True
+                filtered_messages.append(filtered)
+            if messages_changed:
+                new_update["messages"] = filtered_messages
+                changed = True
+
+        if "retrieved_tool_names" in update:
+            names = update["retrieved_tool_names"]
+            filtered_names = _filter_retrieved_names(names, decision)
+            if filtered_names is not names:
+                new_update["retrieved_tool_names"] = filtered_names
+                changed = True
+
+        return replace(result, update=new_update) if changed else result
 
     # ---- hooks -------------------------------------------------------------
 
@@ -172,26 +266,26 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Any],
     ) -> ToolMessage | Any:
-        decision = self._decision(
-            state=getattr(request, "state", None), runtime=request.runtime, baseline=frozenset()
-        )
-        name = _tool_call_name(request)
-        if not decision.is_allowed(name):
-            return _policy_error_tool_message(request, decision)
-        return handler(request)
+        refusal = self._tool_call_refusal(request)
+        if refusal is not None:
+            return refusal
+        result = handler(request)
+        if _tool_call_name(request) == TOOL_SEARCH_NAME:
+            return self._filter_tool_search_result(request, result)
+        return result
 
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Any]],
     ) -> ToolMessage | Any:
-        decision = self._decision(
-            state=getattr(request, "state", None), runtime=request.runtime, baseline=frozenset()
-        )
-        name = _tool_call_name(request)
-        if not decision.is_allowed(name):
-            return _policy_error_tool_message(request, decision)
-        return await handler(request)
+        refusal = self._tool_call_refusal(request)
+        if refusal is not None:
+            return refusal
+        result = await handler(request)
+        if _tool_call_name(request) == TOOL_SEARCH_NAME:
+            return self._filter_tool_search_result(request, result)
+        return result
 
 
 def _tool_name(tool: Any) -> str | None:
@@ -209,6 +303,99 @@ def _tool_call_name(request: ToolCallRequest) -> str:
     tool_call = getattr(request, "tool_call", None) or {}
     name = tool_call.get("name") if isinstance(tool_call, Mapping) else None
     return str(name) if name else ""
+
+
+def _inner_tool_name(request: ToolCallRequest) -> str:
+    """tool_execute's model-facing inner name (the cf__ call name)."""
+    tool_call = getattr(request, "tool_call", None) or {}
+    args = tool_call.get("args") if isinstance(tool_call, Mapping) else None
+    if not isinstance(args, Mapping):
+        return ""
+    for key in INNER_CALL_NAME_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _filter_tool_search_summary(message: Any, decision: ToolPolicyDecision | None) -> Any:
+    """Filter one tool_search ToolMessage's JSON cards, leaving other messages alone."""
+    if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
+        return message
+    try:
+        payload = json.loads(message.content)
+    except (TypeError, ValueError):
+        return message
+    if not isinstance(payload, Mapping):
+        return message
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return message
+    kept = [
+        card
+        for card in tools
+        if isinstance(card, Mapping) and _name_allowed(decision, _card_call_name(card))
+    ]
+    if len(kept) == len(tools):
+        return message
+    filtered = dict(payload)
+    filtered["tools"] = kept
+    if not kept:
+        filtered["message"] = FILTERED_EMPTY_MESSAGE
+    return message.model_copy(
+        update={"content": json.dumps(filtered, ensure_ascii=False)}
+    )
+
+
+def _filter_retrieved_names(names: Any, decision: ToolPolicyDecision | None) -> Any:
+    if not isinstance(names, list):
+        return names
+    kept = [
+        name
+        for name in names
+        if isinstance(name, str) and _name_allowed(decision, name)
+    ]
+    return kept if len(kept) != len(names) else names
+
+
+def _card_call_name(card: Mapping) -> str:
+    name = card.get("call_name")
+    return name.strip() if isinstance(name, str) else ""
+
+
+def _name_allowed(decision: ToolPolicyDecision | None, name: str) -> bool:
+    return bool(name) and decision is not None and decision.is_allowed(name)
+
+
+def _inner_policy_error_tool_message(
+    request: ToolCallRequest,
+    *,
+    inner_name: str,
+    decision: ToolPolicyDecision | None,
+) -> ToolMessage:
+    """Refuse a tool_execute whose inner cf__ name the active skill may not run."""
+    tool_call = getattr(request, "tool_call", None) or {}
+    name = _tool_call_name(request) or TOOL_EXECUTE_NAME
+    tool_call_id = (
+        str(tool_call.get("id") or "missing_tool_call_id")
+        if isinstance(tool_call, Mapping)
+        else "missing_tool_call_id"
+    )
+    inner = inner_name or "<missing>"
+    if decision is None:
+        content = (
+            f"错误：当前激活的技能策略决策缺失，已拒绝执行 ContextForge 工具 '{inner}'"
+            f"（fail closed）。{POLICY_HINT}"
+        )
+    else:
+        content = (
+            f"错误：当前激活的技能下不可执行 ContextForge 工具 '{inner}'"
+            f"（策略模式：{decision.mode}）。{POLICY_HINT}"
+        )
+    message = ToolMessage(
+        content=content, tool_call_id=tool_call_id, name=name, status="error"
+    )
+    return normalize_tool_result(message, tool_call_id=tool_call_id)
 
 
 def _policy_error_tool_message(request: ToolCallRequest, decision: ToolPolicyDecision) -> ToolMessage:

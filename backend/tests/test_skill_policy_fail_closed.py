@@ -33,6 +33,7 @@ ALL_TOOLS = [
         "load_skills",
         "search_skills",
         "tool_search",
+        "tool_execute",
         "search_tools",
     )
 ]

@@ -21,12 +21,14 @@ from typing import Any
 
 from agentkit.skills.types import Skill
 
-#: 最严格的技能策略下也始终可用的**发现基础设施**（§3.8）。
+#: 最严格的技能策略下也始终可用的**发现与执行基础设施**（§3.8）。
 #: task **不在**这里：否则受限技能可以通过委派绕过自己的策略。
 #: load_skills 和 read_file 同级：两者都只是"把某个 SKILL.md 读进上下文"。
+#: tool_search / tool_execute 是 ContextForge 的发现/执行入口；发现不等于可用，
+#: 内层 cf__ 名字仍由 SkillToolPolicyMiddleware 按当前技能策略检查。
 #: search_skills 是 skill-finder 的元数据工具，不属于 always-available。
 ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES = frozenset(
-    {"read_file", "tool_search", "load_skills", "search_tools"}
+    {"read_file", "tool_search", "tool_execute", "load_skills"}
 )
 
 DECISION_VERSION = 1
