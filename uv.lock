@@ -38,7 +38,10 @@ dependencies = [
 
 [package.optional-dependencies]
 contextforge = [
+    { name = "cryptography" },
+    { name = "jsonschema" },
     { name = "langchain-mcp-adapters" },
+    { name = "mcp" },
     { name = "pymilvus" },
 ]
 e2b = [
@@ -75,8 +78,10 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29" },
     { name = "cisco-ai-skill-scanner", marker = "extra == 'skills'", specifier = ">=2.2,<3" },
+    { name = "cryptography", marker = "extra == 'contextforge'", specifier = ">=43,<51" },
     { name = "e2b", marker = "extra == 'e2b'", specifier = ">=2.62,<3" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "jsonschema", marker = "extra == 'contextforge'", specifier = ">=4.23,<5" },
     { name = "langchain", specifier = ">=1.4.1" },
     { name = "langchain-core", specifier = ">=1.6.3" },
     { name = "langchain-deepseek", specifier = ">=1.1.1" },
@@ -85,6 +90,7 @@ requires-dist = [
     { name = "langfuse", marker = "extra == 'observability'", specifier = ">=5.1,<6" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.1.2" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.1" },
+    { name = "mcp", marker = "extra == 'contextforge'", specifier = ">=1.30,<2" },
     { name = "opensandbox", marker = "extra == 'opensandbox'", specifier = ">=1.2,<2" },
     { name = "openviking-sdk", marker = "extra == 'openviking'", specifier = "==0.1.17" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.3.3" },
