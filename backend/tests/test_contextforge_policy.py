@@ -245,3 +245,59 @@ def test_ordinary_tool_calls_are_not_inner_checked(tmp_path):
     )
 
     assert result == "ran"
+
+
+def test_decision_signature_binds_unlimited():
+    from agentkit.skills.tool_policy import build_decision, parse_decision
+
+    decision = build_decision(baseline=frozenset(), activated=[], slash_skill=None)
+    payload = decision.to_payload()
+    assert parse_decision(payload) is not None
+
+    payload["unlimited"] = False
+    assert parse_decision(payload) is None
+
+
+def test_tool_search_filters_tuple_retrieved_names(tmp_path):
+    reader = _write(tmp_path, "reader", allowed="[cf__github_search]")
+    state = _state(reader)
+    context = _context()
+    middleware = _middleware(tmp_path)
+    _prime(middleware, context, state)
+
+    result = middleware.wrap_tool_call(
+        _tool_call("tool_search", context, state, {"task_query": "search code"}),
+        lambda request: Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps(_search_payload("cf__github_search", "cf__read_file")),
+                        tool_call_id="call-1",
+                        name="tool_search",
+                    )
+                ],
+                "retrieved_tool_names": ("cf__github_search", "cf__read_file"),
+            }
+        ),
+    )
+
+    assert result.update["retrieved_tool_names"] == ["cf__github_search"]
+
+
+def test_tool_search_non_json_content_fails_closed(tmp_path):
+    reader = _write(tmp_path, "reader", allowed="[cf__github_search]")
+    state = _state(reader)
+    context = _context()
+    middleware = _middleware(tmp_path)
+    _prime(middleware, context, state)
+
+    result = middleware.wrap_tool_call(
+        _tool_call("tool_search", context, state, {"task_query": "search code"}),
+        lambda request: ToolMessage(
+            content="not json", tool_call_id="call-1", name="tool_search"
+        ),
+    )
+
+    payload = json.loads(result.content)
+    assert payload["tools"] == []
+    assert payload["message"]

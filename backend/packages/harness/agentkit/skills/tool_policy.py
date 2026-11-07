@@ -103,7 +103,9 @@ def build_decision(
         unlimited=unlimited,
         allowed=frozenset(allowed),
         activated_paths=paths,
-        signature=decision_signature(mode=mode, allowed=allowed, activated_paths=paths),
+        signature=decision_signature(
+            mode=mode, unlimited=unlimited, allowed=allowed, activated_paths=paths
+        ),
     )
 
 
@@ -117,15 +119,24 @@ def framework_only_decision(*, reason: str) -> ToolPolicyDecision:
         unlimited=False,
         allowed=allowed,
         activated_paths=paths,
-        signature=decision_signature(mode=f"{MODE_FAIL_CLOSED}:{reason}", allowed=allowed, activated_paths=paths),
+        signature=decision_signature(
+            mode=f"{MODE_FAIL_CLOSED}:{reason}",
+            unlimited=False,
+            allowed=allowed,
+            activated_paths=paths,
+        ),
     )
 
 
 def decision_signature(
-    *, mode: str, allowed: AbstractSet[str], activated_paths: Sequence[str]
+    *,
+    mode: str,
+    unlimited: bool,
+    allowed: AbstractSet[str],
+    activated_paths: Sequence[str],
 ) -> str:
     """路径 + 结果的指纹：对不上的决策（畸形 / 过期 / 外来）一律作废，回退现场解析。"""
-    material = "\n".join([mode, *sorted(allowed), *activated_paths])
+    material = "\n".join([mode, "unlimited" if unlimited else "restricted", *sorted(allowed), *activated_paths])
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
@@ -148,7 +159,9 @@ def parse_decision(payload: Any) -> ToolPolicyDecision | None:
         return None
     if not isinstance(signature, str):
         return None
-    expected = decision_signature(mode=mode, allowed=set(allowed), activated_paths=paths)
+    expected = decision_signature(
+        mode=mode, unlimited=unlimited, allowed=set(allowed), activated_paths=paths
+    )
     if signature != expected:
         return None
     return ToolPolicyDecision(

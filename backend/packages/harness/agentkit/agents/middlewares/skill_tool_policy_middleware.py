@@ -177,7 +177,7 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
             return None
         inner_name = _inner_tool_name(request)
         stored = self._stored_decision(request.runtime)
-        if stored is None:
+        if stored is None or stored != decision:
             return _inner_policy_error_tool_message(
                 request, inner_name=inner_name, decision=None
             )
@@ -195,7 +195,13 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
         removed from the model-visible cards could still pass tool_execute's
         retrieval gate.  A missing decision filters everything: fail closed.
         """
-        decision = self._stored_decision(request.runtime)
+        stored = self._stored_decision(request.runtime)
+        resolved = self._decision(
+            state=getattr(request, "state", None),
+            runtime=request.runtime,
+            baseline=frozenset(),
+        )
+        decision = stored if stored is not None and resolved == stored else None
         if decision is not None and decision.unlimited:
             return result
         if isinstance(result, ToolMessage):
@@ -322,15 +328,17 @@ def _filter_tool_search_summary(message: Any, decision: ToolPolicyDecision | Non
     """Filter one tool_search ToolMessage's JSON cards, leaving other messages alone."""
     if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
         return message
+    if getattr(message, "name", None) != TOOL_SEARCH_NAME:
+        return message
     try:
         payload = json.loads(message.content)
     except (TypeError, ValueError):
-        return message
+        return _empty_tool_search_message(message)
     if not isinstance(payload, Mapping):
-        return message
+        return _empty_tool_search_message(message)
     tools = payload.get("tools")
     if not isinstance(tools, list):
-        return message
+        return _empty_tool_search_message(message)
     kept = [
         card
         for card in tools
@@ -348,14 +356,23 @@ def _filter_tool_search_summary(message: Any, decision: ToolPolicyDecision | Non
 
 
 def _filter_retrieved_names(names: Any, decision: ToolPolicyDecision | None) -> Any:
-    if not isinstance(names, list):
+    if not isinstance(names, (list, tuple)):
         return names
     kept = [
         name
         for name in names
         if isinstance(name, str) and _name_allowed(decision, name)
     ]
-    return kept if len(kept) != len(names) else names
+    if len(kept) == len(names):
+        return names
+    return kept
+
+
+def _empty_tool_search_message(message: ToolMessage) -> ToolMessage:
+    payload = {"tools": [], "message": FILTERED_EMPTY_MESSAGE}
+    return message.model_copy(
+        update={"content": json.dumps(payload, ensure_ascii=False)}
+    )
 
 
 def _card_call_name(card: Mapping) -> str:
