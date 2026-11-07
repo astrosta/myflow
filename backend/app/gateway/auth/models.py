@@ -41,6 +41,8 @@ PAT_SCOPE_MENU = frozenset({
     "memory:write",
     "knowledge:read",
     "knowledge:write",
+    "tools:read",
+    "tools:write",
 })
 
 

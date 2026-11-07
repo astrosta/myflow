@@ -465,7 +465,9 @@ uv sync --package backend --extra contextforge
 embedding / Milvus 不可用时保留本地 BM25 降级，并在 `retrieval.warnings` 里说明。
 召回结果必须能在当前 MCP 快照里确认，Milvus 只负责缩小候选集。
 
-`/api/tools` 全部是 `admin` scope。上游错误映射：工具不存在 404 `tool_not_found`、
+`/api/tools` 对**所有已登录用户**开放；ContextForge 的 admin token 只由网关持有，
+浏览器永远拿不到。工具目录是共享的：任何登录用户都能看到并维护同一份工具，
+不会按 MyFlow 账号隔离。上游错误映射：工具不存在 404 `tool_not_found`、
 凭据/权限 502 `contextforge_auth_failed`、ContextForge 不可达 502
 `contextforge_unavailable`、超时 504 `contextforge_timeout`、参数不合法 422
 `contextforge_validation_error`。详情里的敏感 header 打成 `****`，编辑时原样回传，
@@ -473,19 +475,19 @@ embedding / Milvus 不可用时保留本地 BM25 降级，并在 `retrieval.warn
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| `GET` | `/api/tools` | 分页、`q`、`enabled`、`integration_type` 过滤（`admin`） |
-| `GET` | `/api/tools/status` | ContextForge 可达/鉴权、管理事件、同步、索引与三路通道状态（`admin`） |
-| `POST` | `/api/tools/reindex` | 手动刷新 MCP 快照并重建工具索引（`admin`） |
-| `GET` | `/api/tools/search?q=...` | 检索预览：命中、通道、候选数、是否重排与 warnings（`admin`） |
-| `POST` | `/api/tools` | 新建工具并触发异步刷新（`admin`） |
-| `GET` | `/api/tools/{id}` | 工具详情，敏感 header 掩码（`admin`） |
-| `PUT` | `/api/tools/{id}` | 整份更新并触发异步刷新（`admin`） |
-| `POST` | `/api/tools/{id}/state` | 启用/停用并触发异步刷新（`admin`） |
-| `DELETE` | `/api/tools/{id}` | 删除并触发异步刷新（`admin`） |
+| `GET` | `/api/tools` | 分页、`q`、`enabled`、`integration_type` 过滤（登录用户） |
+| `GET` | `/api/tools/status` | ContextForge 可达/鉴权、管理事件、同步、索引与三路通道状态（登录用户） |
+| `POST` | `/api/tools/reindex` | 手动刷新 MCP 快照并重建工具索引（登录用户） |
+| `GET` | `/api/tools/search?q=...` | 检索预览：命中、通道、候选数、是否重排与 warnings（登录用户） |
+| `POST` | `/api/tools` | 新建工具并触发异步刷新（登录用户） |
+| `GET` | `/api/tools/{id}` | 工具详情，敏感 header 掩码（登录用户） |
+| `PUT` | `/api/tools/{id}` | 整份更新并触发异步刷新（登录用户） |
+| `POST` | `/api/tools/{id}/state` | 启用/停用并触发异步刷新（登录用户） |
+| `DELETE` | `/api/tools/{id}` | 删除并触发异步刷新（登录用户） |
 
-前端入口是 `/workspace/tools`（侧栏「工具管理」）。非管理员看到 403 页面；
-认证关闭的单人模式按管理员放行。写操作后状态栏可能短暂显示旧快照——这是异步刷新的
-预期表现，不是数据丢失。
+前端入口是 `/workspace/tools`（侧栏「工具管理」），所有登录用户都能打开；认证关闭的
+单人模式同样放行。写操作后状态栏可能短暂显示旧快照——这是异步刷新的预期表现，
+不是数据丢失。
 
 ## 认证（M9 §2）
 
@@ -738,75 +740,3 @@ FAQ 384/0，API 768/0；硬上界 1024 token。FAQ 只对问题做 embedding，�
 一条一个分片，条号写进 `section`，引用能直接落到“《XX 办法》第十二条”。
 
 Agent 通过内置子代理 `knowledge-researcher` 使用只读 `knowledge_search`（lead 不再直接持有它；
-子代理不可用时退回 lead 直连）。工具把 `knowledge_base_type` 作为参数，由模型按问题语义路由；服务端始终按 `user_id` 过滤，模型不能传身份。首版入库任务
-在 Gateway 进程内运行，重启会中断；按单 worker 部署，多实例前需换成持久任务队列。
-
-检索是混合检索（§7.4）：问题拆成 `query`（向量）与 `keyword_query`（BM25 关键词，
-可省略、缺省时复用 `query`），两路各取 `retrieval.candidate_k` 条后由 Milvus 
-`hybrid_search` + `RRFRanker(k=retrieval.rrf_k)` 融合；`retrieval.rerank.enabled=true`
-时再把融合候选送给 rerank 模型精排（`protocol: cohere | tei`，模型默认取顶层
-`rerank.model`）。关键词通道或精排不可用时按设计文档降级，并在返回值里
-如实标注 `retrieval_mode` 与 `reranked`。
-
-collection 需要 Milvus 2.5+ 的 BM25 能力：`content` 字段带 analyzer（默认 `chinese`）、
-`sparse` 字段由 BM25 Function 自动生成、稀疏索引 metric 为 `BM25`。上线前的旧
-collection 没有这些字段，关键词通道会报 `keyword_search_unavailable` 并降级为纯向量，
-需要新建 collection 后重索引。`retrieval.keyword.analyzer` 是 destructive 参数。
-
-| 方法 | 路径 | 作用 |
-|---|---|---|
-| `GET` | `/api/knowledge/status` | 启用状态、限制、六类分片参数 |
-| `GET`/`POST` | `/api/knowledge/bases` | 列 / 建知识库 |
-| `GET`/`PATCH`/`DELETE` | `/api/knowledge/bases/{id}` | 详情 / 改名 / 级联删除 |
-| `GET`/`POST` | `/api/knowledge/bases/{id}/documents` | 文档列表 / 批量上传（202） |
-| `GET` | `/api/knowledge/bases/{id}/documents/{doc}` | 文档元数据 |
-| `GET` | `/api/knowledge/bases/{id}/documents/{doc}/chunks` | 文档切片，按 `chunk_index` 排序并分页 |
-| `POST` | `/api/knowledge/bases/{id}/documents/{doc}/reindex` | 重新解析 / 索引 |
-| `DELETE` | `/api/knowledge/bases/{id}/documents/{doc}` | 删除文档与向量 |
-| `GET` | `/api/knowledge/search` | 检索测试（`q` 向量 + `keyword` BM25、`type` / `base_id` 过滤） |
-
-## 测试
-
-```bash
-# 必须在仓库根跑：测试 import backend.* 和 agentkit.*
-uv run python -m pytest backend/tests
-```
-
-E2B 的真集群用例默认跳过，只在 Linux 宿主上显式开启（会创建真实沙箱，不要指向共享生产环境）：
-
-```bash
-cd backend
-E2B_INTEGRATION=1 \
-E2B_API_URL=http://<e2b-api> \
-E2B_TEMPLATE_ID=<template-id> \
-REDIS_URL=redis://127.0.0.1:6379/0 \
-uv run pytest tests/test_e2b_integration.py -v
-```
-
-有鉴权时再加 `E2B_API_KEY`；数据面域名不是 `cube.app` 时加 `E2B_DOMAIN`。用例跑真实 provider 的 acquire →
-uploads 上传 → `echo`/python3 → 沙箱内写 `/mnt/user-data/outputs` → release 下载 → pause/release → 重新 acquire，
-并覆盖一次按需技能读取。
-
-OpenSandbox 的真用例同样默认跳过（会创建并 kill 真实沙箱，需要一个在跑的服务端）：
-
-```bash
-cd backend
-OPENSANDBOX_INTEGRATION=1 \
-OPENSANDBOX_DOMAIN=127.0.0.1:8080 \
-REDIS_URL=redis://127.0.0.1:6379/0 \
-uv run pytest tests/test_opensandbox_integration.py -v
-```
-
-不设 `OPENSANDBOX_IMAGE` 时用默认的 `python:3.12`。用例跑 acquire → `echo`/python3 →
-双向文件 → 二进制往返 → glob/grep → `release_action=destroy` 后重建 → `shutdown` 清沙箱。
-
-## 排障
-
-| 现象 | 处理 |
-|---|---|
-| `No module named 'backend'` | 在仓库根启动 |
-| `No config file found` | `--env-file .env`，或设置 `MYFLOW_CONFIG_PATH` |
-| `$DEEPSEEK_API_KEY is not set` | `.env` 里补上，并用 `--env-file` |
-| `address already in use` | 换 `--port` 或杀掉占用 8001 的进程 |
-| 登录页一直说"登录状态已失效" | 先确认网关进程不是旧的：**改完代码要重启 uvicorn**（README 里的 `--reload` 只在开发时开）。旧 cookie 从 9A 起不会再锁死登录页 |
-| SSE 只有一帧 `event: end` | 订阅早于 worker 第一帧 `publish`；见 `MemoryStreamBridge.subscribe` 在 buffer 为 None 时直接 END |

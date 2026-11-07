@@ -5,12 +5,10 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from agentkit.authz import ADMIN_ROLE
 from agentkit.contextforge.models import ContextForgeTool, ToolWrite
 
-from backend.app.gateway.deps import require_scope
 from backend.app.gateway.errors import ContextForgeDisabled, InvalidToolHeaderAPI
-from backend.app.gateway.tools_deps import get_contextforge_admin_client
+from backend.app.gateway.tools_deps import get_contextforge_admin_client, require_tools_scope
 from agentkit.contextforge.runtime import get_contextforge_runtime
 from agentkit.tools.search.service import get_tool_search_runtime
 
@@ -30,7 +28,8 @@ from backend.app.gateway.run_models import RunCaller
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 
-AdminCaller = Annotated[RunCaller, Depends(require_scope(ADMIN_ROLE))]
+ToolReader = Annotated[RunCaller, Depends(require_tools_scope("tools:read"))]
+ToolWriter = Annotated[RunCaller, Depends(require_tools_scope("tools:write"))]
 
 
 async def _request_refresh(request: Request, reason: str = "admin") -> None:
@@ -69,7 +68,7 @@ def _detail(tool: ContextForgeTool) -> ToolDetail:
 @router.get("", response_model=ToolListResponse)
 async def list_tools(
     request: Request,
-    caller: AdminCaller,
+    caller: ToolReader,
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     q: str | None = None,
@@ -115,7 +114,7 @@ async def list_tools(
 @router.get("/status", response_model=ToolStatusResponse)
 async def tool_status(
     request: Request,
-    caller: AdminCaller,
+    caller: ToolReader,
 ) -> ToolStatusResponse:
     del caller, request
     runtime = get_contextforge_runtime()
@@ -127,7 +126,7 @@ async def tool_status(
 @router.post("/reindex")
 async def reindex_tools(
     request: Request,
-    caller: AdminCaller,
+    caller: ToolWriter,
 ) -> dict[str, object]:
     del caller
     runtime = get_contextforge_runtime()
@@ -147,7 +146,7 @@ async def reindex_tools(
 @router.get("/search")
 async def search_tools_preview(
     request: Request,
-    caller: AdminCaller,
+    caller: ToolReader,
     q: str = Query(min_length=1, max_length=4000),
     limit: int = Query(default=5, ge=1, le=20),
 ) -> dict[str, object]:
@@ -183,7 +182,7 @@ async def search_tools_preview(
 async def get_tool(
     tool_id: str,
     request: Request,
-    caller: AdminCaller,
+    caller: ToolReader,
 ) -> ToolDetail:
     del caller
     client = get_contextforge_admin_client(request)
@@ -194,7 +193,7 @@ async def get_tool(
 async def create_tool(
     body: ToolWrite,
     request: Request,
-    caller: AdminCaller,
+    caller: ToolWriter,
 ) -> ToolDetail:
     del caller
     client = get_contextforge_admin_client(request)
@@ -210,7 +209,7 @@ async def update_tool(
     tool_id: str,
     body: ToolWrite,
     request: Request,
-    caller: AdminCaller,
+    caller: ToolWriter,
 ) -> ToolDetail:
     del caller
     client = get_contextforge_admin_client(request)
@@ -231,7 +230,7 @@ async def update_tool(
 async def delete_tool(
     tool_id: str,
     request: Request,
-    caller: AdminCaller,
+    caller: ToolWriter,
 ) -> Response:
     del caller
     client = get_contextforge_admin_client(request)
@@ -245,7 +244,7 @@ async def set_tool_state(
     tool_id: str,
     body: ToolStateRequest,
     request: Request,
-    caller: AdminCaller,
+    caller: ToolWriter,
 ) -> ToolDetail:
     del caller
     client = get_contextforge_admin_client(request)

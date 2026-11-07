@@ -2,7 +2,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useSession, type SessionState } from "@/core/auth/use-session";
 import {
   createTool,
   deleteTool,
@@ -18,11 +17,10 @@ import {
 import { ToolManagementPage } from "./tool-management-page";
 
 /**
- * 「工具管理」页：管理员入口。API 与 useSession 都换成 vi.fn()，
- * 断言管理员门禁、加载/空/错误态、状态栏、CRUD 与检索预览的调用。
+ * 「工具管理」页：所有登录用户可用。API 换成 vi.fn()，
+ * 断言加载/空/错误态、状态栏、CRUD 与检索预览的调用。
  */
 
-vi.mock("@/core/auth/use-session", () => ({ useSession: vi.fn() }));
 vi.mock("@/core/api/tools", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/core/api/tools")>();
   return {
@@ -38,7 +36,6 @@ vi.mock("@/core/api/tools", async (importOriginal) => {
   };
 });
 
-const mockedUseSession = vi.mocked(useSession);
 const mockedList = vi.mocked(listTools);
 const mockedStatus = vi.mocked(getToolsStatus);
 const mockedCreate = vi.mocked(createTool);
@@ -46,27 +43,6 @@ const mockedDelete = vi.mocked(deleteTool);
 const mockedSetEnabled = vi.mocked(setToolEnabled);
 const mockedReindex = vi.mocked(reindexTools);
 const mockedPreview = vi.mocked(previewToolSearch);
-
-function adminSession(): SessionState {
-  return {
-    user: { id: "u1", email: null, username: "root", system_role: "admin" },
-    status: "authenticated",
-    loading: false,
-    refresh: vi.fn(async () => undefined),
-    signOut: vi.fn(async () => undefined),
-  };
-}
-
-function memberSession(): SessionState {
-  return {
-    ...adminSession(),
-    user: { id: "u2", email: null, username: "alice", system_role: "user" },
-  };
-}
-
-function disabledAuthSession(): SessionState {
-  return { ...adminSession(), user: null, status: "disabled" };
-}
 
 function makeTool(overrides: Partial<ContextForgeTool> = {}): ContextForgeTool {
   return {
@@ -119,7 +95,6 @@ function renderPage() {
 }
 
 beforeEach(() => {
-  mockedUseSession.mockReturnValue(adminSession());
   mockedList.mockResolvedValue({ tools: [makeTool()], count: 1, next_cursor: null });
   mockedStatus.mockResolvedValue(makeStatus());
   mockedCreate.mockResolvedValue({ ...makeTool({ id: "tool-2", name: "new_tool" }), headers: {}, input_schema: {}, annotations: {} });
@@ -151,26 +126,14 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
-  mockedUseSession.mockReturnValue(adminSession());
 });
 
 describe("工具管理页", () => {
-  it("非管理员显示 403，且不请求工具列表", async () => {
-    mockedUseSession.mockReturnValue(memberSession());
-
-    renderPage();
-
-    expect(await screen.findByRole("heading", { name: "无权访问" })).toBeTruthy();
-    expect(screen.getByText(/只有管理员可以管理工具/)).toBeTruthy();
-    expect(mockedList).not.toHaveBeenCalled();
-  });
-
-  it("认证关闭时按管理员放行", async () => {
-    mockedUseSession.mockReturnValue(disabledAuthSession());
-
+  it("普通用户也能打开工具管理并加载列表", async () => {
     renderPage();
 
     expect(await screen.findByRole("heading", { name: "工具管理" })).toBeTruthy();
+    expect(await screen.findByRole("article", { name: "gitlab_search" })).toBeTruthy();
     expect(mockedList).toHaveBeenCalledTimes(1);
   });
 

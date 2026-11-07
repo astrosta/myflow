@@ -6,6 +6,7 @@ from starlette.requests import Request
 
 from agentkit.contextforge.models import ContextForgeTool
 from backend.app.gateway import tools_deps
+from backend.app.gateway.auth.result import AuthKind, AuthResult
 from backend.app.gateway.run_models import CallerKind, RunCaller
 from backend.app.gateway.routers import tools as tools_router
 
@@ -108,3 +109,32 @@ async def test_status_keeps_channels_for_the_management_page(monkeypatch) -> Non
     assert response.indexed_tools == 12
     assert response.channels.keyword == "ready"
     assert response.channels.rerank == "degraded"
+
+def test_regular_authenticated_user_can_use_the_tools_proxy() -> None:
+    request = _request()
+    request.state.auth = AuthResult(
+        kind=AuthKind.session,
+        user_id="u1",
+        identity="user-1",
+        role="user",
+    )
+
+    caller = tools_deps.require_tools_scope("tools:read")(request)
+
+    assert caller.user_id == "u1"
+    assert caller.allows("admin") is False
+
+def test_pat_without_tools_scope_is_denied() -> None:
+    from backend.app.gateway.services import RunPermissionDenied
+
+    request = _request()
+    request.state.auth = AuthResult(
+        kind=AuthKind.pat,
+        user_id="u1",
+        identity="user-1",
+        role="user",
+        scopes=frozenset({"models:read"}),
+    )
+
+    with pytest.raises(RunPermissionDenied):
+        tools_deps.require_tools_scope("tools:read")(request)

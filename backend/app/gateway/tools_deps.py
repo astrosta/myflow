@@ -11,7 +11,28 @@ from fastapi import Request
 from agentkit.config import get_app_config
 from agentkit.contextforge.admin import ContextForgeAdminClient
 from agentkit.contextforge.runtime import get_contextforge_runtime
+from backend.app.gateway.deps import caller_from_request, require_authenticated
 from backend.app.gateway.errors import ContextForgeDisabled
+from backend.app.gateway.run_models import RunCaller
+
+
+def require_tools_scope(scope: str):
+    """Any signed-in user may use the shared catalog; PATs keep their scopes.
+
+    ContextForge credentials stay server-side. Session callers have
+    scopes=None and pass; a PAT must carry tools:read / tools:write.
+    """
+
+    def _dep(request: Request) -> RunCaller:
+        from backend.app.gateway.services import RunPermissionDenied
+
+        require_authenticated(request)
+        caller = caller_from_request(request)
+        if not caller.allows(scope):
+            raise RunPermissionDenied(f"missing scope: {scope}")
+        return caller
+
+    return _dep
 
 
 def get_contextforge_admin_client(request: Request) -> ContextForgeAdminClient:
@@ -29,4 +50,4 @@ def get_contextforge_admin_client(request: Request) -> ContextForgeAdminClient:
     return client
 
 
-__all__ = ["get_contextforge_admin_client"]
+__all__ = ["get_contextforge_admin_client", "require_tools_scope"]

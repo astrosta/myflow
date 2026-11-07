@@ -18,7 +18,6 @@ import {
   type ContextForgeTool,
   type ToolStatus,
 } from "@/core/api/tools";
-import { useSession } from "@/core/auth/use-session";
 import { cn } from "@/lib/utils";
 
 import { ToolEditorDialog } from "./tool-editor-dialog";
@@ -70,11 +69,6 @@ interface EditorState {
 
 export function ToolManagementPage() {
   const queryClient = useQueryClient();
-  const { status: sessionStatus, user, loading: sessionLoading } = useSession();
-  const isAdmin =
-    sessionStatus === "disabled" ||
-    (sessionStatus === "authenticated" && user?.system_role === "admin");
-
   const [filter, setFilter] = useState("");
   const [appliedFilter, setAppliedFilter] = useState("");
   const [editor, setEditor] = useState<EditorState | null>(null);
@@ -86,13 +80,11 @@ export function ToolManagementPage() {
   const listQuery = useQuery({
     queryKey: ["tools", "list", appliedFilter],
     queryFn: () => listTools({ q: appliedFilter || undefined, limit: 100 }),
-    enabled: isAdmin,
     staleTime: 5_000,
   });
   const statusQuery = useQuery({
     queryKey: ["tools", "status"],
     queryFn: getToolsStatus,
-    enabled: isAdmin,
     staleTime: 5_000,
   });
   const preview = useMutation({
@@ -108,29 +100,6 @@ export function ToolManagementPage() {
   const refreshAll = async () => {
     await queryClient.invalidateQueries({ queryKey: ["tools"] });
   };
-
-  if (sessionLoading) {
-    return (
-      <div className="h-full bg-white px-5 py-6 sm:px-8" aria-busy="true" aria-label="加载会话">
-        <Skeleton className="h-8 w-48" />
-        <Skeleton className="mt-4 h-24 w-full" />
-      </div>
-    );
-  }
-
-  if (!isAdmin) {
-    return (
-      <div className="flex h-full items-center justify-center bg-white px-5 py-10">
-        <div className="max-w-md rounded-xl border border-neutral-200 bg-neutral-50 px-6 py-8 text-center">
-          <WrenchIcon className="mx-auto text-neutral-300" size={28} />
-          <h1 className="mt-3 text-lg font-semibold text-neutral-900">无权访问</h1>
-          <p className="mt-2 text-xs leading-relaxed text-neutral-500">
-            只有管理员可以管理工具。工具管理和 ContextForge 凭据都属于系统管理员。
-          </p>
-        </div>
-      </div>
-    );
-  }
 
   const tools = listQuery.data?.tools ?? [];
   const loading = listQuery.isLoading;
@@ -178,7 +147,7 @@ export function ToolManagementPage() {
               <h1 className="text-xl font-semibold tracking-tight text-neutral-900">工具管理</h1>
             </div>
             <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-              工具写在 ContextForge；MyFlow 异步同步到运行时与 Milvus。提示「尚未生效」时稍等状态栏刷新。
+              所有登录用户都可以维护 ContextForge 工具；管理凭据由网关统一持有，MyFlow 异步同步到运行时与 Milvus。
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
