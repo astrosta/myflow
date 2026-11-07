@@ -9,7 +9,7 @@
 #   gitea web    0.0.0.0:3001           Web UI（容器内 3000）
 #   gitea ssh    127.0.0.1:2222         SKILLS_GIT_REPOSITORY
 #   contextforge 127.0.0.1:4444         config.yaml contextforge.base_url
-#                容器内用 http://contextforge:4444；管理 API 已打开
+#                容器内用 http://contextforge:4444；库在 Postgres 的 mcp 库；管理 API 已打开
 #   opensandbox  127.0.0.1:8080         sandbox.opensandbox.domain，无 API key
 #                allowed_host_paths ← 仓库根 .env 的 SANDBOX_HOST_ROOT
 #   langfuse     0.0.0.0:3050          对外端口（容器内 3000）；NEXTAUTH_URL 用 LANGFUSE_BASE_URL
@@ -190,6 +190,25 @@ services:
   # 网关在同一 Docker 网络里用 http://contextforge:4444；宿主机进程用 127.0.0.1:4444。
   # admin_token 不在这里生成：进 http://127.0.0.1:4444/admin 登录后签发，
   # 写入 config.yaml 的 contextforge.admin_token（需 admin.events 或 *）。
+  #
+  # 不用挂卷 SQLite：镜像以 uid 10001 运行，named volume 属主是 root，
+  # /health 会因库连不上一直报 unhealthy。库用现有 Postgres 的 mcp 库。
+  contextforge-db:
+    image: postgres:16
+    container_name: myflow-contextforge-db-init
+    restart: "no"
+    environment:
+      PGPASSWORD: postgres
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        psql -h postgres -U postgres -tc
+        "SELECT 1 FROM pg_database WHERE datname='mcp'" | grep -q 1
+        || psql -h postgres -U postgres -c "CREATE DATABASE mcp"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   contextforge:
     image: ghcr.io/ibm/mcp-context-forge:latest
     container_name: myflow-contextforge
@@ -197,12 +216,14 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      contextforge-db:
+        condition: service_completed_successfully
     environment:
       HOST: 0.0.0.0
       PORT: "4444"
       MCPGATEWAY_UI_ENABLED: "true"
       MCPGATEWAY_ADMIN_API_ENABLED: "true"
-      DATABASE_URL: sqlite:////data/mcp.db
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/mcp
       CACHE_TYPE: redis
       REDIS_URL: redis://myflow:123456@redis:6379/1
       JWT_SECRET_KEY: ${CONTEXTFORGE_JWT_SECRET:-myflow-contextforge-jwt-secret-32b}
@@ -214,20 +235,19 @@ services:
       PLATFORM_ADMIN_FULL_NAME: Platform Administrator
     ports:
       - "127.0.0.1:4444:4444"
-    volumes:
-      - contextforge_data:/data
+    # 与官方镜像 HEALTHCHECK 对齐：看 HTTP 200，启动宽限 60s。
     healthcheck:
       test:
         [
           "CMD",
           "python3",
           "-c",
-          "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:4444/health', timeout=5); raise SystemExit(0 if json.load(r).get('status')=='healthy' else 1)",
+          "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:4444/health', timeout=5).status_code==200 else 1)",
         ]
-      interval: 15s
-      timeout: 5s
-      retries: 8
-      start_period: 20s
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # 沙箱镜像必须在宿主 Docker 里。OpenSandbox 挂了 docker.sock，本地没有时会在创建沙箱时现拉。
   # 这些服务只负责把镜像拉下来，进程立刻退出；opensandbox 等它们成功后再启动。
@@ -408,7 +428,6 @@ volumes:
   milvus_data:
   openviking_data:
   gitea_data:
-  contextforge_data:
   opensandbox_data:
   langfuse_clickhouse_data:
   langfuse_clickhouse_logs:
