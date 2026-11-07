@@ -21,13 +21,15 @@ from agentkit.sandbox.tools import (
 )
 from agentkit.tools.builtin.load_skills import load_skills
 from agentkit.tools.builtin.search_skills import search_skills
-from agentkit.tools.builtin.search_tools import search_tools
-from agentkit.tools.contextforge_metadata import (
-    contextforge_owner,
-    is_contextforge_tool,
-)
+from agentkit.tools.builtin.tool_execute import tool_execute
+from agentkit.tools.builtin.tool_search import tool_search
 
 logger = logging.getLogger(__name__)
+
+#: The only external-tool builtins.  ContextForge tools are never bound as
+#: LangChain tool objects: tool_search hands the model a card, tool_execute runs
+#: it (2026-11-07 design §10).
+_CONTEXTFORGE_BUILTIN_TOOL_NAMES = frozenset({"tool_search", "tool_execute"})
 
 _BASH_TOOL_NAMES = frozenset({"bash"})
 _HOST_BASH_DISABLED = (
@@ -48,7 +50,8 @@ _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
     ("sandbox", grep),
     ("sandbox", bash_tool),
     ("sandbox", run_code),
-    ("tools", search_tools),
+    ("tools", tool_search),
+    ("tools", tool_execute),
 )
 
 
@@ -60,7 +63,14 @@ def get_available_tools(
     app_config: AppConfig | None = None,
     user_id: str | None = None,
 ) -> list[BaseTool]:
-    """Config tools, then builtins, then MCP. Duplicate ``tool.name`` values are skipped."""
+    """Config tools, then builtins, then MCP. Duplicate ``tool.name`` values are skipped.
+
+    No ContextForge tool object is ever bound: the catalog is reached through the
+    two builtins, and ownership is enforced by tool_execute's owner-scoped store
+    read, not by a per-user tool table.  ``user_id`` stays in the signature for
+    the authorization hook (M9).
+    """
+    del user_id
     resolved = app_config if app_config is not None else get_app_config()
     selected_groups = set(groups) if groups is not None else None
     tools: list[BaseTool] = []
@@ -83,9 +93,6 @@ def get_available_tools(
     for group, tool in _BUILTIN_TOOLS:
         if selected_groups is not None and group not in selected_groups:
             continue
-        _add_tool(tools, seen, tool)
-
-    for tool in _load_contextforge_tools(resolved, user_id=user_id):
         _add_tool(tools, seen, tool)
 
     return apply_tool_authorization(
@@ -114,39 +121,6 @@ def _configured_tools(app_config: AppConfig) -> list[ToolConfig]:
         else:
             configs.append(ToolConfig.model_validate(item))
     return configs
-
-
-def _load_contextforge_tools(
-    app_config: AppConfig, *, user_id: str | None = None
-) -> list[BaseTool]:
-    if not app_config.contextforge.enabled:
-        return []
-    from agentkit.contextforge.cache import get_contextforge_snapshot
-
-    snapshot = get_contextforge_snapshot()
-    if snapshot is None:
-        return []
-    if user_id is None:
-        # Authentication disabled / internal single-user mode: the process has
-        # exactly one owner, so the whole snapshot belongs to it.
-        return list(snapshot.tools)
-    return [tool for tool in snapshot.tools if contextforge_owner(tool) == user_id]
-
-
-def contextforge_tool_count(tools: list[BaseTool]) -> int:
-    return sum(1 for tool in tools if is_contextforge_tool(tool))
-
-
-def should_defer_contextforge(app_config: AppConfig, tools: list[BaseTool]) -> bool:
-    """Auto/eager/deferred decision for one assembly."""
-    config = app_config.contextforge
-    if not config.enabled or not config.search.enabled:
-        return False
-    if config.tool_loading == "eager":
-        return False
-    if config.tool_loading == "deferred":
-        return True
-    return contextforge_tool_count(tools) > config.deferred_threshold
 
 
 def _add_tool(tools: list[BaseTool], seen: set[str], tool: BaseTool) -> None:
@@ -183,7 +157,10 @@ def _apply_capability_filters(
             continue
         if tool.name == "search_skills" and not skill_search_enabled:
             continue
-        if tool.name == "search_tools" and not getattr(app_config.contextforge, "enabled", False):
+        if (
+            tool.name in _CONTEXTFORGE_BUILTIN_TOOL_NAMES
+            and not getattr(app_config.contextforge, "enabled", False)
+        ):
             continue
         if tool.name == "view_image" and not vision:
             continue
