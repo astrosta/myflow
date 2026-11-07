@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import StructuredTool
 
 from agentkit.agents.leader_agent import (
     ASSEMBLY_INPUT_KEYS,
@@ -24,10 +25,15 @@ from agentkit.agents.middlewares.retrieval_scope_middleware import (
 )
 from agentkit.agents.thread_state import ThreadState, merge_retrieved_tool_names
 from agentkit.config import AppConfig, ModelConfig
+from agentkit.contextforge.cache import (
+    get_contextforge_snapshot,
+    invalidate_contextforge_cache,
+    set_contextforge_snapshot,
+)
 from agentkit.tools import get_available_tools
 from agentkit.tools.builtin.tool_execute import TOOL_NAME as TOOL_EXECUTE_TOOL_NAME
 from agentkit.tools.builtin.tool_search import TOOL_NAME as TOOL_SEARCH_TOOL_NAME
-from agentkit.tools.contextforge_metadata import is_contextforge_tool
+from agentkit.tools.contextforge_metadata import is_contextforge_tool, tag_contextforge_tool
 
 
 def _key(cfg: Mapping[str, Any] | None = None, *, app_config: AppConfig | None = None, checkpointer: Any = None, user_id: str = "default"):
@@ -169,18 +175,45 @@ def _contextforge_app(*, enabled: bool = True) -> AppConfig:
     )
 
 
-def test_tool_search_and_tool_execute_are_bound_instead_of_contextforge_tools() -> None:
-    tools = get_available_tools(app_config=_contextforge_app())
-    names = [tool.name for tool in tools]
+def _tagged_contextforge_tool(name: str, owner: str | None = None) -> StructuredTool:
+    """A ContextForge tool object exactly as the loader used to produce it."""
 
-    assert TOOL_SEARCH_TOOL_NAME in names
-    assert TOOL_EXECUTE_TOOL_NAME in names
-    # §10: the ContextForge catalog is no longer bound as LangChain tools.
-    assert [tool.name for tool in tools if is_contextforge_tool(tool)] == []
-    # the retired eager/deferred snapshot tool left the table with it.
-    assert "search_tools" not in names
-    # ordinary builtins are untouched.
-    assert {"load_skills", "read_file"} <= set(names)
+    def _run(query: str = "") -> str:
+        return query
+
+    tool = StructuredTool.from_function(_run, name=name, description=f"{name} tool")
+    return tag_contextforge_tool(tool, original_name=name, owner=owner)
+
+
+def test_tool_search_and_tool_execute_are_bound_instead_of_contextforge_tools() -> None:
+    # A populated snapshot is what the retired loader bound into the tool table.
+    # Without it the "no ContextForge tool objects" assertion below could never
+    # fail, so the snapshot is staged here and torn down afterwards.
+    invalidate_contextforge_cache("registry-test")
+    snapshot_tool = _tagged_contextforge_tool("cf__github_search", owner="u1")
+    set_contextforge_snapshot(tools=(snapshot_tool,), entries=())
+    try:
+        # Guard: the tool is really reachable through the cache the registry
+        # used to read, otherwise the rest of this test proves nothing.
+        assert get_contextforge_snapshot() is not None
+        assert snapshot_tool in get_contextforge_snapshot().tools
+
+        tools = get_available_tools(app_config=_contextforge_app(), user_id="u1")
+        names = [tool.name for tool in tools]
+
+        assert TOOL_SEARCH_TOOL_NAME in names
+        assert TOOL_EXECUTE_TOOL_NAME in names
+        # §10: the ContextForge catalog is no longer bound as LangChain tools.
+        assert [tool.name for tool in tools if is_contextforge_tool(tool)] == []
+        assert snapshot_tool.name not in names
+        # the retired eager/deferred snapshot tool left the table with it.
+        assert "search_tools" not in names
+        # ordinary builtins are untouched.
+        assert {"load_skills", "read_file"} <= set(names)
+        # the snapshot itself is left for tool_search/tool_execute to read.
+        assert get_contextforge_snapshot().tools == (snapshot_tool,)
+    finally:
+        invalidate_contextforge_cache("registry-test")
 
 
 def test_the_two_contextforge_builtins_follow_the_contextforge_switch() -> None:
