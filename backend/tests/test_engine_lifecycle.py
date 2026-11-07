@@ -454,3 +454,72 @@ class _UnusedEngine:
 
     async def dispose(self) -> None:
         return None
+
+def test_isolated_postgres_engine_uses_nullpool_without_main_pool_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sqlalchemy.pool import NullPool
+
+    recorded: dict[str, object] = {}
+
+    def _capture(url: str, **kwargs):
+        recorded["url"] = url
+        recorded["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(engine_mod, "create_async_engine", _capture)
+    monkeypatch.setattr(engine_mod, "_require_asyncpg", lambda: None)
+
+    engine_mod._create_engine(
+        "postgres",
+        url="postgresql+asyncpg://localhost/app",
+        echo=False,
+        pool_size=7,
+        postgres_schema="",
+        isolated=True,
+    )
+
+    kwargs = recorded["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["poolclass"] is NullPool
+    assert "pool_size" not in kwargs
+    assert "pool_pre_ping" not in kwargs
+
+
+
+def test_sessions_from_another_loop_get_a_loop_local_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Subagents run on an isolated loop; asyncpg pools cannot cross loops."""
+    from sqlalchemy import text
+
+    created: list[bool] = []
+    original = engine_mod._create_engine
+
+    def _spy(backend, **kwargs):
+        created.append(bool(kwargs["isolated"]))
+        return original(backend, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "_create_engine", _spy)
+
+    async def scenario() -> None:
+        await init_engine("sqlite", url=_sqlite_url(tmp_path), sqlite_dir=str(tmp_path))
+        factory = get_session_factory()
+        assert factory is not None
+        assert factory.kw["expire_on_commit"] is False
+
+        async with factory() as session:
+            assert await session.scalar(text("SELECT 42")) == 42
+
+        def _query_in_isolated_loop() -> int:
+            async def _query() -> int:
+                async with factory() as session:
+                    return int(await session.scalar(text("SELECT 42")))
+
+            return asyncio.run(_query())
+
+        assert await asyncio.to_thread(_query_in_isolated_loop) == 42
+        assert created == [False, True]
+        assert engine_mod._engine is not None
+
+    _run(scenario)
