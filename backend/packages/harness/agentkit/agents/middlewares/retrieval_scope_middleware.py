@@ -16,7 +16,7 @@ it says:
   ``SubagentRetrievalToolStripMiddleware``.
 
 The names are literals on purpose: importing the two tool modules here would pull
-the retrieval service and the ContextForge runtime into every assembly.
+the retrieval service and the MCP runtime into every assembly.
 ``tests/test_agent_factory.py`` pins them to the tools' own ``TOOL_NAME`` so the
 pair can never drift.
 """
@@ -34,7 +34,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from agentkit.agents.thread_state import ThreadState
 
-#: The two ContextForge builtins.  Subagents (v1) never inherit them.
+#: The two retrieval builtins.  Subagents (v1) never inherit them.
 RETRIEVAL_TOOL_NAMES = frozenset({"tool_search", "tool_execute"})
 
 SUBAGENT_UNAVAILABLE_MESSAGE = (

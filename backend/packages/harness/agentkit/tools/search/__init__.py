@@ -6,7 +6,6 @@ from agentkit.tools.search.service import (
     MAX_RETRIEVED_TOOLS,
     MAX_SCHEMA_CHARS,
     RERANK_UNAVAILABLE,
-    ContextForgeToolSearchService,
     McpToolSearchService,
     ToolSearchCard,
     ToolSearchOutcome,
@@ -18,7 +17,6 @@ from agentkit.tools.search.service import (
 
 __all__ = [
     "CATALOG_UNAVAILABLE",
-    "ContextForgeToolSearchService",
     "McpToolSearchService",
     "MAX_RESULT_CHARS",
     "MAX_RETRIEVED_TOOLS",

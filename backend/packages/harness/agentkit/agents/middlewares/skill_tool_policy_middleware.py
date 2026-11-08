@@ -159,8 +159,8 @@ class SkillToolPolicyMiddleware(AgentMiddleware[AgentState]):
     def _stored_decision(self, runtime) -> ToolPolicyDecision | None:
         """The decision written by this middleware for the current model call.
 
-        No fallback to a fresh computation: inner cf__ names are only safe to
-        allow when the exact decision that hid the outer tool table is present.
+        No fallback to a fresh computation: the inner mcp__ names are only safe
+        to allow when the exact decision that hid the outer tool table is present.
         """
         return parse_decision(
             read_secret_context(

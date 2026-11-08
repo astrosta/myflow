@@ -41,8 +41,10 @@ PAT_SCOPE_MENU = frozenset({
     "memory:write",
     "knowledge:read",
     "knowledge:write",
-    "tools:read",
-    "tools:write",
+    # Per-user MCP servers replaced the retired gateway tool API; its
+    # tools:read/tools:write scopes are gone with it.
+    "mcp_servers:read",
+    "mcp_servers:write",
 })
 
 

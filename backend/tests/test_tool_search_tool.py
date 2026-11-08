@@ -21,12 +21,7 @@ from langchain_core.messages import ToolMessage
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.thread_state import merge_retrieved_tool_names
-from agentkit.config.contextforge_config import ContextForgeConfig
 from agentkit.config.tool_search_config import ToolSearchConfig
-from agentkit.contextforge.runtime import (
-    build_contextforge_runtime,
-    reset_contextforge_runtime,
-)
 from agentkit.mcp.index import ToolVectorHit
 from agentkit.mcp.store.tool_repository import (
     McpToolRecord,
@@ -41,7 +36,6 @@ from agentkit.tools.search.service import (
     CATALOG_UNAVAILABLE,
     MAX_RESULT_CHARS,
     MAX_RETRIEVED_TOOLS,
-    ContextForgeToolSearchService,
     McpToolSearchService,
     ToolSearchCard,
     ToolSearchOutcome,
@@ -250,10 +244,6 @@ def _payload(update: dict[str, Any]) -> dict[str, Any]:
     return json.loads(message.content)
 
 
-def test_the_compatibility_alias_still_names_the_mcp_service() -> None:
-    assert ContextForgeToolSearchService is McpToolSearchService
-
-
 def test_the_service_accepts_the_documented_constructor_order() -> None:
     config = ToolSearchConfig()
     service = McpToolSearchService(config, None, None, None, None)
@@ -263,7 +253,6 @@ def test_the_service_accepts_the_documented_constructor_order() -> None:
 
 def test_the_tool_description_speaks_about_mcp_tools() -> None:
     assert "MCP" in (tool_search.description or "")
-    assert "ContextForge" not in (tool_search.description or "")
 
 
 @pytest.mark.asyncio
@@ -751,47 +740,6 @@ async def test_an_empty_query_or_missing_owner_never_searches() -> None:
     assert (await service.search(task_query="search the web", user_id=None)).hits == ()
 
     assert index.calls == []
-
-
-def _enabled_contextforge_config() -> ContextForgeConfig:
-    return ContextForgeConfig(
-        enabled=True,
-        base_url="http://cf",
-        admin_token="adm",
-        search={
-            "enabled": True,
-            "embedding": EMBEDDING,
-            "vector_store": {"uri": "http://milvus:19530"},
-        },
-    )
-
-
-@pytest.mark.asyncio
-async def test_build_contextforge_runtime_installs_the_mcp_tool_search_service(
-    tmp_path: Path,
-) -> None:
-    """The retired runtime is the only production consumer of the alias."""
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///" + (tmp_path / "wiring.db").as_posix()
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    runtime = None
-    try:
-        runtime = build_contextforge_runtime(
-            _enabled_contextforge_config(),
-            session_factory=async_sessionmaker(engine, expire_on_commit=False),
-        )
-        assert runtime is not None
-        service = get_tool_search_runtime()
-        assert isinstance(service, McpToolSearchService)
-        assert service.max_result_chars == MAX_RESULT_CHARS
-    finally:
-        reset_tool_search_runtime()
-        reset_contextforge_runtime()
-        if runtime is not None:
-            await runtime.admin.aclose()
-        await engine.dispose()
 
 
 def test_get_tool_search_runtime_is_empty_by_default() -> None:

@@ -74,8 +74,7 @@ class McpSessionRequest:
     """Everything the transport needs to open one short MCP session.
 
     'timeout' is the connect/HTTP budget; 'read_timeout' is how long an
-    initialize/tools/list/tools/call response may take.  The names match the
-    old ContextForge client so the transport wiring stays familiar.
+    initialize/tools/list/tools/call response may take.
     """
 
     url: str

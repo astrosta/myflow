@@ -41,25 +41,33 @@ def test_get_thread_state_schema_returns_thread_state() -> None:
 
 
 def test_retrieved_tool_names_replace_instead_of_merging() -> None:
-    assert merge_retrieved_tool_names(["cf__github_search"], ["cf__gitlab_search"]) == [
-        "cf__gitlab_search"
-    ]
+    assert merge_retrieved_tool_names(
+        ["mcp__github__search"], ["mcp__gitlab__search"]
+    ) == ["mcp__gitlab__search"]
 
 
 def test_retrieved_tool_names_empty_list_clears_the_previous_search() -> None:
-    assert merge_retrieved_tool_names(["cf__github_search"], []) == []
+    assert merge_retrieved_tool_names(["mcp__github__search"], []) == []
 
 
 def test_retrieved_tool_names_none_leaves_the_state_untouched() -> None:
-    assert merge_retrieved_tool_names(["cf__github_search"], None) == [
-        "cf__github_search"
+    assert merge_retrieved_tool_names(["mcp__github__search"], None) == [
+        "mcp__github__search"
     ]
 
 
 def test_retrieved_tool_names_dedupe_and_cap_at_five() -> None:
     merged = merge_retrieved_tool_names(
-        ["cf__a"], ["cf__a", "cf__b", "cf__c", "cf__d", "cf__e", "cf__f"]
+        ["mcp__a"],
+        [
+            "mcp__a",
+            "mcp__b",
+            "mcp__c",
+            "mcp__d",
+            "mcp__e",
+            "mcp__f",
+        ],
     )
 
     assert RETRIEVED_TOOL_NAMES_MAX_ENTRIES == 5
-    assert merged == ["cf__a", "cf__b", "cf__c", "cf__d", "cf__e"]
+    assert merged == ["mcp__a", "mcp__b", "mcp__c", "mcp__d", "mcp__e"]

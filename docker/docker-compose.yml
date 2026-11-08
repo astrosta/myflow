@@ -8,8 +8,6 @@
 #   openviking   127.0.0.1:1933         配置只来自挂载的 ov.conf
 #   gitea web    0.0.0.0:3001           Web UI（容器内 3000）
 #   gitea ssh    127.0.0.1:2222         SKILLS_GIT_REPOSITORY
-#   contextforge 127.0.0.1:4444         config.yaml contextforge.base_url
-#                容器内用 http://contextforge:4444；库在 Postgres 的 mcp 库；管理 API 已打开
 #   opensandbox  127.0.0.1:8080         sandbox.opensandbox.domain，无 API key
 #                allowed_host_paths ← 仓库根 .env 的 SANDBOX_HOST_ROOT
 #   langfuse     0.0.0.0:3050          对外端口（容器内 3000）；NEXTAUTH_URL 用 LANGFUSE_BASE_URL
@@ -185,80 +183,6 @@ services:
       - "127.0.0.1:2222:22"
     volumes:
       - gitea_data:/data
-
-  # ContextForge（IBM mcp-context-forge）。管理 API / UI 打开。
-  # 网关在同一 Docker 网络里用 http://contextforge:4444；宿主机进程用 127.0.0.1:4444。
-  # 本 compose 默认关闭 token 校验（仅适合本机/内网联调，生产勿用）：
-  # 管理 API 用 platform-admin 匿名上下文，MCP 端点只暴露 public 工具。
-  # MyFlow 的 contextforge.admin_token / agent_token 必须留空。
-  #
-  # 不用挂卷 SQLite：镜像以 uid 10001 运行，named volume 属主是 root，
-  # /health 会因库连不上一直报 unhealthy。库用现有 Postgres 的 mcp 库。
-  contextforge-db:
-    image: postgres:16
-    container_name: myflow-contextforge-db-init
-    restart: "no"
-    environment:
-      PGPASSWORD: postgres
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >-
-        psql -h postgres -U postgres -tc
-        "SELECT 1 FROM pg_database WHERE datname='mcp'" | grep -q 1
-        || psql -h postgres -U postgres -c "CREATE DATABASE mcp"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  contextforge:
-    image: ghcr.io/ibm/mcp-context-forge:latest
-    container_name: myflow-contextforge
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-      contextforge-db:
-        condition: service_completed_successfully
-    environment:
-      HOST: 0.0.0.0
-      PORT: "4444"
-      MCPGATEWAY_UI_ENABLED: "true"
-      MCPGATEWAY_ADMIN_API_ENABLED: "true"
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/mcp
-      CACHE_TYPE: redis
-      REDIS_URL: redis://myflow:123456@redis:6379/1
-      JWT_SECRET_KEY: ${CONTEXTFORGE_JWT_SECRET:-myflow-contextforge-jwt-secret-32b}
-      AUTH_ENCRYPTION_SECRET: ${CONTEXTFORGE_AUTH_SECRET:-myflow-contextforge-auth-secret-32}
-      PLATFORM_ADMIN_EMAIL: ${CONTEXTFORGE_ADMIN_EMAIL:-admin@example.com}
-      PLATFORM_ADMIN_PASSWORD: ${CONTEXTFORGE_ADMIN_PASSWORD:-changeme-local}
-      # 未设置时镜像默认 changeme（8 位），邮箱登录开启时启动会被拒。
-      DEFAULT_USER_PASSWORD: ${CONTEXTFORGE_DEFAULT_USER_PASSWORD:-myflow-user-local}
-      PLATFORM_ADMIN_FULL_NAME: Platform Administrator
-      # 本机/内网免 token。关键点：
-      # - MCP_CLIENT_AUTH_ENABLED 必须为 true：管理 API 才会走
-      #   “无 token -> ALLOW_UNAUTHENTICATED_ADMIN -> platform admin”的分支。
-      #   设为 false 时 get_current_user_with_permissions 直接返回 anonymous，
-      #   /tools 会因缺少 tools.read 返回 403，MyFlow 侧表现为 502。
-      # - MCP 端点由 MCP_REQUIRE_AUTH=false 放行匿名访问（public-only）。
-      AUTH_REQUIRED: "false"
-      ALLOW_UNAUTHENTICATED_ADMIN: "true"
-      MCP_CLIENT_AUTH_ENABLED: "true"
-      MCP_REQUIRE_AUTH: "false"
-    ports:
-      - "127.0.0.1:4444:4444"
-    # 与官方镜像 HEALTHCHECK 对齐：看 HTTP 200，启动宽限 60s。
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python3",
-          "-c",
-          "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:4444/health', timeout=5).status_code==200 else 1)",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
 
   # 沙箱镜像必须在宿主 Docker 里。OpenSandbox 挂了 docker.sock，本地没有时会在创建沙箱时现拉。
   # 这些服务只负责把镜像拉下来，进程立刻退出；opensandbox 等它们成功后再启动。

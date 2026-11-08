@@ -24,26 +24,22 @@ source = { editable = "backend/packages/harness" }
 dependencies = [
     { name = "aiosqlite" },
     { name = "alembic" },
+    { name = "cryptography" },
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "langchain" },
     { name = "langchain-core" },
     { name = "langchain-deepseek" },
     { name = "langchain-openai" },
     { name = "langgraph-checkpoint-postgres" },
     { name = "langgraph-checkpoint-sqlite" },
+    { name = "mcp" },
     { name = "pydantic" },
     { name = "pygit2" },
     { name = "sqlalchemy", extra = ["asyncio"] },
-    { name = "tzlocal" },
 ]
 
 [package.optional-dependencies]
-contextforge = [
-    { name = "cryptography" },
-    { name = "jsonschema" },
-    { name = "mcp" },
-    { name = "pymilvus" },
-]
 e2b = [
     { name = "e2b" },
 ]
@@ -71,6 +67,9 @@ skills = [
     { name = "cisco-ai-skill-scanner" },
     { name = "pymilvus" },
 ]
+tool-search = [
+    { name = "pymilvus" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -78,10 +77,10 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29" },
     { name = "cisco-ai-skill-scanner", marker = "extra == 'skills'", specifier = ">=2.2,<3" },
-    { name = "cryptography", marker = "extra == 'contextforge'", specifier = ">=43,<51" },
+    { name = "cryptography", specifier = ">=43,<51" },
     { name = "e2b", marker = "extra == 'e2b'", specifier = ">=2.62,<3" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "jsonschema", marker = "extra == 'contextforge'", specifier = ">=4.23,<5" },
+    { name = "jsonschema", specifier = ">=4.23,<5" },
     { name = "langchain", specifier = ">=1.4.1" },
     { name = "langchain-core", specifier = ">=1.6.3" },
     { name = "langchain-deepseek", specifier = ">=1.1.1" },
@@ -89,21 +88,20 @@ requires-dist = [
     { name = "langfuse", marker = "extra == 'observability'", specifier = ">=5.1,<6" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.1.2" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.1" },
-    { name = "mcp", marker = "extra == 'contextforge'", specifier = ">=1.30,<2" },
+    { name = "mcp", specifier = ">=1.30,<2" },
     { name = "opensandbox", marker = "extra == 'opensandbox'", specifier = ">=1.2,<2" },
     { name = "openviking-sdk", marker = "extra == 'openviking'", specifier = "==0.1.17" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.3.3" },
     { name = "psycopg-pool", marker = "extra == 'postgres'", specifier = ">=3.3.0" },
     { name = "pydantic", specifier = ">=2.13.5" },
     { name = "pygit2", specifier = ">=1.20,<2" },
-    { name = "pymilvus", marker = "extra == 'contextforge'", specifier = ">=2.5" },
     { name = "pymilvus", marker = "extra == 'knowledge'", specifier = ">=2.5" },
     { name = "pymilvus", marker = "extra == 'skills'", specifier = ">=2.5" },
+    { name = "pymilvus", marker = "extra == 'tool-search'", specifier = ">=2.5" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3.0" },
-    { name = "tzlocal", specifier = ">=5.0,<6" },
 ]
-provides-extras = ["postgres", "knowledge", "contextforge", "observability", "skills", "redis", "e2b", "opensandbox", "openviking"]
+provides-extras = ["postgres", "knowledge", "tool-search", "observability", "skills", "redis", "e2b", "opensandbox", "openviking"]
 
 [[package]]
 name = "aiohappyeyeballs"
@@ -404,9 +402,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-contextforge = [
-    { name = "agentkit", extra = ["contextforge"] },
-]
 e2b = [
     { name = "agentkit", extra = ["e2b", "redis"] },
 ]
@@ -428,6 +423,9 @@ redis = [
 skills = [
     { name = "agentkit", extra = ["skills"] },
 ]
+tool-search = [
+    { name = "agentkit", extra = ["tool-search"] },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -439,7 +437,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "agentkit", editable = "backend/packages/harness" },
-    { name = "agentkit", extras = ["contextforge"], marker = "extra == 'contextforge'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["e2b", "redis"], marker = "extra == 'e2b'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["knowledge"], marker = "extra == 'knowledge'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["observability"], marker = "extra == 'observability'", editable = "backend/packages/harness" },
@@ -447,12 +444,13 @@ requires-dist = [
     { name = "agentkit", extras = ["postgres"], marker = "extra == 'postgres'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["redis"], marker = "extra == 'redis'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["skills"], marker = "extra == 'skills'", editable = "backend/packages/harness" },
+    { name = "agentkit", extras = ["tool-search"], marker = "extra == 'tool-search'", editable = "backend/packages/harness" },
     { name = "bcrypt", specifier = ">=4.1" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "pyjwt", specifier = ">=2.8" },
     { name = "python-multipart", specifier = ">=0.0.20" },
 ]
-provides-extras = ["postgres", "knowledge", "contextforge", "observability", "skills", "redis", "e2b", "opensandbox"]
+provides-extras = ["postgres", "knowledge", "tool-search", "observability", "skills", "redis", "e2b", "opensandbox"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -4162,18 +4160,6 @@ source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/e4/31/3d74fa778a63b98b7374323befcc0be5ab3bd94afd4096a0124e7379152c/tzdata-2026.4.tar.gz", hash = "sha256:f1b8bd365d8d210c55353f4d7f8d6d8561c0ba50d704b700d195a9424bba0d79", size = 199350, upload-time = "2026-09-12T12:56:03.251Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/f9/bc/8737e8d54cf51106118039b83f485a4783112fab49ea9d044b234978a46e/tzdata-2026.4-py2.py3-none-any.whl", hash = "sha256:c2169a8b0a7a5e9674da5a135ccdfb2b3e671b333ed9fed17b41f73c34476e81", size = 347494, upload-time = "2026-09-12T12:56:01.67Z" },
-]
-
-[[package]]
-name = "tzlocal"
-version = "5.4.5"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-dependencies = [
-    { name = "tzdata", marker = "sys_platform == 'win32'" },
-]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/d8/89/2bd035df331499589fc92e59375c17c6cea6a500453b2c5f6a6ec9572825/tzlocal-5.4.5.tar.gz", hash = "sha256:ba976898bad27945178c9ca25c222c19e322b30c10342b9f40b46714f70d2d5f", size = 31483, upload-time = "2026-10-22T09:09:26.38Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/7b/c1/9be4e1a8a30db8729a86628073910e56f85aaf8a659e053f376a2e6ea5a8/tzlocal-5.4.5-py3-none-any.whl", hash = "sha256:ecab534f6d65d9deb4c4ea52c121ab6dd5958e9b878e71dcb102578269752454", size = 18215, upload-time = "2026-10-22T09:09:24.447Z" },
 ]
 
 [[package]]

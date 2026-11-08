@@ -18,10 +18,13 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0,<3.0",
     "httpx>=0.27",
     "pygit2>=1.20,<2",
-    # contextforge.sync.timezone="local" 要在配置加载时就解析成本机时区，而默认值
-    # 就是这个哨兵，所以它在核心依赖里：datetime.now().astimezone() 只给固定偏移，
-    # 冬夏令时切换当天午夜会错一小时；tzlocal 读平台时区库，给出真正的 DST zone。
-    "tzlocal>=5.0,<6",
+    # MCP 服务管理是核心功能：MCP SDK（tools/list + tools/call 的客户端）由
+    # agentkit/mcp/* 直接 import，不能在 extra 里；mcp_servers.headers 的 Fernet
+    # 加密同样在配置加载路径上，所以 cryptography 也在核心依赖。
+    "mcp>=1.30,<2",
+    "cryptography>=43,<51",
+    # tool_execute 在本地校验远程 inputSchema；缺了它这个工具就没法安全执行。
+    "jsonschema>=4.23,<5",
 ]
 
 [project.optional-dependencies]
@@ -33,14 +36,11 @@ postgres = [
 knowledge = [
     "pymilvus>=2.5",
 ]
-# ContextForge：原生 MCP 客户端（tools/list + tools/call）+ 工具目录的 Milvus
-# collection + tool_execute 的本地 schema 校验。同步和执行都直接用 mcp SDK
-# （ClientSession / streamablehttp_client），所以 mcp 必须显式声明。
-contextforge = [
-    "mcp>=1.30,<2",
+# tool_search 的检索通道：MCP 工具目录的 Milvus collection（pymilvus 只在这里
+# 懒加载，没装也不影响启动；开关打开时才需要）。MCP SDK、jsonschema、
+# cryptography 已是核心依赖。
+tool_search = [
     "pymilvus>=2.5",
-    "jsonschema>=4.23,<5",
-    "cryptography>=43,<51",
 ]
 # Langfuse 可观测性。enabled=false 时不 import；启用前先 uv sync --extra observability。
 observability = [

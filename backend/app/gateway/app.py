@@ -23,11 +23,6 @@ from agentkit.agents.memory.openviking.runtime import (
     build_profile_services,
     configure_openviking_memory,
 )
-from agentkit.contextforge.runtime import (
-    ContextForgeRuntime,
-    build_contextforge_runtime,
-    reset_contextforge_runtime,
-)
 from agentkit.config import AppConfig, get_app_config
 from agentkit.observability import configure_observability, shutdown_observability
 from agentkit.knowledge.service import configure_knowledge_service, reset_knowledge_service
@@ -64,7 +59,6 @@ from backend.app.gateway.routers import (
     skills,
     thread_runs,
     threads,
-    tools,
     uploads,
 )
 from backend.app.gateway.skills_catalog import (
@@ -107,33 +101,6 @@ async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRunti
     return runtime
 
 
-async def start_contextforge_runtime(
-    app: FastAPI, app_config: AppConfig, session_factory: Any
-) -> None:
-    """Build the process tool runtime. Failing to reach ContextForge is non-fatal."""
-    runtime: ContextForgeRuntime | None = None
-    try:
-        runtime = build_contextforge_runtime(
-            app_config.contextforge, session_factory=session_factory
-        )
-        app.state.contextforge = runtime
-        if runtime is not None:
-            await runtime.start()
-    except Exception:  # noqa: BLE001 - tools degrade, the gateway still starts
-        logger.warning("ContextForge runtime failed to start", exc_info=True)
-        app.state.contextforge = runtime
-
-
-async def stop_contextforge_runtime(app: FastAPI) -> None:
-    runtime = getattr(app.state, "contextforge", None)
-    try:
-        if runtime is not None:
-            await runtime.stop()
-    finally:
-        app.state.contextforge = None
-        reset_contextforge_runtime()
-
-
 def preflight_mcp_servers(app_config: AppConfig) -> None:
     """Refuse to boot an MCP deployment that cannot own its catalog.
 
@@ -168,10 +135,9 @@ async def start_mcp_runtime(
 ) -> None:
     """Build the process runtime and the management service (lifespan-owned).
 
-    Unlike the retiring ContextForge runtime, a broken MCP runtime fails the boot:
-    the catalog is the source of the two builtins the agent is told about, and a
-    gateway that starts with neither a catalog nor an error is worse than one that
-    refuses to start.  A slow or unreachable *server* never fails the boot - the
+    A broken MCP runtime fails the boot: the catalog is the source of the two
+    builtins the agent is told about, and a gateway that starts with neither a
+    catalog nor an error is worse than one that refuses to start.  A slow or unreachable *server* never fails the boot - the
     sync reports that as per-server status.
     """
     if not app_config.mcp_servers.enabled:
@@ -270,24 +236,6 @@ async def stop_skill_runtime(app: FastAPI) -> None:
         app.state.skill_catalog = None
         app.state.skill_search = None
         reset_skill_runtime()
-
-
-def preflight_contextforge(app_config: AppConfig) -> None:
-    """固定 GATEWAY_WORKERS=1（rev.9 §6.4）。
-
-    ContextForge runtime 是进程级的：一个 /admin/events 订阅器、一个午夜任务、
-    一把同步锁。多 worker 启动会让每个进程各自订阅、各自午夜同步同一个目录，
-    重复写入且互相看不到对方的事件。宁可起不来，也不要悄悄双写。
-    """
-    if not app_config.contextforge.enabled:
-        return
-    workers = gateway_worker_count()
-    if workers > 1:
-        raise RuntimeError(
-            "contextforge.enabled=true with GATEWAY_WORKERS>1: every worker would "
-            "run its own /admin/events subscriber and midnight sync against the same "
-            "catalog. Run a single gateway worker (rev.9 §6.4)."
-        )
 
 
 def preflight_auth(app_config: AppConfig) -> AuthSettings:
@@ -395,12 +343,8 @@ async def lifespan(app: FastAPI):
     app_config = get_app_config()
     # 固定单 worker 的理由在这里都成立：认证桶不能共享，进程级工具运行时
     # （启动同步 + 午夜任务 + 同步锁）也不能被复制到多个 worker。
-    # mcp_servers 打开时它是唯一的工具运行时：正在退役的 ContextForge 运行时
-    # 不能再启动一次，否则两个同步器会写同一份目录。
-    if app_config.mcp_servers.enabled:
-        preflight_mcp_servers(app_config)
-    else:
-        preflight_contextforge(app_config)
+    # mcp_servers 是唯一的工具运行时，preflight 只在它打开时检查密钥与 worker 数。
+    preflight_mcp_servers(app_config)
     preflight_auth(app_config)
     await init_engine_from_config(app_config.database)
     try:
@@ -451,12 +395,7 @@ async def lifespan(app: FastAPI):
                     app.state.knowledge_service = await configure_knowledge_service(
                         app_config.knowledge_base
                     )
-                    if app_config.mcp_servers.enabled:
-                        await start_mcp_runtime(app, app_config, session_factory)
-                    else:
-                        await start_contextforge_runtime(
-                            app, app_config, session_factory
-                        )
+                    await start_mcp_runtime(app, app_config, session_factory)
                     # M8 §10.1：进程级子代理容量控制器在这里冻结一次（subagent_runtime.* 是
                     # startup-only）。建在启动时而不是"第一个启用子代理的 run"，是为了让 YAML
                     # 里那个值在启动那一刻就定下来——热重载不能悄悄抬高已经宣告出去的容量。
@@ -488,10 +427,7 @@ async def lifespan(app: FastAPI):
                         # release 自己的沙箱。reset 顺带 shutdown（本地杀进程，远程 kill 容器），
                         # 那是网络 IO——必须在线程池里跑，不能占着正在收尾的事件循环。
                         await shutdown_sandbox_provider()
-                        if app_config.mcp_servers.enabled:
-                            await stop_mcp_runtime(app)
-                        else:
-                            await stop_contextforge_runtime(app)
+                        await stop_mcp_runtime(app)
                         await stop_skill_runtime(app)
                         cancel_detached()
                         await services.bridge.aclose()  # 最后放掉桥的连接池（Redis 后端才有事可做）
@@ -568,11 +504,10 @@ def create_app(*, use_openviking_memory: bool | None = None) -> FastAPI:
     # /api/skills/mine has to win over any /skills/{skill_id} route.
     application.include_router(skill_drafts.router, prefix="/api")
     application.include_router(skills.router, prefix="/api")
-    # Human-facing knowledge base; same /api prefix as the rest of the browser API.
-    application.include_router(tools.router, prefix="/api")
     # Per-user MCP server management (rev.10). Mounted unconditionally: with the
     # block disabled every route answers a coded 503, which is a better answer
-    # than a 404 that reads as "this deployment has no such feature".
+    # than a 404 that reads as "this deployment has no such feature".  It is the
+    # only tool-management API: the external-gateway surface is retired.
     application.include_router(mcp_servers.router, prefix="/api")
     application.include_router(knowledge.router, prefix="/api")
     # The profile/onboarding surface is DB-backed identity data and is always

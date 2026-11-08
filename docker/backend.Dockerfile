@@ -31,15 +31,15 @@ COPY skills skills
 
 # 根项目没有 extras。网关可选依赖在 backend / agentkit 上。
 # --inexact 让第二次 sync 只补 OpenViking，不卸掉第一次装上的包。
-# MCP SDK 已归入 contextforge extra（不再有独立的 mcp extra）。
+# MCP SDK / cryptography / jsonschema 是 agentkit 的核心依赖，不用 extra。
 RUN uv sync --frozen --no-dev --package backend \
         --extra postgres \
         --extra redis \
         --extra knowledge \
         --extra skills \
+        --extra tool_search \
         --extra observability \
         --extra opensandbox \
-        --extra contextforge \
     && uv sync --frozen --no-dev --inexact --package agentkit \
         --extra openviking \
     && uv pip install --python /app/.venv/bin/python "uvicorn[standard]>=0.32"

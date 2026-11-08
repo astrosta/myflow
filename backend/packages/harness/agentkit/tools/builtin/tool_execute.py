@@ -141,8 +141,8 @@ class _UpstreamError(Enum):
 
 
 #: Text an upstream server uses when the tool itself is gone, or when it rejects
-#: the arguments.  Copied from the retiring contextforge/retry.py vocabulary: this
-#: tool keeps its own copy so no ContextForge module is imported at runtime.
+#: the arguments.  The vocabulary is part of this tool, so no gateway module is
+#: imported at runtime.
 _NOT_FOUND_MARKERS = (
     "tool not found",
     "unknown tool",

@@ -47,17 +47,6 @@ EXPECTED_ROUTES = {
     ("POST", "/api/threads/{thread_id}/uploads"),
     ("DELETE", "/api/threads/{thread_id}/uploads/{filename}"),
     ("GET", "/api/threads/{thread_id}/artifacts/{path:path}"),
-    # ContextForge 工具管理：浏览器只打同源 /api/tools，token 留在网关。
-    ("GET", "/api/tools"),
-    ("POST", "/api/tools"),
-    ("GET", "/api/tools/status"),
-    ("POST", "/api/tools/reindex"),
-    ("GET", "/api/tools/search"),
-    ("GET", "/api/tools/{tool_id}"),
-    ("PUT", "/api/tools/{tool_id}"),
-    ("DELETE", "/api/tools/{tool_id}"),
-    ("POST", "/api/tools/{tool_id}/claim"),
-    ("POST", "/api/tools/{tool_id}/state"),
     # rev.10：用户自己的 MCP server（/api/mcp-servers）。静态 /status、/reindex
     # 先于 /{server_id} 注册；server 是 user-private，路由只认调用者的 owner。
     ("GET", "/api/mcp-servers"),

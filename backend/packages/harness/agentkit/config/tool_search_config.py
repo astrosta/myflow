@@ -15,10 +15,9 @@ here so tool documents can never be written into the knowledge or skills
 collection: a wrong collection name does not fail loudly at query time, it
 quietly returns someone else's passages.
 
-This module is the surviving home of the tool_search policy.  The ContextForge
-block still carries an identical copy of it (same budgets, different collection)
-for the retiring gateway path; when that block is deleted this file keeps the
-field set unchanged and only the pinned collection differs.
+This module is the only home of the tool_search policy: the retired external
+gateway carried a near-identical copy under a different collection, and that copy
+is gone with the gateway.
 """
 
 from __future__ import annotations

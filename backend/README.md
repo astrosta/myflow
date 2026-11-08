@@ -319,88 +319,84 @@ observability:
 回滚：`enabled: false` 并重启。服务端 trace 保留期/采样由远程 Langfuse 管理；`sample_rate` 是 head sampling，
 降采样会同时丢掉一部分错误 trace。
 
-## ContextForge 工具管理（可选）
+## MCP 服务（可选）
 
-ContextForge 是 MCP 工具的**管理来源**：MyFlow 把合并后的权威目录存进 `contextforge_tools` 表，
-Milvus 里的 collection 只是可重建的检索投影。浏览器只打同源 `/api/tools`，ContextForge 的
-admin token 始终留在网关。
+MCP 工具由 **MyFlow 自己管理**：每个用户把自己的 MCP server 加进工作区，网关按 server 发
+`tools/list` 与 `tools/call`。没有外部网关、没有管理 API 订阅器，也没有 admin/agent token。
+权威目录在 `mcp_servers` / `mcp_tools` 两张表；Milvus 里的 collection 只是可重建的检索投影。
 
-部署前提（ContextForge 1.1.0）：
+- 页面：`/workspace/mcp-servers`（侧栏「MCP 服务」）。旧入口 `/workspace/tools` 重定向过去。
+- 唯一的管理 API 是 `/api/mcp-servers`；旧的 `/api/tools` 已删除。
+- 旧的 `contextforge_tools` 表与 `myflow_contextforge_tools` collection 已删除（迁移 `0020`）。
+  **旧数据故意丢弃**：新目录由每个 server 的 `tools/list` 重建，不做历史迁移。
 
-- `MCPGATEWAY_ADMIN_API_ENABLED=true`：`/tools` 与 `GET /admin/events` 才会挂载；
-  `MCPGATEWAY_UI_ENABLED` 可以保持 `false`，本功能不依赖 Admin UI。
-- `admin_token` 需要 `admin.events` 或 `*`；事件订阅只发 `Authorization: Bearer ...`，
-  GET 不要求 CSRF。
-- ContextForge 多 worker 时，跨进程事件需要它自己的 Redis 配置；否则只有处理写操作的那个
-  worker 能看到事件，MyFlow 会退回"管理动作主动刷新 + 每日全量 + 工具调用纠错刷新"。
-- MyFlow 固定单 worker：ContextForge runtime 是进程级的（一个 `/admin/events` 订阅器、
-  一个每日任务、一把同步锁），`contextforge.enabled=true` 且 `GATEWAY_WORKERS>1` 时拒绝启动。
-- Milvus 复用现有实例，但 collection 固定为 `myflow_contextforge_tools`，**绝不写**
-  `myflow_knowledge` / `myflow_skills_active`。`contextforge_tools` 由迁移 `0016` 创建。
+部署前提：
+
+- `MYFLOW_MCP_SERVER_KEY`：32 字节 url-safe base64 的 Fernet 密钥，加密每个 server 的 header。
+  `config.yaml` 写 `mcp_servers.encryption_key: $MYFLOW_MCP_SERVER_KEY`。生成一把：
+  `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`。
+  **不要复用** `AUTH_JWT_SECRET`：轮换 JWT 密钥会同时作废所有已存的 header。
+- MyFlow 固定单 worker：MCP runtime 是进程级的（一次启动同步、一次午夜同步、一把同步锁），
+  `mcp_servers.enabled=true` 且 `GATEWAY_WORKERS>1` 时拒绝启动。
+- Milvus 复用现有实例，但 collection 固定 `myflow_mcp_tools`（`tool_search.vector_store.collection`），
+  **绝不写** `myflow_knowledge` / `myflow_skills_active`。
+- server URL 默认只允许 `https`（`allowed_schemes`），私网/loopback 默认拒绝
+  （`allow_private_networks=false`）。这是 SSRF 边界，前端勾选不算数。
 
 ```bash
-# 原生 MCP 客户端 + Milvus + jsonschema；knowledge / skills 的 extra 不会自动带上它。
+# MCP SDK / cryptography / jsonschema 已在核心依赖里。
+# 工具目录的 Milvus 索引（pymilvus）在 tool_search extra：
+uv sync --package backend --extra tool_search
+# 或一次性装齐：
 uv sync --all-packages --all-extras
-# 或只装这一组：
-uv sync --package backend --extra contextforge
 ```
 
-配置见 `config.example.yaml` 的 `contextforge:`。`enabled: false` 时不发任何请求，
-`/api/tools` 返回 503 `contextforge_disabled`。ContextForge 工具不绑进模型工具表：
-模型只看到 `tool_search` 和 `tool_execute` 两个内建工具。
+配置见 `config.example.yaml` 的 `mcp_servers:` 与 `tool_search:`。
+`mcp_servers.enabled: false` 时不连任何上游，`/api/mcp-servers` 返回 503
+`mcp_servers_disabled`。MCP 工具不绑进模型工具表：模型只看到 `tool_search` 和
+`tool_execute` 两个内建工具。
 
-- `tool_search` 按任务做混合检索，返回最多 5 张卡片；每张带 `cf__<name>` 形式的
+- `tool_search` 按任务做混合检索，返回最多 5 张卡片；每张带 `mcp__<server>__<tool>` 形式的
   `call_name`、截断后仍是合法 JSON 的 `input_schema`，并把名字写进本轮 run 的可调用名单。
-- `tool_execute` 只接受本轮 `tool_search` 返回过的 `call_name`（`search.require_retrieved`，
-  默认开），回 `contextforge_tools` 读原始 schema 校验参数，再用未加前缀的名字调 MCP。
+- `tool_execute` 只接受本轮 `tool_search` 返回过的 `call_name`（`tool_search.require_retrieved`，
+  默认开），回 `mcp_tools` 读原始 schema 校验参数，再用 MCP 原名调对应的 server。
 - 预算：单卡 schema `max_schema_chars=3000`，整条工具消息 `max_result_chars=16000`。
-- 旧的 `tool_loading` / `deferred_threshold` 已删除；所有 ContextForge 工具一律按需检索。
 
-工具更新有四条自动路径，外加一次手动全量：
+目录更新路径：
 
-1. **管理页写操作**：`POST/PUT/DELETE /api/tools` 写 ContextForge 后立即返回，网关异步
-   刷新目录并更新索引；`sync.admin_refresh_async=false` 时改成同步等待。
-2. **事件订阅**：启动时连 `GET /admin/events`，对 `tool_added / tool_updated / tool_deleted /
-   tool_activated / tool_deactivated / tool_offline / tool_removed / gateway_*` 做 debounce
-   刷新；断线指数退避重连，状态在 `/api/tools/status` 的 `admin_events` 里可见。
-3. **每日全量**：按 `sync.daily_at`（本地墙钟，`sync.timezone` 可为 `local` 或 IANA 名）
-   做一次全量同步；`daily_jitter_seconds` 只用来错开重启。
-4. **工具调用纠错**：MCP 返回 not-found 或参数校验错误时，先刷新 ContextForge 并更新
-   索引，再重试**一次**；认证失败、超时、429、5xx、网络错误和工具执行错误都不重试。
-5. **手动全量**：`POST /api/tools/reindex` 立即做一次全量同步并清理不再索引的行。
+1. **页面写操作**：`POST/PUT/DELETE /api/mcp-servers` 落库后立即同步该 server；失败保留
+   server 行并记 `last_error`，用户修正后点刷新。
+2. **refresh**：`POST /api/mcp-servers/{id}/refresh` 重新 `tools/list` 并同步该 server。
+3. **每日全量 + 启动同步**：进程级任务定期全量；启动时先同步一次。
+4. **工具调用纠错**：MCP 返回 not-found 或参数校验错误时，先刷新该 server 再重试**一次**；
+   认证失败、超时、429、5xx、网络错误和工具执行错误都不重试。
+5. **手动全量**：`POST /api/mcp-servers/reindex` 立即做一次全量同步并清理不再索引的行。
 
 检索是混合检索：dense embedding + Milvus BM25 稀疏通道，RRF 融合后可选 rerank。
-命中只带 `tool_id`，工具定义永远回 `contextforge_tools` 读并重新核对 owner 与
-callable；陈旧文档直接丢掉。索引或数据库不可用时返回空结果并带
-`retrieval.warnings=[catalog_unavailable]`，**没有**本地 BM25 降级——不扫描全表，
-避免绕过 owner 过滤。
+命中只带 `tool_id`，工具定义永远回 `mcp_tools` 读并重新核对 owner 与 callable；陈旧文档
+直接丢掉。索引或数据库不可用时返回空结果并带 `retrieval.warnings=[catalog_unavailable]`，
+**没有**本地 BM25 降级——不扫描全表，避免绕过 owner 过滤。
 
-`/api/tools` 对**所有已登录用户**开放；ContextForge 的 admin token 只由网关持有，
-浏览器永远拿不到。工具按 MyFlow 用户隔离：每个用户只看到、修改和调用自己创建的工具；
-没有 `myflow_owner` 注释的历史工具显示为「未归属」，可由第一个认领者接管。
-归属信息存在 ContextForge 的 `annotations.myflow_owner`（存储用户 ID），在 API 响应和
-编辑器里会被剥掉。上游错误映射：工具不存在 404 `tool_not_found`、
-凭据/权限 502 `contextforge_auth_failed`、ContextForge 不可达 502
-`contextforge_unavailable`、超时 504 `contextforge_timeout`、参数不合法 422
-`contextforge_validation_error`。详情里的敏感 header 打成 `****`，编辑时原样回传，
-由网关还原真实值；只发 `****` 而没有已存值会被拒绝，不会把掩码当凭据写进 ContextForge。
+`/api/mcp-servers` 是**每个用户自己的**接口：server 是 user-private，PAT 需要
+`mcp_servers:read` / `mcp_servers:write`，会话用户放行。header 在库里是 Fernet 密文，
+API 永远只回 `****`；编辑时原样回传，只发 `****` 而没有已存值会被拒绝（422），不会把
+掩码当凭据写库。server URL 的查询串不进 API/日志。
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| `GET` | `/api/tools` | 自己的工具 + 未归属工具（可认领），支持分页与过滤 |
-| `GET` | `/api/tools/status` | ContextForge 可达/鉴权、管理事件、同步、索引与检索通道状态（登录用户） |
-| `POST` | `/api/tools/reindex` | 手动刷新工具目录并重建索引（登录用户） |
-| `GET` | `/api/tools/search?q=...` | 检索预览：命中、通道、候选数、是否重排与 warnings（登录用户） |
-| `POST` | `/api/tools` | 新建工具并触发异步刷新（登录用户） |
-| `GET` | `/api/tools/{id}` | 自己的或未归属工具详情，敏感 header 掩码 |
-| `PUT` | `/api/tools/{id}` | 整份更新；未归属工具会先认领 |
-| `POST` | `/api/tools/{id}/claim` | 认领未归属的历史工具（登录用户） |
-| `POST` | `/api/tools/{id}/state` | 启用/停用并触发异步刷新（登录用户；未归属工具会先认领） |
-| `DELETE` | `/api/tools/{id}` | 删除并触发异步刷新（登录用户） |
+| `GET` | `/api/mcp-servers` | 当前用户的 server 列表 |
+| `POST` | `/api/mcp-servers` | 新建 server，尝试 initialize + `tools/list` |
+| `GET` | `/api/mcp-servers/status` | 全局 server 计数与同步状态 |
+| `POST` | `/api/mcp-servers/reindex` | 手动全量同步 + 清理陈旧行（登录用户） |
+| `GET` | `/api/mcp-servers/{id}` | server 详情（header 掩码） |
+| `PUT` | `/api/mcp-servers/{id}` | 改 display_name/description/url/transport/headers/verify_tls |
+| `DELETE` | `/api/mcp-servers/{id}` | 删除 server + 它的工具 + 对应 Milvus 文档 |
+| `POST` | `/api/mcp-servers/{id}/state` | 启用/停用并同步 |
+| `POST` | `/api/mcp-servers/{id}/refresh` | 重新 `tools/list` 并同步该 server |
+| `GET` | `/api/mcp-servers/{id}/tools` | 该 server 的只读工具列表 |
 
-前端入口是 `/workspace/tools`（侧栏「工具管理」），所有登录用户都能打开；认证关闭的
-单人模式同样放行。写操作后状态栏可能短暂显示旧目录——这是异步刷新的预期表现，
-不是数据丢失。
+工具是**只读目录**：页面不提供工具编辑/删除/认领。停用一个 server 会立刻让它名下的工具
+不可调用，即使检索仍返回旧卡片。
 
 ## 认证（M9 §2）
 

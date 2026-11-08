@@ -10,16 +10,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from agentkit.authz import ADMIN_ROLE
-from agentkit.contextforge.models import (
-    ContextForgeAuthError,
-    ContextForgeConflict,
-    ContextForgeError,
-    ContextForgeNotFound,
-    ContextForgeProtocolError,
-    ContextForgeTimeout,
-    ContextForgeUnavailable,
-    ContextForgeValidationError,
-)
 from agentkit.knowledge.errors import KnowledgeError
 from agentkit.mcp.errors import (
     McpServerConfigurationError,
@@ -153,20 +143,6 @@ class SummarizationFailed(Exception):
     code: ClassVar[str] = "summarization_failed"
 
 
-class ContextForgeDisabled(Exception):
-    """The contextforge block is disabled in this deployment."""
-
-    status_code: ClassVar[int] = 503
-    code: ClassVar[str] = "contextforge_disabled"
-
-
-class InvalidToolHeaderAPI(Exception):
-    """A masked header had no stored value to restore."""
-
-    status_code: ClassVar[int] = 422
-    code: ClassVar[str] = "invalid_tool_header"
-
-
 class McpServersDisabled(Exception):
     """The mcp_servers block is disabled or no service was composed."""
 
@@ -284,16 +260,6 @@ def install_error_handlers(app: FastAPI) -> None:
         InvalidStateUpdate,
         CompactionDisabled,
         SummarizationFailed,
-        ContextForgeDisabled,
-        InvalidToolHeaderAPI,
-        ContextForgeError,
-        ContextForgeAuthError,
-        ContextForgeConflict,
-        ContextForgeNotFound,
-        ContextForgeProtocolError,
-        ContextForgeTimeout,
-        ContextForgeUnavailable,
-        ContextForgeValidationError,
         McpServersDisabled,
         McpServerConfigurationError,
         McpServerNotFound,

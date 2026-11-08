@@ -463,10 +463,6 @@ def _keyword_text(query: str, domain_keywords: Sequence[str]) -> str:
     return " ".join([query, *keywords[:MAX_KEYWORDS]])
 
 
-#: Temporary compatibility alias: old router tests and callers keep importing the
-#: retired name until Task 10 deletes the ContextForge runtime path.
-ContextForgeToolSearchService = McpToolSearchService
-
 #: The process-global service the startup hook publishes and tool_search reads.
 #: There is only one implementation: the authoritative catalog plus its derived
 #: index.  A process that cannot build it publishes None, so the tool reports
@@ -490,7 +486,6 @@ def reset_tool_search_runtime() -> None:
 
 __all__ = [
     "CATALOG_UNAVAILABLE",
-    "ContextForgeToolSearchService",
     "McpToolSearchService",
     "MAX_KEYWORDS",
     "MAX_RESULT_CHARS",

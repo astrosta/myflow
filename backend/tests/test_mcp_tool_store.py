@@ -359,7 +359,7 @@ def test_is_safe_call_name_accepts_derived_names_and_rejects_the_unsafe() -> Non
     for unsafe in (
         "",
         "search",
-        "cf__anysearch__search",
+        "mcp_anysearch__search",  # wrong prefix
         "mcp__anysearch",  # no tool segment
         "mcp__anysearch__",  # empty tool segment
         " mcp__anysearch__search",  # leading space

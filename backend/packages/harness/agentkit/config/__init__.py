@@ -2,16 +2,6 @@ from agentkit.config.agents_config import AgentsConfig
 from agentkit.config.app_config import AppConfig, get_app_config, set_app_config
 from agentkit.config.auth_config import INTERNAL_AUTH_TOKEN_ENV, AuthConfig, LocalLoginConfig
 from agentkit.config.checkpointer_config import CheckpointerConfig
-from agentkit.config.contextforge_config import (
-    AdminEventsConfig,
-    ContextForgeConfig,
-    ContextForgeSyncConfig,
-    ToolEmbeddingConfig,
-    ToolKeywordConfig,
-    ToolRerankConfig,
-    ToolSearchConfig,
-    ToolVectorStoreConfig,
-)
 from agentkit.config.database_config import DatabaseConfig
 from agentkit.config.knowledge_config import KnowledgeBaseConfig
 from agentkit.config.llm_call_config import LlmCallConfig
@@ -48,15 +38,19 @@ from agentkit.config.subagents_config import (
 from agentkit.config.summarization_config import SummarizationConfig
 from agentkit.config.title_config import TitleConfig
 from agentkit.config.tool_config import ToolConfig
+from agentkit.config.tool_search_config import (
+    ToolEmbeddingConfig,
+    ToolKeywordConfig,
+    ToolRerankConfig,
+    ToolSearchConfig,
+    ToolVectorStoreConfig,
+)
 
 __all__ = [
     "EXTENSIONS_CONFIG_FILENAME",
     "INTERNAL_AUTH_TOKEN_ENV",
-    "AdminEventsConfig",
     "AgentsConfig",
     "AppConfig",
-    "ContextForgeConfig",
-    "ContextForgeSyncConfig",
     "AuthConfig",
     "LocalLoginConfig",
     "CheckpointerConfig",

@@ -6,6 +6,12 @@
 #   docker compose -f docker/docker-compose.yml --env-file .env up -d
 #   docker compose -f docker/backend-compose.yml --env-file .env up -d --build
 #
+# MYFLOW_MCP_SERVER_KEY 在仓库根的 .env 里（config.yaml 的
+# mcp_servers.encryption_key 写 $MYFLOW_MCP_SERVER_KEY）：32 url-safe base64
+# 字节的 Fernet 密钥，加密每个 MCP server 的 header。生成一把：
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# 不要复用 AUTH_JWT_SECRET，也不要把真钥匙提交进仓库。
+#
 # SANDBOX_HOST_ROOT 必须在仓库根 .env：与 config.yaml host_mount.host_root、
 # opensandbox allowed_host_paths 相同。Gateway 容器内 local_root=/app，
 # 把宿主机项目的 .myflow / skills 挂进来，沙箱才能看到同一份数据。
@@ -29,6 +35,8 @@ services:
       - ../.env
     environment:
       MYFLOW_CONFIG_PATH: /app/config.yaml
+      # 留空 = 还没配；config.yaml 直接写死密钥时也不需要它。
+      MYFLOW_MCP_SERVER_KEY: ${MYFLOW_MCP_SERVER_KEY:-}
       # 覆盖 .env 里给浏览器用的公网 LANGFUSE_BASE_URL，只影响本容器。
       LANGFUSE_BASE_URL: http://langfuse-web:3000
     volumes:

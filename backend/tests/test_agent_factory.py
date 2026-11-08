@@ -205,8 +205,8 @@ def test_the_two_mcp_builtins_follow_the_mcp_servers_switch() -> None:
 def test_registry_no_longer_decides_whether_the_catalog_is_deferred() -> None:
     import agentkit.tools.registry as registry
 
-    assert not hasattr(registry, "should_defer_contextforge")
-    assert not hasattr(registry, "contextforge_tool_count")
+    # No deferral knob may come back: every tool is retrieved on demand.
+    assert {name for name in dir(registry) if "defer" in name.lower()} == set()
 
 
 def test_the_prompt_teaches_tool_search_and_tool_execute() -> None:
@@ -228,10 +228,9 @@ def test_the_prompt_omits_the_external_tools_section_when_mcp_servers_are_off() 
     assert "## External tools" not in prompt
 
 
-def test_the_deleted_contextforge_middlewares_cannot_be_imported() -> None:
+def test_the_deleted_tool_middlewares_cannot_be_imported() -> None:
     for module in (
         "agentkit.agents.middlewares.tool_search_middleware",
-        "agentkit.agents.middlewares.contextforge_ownership_middleware",
         "agentkit.agents.middlewares.tool_refresh_retry_middleware",
     ):
         with pytest.raises(ModuleNotFoundError):
@@ -245,20 +244,19 @@ def test_the_lead_chain_resets_retrieval_scope_and_drops_the_tool_middlewares() 
     assert "RetrievalScopeMiddleware" in registered
     assert not registered & {
         "ToolSearchMiddleware",
-        "ContextForgeOwnershipMiddleware",
         "ToolRefreshRetryMiddleware",
     }
 
 
 def test_retrieval_scope_clears_the_previous_runs_cards() -> None:
     update = RetrievalScopeMiddleware().before_agent(
-        {"retrieved_tool_names": ["cf__github_search"]}, None
+        {"retrieved_tool_names": ["mcp__github__search"]}, None
     )
 
     assert update == {"retrieved_tool_names": []}
     assert (
         merge_retrieved_tool_names(
-            ["cf__github_search"], update["retrieved_tool_names"]
+            ["mcp__github__search"], update["retrieved_tool_names"]
         )
         == []
     )
@@ -280,7 +278,7 @@ def test_a_graph_run_starts_with_an_empty_retrieval_set() -> None:
     result = graph.invoke(
         {
             "messages": [HumanMessage(content="hi")],
-            "retrieved_tool_names": ["cf__github_search"],
+            "retrieved_tool_names": ["mcp__github__search"],
         }
     )
 

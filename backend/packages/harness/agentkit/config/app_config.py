@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from agentkit.config.agents_config import AgentsConfig
 from agentkit.config.auth_config import AuthConfig
 from agentkit.config.checkpointer_config import CheckpointerConfig
-from agentkit.config.contextforge_config import ContextForgeConfig
 from agentkit.config.database_config import DatabaseConfig
 from agentkit.config.file_signature import ConfigSignature, get_config_signature
 from agentkit.config.knowledge_config import (
@@ -46,19 +45,16 @@ _SHARED_SERVICE_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
     "embedding": (
         ("knowledge_base", "embedding"),
         ("skills", "search", "embedding"),
-        ("contextforge", "search", "embedding"),
         ("tool_search", "embedding"),
     ),
     "rerank": (
         ("knowledge_base", "retrieval", "rerank"),
         ("skills", "search", "rerank"),
-        ("contextforge", "search", "rerank"),
         ("tool_search", "rerank"),
     ),
     "vector_store": (
         ("knowledge_base", "vector_store"),
         ("skills", "search", "vector_store"),
-        ("contextforge", "search", "vector_store"),
         ("tool_search", "vector_store"),
     ),
 }
@@ -100,7 +96,6 @@ class AppConfig(BaseModel):
     checkpointer: CheckpointerConfig = Field(default_factory=CheckpointerConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
-    contextforge: ContextForgeConfig = Field(default_factory=ContextForgeConfig)
     # MyFlow-owned MCP servers (rev.10): disabled by default; enabling demands a
     # Fernet key or startup fails.  Replaces the external-gateway tool catalog.
     mcp_servers: McpServersConfig = Field(default_factory=McpServersConfig)
@@ -198,9 +193,9 @@ class AppConfig(BaseModel):
     def _validate_tool_search_prerequisites(self) -> Self:
         """MCP servers imply tool discovery, and discovery needs Milvus + an embedder.
 
-        Mirrors ``contextforge.search``: ``tool_search`` and ``mcp_servers`` are
-        independent blocks, so the cross-block prerequisite check has to live with the
-        parent that knows about both.  It fires only when the user actually turned MCP
+        ``tool_search`` and ``mcp_servers`` are independent blocks, so the
+        cross-block prerequisite check has to live with the parent that knows about
+        both.  It fires only when the user actually turned MCP
         servers on: the default ``AppConfig()`` (and every deployment that has not
         adopted MCP servers yet) must stay loadable without a vector store.
         """

@@ -528,91 +528,75 @@ skills:
 
 
 # ------------------------------------------------------------
-# ContextForge 工具管理（可选）。enabled=false 时不发任何网络请求。
+# MCP 服务（可选）。enabled=false 时不连任何上游 MCP server，
+# /api/mcp-servers 与 tool_search/tool_execute 全部不可用。
 #
-# 部署前提（ContextForge 侧）：
-#   MCPGATEWAY_ADMIN_API_ENABLED=true   # /admin/events 与 /tools 管理 API 才会挂载
-#   MCPGATEWAY_UI_ENABLED 可以保持 false
-#   admin_token 需要 admin.events（或 *）权限；GET /admin/events 不需要 CSRF
-#   ContextForge 侧多 worker 时它需要 Redis，跨进程事件才会出现在 /admin/events。
+# 每个用户在自己的工作区里添加 MCP server（页面 /workspace/mcp-servers，
+# API /api/mcp-servers）。MyFlow 自己按 server 发 tools/list 与 tools/call，
+# 不需要外部网关、管理 API、事件订阅器，也没有 admin/agent token。
 #
-# 权威数据：contextforge_tools 表（MCP tools/list + Admin /tools 合并）。Milvus
-# 里那个 collection 只是可重建的检索投影，工具定义永远回表读，读不到就丢掉陈旧
-# 的命中文档。工具更新有四条路径：管理页写操作、GET /admin/events、每天本地
-# daily_at 全量、以及工具调用失败后的一次刷新；POST /api/tools/reindex 手动全量。
+# 权威数据：mcp_servers / mcp_tools 两张表。Milvus 里的 collection 只是可重建
+# 的检索投影（固定 myflow_mcp_tools），工具定义永远回表读。
+# 旧的 contextforge_tools 表与 myflow_contextforge_tools collection 已删除
+# （迁移 0020）：旧数据**故意丢弃**，新目录由每个 server 的 tools/list 重建。
 #
-# 固定单 worker：GATEWAY_WORKERS 必须为 1。这个 runtime 是进程级的（一个事件
-# 订阅器、一个午夜任务、一把同步锁），enabled=true 且 workers>1 时启动直接拒绝。
-# 安装：uv sync --all-packages --all-extras（或 --extra contextforge）。
+# 固定单 worker：运行时是进程级的（一次启动同步、一次午夜同步、一把同步锁），
+# enabled=true 且 GATEWAY_WORKERS>1 时启动直接拒绝。
+# 安装：uv sync --all-packages --all-extras（或 --extra tool_search，
+#       MCP SDK / cryptography / jsonschema 已是核心依赖）。
 # ------------------------------------------------------------
-contextforge:
+mcp_servers:
   enabled: false
-  base_url: ""                    # 例如 http://127.0.0.1:4444
-  admin_token: ""                 # 生产用 $CONTEXTFORGE_ADMIN_TOKEN；需 admin.events 或 *；
-                                  # 本机 compose 关闭鉴权时必须留空，旧 token 会被拒绝
-  agent_token: ""                 # 可留空；默认复用 admin_token
-  mcp_url: ""                     # 留空 = <base_url>/mcp；有虚拟服务器时自动加 /servers/<id>/mcp
-  virtual_server_id: ""
-  verify_tls: true
-  request_timeout_seconds: 15
-  connect_timeout_seconds: 5
-  tool_name_prefix: false
+  # headers 用 Fernet 加密后存库。生成一把：
+  #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  # 也可以在 .env 里放 MYFLOW_MCP_SERVER_KEY，这里写 $MYFLOW_MCP_SERVER_KEY。
+  # 留空 = 还没配；enabled=true 而没有有效密钥时启动直接失败。
+  # 不要复用 auth.jwt_secret：轮换它等于作废所有已存的 header。
+  encryption_key: ""
+  request_timeout_seconds: 30     # tools/call 单次请求超时
+  connect_timeout_seconds: 5      # initialize 建连超时
+  max_servers_per_user: 20
+  allow_private_networks: false   # SSRF 边界：默认只允许公网地址
+  allowed_schemes: ["https"]      # server URL 允许的协议
 
-  sync:
-    admin_refresh_async: true     # 管理页写操作立即返回，刷新在后台跑
-    startup_sync: true
-    daily_at: "00:00"             # 本地墙钟时间；格式错了加载时直接报
-    timezone: local               # local = 网关主机时区；也可写 IANA 名（Asia/Shanghai）
-    daily_jitter_seconds: 60      # 只用来错开重启，不改变日期边界
-    sync_timeout_seconds: 60      # 单次同步预算；超时算失败，保留上一版
-    cache_ttl_seconds: 60
-    retry_on_tool_error: true
-    tool_error_refresh_timeout_seconds: 10
-    gc_on_manual_reindex: true
+# ------------------------------------------------------------
+# tool_search：模型只看到 tool_search / tool_execute 两个内建工具。
+# 这里只有召回策略与输出预算；server 列表在页面上管理。
+# collection 固定 myflow_mcp_tools（写错会报错，绝不与知识库/技能共用）。
+# ------------------------------------------------------------
+tool_search:
+  enabled: true
+  candidate_k: 20
+  top_k: 5
+  rrf_k: 60                       # Milvus RRFRanker 的 k（服务端融合）
+  min_score: null                 # Milvus 返回分下限（RRF 原始分），null = 不过滤
+  max_document_chars: 4000
+  max_description_chars: 500
+  max_schema_chars: 3000          # 单张卡片的 schema 预算；截断后仍是合法 JSON
+  max_result_chars: 16000         # 整条 tool_search ToolMessage 的预算
+  require_retrieved: true         # tool_execute 只接受本轮 tool_search 返回过的 call_name
+  max_retrieved_tools: 5          # run-scoped 可调用名单上限，最大 5
 
-  admin_events:
-    enabled: true                 # ContextForge 未开管理 API 时可关掉，避免重连日志
-    url: ""                       # 留空 = <base_url>/admin/events
-    token: ""                     # 留空复用 admin_token
-    reconnect_min_seconds: 1
-    reconnect_max_seconds: 60
-    read_timeout_seconds: 90
-    debounce_ms: 500              # 一阵事件合并成一次同步
-    refresh_min_interval_seconds: 5
-
-  search:                         # tool_search 的召回策略与输出预算
+  keyword:                        # Milvus 内的 BM25 稀疏通道
     enabled: true
-    candidate_k: 20
-    top_k: 5
-    rrf_k: 60                     # Milvus RRFRanker 的 k（服务端融合）
-    min_score: null               # Milvus 返回分下限（RRF 原始分），null = 不过滤
-    max_document_chars: 4000
-    max_description_chars: 500
-    max_schema_chars: 3000        # 单张卡片的 schema 预算；截断后仍是合法 JSON
-    max_result_chars: 16000       # 整条 tool_search ToolMessage 的预算
-    require_retrieved: true       # tool_execute 只接受本轮 tool_search 返回过的 call_name
-    max_retrieved_tools: 5        # run-scoped 可调用名单上限，最大 5
+    analyzer: chinese             # destructive：建 collection 前确定
+    bm25_k1: 1.2
+    bm25_b: 0.75
 
-    keyword:                      # Milvus 内的 BM25 稀疏通道
-      enabled: true
-      analyzer: chinese           # destructive：建 collection 前确定
-      bm25_k1: 1.2
-      bm25_b: 0.75
+  embedding:                      # 复用顶层 embedding 的地址、模型与维度
+    enabled: true
+    query_instruction: "Given a task, retrieve the tool that can perform it"
 
-    embedding:                    # 复用顶层 embedding 的地址、模型与维度
-      enabled: true
-      query_instruction: "Given a task, retrieve the tool that can perform it"
+  rerank:                         # 可选精排；失败自动保留融合顺序
+    enabled: false
 
-    rerank:                       # 可选精排；失败自动保留融合顺序
-      enabled: false
-
-    vector_store:                 # 复用顶层 Milvus 连接，只固定 collection
-      collection: myflow_contextforge_tools   # 固定值；写成知识库/技能 collection 会报错
-      metric_type: COSINE
-      index_type: AUTOINDEX
-      consistency_level: Bounded  # Bounded Staleness：有界延迟一致
-      flush: true
-      timeout_seconds: 30
+  vector_store:                   # 复用顶层 Milvus 连接，只固定 collection
+    collection: myflow_mcp_tools  # 固定值；写成知识库/技能 collection 会报错
+    metric_type: COSINE
+    index_type: AUTOINDEX
+    consistency_level: Bounded    # Bounded Staleness：有界延迟一致
+    flush: true
+    timeout_seconds: 30
 
 
 # ------------------------------------------------------------

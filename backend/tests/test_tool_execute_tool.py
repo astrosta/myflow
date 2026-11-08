@@ -494,7 +494,6 @@ async def test_an_unpublished_runtime_is_unavailable(tmp_path: Path) -> None:
     assert payload["retryable"] is False
     assert payload["inner_name"] == "search"
     assert "MCP" in payload["error"]
-    assert "ContextForge" not in payload["error"]
 
 
 @pytest.mark.asyncio

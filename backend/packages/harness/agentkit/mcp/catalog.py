@@ -1,9 +1,9 @@
 """Retrieval text for one MCP tool, built from what `tools/list` advertises.
 
-Copied from the retired ContextForge catalog builder
-(`agentkit/contextforge/catalog.py`): the parameter extraction and the document layout
-are the same, so the BM25 channel of `myflow_mcp_tools` keeps scoring the same way.
-Two things differ, and both come from MCP owning the catalog now:
+The parameter extraction and the document layout follow the tool-catalog builder
+that the retired external gateway used, so the BM25 channel of `myflow_mcp_tools`
+keeps scoring the same way.  Two things differ, and both come from MCP owning the
+catalog now:
 
 * the input schema arrives as JSON (`Tool.inputSchema`), not as a Pydantic model, so
   `parameter_names` reads `properties` - and nothing else, because there is nothing

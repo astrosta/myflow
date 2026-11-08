@@ -190,7 +190,7 @@ def test_app_config_parses_the_deployed_yaml_shape() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# tool_search prerequisites (mirrors contextforge.search)
+# tool_search prerequisites (the retired gateway block had the same rule)
 # --------------------------------------------------------------------------- #
 
 

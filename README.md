@@ -10,6 +10,13 @@
 更细的启动约束、配置和排障写在各自目录的 README 里。知识库（MinerU + Qwen3-Embedding-8B +
 Milvus）默认关闭，配置、安装可选依赖和 API 见 [`backend/README.md`](backend/README.md#知识库mineru--qwen3-embedding-8b--milvus)。
 
+MCP 服务（每个用户自己添加的 MCP server）也默认关闭：在 `/workspace/mcp-servers` 添加，
+配置是 `mcp_servers` 与 `tool_search`，server header 的 Fernet 密钥来自
+`MYFLOW_MCP_SERVER_KEY`（**不要**复用 `AUTH_JWT_SECRET`）。模型只看到
+`tool_search` / `tool_execute` 两个内建工具，目录落在 `mcp_tools` + Milvus collection
+`myflow_mcp_tools`。旧的外部网关路径已删除：旧表 `contextforge_tools` 与旧 collection
+`myflow_contextforge_tools` **故意丢弃**，新目录由每个 server 的 `tools/list` 重建。
+
 ## 前置
 
 - Python **3.12+**、[uv](https://docs.astral.sh/uv/)
