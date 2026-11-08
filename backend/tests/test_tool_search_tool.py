@@ -1,21 +1,15 @@
-"""tool_search: DB-joined tool cards, owner scoping, budgets, and state writes.
+"""tool_search: MCP tool cards, owner scoping, budgets, and state writes.
 
-The Milvus collection is derived, so a hit is only a `tool_id` plus a score:
-these tests pin the database join that turns it into a card (verbatim
-`input_schema`, owner and callability confirmed by the store), the output
-budget (max 5 cards, 3000-char schemas, 16000-char payload), and the
-`retrieved_tool_names` state write: only a real answer writes that key - an
-empty one clears the previous run's names - while a blank query, a missing
-service, a service exception or an unavailable retrieval omits it, so an
-earlier search's names survive for tool_execute.  A retrieval failure never
-falls back to a catalog-wide scan.  The recall channel follows the
-embedding/keyword flags, and both hit shapes (card and legacy snapshot entry)
-produce a card.
+A Milvus hit is only a tool id plus a score. These tests pin the database join
+that confirms the row (owner + callable) and turns it into a card whose
+server_name and call_name (mcp__server__tool) are the MCP identity, plus the
+output budget and the retrieved_tool_names state write: only a real answer
+writes that key, while an unavailable retrieval leaves earlier names for
+tool_execute.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -27,16 +21,13 @@ from langchain_core.messages import ToolMessage
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.thread_state import merge_retrieved_tool_names
-from agentkit.config.contextforge_config import ContextForgeConfig
-from agentkit.contextforge.index import ToolVectorHit
-from agentkit.contextforge.runtime import (
-    build_contextforge_runtime,
-    reset_contextforge_runtime,
-)
-from agentkit.contextforge.store import (
-    ContextForgeToolRecord,
-    ContextForgeToolStore,
+from agentkit.config.tool_search_config import ToolSearchConfig
+from agentkit.mcp.index import ToolVectorHit
+from agentkit.mcp.store.tool_repository import (
+    McpToolRecord,
+    McpToolStore,
     call_name_for,
+    tool_id_for,
 )
 from agentkit.persistence.schema import Base
 from agentkit.runtime.user_context import reset_current_user, set_current_user
@@ -46,6 +37,7 @@ from agentkit.tools.search.service import (
     MAX_RESULT_CHARS,
     MAX_RETRIEVED_TOOLS,
     ContextForgeToolSearchService,
+    McpToolSearchService,
     ToolSearchCard,
     ToolSearchOutcome,
     get_tool_search_runtime,
@@ -55,8 +47,6 @@ from agentkit.tools.search.service import (
 
 EMBEDDING = {"base_url": "http://embed", "dimensions": 8}
 
-#: A schema with every shape a Pydantic round-trip would rewrite plus the keys a
-#: truncated card is expected to keep; tool_search must return it verbatim.
 VERBATIM_SCHEMA: dict[str, Any] = {
     "$defs": {
         "Filter": {
@@ -81,48 +71,49 @@ def _reset_tool_search() -> Any:
 
 
 @asynccontextmanager
-async def catalog(tmp_path: Path) -> AsyncIterator[ContextForgeToolStore]:
+async def catalog(tmp_path: Path) -> AsyncIterator[McpToolStore]:
     engine = create_async_engine(
-        "sqlite+aiosqlite:///" + (tmp_path / "contextforge.db").as_posix()
+        "sqlite+aiosqlite:///" + (tmp_path / "mcp.db").as_posix()
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     try:
-        yield ContextForgeToolStore(
-            async_sessionmaker(engine, expire_on_commit=False)
-        )
+        yield McpToolStore(async_sessionmaker(engine, expire_on_commit=False))
     finally:
         await engine.dispose()
 
 
 def _record(
-    name: str = "github_search",
+    name: str = "search",
     *,
+    server_name: str = "anysearch",
     owner: str = "u1",
     schema: dict[str, Any] | None = None,
-    description: str = "Search GitHub code",
-) -> ContextForgeToolRecord:
-    return ContextForgeToolRecord(
-        id="tool-" + name,
+    description: str = "Search the web",
+    callable_: bool = True,
+) -> McpToolRecord:
+    server_id = "server-" + server_name
+    return McpToolRecord(
+        id=tool_id_for(server_id, name),
+        server_id=server_id,
+        server_name=server_name,
+        owner_user_id=owner,
         name=name,
-        call_name=call_name_for(name),
-        display_name=name,
+        call_name=call_name_for(server_name, name),
         description=description,
         input_schema=dict(VERBATIM_SCHEMA) if schema is None else schema,
-        tags=("github", "code"),
         parameters=("query",),
-        owner_user_id=owner,
         enabled=True,
         reachable=True,
-        callable=True,
-        content=name + " " + description,
+        callable=callable_,
+        content=f"{server_name} {name} {description}",
     )
 
 
 async def _store_catalog(
-    store: ContextForgeToolStore, records: Sequence[ContextForgeToolRecord]
+    store: McpToolStore, records: Sequence[McpToolRecord]
 ) -> None:
-    await store.upsert_snapshot(list(records), [record.name for record in records])
+    await store.upsert_snapshot(list(records), [record.id for record in records])
 
 
 class HitIndex:
@@ -153,11 +144,7 @@ class HitIndex:
 
     async def dense_search(self, *, vector, owner_user_id, limit):
         self.calls.append(
-            {
-                "channel": "dense",
-                "owner_user_id": owner_user_id,
-                "limit": limit,
-            }
+            {"channel": "dense", "owner_user_id": owner_user_id, "limit": limit}
         )
         if self._error is not None:
             raise self._error
@@ -182,7 +169,19 @@ class FakeEmbedder:
         return [0.0] * 8
 
 
-#: "leave the embedder as the fake one"; None means "no embedder at all".
+class ReverseReranker:
+    async def rerank(self, *, query, documents):
+        return [
+            type("Score", (), {"index": position})
+            for position in reversed(range(len(documents)))
+        ]
+
+
+class BrokenReranker:
+    async def rerank(self, *, query, documents):
+        raise RuntimeError("rerank down")
+
+
 _DEFAULT_EMBEDDER = object()
 
 
@@ -195,13 +194,13 @@ def _service(
     embedding: bool = True,
     keyword: bool = True,
     embedder: Any = _DEFAULT_EMBEDDER,
-) -> ContextForgeToolSearchService:
-    from agentkit.config.contextforge_config import ToolSearchConfig
-
-    return ContextForgeToolSearchService(
+    min_score: float | None = None,
+) -> McpToolSearchService:
+    return McpToolSearchService(
         config=ToolSearchConfig(
             candidate_k=max(top_k, 10),
             top_k=top_k,
+            min_score=min_score,
             embedding=EMBEDDING if embedding else {"enabled": False},
             keyword={"enabled": keyword},
         ),
@@ -220,7 +219,7 @@ def _runtime(user_id: str | None = "u1") -> Any:
 async def _run(
     service: Any,
     *,
-    task_query: str = "search github code",
+    task_query: str = "search the web",
     domain_keywords: Sequence[str] = (),
     runtime: Any = None,
     tool_call_id: str = "call-1",
@@ -246,23 +245,69 @@ def _payload(update: dict[str, Any]) -> dict[str, Any]:
     return json.loads(message.content)
 
 
+def test_the_compatibility_alias_still_names_the_mcp_service() -> None:
+    assert ContextForgeToolSearchService is McpToolSearchService
+
+
+def test_the_service_accepts_the_documented_constructor_order() -> None:
+    config = ToolSearchConfig()
+    service = McpToolSearchService(config, None, None, None, None)
+
+    assert service.max_cards == 5
+
+
+def test_the_tool_description_speaks_about_mcp_tools() -> None:
+    assert "MCP" in (tool_search.description or "")
+    assert "ContextForge" not in (tool_search.description or "")
+
+
 @pytest.mark.asyncio
-async def test_tool_search_returns_db_schemas_for_milvus_hits(tmp_path: Path) -> None:
+async def test_card_uses_mcp_namespace_and_server_name(tmp_path: Path) -> None:
+    record = _record()
     async with catalog(tmp_path) as store:
-        await _store_catalog(store, [_record()])
-        index = HitIndex([ToolVectorHit("github_search", 0.9, tool_id="tool-github_search")])
+        await _store_catalog(store, [record])
+        index = HitIndex(
+            [
+                ToolVectorHit(
+                    "search",
+                    0.9,
+                    tool_id=record.id,
+                    server_id=record.server_id,
+                    server_name=record.server_name,
+                )
+            ]
+        )
+
+        outcome = await _service(store=store, index=index).search(
+            task_query="search the web", user_id="u1"
+        )
+
+    assert outcome.hits[0].call_name == "mcp__anysearch__search"
+    assert outcome.hits[0].server_name == "anysearch"
+    assert outcome.hits[0].tool_name == "search"
+    assert isinstance(outcome.hits[0], ToolSearchCard)
+
+
+@pytest.mark.asyncio
+async def test_tool_search_returns_db_schemas_and_server_aware_cards(
+    tmp_path: Path,
+) -> None:
+    record = _record()
+    async with catalog(tmp_path) as store:
+        await _store_catalog(store, [record])
+        index = HitIndex([ToolVectorHit("search", 0.9, tool_id=record.id)])
 
         update = await _run(_service(store=store, index=index))
         assert index.calls[0]["owner_user_id"] == "u1"
 
-    assert update["retrieved_tool_names"] == ["cf__github_search"]
+    assert update["retrieved_tool_names"] == ["mcp__anysearch__search"]
     payload = _payload(update)
     card = payload["tools"][0]
-    assert card["tool_id"] == "tool-github_search"
-    assert card["tool_name"] == "github_search"
-    assert card["call_name"] == "cf__github_search"
-    assert card["description"] == "Search GitHub code"
-    assert card["tags"] == ["github", "code"]
+    assert card["tool_id"] == record.id
+    assert card["tool_name"] == "search"
+    assert card["server_name"] == "anysearch"
+    assert card["call_name"] == "mcp__anysearch__search"
+    assert card["description"] == "Search the web"
     assert card["parameters"] == ["query"]
     assert card["input_schema"] == VERBATIM_SCHEMA
     assert card["schema_truncated"] is False
@@ -274,41 +319,50 @@ async def test_tool_search_returns_db_schemas_for_milvus_hits(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_tool_search_never_returns_another_users_tool(tmp_path: Path) -> None:
-    own = _record("github_search", owner="u1")
-    other = _record("gitlab_search", owner="u2")
+    own = _record("search", owner="u1")
+    other = _record("search", server_name="other", owner="u2")
     async with catalog(tmp_path) as store:
         await _store_catalog(store, [own, other])
         index = HitIndex(
             [
-                ToolVectorHit("gitlab_search", 0.9, tool_id=other.id),
-                ToolVectorHit("github_search", 0.8, tool_id=own.id),
+                ToolVectorHit("search", 0.9, tool_id=other.id),
+                ToolVectorHit("search", 0.8, tool_id=own.id),
             ]
         )
 
         update = await _run(_service(store=store, index=index))
 
     payload = _payload(update)
-    assert [card["tool_name"] for card in payload["tools"]] == ["github_search"]
-    assert update["retrieved_tool_names"] == ["cf__github_search"]
+    assert [card["call_name"] for card in payload["tools"]] == [
+        "mcp__anysearch__search"
+    ]
+    assert payload["tools"][0]["server_name"] == "anysearch"
+    assert update["retrieved_tool_names"] == ["mcp__anysearch__search"]
 
 
 @pytest.mark.asyncio
-async def test_tool_search_drops_hits_the_catalog_does_not_confirm(
+async def test_tool_search_drops_hits_the_store_does_not_confirm(
     tmp_path: Path,
 ) -> None:
+    retired = _record("retired", callable_=False)
     async with catalog(tmp_path) as store:
-        await _store_catalog(store, [_record()])
+        # The retired tool exists but was not seen upstream, so the store keeps
+        # the row non-callable; a stale Milvus id must not revive it.
+        await store.upsert_snapshot([_record(), retired], [_record().id])
         index = HitIndex(
             [
-                ToolVectorHit("github_search", 0.9, tool_id="tool-github_search"),
-                ToolVectorHit("stale_tool", 0.8, tool_id="tool-stale_tool"),
+                ToolVectorHit("search", 0.9, tool_id=_record().id),
+                ToolVectorHit("retired", 0.8, tool_id=retired.id),
+                ToolVectorHit("stale", 0.7, tool_id="stale-id"),
             ]
         )
 
         update = await _run(_service(store=store, index=index))
 
     payload = _payload(update)
-    assert [card["call_name"] for card in payload["tools"]] == ["cf__github_search"]
+    assert [card["call_name"] for card in payload["tools"]] == [
+        "mcp__anysearch__search"
+    ]
     assert payload["retrieval"]["candidates"] == 1
 
 
@@ -330,11 +384,6 @@ async def test_empty_result_clears_retrieved_tool_names(tmp_path: Path) -> None:
 async def test_a_retrieval_failure_leaves_the_retrieved_names_untouched(
     tmp_path: Path,
 ) -> None:
-    """Design 13: an unavailable index must not disarm the tools already found.
-
-    Writing [] here would clear the names of the last successful search, and
-    tool_execute would then refuse a tool the model was already shown.
-    """
     async with catalog(tmp_path) as store:
         await _store_catalog(store, [_record()])
         index = HitIndex(error=RuntimeError("milvus down"))
@@ -343,8 +392,8 @@ async def test_a_retrieval_failure_leaves_the_retrieved_names_untouched(
 
     assert "retrieved_tool_names" not in update
     assert merge_retrieved_tool_names(
-        ["cf__github_search"], update.get("retrieved_tool_names")
-    ) == ["cf__github_search"]
+        ["mcp__anysearch__search"], update.get("retrieved_tool_names")
+    ) == ["mcp__anysearch__search"]
     payload = _payload(update)
     assert payload["tools"] == []
     assert payload["retrieval"]["warnings"] == [CATALOG_UNAVAILABLE]
@@ -362,8 +411,8 @@ async def test_a_service_exception_leaves_the_retrieved_names_untouched() -> Non
 
     assert "retrieved_tool_names" not in update
     assert merge_retrieved_tool_names(
-        ["cf__github_search"], update.get("retrieved_tool_names")
-    ) == ["cf__github_search"]
+        ["mcp__anysearch__search"], update.get("retrieved_tool_names")
+    ) == ["mcp__anysearch__search"]
     assert _payload(update)["retrieval"]["warnings"] == [CATALOG_UNAVAILABLE]
 
 
@@ -379,7 +428,9 @@ async def test_tool_search_caps_cards_and_retrieved_names_at_five(
         await _store_catalog(store, records)
         index = HitIndex(
             [
-                ToolVectorHit(record.name, 1.0 - position / 100, tool_id=record.id)
+                ToolVectorHit(
+                    record.name, 1.0 - position / 100, tool_id=record.id
+                )
                 for position, record in enumerate(records)
             ]
         )
@@ -393,7 +444,7 @@ async def test_tool_search_caps_cards_and_retrieved_names_at_five(
         f"tool_{position}" for position in range(5)
     ]
     assert update["retrieved_tool_names"] == [
-        call_name_for(f"tool_{position}") for position in range(5)
+        call_name_for("anysearch", f"tool_{position}") for position in range(5)
     ]
 
 
@@ -401,9 +452,6 @@ async def test_tool_search_caps_cards_and_retrieved_names_at_five(
 async def test_tool_search_keeps_its_payload_inside_the_result_budget(
     tmp_path: Path,
 ) -> None:
-    # Each schema is bigger than max_schema_chars, so every card carries a
-    # 3000-char schema plus a 500-char description: five of those do not fit a
-    # 16000-char payload, and the lowest-ranked cards have to go.
     fat_schema = {
         "type": "object",
         "properties": {
@@ -451,8 +499,9 @@ async def test_tool_search_truncates_an_oversized_schema_to_valid_json(
         "examples": [{"query": "z" * 1000}],
     }
     async with catalog(tmp_path) as store:
-        await _store_catalog(store, [_record(schema=huge_schema)])
-        index = HitIndex([ToolVectorHit("github_search", 0.9, tool_id="tool-github_search")])
+        record = _record(schema=huge_schema)
+        await _store_catalog(store, [record])
+        index = HitIndex([ToolVectorHit("search", 0.9, tool_id=record.id)])
 
         update = await _run(_service(store=store, index=index))
 
@@ -472,14 +521,12 @@ async def test_tool_search_without_a_runtime_reports_catalog_unavailable() -> No
     reset_tool_search_runtime()
 
     result = await tool_search.coroutine(
-        task_query="search github code",
+        task_query="search the web",
         domain_keywords=[],
         tool_call_id="call-1",
     )
 
     update = result.update
-    # No search ran, so the state key is absent and the reducer leaves the
-    # names of an earlier successful search alone.
     assert "retrieved_tool_names" not in update
     payload = _payload(update)
     assert payload["tools"] == []
@@ -487,8 +534,6 @@ async def test_tool_search_without_a_runtime_reports_catalog_unavailable() -> No
 
 
 class RecordingStore:
-    """A catalog read here would be the full-scan fallback the design forbids."""
-
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], str]] = []
 
@@ -534,7 +579,7 @@ async def test_tool_search_passes_the_runtime_user_to_the_service() -> None:
     await _run(service, runtime=_runtime("u1"))
 
     assert service.calls[0]["user_id"] == "u1"
-    assert service.calls[0]["task_query"] == "search github code"
+    assert service.calls[0]["task_query"] == "search the web"
 
 
 @pytest.mark.asyncio
@@ -565,10 +610,9 @@ async def test_tool_search_rejects_a_blank_query_without_searching() -> None:
 @pytest.mark.asyncio
 async def test_embedding_only_config_uses_the_dense_channel(tmp_path: Path) -> None:
     async with catalog(tmp_path) as store:
-        await _store_catalog(store, [_record()])
-        index = HitIndex(
-            [ToolVectorHit("github_search", 0.9, tool_id="tool-github_search")]
-        )
+        record = _record()
+        await _store_catalog(store, [record])
+        index = HitIndex([ToolVectorHit("search", 0.9, tool_id=record.id)])
 
         update = await _run(_service(store=store, index=index, keyword=False))
 
@@ -576,40 +620,39 @@ async def test_embedding_only_config_uses_the_dense_channel(tmp_path: Path) -> N
     payload = _payload(update)
     assert payload["retrieval"]["channels"] == ["embedding"]
     assert payload["retrieval"]["index"] == "milvus"
-    assert update["retrieved_tool_names"] == ["cf__github_search"]
+    assert update["retrieved_tool_names"] == ["mcp__anysearch__search"]
 
 
 @pytest.mark.asyncio
 async def test_keyword_only_config_uses_the_sparse_channel(tmp_path: Path) -> None:
     async with catalog(tmp_path) as store:
-        await _store_catalog(store, [_record()])
-        index = HitIndex(
-            [ToolVectorHit("github_search", 0.9, tool_id="tool-github_search")]
-        )
+        record = _record()
+        await _store_catalog(store, [record])
+        index = HitIndex([ToolVectorHit("search", 0.9, tool_id=record.id)])
         service = _service(
             store=store, index=index, embedding=False, embedder=None
         )
 
-        update = await _run(service, domain_keywords=["github"])
+        update = await _run(service, domain_keywords=["web"])
 
-    # No embedding is required: the sparse channel is the whole search.
     assert [call["channel"] for call in index.calls] == ["keyword"]
     assert index.calls[0]["owner_user_id"] == "u1"
-    assert index.calls[0]["query"] == "search github code github"
+    assert index.calls[0]["query"] == "search the web web"
     payload = _payload(update)
     assert payload["retrieval"]["channels"] == ["keyword"]
     assert payload["retrieval"]["index"] == "milvus"
-    assert payload["tools"][0]["call_name"] == "cf__github_search"
-    assert update["retrieved_tool_names"] == ["cf__github_search"]
+    assert payload["tools"][0]["call_name"] == "mcp__anysearch__search"
+    assert update["retrieved_tool_names"] == ["mcp__anysearch__search"]
 
 
 @pytest.mark.asyncio
 async def test_an_embedding_search_without_an_embedder_is_unavailable(
     tmp_path: Path,
 ) -> None:
-    index = HitIndex([ToolVectorHit("github_search", 0.9, tool_id="tool-github_search")])
     async with catalog(tmp_path) as store:
-        await _store_catalog(store, [_record()])
+        record = _record()
+        await _store_catalog(store, [record])
+        index = HitIndex([ToolVectorHit("search", 0.9, tool_id=record.id)])
 
         update = await _run(_service(store=store, index=index, embedder=None))
 
@@ -621,77 +664,87 @@ async def test_an_embedding_search_without_an_embedder_is_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_a_keyword_only_config_without_keyword_search_is_unavailable(
-    tmp_path: Path,
-) -> None:
-    class NoSparseIndex:
-        async def dense_search(self, *, vector, owner_user_id, limit):  # pragma: no cover
-            raise AssertionError("embedding is disabled")
-
-        async def hybrid_search(self, *, vector, query, owner_user_id, limit):  # pragma: no cover
-            raise AssertionError("embedding is disabled")
-
-    async with catalog(tmp_path) as store:
-        await _store_catalog(store, [_record()])
-
-        update = await _run(
-            _service(store=store, index=NoSparseIndex(), embedding=False, embedder=None)
-        )
-
-    assert "retrieved_tool_names" not in update
-    assert _payload(update)["retrieval"]["warnings"] == [CATALOG_UNAVAILABLE]
-
-
-def _enabled_config() -> ContextForgeConfig:
-    return ContextForgeConfig(
-        enabled=True,
-        base_url="http://cf",
-        admin_token="adm",
-        search={
-            "enabled": True,
-            "embedding": EMBEDDING,
-            "vector_store": {"uri": "http://milvus:19530"},
-        },
+async def test_rerank_reorders_the_confirmed_cards() -> None:
+    first, second = _record("first"), _record("second")
+    index = HitIndex(
+        [
+            ToolVectorHit("first", 0.9, tool_id=first.id),
+            ToolVectorHit("second", 0.8, tool_id=second.id),
+        ]
     )
 
+    class Store:
+        async def get_by_ids(self, ids, owner_user_id):
+            return [first, second]
 
-def test_build_contextforge_runtime_installs_the_tool_search_service(
-    tmp_path: Path,
-) -> None:
-    async def _build() -> Any:
-        engine = create_async_engine(
-            "sqlite+aiosqlite:///" + (tmp_path / "wiring.db").as_posix()
-        )
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        try:
-            return (
-                build_contextforge_runtime(
-                    _enabled_config(),
-                    session_factory=async_sessionmaker(engine, expire_on_commit=False),
-                ),
-                engine,
-            )
-        except BaseException:  # pragma: no cover - cleanup on a failed build
-            await engine.dispose()
-            raise
+    outcome = await _service(
+        store=Store(), index=index, reranker=ReverseReranker()
+    ).search(task_query="search the web", user_id="u1")
 
-    runtime, engine = asyncio.run(_build())
-    try:
-        assert runtime is not None
-        service = get_tool_search_runtime()
-        assert isinstance(service, ContextForgeToolSearchService)
-        assert service.max_result_chars == MAX_RESULT_CHARS
-    finally:
-        reset_tool_search_runtime()
-        reset_contextforge_runtime()
-        assert runtime is not None
-        asyncio.run(runtime.admin.aclose())
-        asyncio.run(engine.dispose())
+    assert outcome.reranked is True
+    assert [hit.tool_name for hit in outcome.hits] == ["second", "first"]
 
 
-def test_a_disabled_runtime_clears_the_tool_search_service() -> None:
-    set_tool_search_runtime(RecordingService())  # type: ignore[arg-type]
+@pytest.mark.asyncio
+async def test_a_rerank_failure_keeps_the_fused_order() -> None:
+    first, second = _record("first"), _record("second")
+    index = HitIndex(
+        [
+            ToolVectorHit("first", 0.9, tool_id=first.id),
+            ToolVectorHit("second", 0.8, tool_id=second.id),
+        ]
+    )
 
-    assert build_contextforge_runtime(ContextForgeConfig()) is None
+    class Store:
+        async def get_by_ids(self, ids, owner_user_id):
+            return [first, second]
+
+    outcome = await _service(
+        store=Store(), index=index, reranker=BrokenReranker()
+    ).search(task_query="search the web", user_id="u1")
+
+    assert outcome.reranked is False
+    assert outcome.warnings == ("rerank_unavailable",)
+    assert [hit.tool_name for hit in outcome.hits] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_min_score_filters_normalized_scores() -> None:
+    strong, weak = _record("strong"), _record("weak")
+    index = HitIndex(
+        [
+            ToolVectorHit("strong", 0.9, tool_id=strong.id),
+            ToolVectorHit("weak", 0.3, tool_id=weak.id),
+        ]
+    )
+
+    class Store:
+        async def get_by_ids(self, ids, owner_user_id):
+            return [strong, weak]
+
+    outcome = await _service(
+        store=Store(), index=index, min_score=0.6
+    ).search(task_query="search the web", user_id="u1")
+
+    assert [hit.tool_name for hit in outcome.hits] == ["strong"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_query_or_missing_owner_never_searches() -> None:
+    record = _record()
+    index = HitIndex([ToolVectorHit("search", 0.9, tool_id=record.id)])
+
+    class Store:
+        async def get_by_ids(self, ids, owner_user_id):
+            return [record]
+
+    service = _service(store=Store(), index=index)
+
+    assert (await service.search(task_query="   ", user_id="u1")).hits == ()
+    assert (await service.search(task_query="search the web", user_id=None)).hits == ()
+
+    assert index.calls == []
+
+
+def test_get_tool_search_runtime_is_empty_by_default() -> None:
     assert get_tool_search_runtime() is None

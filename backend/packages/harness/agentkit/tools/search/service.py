@@ -1,6 +1,6 @@
 """Tool retrieval: Milvus recall, database confirmation, rerank, tool cards.
 
-`contextforge_tools` is the authority and the Milvus collection is derived, so
+`mcp_tools` is the authority and the Milvus collection is derived, so
 there is exactly one service here: a hit is an owner-scoped `tool_id` that the
 store re-checks before its verbatim schema becomes a card for the model.  The
 retired snapshot catalog and its local BM25 fallback are gone with the loader
@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agentkit.config.contextforge_config import ToolSearchConfig
+from agentkit.config.tool_search_config import ToolSearchConfig
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +38,19 @@ class Reranker(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ToolSearchCard:
-    """One ContextForge tool card: the authoritative DB row, ready to serialize.
+    """One MCP tool card: the authoritative DB row, ready to serialize.
 
     The Milvus collection stores no schema, so every field here comes from the
-    ``contextforge_tools`` row the hit's ``tool_id`` was joined to.  ``score`` is
-    the retrieval score; ``input_schema`` is verbatim unless it exceeded the card
-    budget, in which case ``schema_truncated`` is True and it is still valid JSON.
+    ``mcp_tools`` row the hit's ``tool_id`` was joined to.  ``server_name`` names
+    the MCP server, ``tool_name`` is the remote name and ``call_name`` is
+    ``mcp__server__tool``.  ``score`` is the retrieval score; ``input_schema`` is
+    verbatim unless it exceeded the card budget, in which case
+    ``schema_truncated`` is True and it is still valid JSON.
     """
 
     tool_id: str
     tool_name: str
+    server_name: str
     call_name: str
     description: str
     tags: tuple[str, ...]
@@ -75,7 +78,7 @@ class ToolSearchOutcome:
 
 
 # --------------------------------------------------------------------------- #
-# ContextForgeToolSearchService: Milvus recall -> DB confirmation -> cards
+# McpToolSearchService: Milvus recall -> DB confirmation -> cards
 # --------------------------------------------------------------------------- #
 
 #: The model sees at most five cards, each schema at most 3000 chars, inside one
@@ -121,7 +124,7 @@ def truncate_input_schema(
     """Fit one tool schema into the card budget while keeping valid JSON.
 
     A schema that already fits is returned untouched: the database row is the
-    verbatim source, and the model must see exactly what ContextForge published.
+    verbatim source, and the model must see exactly what the MCP server published.
     Over budget, presentation keys go first, then properties are dropped from the
     tail with required trimmed to match, and the last resort is a typed empty
     object.  Every step is still a JSON object, so a card can never carry the
@@ -137,10 +140,10 @@ def truncate_input_schema(
     return _clip_properties(pruned, max_chars), True
 
 
-class ContextForgeToolSearchService:
+class McpToolSearchService:
     """tool_search retrieval: Milvus recall, database confirmation, cards.
 
-    contextforge_tools is the authority and the Milvus collection is derived, so
+    mcp_tools is the authority and the Milvus collection is derived, so
     a search is always two steps: recall owner-scoped tool_id hits, then confirm
     each one through the store, which re-checks the owner and the callable gate
     and hands back the verbatim schema.  A candidate the store does not confirm
@@ -158,7 +161,6 @@ class ContextForgeToolSearchService:
 
     def __init__(
         self,
-        *,
         config: ToolSearchConfig,
         index: Any | None = None,
         store: ToolStore | None = None,
@@ -337,6 +339,7 @@ class ContextForgeToolSearchService:
         return ToolSearchCard(
             tool_id=str(getattr(record, "id", "") or ""),
             tool_name=str(getattr(record, "name", "") or ""),
+            server_name=str(getattr(record, "server_name", "") or ""),
             call_name=str(getattr(record, "call_name", "") or ""),
             description=_clip_text(
                 str(getattr(record, "description", "") or ""),
@@ -458,19 +461,23 @@ def _keyword_text(query: str, domain_keywords: Sequence[str]) -> str:
     return " ".join([query, *keywords[:MAX_KEYWORDS]])
 
 
+#: Temporary compatibility alias: old router tests and callers keep importing the
+#: retired name until Task 10 deletes the ContextForge runtime path.
+ContextForgeToolSearchService = McpToolSearchService
+
 #: The process-global service the startup hook publishes and tool_search reads.
 #: There is only one implementation: the authoritative catalog plus its derived
 #: index.  A process that cannot build it publishes None, so the tool reports
 #: retrieval as unavailable instead of falling back to a second source.
-_service: ContextForgeToolSearchService | None = None
+_service: McpToolSearchService | None = None
 
 
-def set_tool_search_runtime(service: ContextForgeToolSearchService | None) -> None:
+def set_tool_search_runtime(service: McpToolSearchService | None) -> None:
     global _service
     _service = service
 
 
-def get_tool_search_runtime() -> ContextForgeToolSearchService | None:
+def get_tool_search_runtime() -> McpToolSearchService | None:
     return _service
 
 
@@ -482,6 +489,7 @@ def reset_tool_search_runtime() -> None:
 __all__ = [
     "CATALOG_UNAVAILABLE",
     "ContextForgeToolSearchService",
+    "McpToolSearchService",
     "MAX_KEYWORDS",
     "MAX_RESULT_CHARS",
     "MAX_RETRIEVED_TOOLS",
