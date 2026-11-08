@@ -605,3 +605,129 @@ async def test_sync_reports_embedding_failures_as_stats() -> None:
 
     assert stats.error == "RuntimeError"
     assert stats.upserted == 0
+
+# --------------------------------------------------------------------------- #
+# pruning: the collection only ever mirrors the catalog it was handed
+#
+# Ported from the retired tool-vector-index suite: these are the deletion and
+# diff behaviours the sync service relies on, and they must keep holding for
+# mcp_tools records (one row per server-owned tool).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_query_hashes_is_keyed_by_tool_id() -> None:
+    fake = FakeMilvus(stored={"tool-1": "h1", "tool-2": "h2"})
+    index = _index(fake)
+
+    hashes = await index.query_hashes(["tool-1", "tool-missing", "tool-1"])
+
+    # Duplicates collapse, a missing tool is absent (not an empty hash), and the
+    # query only asks for the two diff fields.
+    assert hashes == {"tool-1": "h1"}
+    assert fake.queries[-1]["output_fields"] == ["tool_id", "content_hash"]
+
+
+@pytest.mark.asyncio
+async def test_delete_by_ids_removes_the_rows_and_reports_the_count() -> None:
+    fake = FakeMilvus(stored={"tool-1": "h1", "tool-2": "h2", "tool-3": "h3"})
+    index = _index(fake)
+
+    assert await index.delete_by_ids(["tool-1", "tool-2", "tool-1"]) == 2
+
+    assert fake.deletes[0].startswith("tool_id in ")
+    assert json.loads(fake.deletes[0].split(" in ", 1)[1]) == ["tool-1", "tool-2"]
+    assert sorted(fake.stored) == ["tool-3"]
+    assert await index.delete_by_ids([]) == 0
+    assert len(fake.deletes) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_or_call_name_change_reupserts_the_row() -> None:
+    content = "search AnySearch web search"
+    tool_id = _record(content=content).id
+    fake = FakeMilvus(stored={tool_id: content_hash_for(content, "u1", "mcp__anysearch__search")})
+    index = _index(fake)
+    embedder = Embedder()
+
+    moved = _record(content=content, owner_user_id="u2")
+    moved_stats = await index.sync([moved], embedder=embedder)
+
+    assert (moved_stats.changed, moved_stats.upserted) == (1, 1)
+    assert fake.written[-1]["owner_user_id"] == "u2"
+    assert fake.written[-1]["content_hash"] == content_hash_for(
+        content, "u2", "mcp__anysearch__search"
+    )
+
+    # The call name is inside the hash too: a namespace change re-embeds the row
+    # even though the text is identical.
+    renamed = _record(content=content, call_name="mcp__anysearch__v2")
+    renamed_stats = await index.sync([renamed], embedder=embedder)
+
+    assert (renamed_stats.changed, renamed_stats.upserted) == (1, 1)
+    assert fake.written[-1]["call_name"] == "mcp__anysearch__v2"
+
+
+@pytest.mark.asyncio
+async def test_full_sync_drops_rows_that_stopped_being_owner_scoped() -> None:
+    orphan = _record()
+    fake = FakeMilvus(stored={orphan.id: orphan.content_hash})
+    index = _index(fake)
+
+    stats = await index.sync(
+        [_record(owner_user_id=None)], embedder=Embedder(), full=True
+    )
+
+    assert (stats.upserted, stats.deleted) == (0, 1)
+    assert fake.stored == {}
+
+
+@pytest.mark.asyncio
+async def test_full_sync_still_prunes_a_catalog_of_nothing_but_non_callable_tools() -> None:
+    """An empty *keep* set is not a caller bug when the records do carry ids."""
+    records = [
+        _record(callable=False),
+        _record(name="fetch", enabled=False),
+        _record(name="offline_tool", reachable=False),
+    ]
+    fake = FakeMilvus(stored={record.id: "stale-hash" for record in records})
+    index = _index(fake)
+    embedder = Embedder()
+
+    stats = await index.sync(records, embedder=embedder, full=True)
+
+    assert stats.error is None
+    assert (stats.changed, stats.upserted, stats.deleted) == (0, 0, 3)
+    assert embedder.texts == []
+    assert fake.written == []
+    assert fake.stored == {}
+
+
+@pytest.mark.asyncio
+async def test_incremental_sync_drops_the_row_of_a_record_that_became_unindexable() -> None:
+    record = _record()
+    fake = FakeMilvus(stored={record.id: record.content_hash})
+    index = _index(fake)
+    embedder = Embedder()
+
+    stats = await index.sync([_record(owner_user_id=None)], embedder=embedder)
+
+    assert (stats.changed, stats.upserted, stats.deleted) == (0, 0, 1)
+    assert embedder.texts == []
+    assert fake.stored == {}
+    assert json.loads(fake.deletes[-1].split(" in ", 1)[1]) == [record.id]
+
+
+@pytest.mark.asyncio
+async def test_incremental_sync_leaves_rows_it_was_not_handed_alone() -> None:
+    """Only a full sync prunes rows outside the snapshot it was given."""
+    kept = _record()
+    fake = FakeMilvus(stored={kept.id: kept.content_hash, "tool-gone": "stale-hash"})
+    index = _index(fake)
+
+    stats = await index.sync([kept], embedder=Embedder())
+
+    assert stats.deleted == 0
+    assert fake.deletes == []
+    assert sorted(fake.stored) == [kept.id, "tool-gone"]
+

@@ -80,11 +80,13 @@ def test_0020_downgrade_recreates_nothing(tmp_path: Path) -> None:
 
     with engine.connect() as conn:
         names = set(inspect(conn).get_table_names())
-        # 0017 still creates the table on the way down, but 0020 itself recreates
-        # nothing of its own: the revision only ever drops.
+        # 0020 only ever drops: stepping back to 0019 leaves the retired table
+        # gone. Only downgrading past 0017 would recreate it, which is why the
+        # old catalog is never resurrected by this revision.
         assert conn.scalar(text("SELECT version_num FROM alembic_version")) == (
             "0019_mcp_tools"
         )
+        assert RETIRED_TABLE not in names
         assert NEW_TABLE in names
     engine.dispose()
 

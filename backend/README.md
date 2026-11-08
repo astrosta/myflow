@@ -327,8 +327,26 @@ MCP 工具由 **MyFlow 自己管理**：每个用户把自己的 MCP server 加�
 
 - 页面：`/workspace/mcp-servers`（侧栏「MCP 服务」）。旧入口 `/workspace/tools` 重定向过去。
 - 唯一的管理 API 是 `/api/mcp-servers`；旧的 `/api/tools` 已删除。
-- 旧的 `contextforge_tools` 表与 `myflow_contextforge_tools` collection 已删除（迁移 `0020`）。
-  **旧数据故意丢弃**：新目录由每个 server 的 `tools/list` 重建，不做历史迁移。
+- 旧的 `contextforge_tools` 表由迁移 `0020` 删除；**旧数据故意丢弃**，新目录由每个
+  server 的 `tools/list` 重建，不做历史迁移。
+- 迁移只碰 SQL：**旧的 Milvus collection `myflow_contextforge_tools` 和旧网关在 Postgres
+  里留下的 `mcp` 库要人工清掉**。上线前跑一次（确认 `mcp_servers` 已启用、新 collection
+  `myflow_mcp_tools` 正常检索之后再删）：
+
+  ```bash
+  # Milvus：旧网关工具投影，属于已删除路径，删除后由 mcp_tools 重建
+  curl -s -X POST http://127.0.0.1:19530/v2/vectordb/collections/drop \
+    -H 'Content-Type: application/json' \
+    -d '{"collectionName": "myflow_contextforge_tools"}'
+  # 或 pymilvus：
+  # python -c "from pymilvus import MilvusClient; \
+  #   MilvusClient(uri='http://127.0.0.1:19530').drop_collection('myflow_contextforge_tools')"
+
+  # Postgres：旧网关自己的库（MyFlow 只在 myflow 库里工作）
+  psql -h 127.0.0.1 -U postgres -c 'DROP DATABASE IF EXISTS mcp'
+  ```
+
+  这两条都不由代码执行：迁移没有 Milvus 句柄，网关也不该能删别人的库。
 
 部署前提：
 

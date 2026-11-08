@@ -562,6 +562,8 @@ mcp_servers:
 # ------------------------------------------------------------
 # tool_search：模型只看到 tool_search / tool_execute 两个内建工具。
 # 这里只有召回策略与输出预算；server 列表在页面上管理。
+# 前提：只有 mcp_servers.enabled=true 时这两个工具才挂给模型——没有 server 就没
+# 有目录，本块即使 enabled=true 也不会产生检索。
 # collection 固定 myflow_mcp_tools（写错会报错，绝不与知识库/技能共用）。
 # ------------------------------------------------------------
 tool_search:
