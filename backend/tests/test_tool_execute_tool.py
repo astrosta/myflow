@@ -1,27 +1,34 @@
-"""tool_execute: retrieve-gated ContextForge MCP execution and its fallback.
+"""tool_execute: direct execution against the MCP server that owns the tool.
 
-tool_search hands the model a ``cf__<name>`` call name, its verbatim schema and
-the arguments it must send; tool_execute is the only thing that actually runs
-the tool, and it runs it through ContextForge MCP tools/call with the original
-(unprefixed) name.  These tests pin the contract around that call:
+tool_search hands the model an ``mcp__<server>__<tool>`` call name, its verbatim
+schema and the arguments it must send; tool_execute is the only thing that
+actually runs the tool, and it runs it by connecting straight to the server that
+owns it and calling ``tools/call`` with the original (unprefixed) name.  These
+tests pin the contract around that call:
 
 * two gates before anything leaves the process - the call name must be in
-  ``ThreadState.retrieved_tool_names`` for this run, and the row must be
-  owner-scoped *and* callable in ``contextforge_tools``;
+  ``ThreadState.retrieved_tool_names`` for this run, and the row must be this
+  owner's, still callable in ``mcp_tools``, and behind a server that is enabled
+  and reachable.  A refusal names *which* gate closed: ``server_disabled``,
+  ``server_unavailable`` or ``tool_not_found``;
 * local validation with Draft202012Validator, with remote $ref retrieval disabled
   so a stored schema can never make the gateway fetch a URL - and, because the
   check cannot be skipped, a schema that will not compile or resolve is refused
-  instead of deferred to ContextForge (design 9.3: fail closed);
+  instead of deferred to the server (design 9.3: fail closed);
 * the failure fallback of design 9.1: a local validation failure and an upstream
-  invalid-params/schema-mismatch refresh the catalog and answer with the new
-  schema but never retry, a stale or missing tool refreshes and retries exactly
-  once, and a timeout/5xx/transport error neither refreshes nor retries;
-* the reply is a ToolMessage that carries the inner name, tool_id and call name
-  in ``myflow_tool_meta``, so an audit sees the tool that ran, not tool_execute;
+  invalid-params/schema-mismatch refresh the server and answer with the new schema
+  but never retry, a stale or missing tool refreshes and retries exactly once, and
+  a timeout/unreachable server/protocol failure/upstream error neither refreshes
+  nor retries;
+* only a not-found or a schema/argument mismatch refreshes the owning server, and
+  ``refresh_server`` is called with that server's id;
+* the reply is a ToolMessage that carries the inner name, tool_id and call name in
+  ``myflow_tool_meta``, so an audit sees the tool that ran, not tool_execute;
 * a refresh that completed but whose catalog re-read then raised is
-  ``contextforge_unavailable``, never a refreshed ``tool_not_found``: the third
-  outcome exists because "the row is gone" and "I could not look" are different
-  facts, and only one of them tells the model to stop calling the tool.
+  ``mcp_unavailable``, never a refreshed ``tool_not_found``: the third outcome
+  exists because "the row is gone" and "I could not look" are different facts, and
+  only one of them tells the model to stop calling the tool;
+* no failure text ever carries a request header, a bearer token or an endpoint.
 """
 
 from __future__ import annotations
@@ -41,24 +48,31 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import agentkit.tools.builtin.tool_execute as executor_module
 from agentkit.agents.middlewares.tool_result_meta import TOOL_META_KEY
-from agentkit.config.contextforge_config import ContextForgeConfig
-from agentkit.contextforge.mcp_client import ContextForgeMcpClient
-from agentkit.contextforge.models import ContextForgeTimeout, ContextForgeUnavailable
-from agentkit.contextforge.runtime import (
-    build_contextforge_runtime,
-    configure_contextforge_runtime,
-    reset_contextforge_runtime,
+from agentkit.mcp.errors import (
+    McpProtocolError,
+    McpServerTimeout,
+    McpServerUnavailable,
+    McpToolError,
 )
-from agentkit.contextforge.store import (
-    ContextForgeToolRecord,
-    ContextForgeToolStore,
+from agentkit.mcp.models import McpServerRecord
+from agentkit.mcp.runtime_protocol import (
+    get_mcp_runtime,
+    reset_mcp_runtime,
+    set_mcp_runtime,
+)
+from agentkit.mcp.store.repository import McpServerStore
+from agentkit.mcp.store.tool_repository import (
+    McpToolRecord,
+    McpToolStore,
     call_name_for,
+    tool_id_for,
 )
-from agentkit.contextforge.sync import ContextForgeSyncStats
 from agentkit.persistence.schema import Base
 from agentkit.tools.builtin.tool_execute import TOOL_NAME, tool_execute
 
-CALL_NAME = "cf__github_search"
+SERVER_ID = "s1"
+SERVER_NAME = "anysearch"
+CALL_NAME = call_name_for(SERVER_NAME, "search")
 
 #: The schema tool_search showed the model: ``query`` is required.
 QUERY_SCHEMA: dict[str, Any] = {
@@ -75,57 +89,92 @@ TEXT_SCHEMA: dict[str, Any] = {
 
 
 @pytest.fixture(autouse=True)
-def _reset_runtime() -> Any:
-    reset_contextforge_runtime()
+def _unpublished_runtime() -> Any:
+    reset_mcp_runtime()
     yield
-    reset_contextforge_runtime()
+    reset_mcp_runtime()
 
 
 @asynccontextmanager
-async def catalog(tmp_path: Path) -> AsyncIterator[ContextForgeToolStore]:
+async def catalog(
+    tmp_path: Path,
+) -> AsyncIterator[tuple[McpToolStore, McpServerStore]]:
+    """One SQLite database with both MCP stores, as the runtime builds them."""
     engine = create_async_engine(
-        "sqlite+aiosqlite:///" + (tmp_path / "contextforge.db").as_posix()
+        "sqlite+aiosqlite:///" + (tmp_path / "mcp.db").as_posix()
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        yield ContextForgeToolStore(
-            async_sessionmaker(engine, expire_on_commit=False)
-        )
+        yield McpToolStore(factory), McpServerStore(factory)
     finally:
         await engine.dispose()
 
 
-def _record(
-    name: str = "github_search",
+async def _server(
+    server_store: McpServerStore,
+    *,
+    server_id: str = SERVER_ID,
+    name: str = SERVER_NAME,
+    owner: str = "u1",
+    enabled: bool = True,
+    reachable: bool = True,
+) -> McpServerRecord:
+    """One stored server, left in the state the test needs."""
+    created = await server_store.create(
+        McpServerRecord(
+            id=server_id,
+            owner_user_id=owner,
+            name=name,
+            transport="streamable_http",
+            url="https://mcp.example.com/mcp",
+        )
+    )
+    await server_store.set_status(
+        created.id,
+        owner,
+        status="active" if reachable else "error",
+        reachable=reachable,
+        last_error=None if reachable else "connect timed out",
+    )
+    if not enabled:
+        await server_store.set_enabled(created.id, owner, False)
+    stored = await server_store.get(created.id, owner)
+    assert stored is not None
+    return stored
+
+
+def _tool(
+    name: str = "search",
     *,
     owner: str = "u1",
+    server_id: str = SERVER_ID,
+    server_name: str = SERVER_NAME,
     schema: dict[str, Any] | None = None,
-) -> ContextForgeToolRecord:
-    return ContextForgeToolRecord(
-        id="tool-" + name,
-        name=name,
-        call_name=call_name_for(name),
-        display_name=name,
-        description="Search GitHub code",
-        input_schema=dict(QUERY_SCHEMA) if schema is None else schema,
-        tags=("github",),
-        parameters=("query",),
+) -> McpToolRecord:
+    return McpToolRecord(
+        server_id=server_id,
+        server_name=server_name,
         owner_user_id=owner,
-        enabled=True,
-        reachable=True,
+        name=name,
+        call_name=call_name_for(server_name, name),
+        description="Search the web",
+        input_schema=dict(QUERY_SCHEMA) if schema is None else schema,
+        parameters=("query",),
         content=name,
     )
 
 
-async def _store_record(
-    store: ContextForgeToolStore,
-    record: ContextForgeToolRecord,
+async def _store_tool(
+    store: McpToolStore,
+    record: McpToolRecord,
     *,
     seen: bool = True,
 ) -> None:
     """Write one row; ``seen=False`` stores it without making it callable."""
-    await store.upsert_snapshot([record], [record.name] if seen else [])
+    ids = [tool_id_for(record.server_id, record.name)] if seen else []
+    await store.upsert_snapshot([record], ids)
 
 
 def _ok(*blocks: Any) -> mcp_types.CallToolResult:
@@ -140,135 +189,94 @@ def _error(text: str) -> mcp_types.CallToolResult:
     return mcp_types.CallToolResult(content=[_text(text)], isError=True)
 
 
-class FakeMcp:
-    """The ContextForge MCP slice tool_execute uses, scripted per call.
+class FakeRuntime:
+    """The published runtime, shaped like McpToolRuntime: stores, refresh, call.
 
-    An empty script raises instead of repeating itself: a test that says "one
-    call" must fail if the executor calls twice.
+    ``script`` is consumed one entry per tools/call: an exception entry is raised,
+    a CallToolResult is returned.  An empty script raises instead of repeating
+    itself, because a test that says "one call" must fail if the executor calls
+    twice.
     """
 
-    def __init__(self, *script: Any) -> None:
-        self.calls: list[dict[str, Any]] = []
+    def __init__(
+        self,
+        tool_store: Any,
+        server_store: Any,
+        *script: Any,
+        on_refresh: Any = None,
+        refresh_error: Exception | None = None,
+        refresh_delay: float = 0.0,
+        refresh_stats: Any = None,
+        retry_on_tool_error: bool = True,
+        require_retrieved: bool | None = None,
+    ) -> None:
+        self.tool_store = tool_store
+        self.server_store = server_store
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.refreshed: list[str] = []
+        self.retries: list[tuple[str, str]] = []
+        self.retry_on_tool_error = retry_on_tool_error
+        self.require_retrieved = require_retrieved
+        self.config = SimpleNamespace(
+            tool_search=SimpleNamespace(require_retrieved=True),
+        )
         self._script = list(script)
+        self._on_refresh = on_refresh
+        self._refresh_error = refresh_error
+        self._refresh_delay = refresh_delay
+        self._refresh_stats = refresh_stats
 
     async def call_tool(
-        self,
-        name: str,
-        arguments: dict[str, Any],
-        timeout: float | None = None,
+        self, record: McpToolRecord, arguments: dict[str, Any]
     ) -> mcp_types.CallToolResult:
-        self.calls.append(
-            {"name": name, "arguments": dict(arguments), "timeout": timeout}
-        )
+        self.calls.append((record.server_id, record.name, dict(arguments)))
         if not self._script:
-            raise AssertionError("tool_execute called ContextForge more often than allowed")
+            raise AssertionError(
+                "tool_execute called the MCP server more often than allowed"
+            )
         outcome = self._script.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
-
-class UnreadableStore:
-    """The real store, whose catalog read starts failing after ``after`` reads.
-
-    A database that disappears mid-call is not evidence that the row is gone:
-    the sync completed and the read did not.  That third outcome is what these
-    tests drive, because reporting it as tool_not_found tells the model to stop
-    calling a tool that is probably still there.
-    """
-
-    def __init__(self, store: ContextForgeToolStore, *, after: int = 1) -> None:
-        self._store = store
-        self._after = after
-        self.reads = 0
-
-    async def get_by_call_name(
-        self, call_name: str, owner_user_id: str
-    ) -> ContextForgeToolRecord | None:
-        self.reads += 1
-        if self.reads > self._after:
-            raise RuntimeError("database connection lost")
-        return await self._store.get_by_call_name(call_name, owner_user_id)
-
-
-class FakeExecutionRuntime:
-    """The process runtime, shaped like ContextForgeRuntime: store + MCP + refresh."""
-
-    def __init__(
-        self,
-        store: ContextForgeToolStore,
-        mcp: FakeMcp,
-        *,
-        on_refresh: Any = None,
-        refresh_error: Exception | None = None,
-        refresh_delay: float = 0.0,
-        refresh_timeout: float = 1.0,
-        retry_on_tool_error: bool = True,
-    ) -> None:
-        self.store = store
-        self.mcp_client = mcp
-        self.config = ContextForgeConfig(
-            enabled=True,
-            base_url="http://cf",
-            admin_token="token",
-            search={"enabled": False},
-            sync={
-                "tool_error_refresh_timeout_seconds": refresh_timeout,
-                "retry_on_tool_error": retry_on_tool_error,
-            },
-        )
-        self.refresh_reasons: list[str] = []
-        self.retries: list[tuple[str, str]] = []
-        self._on_refresh = on_refresh
-        self._refresh_error = refresh_error
-        self._refresh_delay = refresh_delay
-
-    async def refresh_now(self, reason: str = "tool_error") -> ContextForgeSyncStats:
-        self.refresh_reasons.append(reason)
+    async def refresh_server(self, server_id: str) -> Any:
+        self.refreshed.append(server_id)
         if self._refresh_delay:
             await asyncio.sleep(self._refresh_delay)
         if self._refresh_error is not None:
             raise self._refresh_error
         if self._on_refresh is not None:
             await self._on_refresh()
-        return ContextForgeSyncStats()
+        return self._refresh_stats
 
     def record_retry(self, *, tool_name: str, result: str) -> None:
         self.retries.append((tool_name, result))
 
 
-class StatsErrorRuntime(FakeExecutionRuntime):
-    """A refresh that reports a failure in its stats, as the real runtime does.
+class UnreadableStore:
+    """The real store, whose catalog read starts failing after ``after`` reads.
 
-    ContextForgeRuntime.refresh_now swallows an upstream, database or budget
-    failure into ContextForgeSyncStats.error instead of raising, so a normal
-    return is not evidence the snapshot was replaced.  index_failed is the
-    exception: the DB snapshot was committed and only the Milvus index failed.
+    A database that disappears mid-call is not evidence that the row is gone: the
+    sync completed and the read did not.  That third outcome is what these tests
+    drive, because reporting it as tool_not_found tells the model to stop calling
+    a tool that is probably still there.
     """
 
-    def __init__(
-        self,
-        store: ContextForgeToolStore,
-        mcp: FakeMcp,
-        *,
-        on_refresh: Any = None,
-        index_failed: bool = False,
-    ) -> None:
-        super().__init__(store, mcp, on_refresh=on_refresh)
-        self.index_failed = index_failed
+    def __init__(self, store: McpToolStore, *, after: int = 1) -> None:
+        self._store = store
+        self._after = after
+        self.reads = 0
 
-    async def refresh_now(self, reason: str = "tool_error") -> ContextForgeSyncStats:
-        self.refresh_reasons.append(reason)
-        if self._on_refresh is not None:
-            await self._on_refresh()
-        return ContextForgeSyncStats(
-            error="index_unavailable" if self.index_failed else "admin_read_failed",
-            index_failed=self.index_failed,
-        )
+    async def get_by_call_name(
+        self, call_name: str, owner_user_id: str
+    ) -> McpToolRecord | None:
+        self.reads += 1
+        if self.reads > self._after:
+            raise RuntimeError("database connection lost")
+        return await self._store.get_by_call_name(call_name, owner_user_id)
 
 
-async def _run(
-    execution: Any,
+async def _invoke(
     *,
     call_name: str = CALL_NAME,
     arguments: dict[str, Any] | None = None,
@@ -276,23 +284,42 @@ async def _run(
     user_id: str = "u1",
     tool_call_id: str = "call-1",
 ) -> ToolMessage:
-    configure_contextforge_runtime(execution)
-    try:
-        result = await tool_execute.coroutine(
-            tool_name=call_name,
-            arguments=dict(arguments or {}),
-            runtime=SimpleNamespace(
-                context={"user_id": user_id},
-                state={"retrieved_tool_names": list(retrieved)},
-            ),
-            tool_call_id=tool_call_id,
-        )
-    finally:
-        reset_contextforge_runtime()
+    """Run the executor the way ToolNode does, against whatever is published."""
+    result = await tool_execute.coroutine(
+        tool_name=call_name,
+        arguments=dict(arguments or {}),
+        runtime=SimpleNamespace(
+            context={"user_id": user_id},
+            state={"retrieved_tool_names": list(retrieved)},
+        ),
+        tool_call_id=tool_call_id,
+    )
     assert isinstance(result, ToolMessage)
     assert result.name == TOOL_NAME
     assert result.tool_call_id == tool_call_id
     return result
+
+
+async def _run(
+    runtime: Any,
+    *,
+    call_name: str = CALL_NAME,
+    arguments: dict[str, Any] | None = None,
+    retrieved: Sequence[str] = (CALL_NAME,),
+    user_id: str = "u1",
+    tool_call_id: str = "call-1",
+) -> ToolMessage:
+    set_mcp_runtime(runtime)
+    try:
+        return await _invoke(
+            call_name=call_name,
+            arguments=arguments,
+            retrieved=retrieved,
+            user_id=user_id,
+            tool_call_id=tool_call_id,
+        )
+    finally:
+        reset_mcp_runtime()
 
 
 def _payload(message: ToolMessage) -> dict[str, Any]:
@@ -310,92 +337,335 @@ def _meta(message: ToolMessage) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Gates: retrieved names, then owner + callable
+# The published runtime: the one seam between the tool and the application
+# --------------------------------------------------------------------------- #
+
+
+def test_the_runtime_slot_publishes_and_clears() -> None:
+    """Task 8 publishes the real runtime here; every test tears it down."""
+    assert get_mcp_runtime() is None
+    runtime = object()
+    set_mcp_runtime(runtime)
+    assert get_mcp_runtime() is runtime
+    reset_mcp_runtime()
+    assert get_mcp_runtime() is None
+
+
+@pytest.mark.asyncio
+async def test_the_executor_reads_the_runtime_the_application_published(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, _ok(_text("ok")))
+
+        assert executor_module.get_mcp_runtime is get_mcp_runtime
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    assert runtime.calls == [(SERVER_ID, "search", {"query": "pytest"})]
+
+
+@pytest.mark.asyncio
+async def test_a_test_may_patch_the_getter_instead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The import is a module attribute, so monkeypatching it works too."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, _ok(_text("ok")))
+        monkeypatch.setattr(executor_module, "get_mcp_runtime", lambda: runtime)
+
+        message = await _invoke(arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    assert runtime.calls == [(SERVER_ID, "search", {"query": "pytest"})]
+
+
+# --------------------------------------------------------------------------- #
+# Gates: retrieved names, then owner + callable + server state
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
 async def test_a_name_that_was_never_retrieved_is_refused(tmp_path: Path) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp)
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, _ok(_text("ok")))
 
-        message = await _run(execution, retrieved=())
+        message = await _run(runtime, retrieved=())
 
     payload = _payload(message)
     assert payload["origin"] == "not_retrieved"
     assert payload["call_name"] == CALL_NAME
     assert "tool_search" in payload["error"]
-    assert mcp.calls == []
-    assert execution.refresh_reasons == []
+    assert runtime.calls == []
+    assert runtime.refreshed == []
     assert _meta(message)["origin"] == "not_retrieved"
-
-
-@pytest.mark.asyncio
-async def test_another_users_tool_is_not_executed(tmp_path: Path) -> None:
-    """The DB read is owner-scoped: a guessed call_name is not a capability."""
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record(owner="u2"))
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution)
-
-    payload = _payload(message)
-    assert payload["origin"] == "tool_not_found"
-    assert mcp.calls == []
-    assert execution.refresh_reasons == ["call_error"]
-
-
-@pytest.mark.asyncio
-async def test_an_uncallable_tool_is_not_executed(tmp_path: Path) -> None:
-    """A stored row that stopped qualifying keeps its definition but not its life."""
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record(), seen=False)
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution)
-
-    payload = _payload(message)
-    assert payload["origin"] == "tool_not_found"
-    assert mcp.calls == []
 
 
 @pytest.mark.asyncio
 async def test_without_state_nothing_is_retrieved(tmp_path: Path) -> None:
     """Fail closed: a runtime that cannot show the run's names retrieves nothing."""
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        execution = FakeExecutionRuntime(store, FakeMcp())
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, _ok(_text("ok")))
 
-        message = await _run(execution, retrieved=())
+        message = await _run(runtime, retrieved=())
 
     assert _payload(message)["origin"] == "not_retrieved"
+    assert runtime.calls == []
 
 
 @pytest.mark.asyncio
 async def test_require_retrieved_false_skips_the_gate_but_not_the_schema(
     tmp_path: Path,
 ) -> None:
-    """contextforge.search.require_retrieved is the switch; safety still applies.
+    """tool_search.require_retrieved is the switch; safety still applies.
 
-    With the gate deliberately loosened, an unretrieved call name reaches the
-    owner-scoped store and the stored schema, so the arguments are still
-    validated before anything runs upstream.
+    With the gate deliberately loosened, an unretrieved call name still reaches
+    the owner-scoped store and the stored schema, so the arguments are validated
+    before anything runs upstream.
     """
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp)
-        execution.config.search.require_retrieved = False
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, _ok(_text("ok")))
+        runtime.config.tool_search.require_retrieved = False
 
-        message = await _run(execution, retrieved=())
+        message = await _run(runtime, retrieved=())
 
     payload = _payload(message)
     assert payload["origin"] == "local_validation"
-    assert mcp.calls == []
+    assert runtime.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_level_require_retrieved_override_wins(tmp_path: Path) -> None:
+    """The policy may be published on the runtime instead of in tool_search config."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store, server_store, _ok(_text("ok")), require_retrieved=False
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"}, retrieved=())
+
+    assert message.status == "success"
+    assert runtime.calls == [(SERVER_ID, "search", {"query": "pytest"})]
+
+
+@pytest.mark.asyncio
+async def test_an_unpublished_runtime_is_unavailable(tmp_path: Path) -> None:
+    """No runtime is not "no tools": it is a deployment that cannot execute."""
+    message = await _invoke(arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "mcp_unavailable"
+    assert payload["retryable"] is False
+    assert "MCP" in payload["error"]
+    assert "ContextForge" not in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_half_built_runtime_is_unavailable(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, _server_store):
+        runtime = FakeRuntime(store, None, _ok(_text("ok")))
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert _payload(message)["origin"] == "mcp_unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# The direct call: the owning server, the remote name, the arguments
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_call_goes_to_the_server_that_owns_the_tool(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, _ok(_text("found 3 repos")))
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    assert runtime.calls == [(SERVER_ID, "search", {"query": "pytest"})], (
+        "the record's server id, the remote name and the arguments are the call"
+    )
+    assert runtime.refreshed == []
+    assert runtime.retries == []
+
+
+@pytest.mark.asyncio
+async def test_the_result_is_stamped_with_the_inner_name_tool_id_and_call_name(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            _ok(
+                _text("found 3 repos"),
+                mcp_types.ImageContent(type="image", data="aGk=", mimeType="image/png"),
+                mcp_types.EmbeddedResource(
+                    type="resource",
+                    resource=mcp_types.TextResourceContents(
+                        uri="file:///notes.txt", mimeType="text/plain", text="body"
+                    ),
+                ),
+            ),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    assert message.content == [
+        {"type": "text", "text": "found 3 repos"},
+        {"type": "image", "base64": "aGk=", "mime_type": "image/png"},
+        {"type": "text", "text": "file:///notes.txt\nbody"},
+    ]
+    meta = _meta(message)
+    assert meta["inner_name"] == "search"
+    assert meta["call_name"] == CALL_NAME
+    assert meta["tool_id"] == tool_id_for(SERVER_ID, "search")
+    assert meta["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_a_structured_result_without_content_still_answers(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            mcp_types.CallToolResult(
+                content=[],
+                structuredContent={"total": 2},
+                isError=False,
+            ),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    assert message.content == [{"type": "text", "text": '{"total": 2}'}]
+
+
+@pytest.mark.asyncio
+async def test_a_stored_schema_that_is_missing_still_defers(tmp_path: Path) -> None:
+    """No schema is not a broken schema: with nothing to check, the server decides."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool(schema={}))
+        runtime = FakeRuntime(store, server_store, _ok(_text("ok")))
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    assert len(runtime.calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Refusals: owner, callability, and the server that explains why
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_another_users_tool_is_not_executed(tmp_path: Path) -> None:
+    """The lookup is owner-scoped: a guessed call name is not a capability."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store, owner="u2")
+        await _store_tool(store, _tool(owner="u2"))
+        runtime = FakeRuntime(store, server_store, _ok(_text("ok")))
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_not_found"
+    assert runtime.calls == []
+    assert runtime.refreshed == [], "another owner's server is not ours to refresh"
+
+
+@pytest.mark.asyncio
+async def test_a_tool_the_sync_no_longer_sees_is_refused_and_refreshed_once(
+    tmp_path: Path,
+) -> None:
+    """A stored row that stopped qualifying keeps its definition, not its life."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool(), seen=False)
+        runtime = FakeRuntime(store, server_store)
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_not_found"
+    assert payload["inner_name"] == "search", "the audit still names the tool"
+    assert runtime.calls == []
+    assert runtime.refreshed == [SERVER_ID], "the server was healthy, so one refresh"
+    assert "refreshed" in payload["error"].casefold()
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_server_refuses_the_call(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store, enabled=False)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store)
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "server_disabled"
+    assert payload["retryable"] is False
+    assert SERVER_NAME in payload["error"]
+    assert runtime.calls == []
+    assert runtime.refreshed == [], "refreshing a disabled server is meaningless"
+    assert _meta(message)["origin"] == "server_disabled"
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_server_refuses_the_call(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store, reachable=False)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store)
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "server_unavailable"
+    assert payload["retryable"] is False
+    assert SERVER_NAME in payload["error"]
+    assert runtime.calls == []
+    assert runtime.refreshed == []
+
+
+@pytest.mark.asyncio
+async def test_a_tool_whose_server_was_deleted_is_not_executed(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store)
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_not_found"
+    assert runtime.calls == []
+    assert runtime.refreshed == [], "a deleted server has nothing to refresh"
 
 
 # --------------------------------------------------------------------------- #
@@ -407,24 +677,24 @@ async def test_require_retrieved_false_skips_the_gate_but_not_the_schema(
 async def test_local_validation_failure_returns_the_new_schema_without_retrying(
     tmp_path: Path,
 ) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
 
         async def refresh() -> None:
-            await store.upsert_snapshot([_record(schema=TEXT_SCHEMA)], ["github_search"])
+            await _store_tool(store, _tool(schema=TEXT_SCHEMA))
 
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp, on_refresh=refresh)
+        runtime = FakeRuntime(store, server_store, on_refresh=refresh)
 
-        message = await _run(execution, arguments={"limit": 3})
+        message = await _run(runtime, arguments={"limit": 3})
 
     payload = _payload(message)
     assert payload["origin"] == "local_validation"
     assert payload["schema_changed"] is True
     assert payload["input_schema"] == TEXT_SCHEMA
     assert "query" in payload["error"]
-    assert mcp.calls == [], "a local validation failure never reaches ContextForge"
-    assert execution.refresh_reasons == ["call_error"]
+    assert runtime.calls == [], "a local validation failure never reaches the server"
+    assert runtime.refreshed == [SERVER_ID]
     assert _meta(message)["origin"] == "local_validation"
 
 
@@ -432,93 +702,123 @@ async def test_local_validation_failure_returns_the_new_schema_without_retrying(
 async def test_local_validation_failure_with_an_unchanged_schema_returns_the_error(
     tmp_path: Path,
 ) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp)
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store)
 
-        message = await _run(execution, arguments={})
+        message = await _run(runtime, arguments={})
 
     payload = _payload(message)
     assert payload["origin"] == "local_validation"
     assert "schema_changed" not in payload
     assert "input_schema" not in payload
     assert "'query' is a required property" in payload["error"]
-    assert mcp.calls == []
-    assert execution.refresh_reasons == ["call_error"]
+    assert runtime.calls == []
+    assert runtime.refreshed == [SERVER_ID]
 
 
 @pytest.mark.asyncio
-async def test_a_failed_refresh_keeps_the_local_validation_error(tmp_path: Path) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(
-            store, mcp, refresh_error=RuntimeError("contextforge unreachable")
+async def test_a_failed_refresh_keeps_the_local_validation_error(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store, server_store, refresh_error=RuntimeError("server unreachable")
         )
 
-        message = await _run(execution, arguments={})
+        message = await _run(runtime, arguments={})
 
     payload = _payload(message)
     assert payload["origin"] == "local_validation"
     assert "input_schema" not in payload
-    assert mcp.calls == []
+    assert runtime.calls == []
 
 
 @pytest.mark.asyncio
 async def test_a_slow_refresh_is_bounded_by_the_configured_timeout(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(
-            store, mcp, refresh_delay=5.0, refresh_timeout=0.05
+    monkeypatch.setattr(executor_module, "DEFAULT_REFRESH_TIMEOUT_SECONDS", 0.05)
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+
+        async def refresh() -> None:
+            await _store_tool(store, _tool(schema=TEXT_SCHEMA))
+
+        runtime = FakeRuntime(
+            store, server_store, on_refresh=refresh, refresh_delay=5.0
         )
 
         loop = asyncio.get_running_loop()
         started = loop.time()
-        message = await _run(execution, arguments={})
+        message = await _run(runtime, arguments={})
         elapsed = loop.time() - started
 
     assert _payload(message)["origin"] == "local_validation"
-    assert elapsed < 1.0, "the refresh budget, not the refresh, decides how long this takes"
-    assert mcp.calls == []
+    assert elapsed < 1.0, (
+        "the refresh budget, not the refresh, decides how long this takes"
+    )
+    assert "input_schema" not in _payload(message), (
+        "a cancelled refresh changed nothing"
+    )
+    assert runtime.calls == []
+
+
+@pytest.mark.asyncio
+async def test_retry_on_tool_error_false_does_not_refresh_a_validation_failure(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, retry_on_tool_error=False)
+
+        message = await _run(runtime, arguments={})
+
+    payload = _payload(message)
+    assert payload["origin"] == "local_validation"
+    assert "input_schema" not in payload
+    assert runtime.refreshed == []
+    assert runtime.calls == []
 
 
 # --------------------------------------------------------------------------- #
-# Not found (design 9.1 B): refresh, then retry exactly once
+# Not found (design 9.1 B): refresh the owning server, then retry exactly once
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
 async def test_a_stale_call_name_is_refreshed_then_retried_once(tmp_path: Path) -> None:
     """The row was missing locally; the refresh brings it back and we run it."""
-    async with catalog(tmp_path) as store:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
 
         async def refresh() -> None:
-            await _store_record(store, _record())
+            await _store_tool(store, _tool())
 
-        mcp = FakeMcp(_ok(_text("found 3 repos")))
-        execution = FakeExecutionRuntime(store, mcp, on_refresh=refresh)
+        runtime = FakeRuntime(
+            store, server_store, _ok(_text("found 3 repos")), on_refresh=refresh
+        )
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     assert message.status == "success"
-    assert execution.refresh_reasons == ["call_error"]
-    assert mcp.calls == [
-        {"name": "github_search", "arguments": {"query": "pytest"}, "timeout": None}
-    ]
-    assert execution.retries == [(CALL_NAME, "success")]
+    assert runtime.refreshed == [SERVER_ID], "the server named by the call name"
+    assert runtime.calls == [(SERVER_ID, "search", {"query": "pytest"})]
+    assert runtime.retries == [(CALL_NAME, "success")]
 
 
 @pytest.mark.asyncio
 async def test_a_missing_tool_is_reported_after_one_refresh(tmp_path: Path) -> None:
-    async with catalog(tmp_path) as store:
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp)
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        runtime = FakeRuntime(store, server_store)
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     payload = _payload(message)
     assert payload["origin"] == "tool_not_found"
@@ -528,154 +828,376 @@ async def test_a_missing_tool_is_reported_after_one_refresh(tmp_path: Path) -> N
         "the refresh already ran and the reply says do not repeat this call"
     )
     assert "Do not repeat this call" in payload["error"]
-    assert execution.refresh_reasons == ["call_error"], "exactly one refresh"
-    assert mcp.calls == []
+    assert runtime.refreshed == [SERVER_ID], "exactly one refresh"
+    assert runtime.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_call_name_that_names_no_server_is_not_refreshed(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        runtime = FakeRuntime(store, server_store)
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_not_found"
+    assert "nothing to refresh" in payload["error"]
+    assert runtime.refreshed == []
+    assert runtime.calls == []
 
 
 @pytest.mark.asyncio
 async def test_retry_on_tool_error_false_does_not_refresh_a_missing_tool(
     tmp_path: Path,
 ) -> None:
-    async with catalog(tmp_path) as store:
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(
-            store, mcp, retry_on_tool_error=False
-        )
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        runtime = FakeRuntime(store, server_store, retry_on_tool_error=False)
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     payload = _payload(message)
     assert payload["origin"] == "tool_not_found"
     assert "retry_on_tool_error" in payload["error"]
-    assert execution.refresh_reasons == []
-    assert execution.retries == []
-    assert mcp.calls == []
-
-
-@pytest.mark.asyncio
-async def test_retry_on_tool_error_false_does_not_refresh_a_validation_failure(
-    tmp_path: Path,
-) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(
-            store, mcp, retry_on_tool_error=False
-        )
-
-        message = await _run(execution, arguments={})
-
-    payload = _payload(message)
-    assert payload["origin"] == "local_validation"
-    assert "input_schema" not in payload
-    assert execution.refresh_reasons == []
-    assert execution.retries == []
-    assert mcp.calls == []
-
-
-@pytest.mark.asyncio
-async def test_upstream_not_found_is_refreshed_and_retried_once(tmp_path: Path) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(_error("tool not found: github_search"), _ok(_text("ok")))
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    assert message.status == "success"
-    assert [call["name"] for call in mcp.calls] == ["github_search", "github_search"]
-    assert execution.refresh_reasons == ["call_error"]
-    assert execution.retries == [(CALL_NAME, "success")]
-
-
-@pytest.mark.asyncio
-async def test_a_second_not_found_is_not_retried_again(tmp_path: Path) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(_error("tool not found"), _error("tool not found"))
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    assert _payload(message)["origin"] == "tool_not_found"
-    assert len(mcp.calls) == 2
-    assert execution.refresh_reasons == ["call_error"], "one refresh, one retry"
-    assert execution.retries == [(CALL_NAME, "failed")]
-
-
-@pytest.mark.asyncio
-async def test_retry_on_tool_error_false_does_not_retry_an_upstream_not_found(
-    tmp_path: Path,
-) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(_error("tool not found: github_search"))
-        execution = FakeExecutionRuntime(
-            store, mcp, retry_on_tool_error=False
-        )
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    assert _payload(message)["origin"] == "tool_not_found"
-    assert len(mcp.calls) == 1, "the upstream call is never repeated"
-    assert execution.refresh_reasons == []
-    assert execution.retries == []
-
-
-@pytest.mark.asyncio
-async def test_a_failed_refresh_on_upstream_not_found_keeps_the_catalog_answer(
-    tmp_path: Path,
-) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(_error("tool not found: github_search"))
-        execution = FakeExecutionRuntime(
-            store, mcp, refresh_error=RuntimeError("contextforge unreachable")
-        )
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    payload = _payload(message)
-    assert payload["origin"] == "tool_not_found"
-    assert "did not complete" in payload["error"]
-    assert len(mcp.calls) == 1, "a refresh that never happened cannot justify a retry"
-    assert execution.refresh_reasons == ["call_error"]
+    assert runtime.refreshed == []
+    assert runtime.retries == []
+    assert runtime.calls == []
 
 
 @pytest.mark.asyncio
 async def test_a_refresh_that_reports_an_error_did_not_refresh(tmp_path: Path) -> None:
-    """refresh_now reports failure in stats.error instead of raising."""
-    async with catalog(tmp_path) as store:
-        mcp = FakeMcp()
-        execution = StatsErrorRuntime(store, mcp)
+    """A sync reports its failure in stats instead of raising."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            refresh_stats=SimpleNamespace(error="admin_read_failed"),
+        )
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     payload = _payload(message)
     assert payload["origin"] == "tool_not_found"
     assert "did not complete" in payload["error"]
-    assert mcp.calls == []
-    assert execution.refresh_reasons == ["call_error"]
+    assert runtime.calls == []
+    assert runtime.refreshed == [SERVER_ID]
 
 
 @pytest.mark.asyncio
 async def test_an_index_only_refresh_failure_still_uses_the_committed_snapshot(
     tmp_path: Path,
 ) -> None:
-    """index_failed committed the DB snapshot; only the Milvus index is degraded."""
-    async with catalog(tmp_path) as store:
+    """index_failed committed the DB snapshot; only the vector index is degraded."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
 
         async def refresh() -> None:
-            await _store_record(store, _record())
+            await _store_tool(store, _tool())
 
-        mcp = FakeMcp(_ok(_text("found 3 repos")))
-        execution = StatsErrorRuntime(store, mcp, on_refresh=refresh, index_failed=True)
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            _ok(_text("found 3 repos")),
+            on_refresh=refresh,
+            refresh_stats=SimpleNamespace(error="index_unavailable", index_failed=True),
+        )
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     assert message.status == "success"
-    assert execution.refresh_reasons == ["call_error"]
-    assert execution.retries == [(CALL_NAME, "success")]
+    assert runtime.refreshed == [SERVER_ID]
+    assert runtime.retries == [(CALL_NAME, "success")]
+
+
+# --------------------------------------------------------------------------- #
+# Upstream isError: the result is data, and only some of it is refreshable
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_upstream_not_found_is_refreshed_and_retried_once(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store, server_store, _error("tool not found: search"), _ok(_text("ok"))
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    assert [call[1] for call in runtime.calls] == ["search", "search"]
+    assert runtime.refreshed == [SERVER_ID]
+    assert runtime.retries == [(CALL_NAME, "success")]
+
+
+@pytest.mark.asyncio
+async def test_a_second_not_found_is_not_retried_again(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store, server_store, _error("tool not found"), _error("tool not found")
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert _payload(message)["origin"] == "tool_not_found"
+    assert len(runtime.calls) == 2
+    assert runtime.refreshed == [SERVER_ID], "one refresh, one retry"
+    assert runtime.retries == [(CALL_NAME, "failed")]
+
+
+@pytest.mark.asyncio
+async def test_retry_on_tool_error_false_does_not_retry_an_upstream_not_found(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            _error("tool not found: search"),
+            retry_on_tool_error=False,
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert _payload(message)["origin"] == "tool_not_found"
+    assert len(runtime.calls) == 1, "the upstream call is never repeated"
+    assert runtime.refreshed == []
+    assert runtime.retries == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_on_upstream_not_found_keeps_the_catalog_answer(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            _error("tool not found: search"),
+            refresh_error=RuntimeError("refresh exploded"),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_not_found"
+    assert "did not complete" in payload["error"]
+    assert len(runtime.calls) == 1, (
+        "a refresh that never happened cannot justify a retry"
+    )
+    assert runtime.refreshed == [SERVER_ID]
+
+
+@pytest.mark.asyncio
+async def test_upstream_schema_mismatch_returns_the_new_schema_without_retrying(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+
+        async def refresh() -> None:
+            await _store_tool(store, _tool(schema=TEXT_SCHEMA))
+
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            _error("invalid params: schema validation failed"),
+            on_refresh=refresh,
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "schema_mismatch"
+    assert payload["schema_changed"] is True
+    assert payload["input_schema"] == TEXT_SCHEMA
+    assert len(runtime.calls) == 1, "the old arguments are never retried"
+    assert runtime.refreshed == [SERVER_ID]
+
+
+@pytest.mark.asyncio
+async def test_upstream_schema_mismatch_without_a_change_returns_the_error(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store, server_store, _error("invalid arguments for tool")
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "invalid_arguments"
+    assert "input_schema" not in payload
+    assert len(runtime.calls) == 1
+    assert runtime.refreshed == [SERVER_ID]
+
+
+@pytest.mark.asyncio
+async def test_an_upstream_error_result_is_an_error_tool_message(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, _error("unauthorized: bad token"))
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_error"
+    assert payload["error"] == "unauthorized: bad token"
+    assert payload["inner_name"] == "search"
+    assert payload["tool_id"] == tool_id_for(SERVER_ID, "search")
+    assert _meta(message)["status"] == "error"
+    assert runtime.refreshed == [], "an upstream answer is never refreshed or retried"
+
+
+@pytest.mark.asyncio
+async def test_an_upstream_5xx_result_is_not_retried(tmp_path: Path) -> None:
+    """isError with a 5xx/timeout marker: the result is uncertain, so no retry."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store, server_store, _error("internal server error: 502")
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_error"
+    assert len(runtime.calls) == 1
+    assert runtime.refreshed == []
+
+
+# --------------------------------------------------------------------------- #
+# No retry: timeout, transport, protocol, and the JSON-RPC tool error
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_is_neither_refreshed_nor_retried(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            McpServerTimeout("MCP server 's1' timed out during tools/call"),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "timeout"
+    assert payload["retryable"] is False
+    assert len(runtime.calls) == 1
+    assert runtime.refreshed == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_server_is_neither_refreshed_nor_retried(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            McpServerUnavailable("MCP server 's1' is unavailable (ConnectError)"),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "server_unavailable"
+    assert len(runtime.calls) == 1
+    assert runtime.refreshed == []
+
+
+@pytest.mark.asyncio
+async def test_a_protocol_failure_is_neither_refreshed_nor_retried(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            McpProtocolError(
+                "MCP server 's1' returned a malformed tools/call response"
+            ),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "transport_error"
+    assert len(runtime.calls) == 1
+    assert runtime.refreshed == []
+
+
+@pytest.mark.asyncio
+async def test_a_json_rpc_tool_error_is_reported_without_retrying(
+    tmp_path: Path,
+) -> None:
+    """McpToolError is the path where no result exists: tool_error, never retried."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            McpToolError(
+                "MCP server 's1' rejected the tool call (JSON-RPC error -32603)"
+            ),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_error"
+    assert "-32603" in payload["error"]
+    assert len(runtime.calls) == 1
+    assert runtime.refreshed == []
+
+
+@pytest.mark.asyncio
+async def test_a_tool_error_that_carries_a_result_reports_its_text(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            McpToolError("rejected", result=_error("upstream exploded")),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_error"
+    assert payload["error"] == "upstream exploded"
+    assert len(runtime.calls) == 1
+    assert runtime.refreshed == []
 
 
 # --------------------------------------------------------------------------- #
@@ -687,259 +1209,48 @@ async def test_an_index_only_refresh_failure_still_uses_the_committed_snapshot(
 async def test_a_re_read_that_raises_is_unavailable_not_a_refreshed_not_found(
     tmp_path: Path,
 ) -> None:
-    """(None, True) used to turn a DB failure into "refreshed, so not found".
+    """Nothing is known about the row here: the refresh ran, the read raised.
 
-    Nothing is known about the row here: the refresh completed and the read that
-    follows it raised.  The model must not be told the tool is gone.
+    The model must not be told the tool is gone, because it probably still exists.
     """
-    async with catalog(tmp_path) as store:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
         unreadable = UnreadableStore(store, after=1)
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(unreadable, mcp)
+        runtime = FakeRuntime(unreadable, server_store)
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     payload = _payload(message)
-    assert payload["origin"] == "contextforge_unavailable"
+    assert payload["origin"] == "mcp_unavailable"
     assert payload["retryable"] is False
-    assert "tool_not_found" not in payload["origin"]
-    assert "refreshed" not in payload["error"].casefold()
     assert "not found" not in payload["error"].casefold()
     assert "could not be read" in payload["error"]
     assert unreadable.reads == 2, "one lookup, one re-read after the refresh"
-    assert execution.refresh_reasons == ["call_error"]
-    assert mcp.calls == [], "an unreadable catalog never reaches ContextForge"
-    assert _meta(message)["origin"] == "contextforge_unavailable"
+    assert runtime.refreshed == [SERVER_ID]
+    assert runtime.calls == [], "an unreadable catalog never reaches the server"
+    assert _meta(message)["origin"] == "mcp_unavailable"
 
 
 @pytest.mark.asyncio
 async def test_an_upstream_not_found_whose_re_read_raises_is_unavailable(
     tmp_path: Path,
 ) -> None:
-    """ContextForge said not found, then the re-read raised: still not a retry."""
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
+    """The server said not found, then the re-read raised: still not a retry."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
         unreadable = UnreadableStore(store, after=1)
-        mcp = FakeMcp(_error("tool not found: github_search"))
-        execution = FakeExecutionRuntime(unreadable, mcp)
+        runtime = FakeRuntime(
+            unreadable, server_store, _error("tool not found: search")
+        )
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     payload = _payload(message)
-    assert payload["origin"] == "contextforge_unavailable"
+    assert payload["origin"] == "mcp_unavailable"
     assert payload["retryable"] is False
-    assert "refreshed" not in payload["error"].casefold()
-    assert len(mcp.calls) == 1, "no retry without a catalog read that succeeded"
-    assert execution.retries == []
-
-
-# --------------------------------------------------------------------------- #
-# Upstream schema mismatch (design 9.1 C): refresh and answer, never retry
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_upstream_schema_mismatch_returns_the_new_schema_without_retrying(
-    tmp_path: Path,
-) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-
-        async def refresh() -> None:
-            await store.upsert_snapshot([_record(schema=TEXT_SCHEMA)], ["github_search"])
-
-        mcp = FakeMcp(_error("invalid params: schema validation failed"))
-        execution = FakeExecutionRuntime(store, mcp, on_refresh=refresh)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    payload = _payload(message)
-    assert payload["origin"] == "schema_mismatch"
-    assert payload["schema_changed"] is True
-    assert payload["input_schema"] == TEXT_SCHEMA
-    assert len(mcp.calls) == 1, "the old arguments are never retried"
-    assert execution.refresh_reasons == ["call_error"]
-
-
-@pytest.mark.asyncio
-async def test_upstream_schema_mismatch_without_a_change_returns_the_error(
-    tmp_path: Path,
-) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(_error("invalid arguments for tool"))
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    payload = _payload(message)
-    assert payload["origin"] == "invalid_arguments"
-    assert "input_schema" not in payload
-    assert len(mcp.calls) == 1
-    assert execution.refresh_reasons == ["call_error"]
-
-
-# --------------------------------------------------------------------------- #
-# No retry: timeout, 5xx, transport, and any other execution error
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_a_timeout_is_neither_refreshed_nor_retried(tmp_path: Path) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(ContextForgeTimeout("request timed out"))
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    payload = _payload(message)
-    assert payload["origin"] == "timeout"
-    assert len(mcp.calls) == 1
-    assert execution.refresh_reasons == []
-
-
-@pytest.mark.asyncio
-async def test_a_transport_failure_is_neither_refreshed_nor_retried(
-    tmp_path: Path,
-) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(ContextForgeUnavailable("ContextForge returned 502 Bad Gateway"))
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    payload = _payload(message)
-    assert payload["origin"] == "transport_error"
-    assert len(mcp.calls) == 1
-    assert execution.refresh_reasons == []
-
-
-@pytest.mark.asyncio
-async def test_an_upstream_5xx_result_is_not_retried(tmp_path: Path) -> None:
-    """isError with a 5xx/timeout marker: the result is uncertain, so no retry."""
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(_error("internal server error: 502"))
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    payload = _payload(message)
-    assert payload["origin"] == "tool_error"
-    assert len(mcp.calls) == 1
-    assert execution.refresh_reasons == []
-
-
-# --------------------------------------------------------------------------- #
-# Success: MCP name, content blocks, and the audit stamp
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_the_result_is_stamped_with_the_inner_name_tool_id_and_call_name(
-    tmp_path: Path,
-) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(
-            _ok(
-                _text("found 3 repos"),
-                mcp_types.ImageContent(type="image", data="aGk=", mimeType="image/png"),
-                mcp_types.EmbeddedResource(
-                    type="resource",
-                    resource=mcp_types.TextResourceContents(
-                        uri="file:///notes.txt", mimeType="text/plain", text="body"
-                    ),
-                ),
-            )
-        )
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    assert message.status == "success"
-    assert message.content == [
-        {"type": "text", "text": "found 3 repos"},
-        {"type": "image", "base64": "aGk=", "mime_type": "image/png"},
-        {"type": "text", "text": "file:///notes.txt\nbody"},
-    ]
-    assert mcp.calls == [
-        {"name": "github_search", "arguments": {"query": "pytest"}, "timeout": None}
-    ], "ContextForge receives the original name, not the cf__ call name"
-    meta = _meta(message)
-    assert meta["inner_name"] == "github_search"
-    assert meta["call_name"] == CALL_NAME
-    assert meta["tool_id"] == "tool-github_search"
-    assert meta["status"] == "success"
-
-
-@pytest.mark.asyncio
-async def test_an_upstream_error_result_is_an_error_tool_message(tmp_path: Path) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(_error("unauthorized: bad token"))
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    payload = _payload(message)
-    assert payload["origin"] == "tool_error"
-    assert payload["error"] == "unauthorized: bad token"
-    assert payload["inner_name"] == "github_search"
-    assert payload["tool_id"] == "tool-github_search"
-    assert _meta(message)["status"] == "error"
-    assert execution.refresh_reasons == []
-
-
-@pytest.mark.asyncio
-async def test_a_structured_result_without_content_still_answers(tmp_path: Path) -> None:
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record())
-        mcp = FakeMcp(
-            mcp_types.CallToolResult(
-                content=[],
-                structuredContent={"total": 2},
-                isError=False,
-            )
-        )
-        execution = FakeExecutionRuntime(store, mcp)
-
-        message = await _run(execution, arguments={"query": "pytest"})
-
-    assert message.status == "success"
-    assert message.content == [{"type": "text", "text": '{"total": 2}'}]
-
-
-@pytest.mark.asyncio
-async def test_the_built_runtime_hands_the_executor_its_store_and_mcp_client(
-    tmp_path: Path,
-) -> None:
-    """The production wiring, not just the test doubles: build_contextforge_runtime."""
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///" + (tmp_path / "wiring.db").as_posix()
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    runtime = build_contextforge_runtime(
-        ContextForgeConfig(
-            enabled=True,
-            base_url="http://cf",
-            admin_token="token",
-            search={"enabled": False},
-        ),
-        session_factory=factory,
-    )
-    assert runtime is not None
-    try:
-        assert isinstance(runtime.store, ContextForgeToolStore)
-        assert isinstance(runtime.mcp_client, ContextForgeMcpClient)
-    finally:
-        reset_contextforge_runtime()
-        await runtime.admin.aclose()
-        await engine.dispose()
+    assert len(runtime.calls) == 1, "no retry without a catalog read that succeeded"
+    assert runtime.retries == []
 
 
 # --------------------------------------------------------------------------- #
@@ -951,7 +1262,7 @@ async def test_the_built_runtime_hands_the_executor_its_store_and_mcp_client(
 async def test_a_schema_that_cannot_resolve_remotely_is_refused(
     tmp_path: Path,
 ) -> None:
-    """A remote $ref is never fetched (9.3): the tool is refused, not deferred.
+    """A remote $ref is never fetched: the tool is refused, not deferred.
 
     Fetching it would make an upstream tool author's schema trigger a request from
     the gateway (SSRF); skipping validation would send arguments nothing checked.
@@ -961,19 +1272,19 @@ async def test_a_schema_that_cannot_resolve_remotely_is_refused(
         "properties": {"query": {"$ref": "https://example.com/args.json"}},
         "required": ["query"],
     }
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record(schema=schema))
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp)
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool(schema=schema))
+        runtime = FakeRuntime(store, server_store)
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     payload = _payload(message)
     assert payload["origin"] == "schema_unresolved"
     assert payload["retryable"] is False
     assert "example.com" in payload["error"], "the reason is reported, not swallowed"
-    assert mcp.calls == [], "unvalidated arguments never leave the process"
-    assert execution.refresh_reasons == []
+    assert runtime.calls == [], "unvalidated arguments never leave the process"
+    assert runtime.refreshed == []
     assert _meta(message)["origin"] == "schema_unresolved"
 
 
@@ -985,32 +1296,68 @@ async def test_a_schema_that_does_not_compile_is_refused(tmp_path: Path) -> None
         "properties": {"query": {"type": "nonsense"}},
         "required": ["query"],
     }
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record(schema=schema))
-        mcp = FakeMcp()
-        execution = FakeExecutionRuntime(store, mcp)
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool(schema=schema))
+        runtime = FakeRuntime(store, server_store)
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
     payload = _payload(message)
     assert payload["origin"] == "schema_unresolved"
     assert "UnknownType" in payload["error"]
-    assert mcp.calls == []
-    assert execution.refresh_reasons == []
+    assert runtime.calls == []
+    assert runtime.refreshed == []
+
+
+# --------------------------------------------------------------------------- #
+# Nothing secret in a failure: no header, no token, no endpoint
+# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_a_stored_schema_that_is_missing_still_defers(tmp_path: Path) -> None:
-    """No schema is not a broken schema: with nothing to check, MCP decides."""
-    async with catalog(tmp_path) as store:
-        await _store_record(store, _record(schema={}))
-        mcp = FakeMcp(_ok(_text("ok")))
-        execution = FakeExecutionRuntime(store, mcp)
+async def test_a_transport_failure_never_carries_a_header_a_token_or_a_url(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            McpServerUnavailable(
+                "connect failed at https://user:secret@mcp.example.com/mcp"
+                "?token=sk-live-123 (Authorization: Bearer sk-live-123)"
+            ),
+        )
 
-        message = await _run(execution, arguments={"query": "pytest"})
+        message = await _run(runtime, arguments={"query": "pytest"})
 
-    assert message.status == "success"
-    assert len(mcp.calls) == 1
+    error = _payload(message)["error"]
+    assert "sk-live-123" not in error
+    assert "secret@" not in error
+    assert "example.com" not in error
+    assert "****" in error, "the credential is redacted, not silently dropped"
+
+
+@pytest.mark.asyncio
+async def test_a_tool_error_result_is_scrubbed_of_credentials(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            McpToolError(
+                "rejected", result=_error("Authorization: Bearer sk-live-999")
+            ),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    error = _payload(message)["error"]
+    assert "sk-live-999" not in error
+    assert "****" in error
 
 
 # --------------------------------------------------------------------------- #
@@ -1020,7 +1367,9 @@ async def test_a_stored_schema_that_is_missing_still_defers(tmp_path: Path) -> N
 #: The decision, per origin.  False is the default for anything that already had
 #: its one fallback: tool_not_found was refreshed and retried once and its own
 #: wording says "do not repeat this call" (9.1 B.4), so a True there would
-#: contradict the message the model reads.
+#: contradict the message the model reads.  server_disabled and server_unavailable
+#: are refusals too - a disabled or unreachable server is not fixed by re-sending
+#: the same call.
 RETRYABLE_BY_ORIGIN: dict[str, bool] = {
     executor_module.ORIGIN_NOT_RETRIEVED: True,
     executor_module.ORIGIN_LOCAL_VALIDATION: True,
@@ -1030,14 +1379,14 @@ RETRYABLE_BY_ORIGIN: dict[str, bool] = {
     executor_module.ORIGIN_TRANSPORT_ERROR: False,
     executor_module.ORIGIN_TIMEOUT: False,
     executor_module.ORIGIN_TOOL_ERROR: False,
-    executor_module.ORIGIN_UNAVAILABLE: False,
+    executor_module.ORIGIN_MCP_UNAVAILABLE: False,
+    executor_module.ORIGIN_SERVER_UNAVAILABLE: False,
+    executor_module.ORIGIN_SERVER_DISABLED: False,
     executor_module.ORIGIN_SCHEMA_UNRESOLVED: False,
 }
 
 
-@pytest.mark.parametrize(
-    ("origin", "expected"), sorted(RETRYABLE_BY_ORIGIN.items())
-)
+@pytest.mark.parametrize(("origin", "expected"), sorted(RETRYABLE_BY_ORIGIN.items()))
 def test_the_retryable_flag_is_pinned_per_origin(
     origin: str, expected: bool
 ) -> None:

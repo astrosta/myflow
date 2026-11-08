@@ -1,43 +1,52 @@
-"""tool_execute: run one retrieved ContextForge tool through MCP tools/call.
+"""tool_execute: run one retrieved MCP tool against the server that owns it.
 
-ContextForge tools are not bound to the agent; tool_search hands the model a
-cf__<name> call name, its verbatim schema and the argument contract, and this
-tool is the only thing that actually runs one.  It always runs it the same way:
-look the row up in contextforge_tools by owner + call name + callable, validate
-the arguments against the stored schema, then call ContextForge MCP tools/call
-with the *original* (unprefixed) name.  No LangChain tool is created at runtime
-and ToolNode stays static.
+MCP tools are not bound to the agent: tool_search hands the model a
+``mcp__<server>__<tool>`` call name, its verbatim schema and the argument
+contract, and this tool is the only thing that actually runs one.  It always runs
+it the same way: look the row up in ``mcp_tools`` by owner + call name, refuse it
+unless the store still calls it callable and the server that owns it can serve it,
+validate the arguments against the stored schema, then run one ``tools/call``
+against the owning server with the *original* (unprefixed) name.  No LangChain
+tool is created at runtime and ToolNode stays static.
 
 Two things shape the code more than anything else.
 
 The gates come first.  require_retrieved is on: a call name that tool_search did
-not return in this run is refused before the DB is touched, because a model that
-guessed cf__read_file must not turn guesswork into a capability.  The DB read is
-owner-scoped and callability is the store's derived gate, so a disabled,
-unreachable or unowned row is simply not found.
+not return in this run is refused before the database is touched, because a model
+that guessed ``mcp__anysearch__search`` must not turn guesswork into a capability.
+The lookup is owner-scoped, and callability is enforced here explicitly instead of
+by filtering the query, because the *reason* is part of the answer: a stored row
+whose server is disabled is ``server_disabled``, one whose server is unreachable is
+``server_unavailable``, and everything else - another owner's row, a tool the last
+sync no longer saw, a row whose server was deleted - is ``tool_not_found``.  A
+non-callable row is never executed, whatever the call name says.
 
 The fallback is per error class (design 9.1), and most errors have none.  Only
-two things justify a refresh: the tool is missing (refresh, then retry exactly
-once) and a schema/argument mismatch, local or upstream (refresh, answer with
-the new schema, never retry the old arguments - the model has to reorganise
-them).  A timeout, a 5xx, a transport failure or any other execution error may
-have already run upstream, so this tool neither refreshes nor retries there.
-The refresh is the runtime's awaited refresh_now("call_error"), bounded by
-sync.tool_error_refresh_timeout_seconds: request_refresh may hand the sync to
-the debounced worker, which would race the re-read that follows it.
+two things justify refreshing the owning server: the tool is missing (refresh,
+then retry exactly once) and a schema/argument mismatch, local or upstream
+(refresh, answer with the new schema, never retry the old arguments - the model
+has to reorganise them).  A timeout, an unreachable server, a protocol failure or
+an upstream ``isError`` answer may already have run upstream, so this tool neither
+refreshes nor retries there.  The refresh is
+``runtime.refresh_server(record.server_id)``, bounded by
+REFRESH_TIMEOUT_SECONDS, and the re-read that follows it can itself fail: "the row
+is gone" and "I could not look" are different facts, so an unreadable catalog is
+``mcp_unavailable`` and never a refreshed ``tool_not_found``.
 
-The local-validation branch also carries origin=local_validation in the reply and
-myflow_tool_meta, and contextforge.retry.classify_tool_error treats that marker as
-not refreshable: the fallback above already ran, so a middleware must not refresh
-a second time and re-run the call.
+The local-validation branch also carries ``origin=local_validation`` in the reply
+and in myflow_tool_meta: its fallback already ran, so a middleware must not
+refresh a second time and re-run the call on top of that reply.
 
-Two rules come from 9.3 and from the difference between "not there" and "could not
-look".  A stored schema this process cannot compile or resolve is refused
-outright: validation is the gate between the model's arguments and ContextForge,
-so a schema that cannot be checked must not be waved through (a remote $ref would
-otherwise make the gateway fetch an author-chosen URL).  And a re-read that
-*raises* after a successful sync is origin=contextforge_unavailable, never a
-refreshed not-found: the row may well exist, we simply could not see it.
+One rule comes from 9.3.  A stored schema this process cannot compile or resolve
+is refused outright: validation is the gate between the model's arguments and the
+server, so a schema that cannot be checked must not be waved through - a remote
+``$ref`` would otherwise make the gateway fetch an author-chosen URL.
+
+Task 2's client returns the CallToolResult even when ``isError`` is true, so an
+upstream tool failure arrives here as *data* and is branched on ``result.isError``
+exactly like any other result, never as a transport failure.  Only ``McpToolError``
+- the JSON-RPC/protocol path, where no result exists - is reported as
+``tool_error`` with the server's own sanitized text.
 """
 
 from __future__ import annotations
@@ -47,6 +56,7 @@ import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import Annotated, Any
 
 from jsonschema import Draft202012Validator
@@ -59,12 +69,18 @@ from agentkit.agents.middlewares.tool_result_meta import (
     TOOL_META_KEY,
     normalize_tool_message,
 )
-from agentkit.contextforge.models import ContextForgeTimeout
-from agentkit.contextforge.retry import RefreshableToolError, classify_tool_error
-from agentkit.contextforge.runtime import get_contextforge_runtime
-from agentkit.contextforge.store import (
+from agentkit.mcp.errors import (
+    McpServerError,
+    McpServerTimeout,
+    McpServerUnavailable,
+    McpToolError,
+    sanitize_error_text,
+)
+from agentkit.mcp.models import McpServerRecord
+from agentkit.mcp.runtime_protocol import get_mcp_runtime
+from agentkit.mcp.store.tool_repository import (
     CALL_NAME_PREFIX,
-    ContextForgeToolRecord,
+    McpToolRecord,
     schema_hash_for,
 )
 from agentkit.runtime.user_context import resolve_runtime_user_id
@@ -72,8 +88,6 @@ from agentkit.runtime.user_context import resolve_runtime_user_id
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "tool_execute"
-#: The refresh reason recorded by the sync status for an execution fallback.
-REFRESH_REASON = "call_error"
 DEFAULT_REFRESH_TIMEOUT_SECONDS = 10.0
 MAX_ERROR_CHARS = 2000
 MAX_VALIDATION_ERRORS = 5
@@ -88,14 +102,18 @@ ORIGIN_INVALID_ARGUMENTS = "invalid_arguments"
 ORIGIN_TRANSPORT_ERROR = "transport_error"
 ORIGIN_TIMEOUT = "timeout"
 ORIGIN_TOOL_ERROR = "tool_error"
-ORIGIN_UNAVAILABLE = "contextforge_unavailable"
+#: This deployment has no usable MCP runtime, or its catalog could not be read.
+ORIGIN_MCP_UNAVAILABLE = "mcp_unavailable"
+#: The borrowed distinctions: the server, not the tool, is what refuses the call.
+ORIGIN_SERVER_UNAVAILABLE = "server_unavailable"
+ORIGIN_SERVER_DISABLED = "server_disabled"
 ORIGIN_SCHEMA_UNRESOLVED = "schema_unresolved"
 
-#: Origins where a corrected call can succeed, so the model should adjust and
-#: try again. Everything else is final for this call: a timeout/5xx/transport
-#: failure may already have run upstream, a missing tool is reported with "do not
-#: repeat" (design 9.1 B.4 - it was refreshed already), an unreadable catalog or
-#: an unusable stored schema cannot be fixed by re-sending the same request.
+#: Origins where a corrected call can succeed, so the model should adjust and try
+#: again. Everything else is final for this call: a timeout/transport failure may
+#: already have run upstream, a missing tool is reported with "do not repeat" (its
+#: refresh already ran), a disabled or unreachable server cannot be fixed by
+#: re-sending the same request, and an unusable stored schema is broken data.
 _RECOVERABLE_ORIGINS = frozenset(
     {
         ORIGIN_NOT_RETRIEVED,
@@ -105,26 +123,75 @@ _RECOVERABLE_ORIGINS = frozenset(
     }
 )
 
-#: What the refresh + re-read pair produced.  REREAD_UNAVAILABLE is the state
-#: that must never be reported as tool_not_found: the sync completed, the catalog
-#: read did not, so "not there" is not something this process knows.
+#: What the refresh + re-read pair produced.
 REREAD_REFRESHED = "refreshed"
 REREAD_NOT_REFRESHED = "not_refreshed"
 REREAD_DISABLED = "disabled"
-REREAD_UNAVAILABLE = "unavailable"
+REREAD_UNKNOWN_SERVER = "unknown_server"
 
 _TIMEOUT_MARKERS = ("timeout", "timed out", "deadline exceeded", "read timeout")
+
+
+class _UpstreamError(Enum):
+    """The upstream failures one refresh and one retry may be worth (design 7)."""
+
+    NONE = "none"
+    NOT_FOUND = "not_found"
+    INVALID_ARGUMENTS = "invalid_arguments"
+
+
+#: Text an upstream server uses when the tool itself is gone, or when it rejects
+#: the arguments.  Copied from the retiring contextforge/retry.py vocabulary: this
+#: tool keeps its own copy so no ContextForge module is imported at runtime.
+_NOT_FOUND_MARKERS = (
+    "tool not found",
+    "unknown tool",
+    "tool does not exist",
+    "no such tool",
+    "工具不存在",
+    "未找到工具",
+    "-32601",
+)
+_INVALID_ARGUMENT_MARKERS = (
+    "validation error",
+    "invalid arguments",
+    "invalid params",
+    "schema validation",
+    "input validation",
+    "参数校验",
+    "参数错误",
+    "缺少必填参数",
+    "-32602",
+)
+#: Failures that must never be refreshed or retried, whatever else they say: the
+#: call may have run, or repeating it is simply wrong.
+_NEVER_RETRY_MARKERS = (
+    "unauthorized",
+    "forbidden",
+    "authentication",
+    "timeout",
+    "timed out",
+    "rate limit",
+    "too many requests",
+    "429",
+    "internal server error",
+    "502",
+    "503",
+    "504",
+    "connection reset",
+    "connection closed",
+)
 
 NOT_RETRIEVED_HINT = (
     "Call tool_search first and pass the call_name from the card it returned; "
     "tool_execute only accepts names retrieved in this run."
 )
-UNAVAILABLE_MESSAGE = (
-    "ContextForge execution is unavailable in this deployment: the process has "
-    "no tool catalog or MCP client. Do not retry; tell the user."
+MCP_UNAVAILABLE_MESSAGE = (
+    "MCP execution is unavailable in this deployment: the process has no MCP "
+    "runtime. Do not retry; tell the user."
 )
 CATALOG_UNAVAILABLE_MESSAGE = (
-    "The ContextForge tool catalog could not be read. Do not retry; tell the user."
+    "The MCP tool catalog could not be read. Do not retry; tell the user."
 )
 SCHEMA_UNUSABLE_MESSAGE = (
     "The stored input_schema for this tool cannot be compiled or resolved here, "
@@ -138,17 +205,17 @@ try:  # jsonschema >= 4.18 resolves $ref through the referencing package
 except ImportError:  # pragma: no cover - jsonschema ships its resolver
     _Registry = None  # type: ignore[assignment,misc]
 
-#: An empty registry: an in-schema $ref still resolves against the schema
-#: itself, while a remote $ref has nowhere to come from.  Retrieving one would
-#: fetch a URL an upstream tool author chose, from inside a tool call.
+#: An empty registry: an in-schema $ref still resolves against the schema itself,
+#: while a remote $ref has nowhere to come from.  Retrieving one would fetch a URL
+#: an upstream tool author chose, from inside a tool call.
 _EMPTY_REGISTRY = _Registry() if _Registry is not None else None
 
 
 class ToolExecuteInput(BaseModel):
     tool_name: str = Field(
         description=(
-            "The call_name tool_search returned, verbatim (cf__ prefixed). "
-            "Never the bare ContextForge name and never a guessed name."
+            "The call_name tool_search returned, verbatim (mcp__ prefixed). "
+            "Never the bare upstream name and never a guessed name."
         )
     )
     arguments: dict[str, Any] = Field(
@@ -167,7 +234,7 @@ async def tool_execute(
     runtime: ToolRuntime[Any, Any] = None,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> ToolMessage:
-    """Run one tool returned by tool_search, through ContextForge.
+    """Run one tool returned by tool_search, on the server that owns it.
 
     Pass its call_name and arguments matching the input_schema from the card.
     The reply carries the tool result, or the failure origin and - when the
@@ -176,12 +243,12 @@ async def tool_execute(
     """
     call_name = (tool_name or "").strip()
     args = dict(arguments) if isinstance(arguments, Mapping) else {}
-    execution = get_contextforge_runtime()
-    # contextforge.search.require_retrieved (default true) is the gate the design
-    # puts in front of every call: retrieval is what makes a name callable, so a
-    # name this run never saw never reaches the store or the MCP endpoint.  The
-    # default when no runtime is configured is still true - an unconfigured
-    # process has no basis to accept a name either.
+    execution = get_mcp_runtime()
+    # tool_search.require_retrieved (default true) is the gate the design puts in
+    # front of every call: retrieval is what makes a name callable, so a name this
+    # run never saw never reaches the store or an upstream server.  The default
+    # when no runtime is configured is still true - an unconfigured process has no
+    # basis to accept a name either.
     if _require_retrieved(execution) and call_name not in _retrieved_names(runtime):
         return _error_reply(
             tool_call_id,
@@ -192,38 +259,37 @@ async def tool_execute(
                 f"not returned by tool_search in this run. {NOT_RETRIEVED_HINT}"
             ),
         )
-
-    store = getattr(execution, "store", None) if execution is not None else None
-    mcp = getattr(execution, "mcp_client", None) if execution is not None else None
-    if execution is None or store is None or mcp is None:
+    if not _usable(execution):
         return _error_reply(
             tool_call_id,
             call_name=call_name,
-            origin=ORIGIN_UNAVAILABLE,
-            message=UNAVAILABLE_MESSAGE,
+            origin=ORIGIN_MCP_UNAVAILABLE,
+            message=MCP_UNAVAILABLE_MESSAGE,
         )
 
     owner = resolve_runtime_user_id(_context(runtime), allow_default=True)
-    try:
-        record = await store.get_by_call_name(call_name, owner)
-    except Exception:  # noqa: BLE001 - a tool result, not a run failure
-        logger.warning("ContextForge catalog read failed", exc_info=True)
-        return _error_reply(
+    resolution = await _resolve(execution, call_name, owner)
+    if resolution.origin is not None:
+        return _unresolved_reply(
             tool_call_id,
             call_name=call_name,
-            origin=ORIGIN_UNAVAILABLE,
-            message=CATALOG_UNAVAILABLE_MESSAGE,
+            resolution=resolution,
+            state=REREAD_NOT_REFRESHED,
         )
+    recovered_from_refresh = False
+    if resolution.record is None:
+        # One refresh of the owning server, then one re-read (design 9.1 B).  That
+        # run is what record_retry reports on; a plain hit has nothing to book.
+        resolution, state = await _reread_after_refresh(
+            execution, call_name, owner, resolution.server_id
+        )
+        if resolution.record is None:
+            return _unresolved_reply(
+                tool_call_id, call_name=call_name, resolution=resolution, state=state
+            )
+        recovered_from_refresh = True
 
-    # The row came from the post-refresh re-read: that run is what record_retry
-    # reports on, and a plain hit has nothing to book.
-    recovered_from_refresh = record is None
-    record, reread = await _resolved_record(
-        execution, store, record, call_name, owner
-    )
-    if record is None:
-        return _missing_reply(tool_call_id, call_name=call_name, state=reread)
-
+    record = resolution.record
     check = _validate_arguments(record, args)
     if check.unusable is not None:
         # Design 9.3: fail closed.  An unverifiable schema is not a licence to
@@ -242,10 +308,10 @@ async def tool_execute(
         )
     if check.problem is not None:
         return await _validation_reply(
-            execution, store, owner, call_name, record, check.problem, tool_call_id
+            execution, owner, call_name, record, check.problem, tool_call_id
         )
 
-    outcome = await _call_tool(mcp, record, args)
+    outcome = await _call_tool(execution, record, args)
     if outcome.origin is not None:
         if recovered_from_refresh:
             _record_retry(execution, call_name, False)
@@ -258,299 +324,194 @@ async def tool_execute(
         )
     if bool(getattr(outcome.result, "isError", False)):
         return await _upstream_error_reply(
-            execution, store, mcp, owner, call_name, record, args, outcome, tool_call_id
+            execution, owner, call_name, record, args, outcome, tool_call_id
         )
     if recovered_from_refresh:
         _record_retry(execution, call_name, True)
     return _success_reply(tool_call_id, record, outcome.result)
 
 
-async def _resolved_record(
-    execution: Any,
-    store: Any,
-    record: ContextForgeToolRecord | None,
-    call_name: str,
-    owner: str | None,
-) -> tuple[ContextForgeToolRecord | None, str]:
-    """The row if it exists, else one refresh and a single re-read (design 9.1 B)."""
-    if record is not None:
-        return record, REREAD_REFRESHED
-    return await _reread_after_refresh(execution, store, call_name, owner)
-
-
-def _missing_reply(
-    tool_call_id: str,
-    *,
-    call_name: str,
-    state: str,
-    record: ContextForgeToolRecord | None = None,
-) -> ToolMessage:
-    """A row we could not produce: absent (refreshed or not) or unreadable.
-
-    REREAD_UNAVAILABLE is the case the caller must not fold into tool_not_found.
-    The sync succeeded and the catalog read then raised, so this process has no
-    idea whether the tool exists; claiming "not found" would tell the model to
-    stop calling a tool that is probably still there.
-    """
-    if state == REREAD_UNAVAILABLE:
-        return _error_reply(
-            tool_call_id,
-            call_name=call_name,
-            origin=ORIGIN_UNAVAILABLE,
-            message=CATALOG_UNAVAILABLE_MESSAGE,
-            record=record,
-        )
-    message = (
-        _retry_disabled_message(call_name)
-        if state == REREAD_DISABLED
-        else _not_found_message(call_name, state == REREAD_REFRESHED)
-    )
-    return _error_reply(
-        tool_call_id,
-        call_name=call_name,
-        origin=ORIGIN_TOOL_NOT_FOUND,
-        message=message,
-        record=record,
-    )
-
-
-async def _validation_reply(
-    execution: Any,
-    store: Any,
-    owner: str | None,
-    call_name: str,
-    record: ContextForgeToolRecord,
-    problem: str,
-    tool_call_id: str,
-) -> ToolMessage:
-    """Design 9.1 A: refresh, then answer with the new schema - no retry, no MCP."""
-    fresh, _state = await _reread_after_refresh(execution, store, call_name, owner)
-    if fresh is not None and _schema_changed(record, fresh):
-        return _error_reply(
-            tool_call_id,
-            call_name=call_name,
-            origin=ORIGIN_LOCAL_VALIDATION,
-            message=problem,
-            record=fresh,
-            schema=fresh.input_schema,
-        )
-    return _error_reply(
-        tool_call_id,
-        call_name=call_name,
-        origin=ORIGIN_LOCAL_VALIDATION,
-        message=problem,
-        record=record,
-    )
-
-
-async def _upstream_error_reply(
-    execution: Any,
-    store: Any,
-    mcp: Any,
-    owner: str | None,
-    call_name: str,
-    record: ContextForgeToolRecord,
-    args: dict[str, Any],
-    outcome: _CallOutcome,
-    tool_call_id: str,
-) -> ToolMessage:
-    """Design 9.1 B/C: what ContextForge answering isError entitles us to."""
-    text = _result_text(outcome.result)
-    kind = classify_tool_error(text)
-    if kind is RefreshableToolError.NOT_FOUND:
-        fresh, state = await _reread_after_refresh(execution, store, call_name, owner)
-        if fresh is None:
-            return _missing_reply(
-                tool_call_id, call_name=call_name, state=state, record=record
-            )
-        retry = await _call_tool(mcp, fresh, args)
-        if retry.origin is not None:
-            _record_retry(execution, call_name, False)
-            return _error_reply(
-                tool_call_id,
-                call_name=call_name,
-                origin=retry.origin,
-                message=retry.message,
-                record=fresh,
-            )
-        if bool(getattr(retry.result, "isError", False)):
-            _record_retry(execution, call_name, False)
-            retry_text = _result_text(retry.result)
-            return _error_reply(
-                tool_call_id,
-                call_name=call_name,
-                origin=_upstream_origin(retry_text),
-                message=retry_text[:MAX_ERROR_CHARS],
-                record=fresh,
-            )
-        _record_retry(execution, call_name, True)
-        return _success_reply(tool_call_id, fresh, retry.result)
-
-    if kind is RefreshableToolError.INVALID_ARGUMENTS:
-        fresh, _state = await _reread_after_refresh(
-            execution, store, call_name, owner
-        )
-        if fresh is not None and _schema_changed(record, fresh):
-            return _error_reply(
-                tool_call_id,
-                call_name=call_name,
-                origin=ORIGIN_SCHEMA_MISMATCH,
-                message=text,
-                record=fresh,
-                schema=fresh.input_schema,
-            )
-        return _error_reply(
-            tool_call_id,
-            call_name=call_name,
-            origin=ORIGIN_INVALID_ARGUMENTS,
-            message=text,
-            record=record,
-        )
-
-    # Timeout, 5xx, transport, or any other execution error: the call may have
-    # run upstream, so this is reported as-is and never repeated.
-    return _error_reply(
-        tool_call_id,
-        call_name=call_name,
-        origin=_failure_origin(text),
-        message=text,
-        record=record,
-    )
-
-
 # --------------------------------------------------------------------------- #
-# The MCP call
+# Lookup: the catalog row, the server behind it, and why a call is refused
 # --------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True, slots=True)
-class _CallOutcome:
-    """Either a CallToolResult, or the origin and text of a transport failure."""
+class _Resolution:
+    """What one catalog read says about a call name.
 
-    result: Any = None
+    Three outcomes, and the difference between them is the difference between a
+    fact and a question.  `record` set means a stored row this process may call
+    (its server is this owner's, enabled and reachable, and the last sync still
+    saw the tool).  `origin` set means a definite refusal a refresh cannot change,
+    with `message` explaining it.  Neither set means "no callable row", which one
+    refresh of `server_id` may still fix.
+
+    `known` is the row the catalog did return, callable or not: it is never used
+    to run anything, but a refusal should still name the tool an audit expects
+    ("search"), not the call name it was asked for ("mcp__anysearch__search").
+    """
+
+    record: McpToolRecord | None = None
     origin: str | None = None
     message: str = ""
+    #: The server a not-found refresh should target, when the call name names one.
+    server_id: str = ""
+    #: The stored row behind this answer, for myflow_tool_meta; never executed.
+    known: McpToolRecord | None = None
 
 
-async def _call_tool(
-    mcp: Any,
-    record: ContextForgeToolRecord,
-    args: dict[str, Any],
-) -> _CallOutcome:
-    """One tools/call with the original ContextForge name, never the cf__ one."""
+def _usable(execution: Any) -> bool:
+    """Does this process have the runtime pieces an execution needs?
+
+    Checked member by member so a half-built runtime is answered with
+    `mcp_unavailable` instead of an AttributeError inside a tool call.
+    """
+    return (
+        execution is not None
+        and getattr(execution, "tool_store", None) is not None
+        and getattr(execution, "server_store", None) is not None
+        and callable(getattr(execution, "call_tool", None))
+    )
+
+
+async def _resolve(execution: Any, call_name: str, owner: str | None) -> _Resolution:
+    """One catalog read, plus the server state that decides whether we may call it.
+
+    Callability is checked here rather than filtered into the query, because the
+    *reason* a row is not callable is what the model needs: a disabled server and
+    a tool that vanished upstream are different answers.  A non-callable row is
+    never returned as a record, so it can never be executed.
+    """
     try:
-        result = await mcp.call_tool(record.name, dict(args), None)
-    except Exception as exc:  # noqa: BLE001 - classified, then reported as a result
-        origin = _exception_origin(exc)
-        logger.warning("ContextForge tools/call failed for %s (%s)", record.name, origin)
-        return _CallOutcome(
-            origin=origin,
-            message=f"ContextForge call failed ({origin}): {_exception_text(exc)}",
+        record = await execution.tool_store.get_by_call_name(call_name, owner)
+    except Exception:  # noqa: BLE001 - a tool result, not a run failure
+        logger.warning("MCP tool catalog read failed", exc_info=True)
+        return _Resolution(
+            origin=ORIGIN_MCP_UNAVAILABLE, message=CATALOG_UNAVAILABLE_MESSAGE
         )
-    return _CallOutcome(result=result)
+    if record is None:
+        # Not in this owner's catalog.  One refresh may still find it, so the
+        # server named by the call name is the target when this owner has one.
+        return _Resolution(server_id=await _server_id_for(execution, call_name, owner))
+    if record.owner_user_id and owner and record.owner_user_id != owner:
+        # The query is owner-scoped, so this can only be a wiring bug; the call is
+        # refused anyway, because a stored row is data and never a capability.
+        return _Resolution(
+            origin=ORIGIN_TOOL_NOT_FOUND,
+            message=_not_found_message(call_name, refreshed=False),
+            known=record,
+        )
+    try:
+        server = await execution.server_store.get(record.server_id, owner)
+    except Exception:  # noqa: BLE001 - "could not look", not "not there"
+        logger.warning("MCP server read failed", exc_info=True)
+        return _Resolution(
+            origin=ORIGIN_MCP_UNAVAILABLE,
+            message=CATALOG_UNAVAILABLE_MESSAGE,
+            known=record,
+        )
+    if server is None:
+        # The server was deleted and its tools with it; a row that outlived it
+        # names nothing anyone can call, and there is nothing left to refresh.
+        return _Resolution(
+            origin=ORIGIN_TOOL_NOT_FOUND,
+            message=_not_found_message(call_name, refreshed=False),
+            known=record,
+        )
+    if not server.enabled:
+        return _Resolution(
+            origin=ORIGIN_SERVER_DISABLED,
+            message=_server_disabled_message(call_name, server),
+            known=record,
+        )
+    if not server.reachable:
+        return _Resolution(
+            origin=ORIGIN_SERVER_UNAVAILABLE,
+            message=_server_unavailable_message(call_name, server),
+            known=record,
+        )
+    if not record.callable:
+        # The server is healthy, so the tool itself stopped qualifying: the last
+        # sync no longer saw it, or it is disabled upstream.  One refresh of that
+        # server can change this, so it takes the same fallback as a missing row.
+        return _Resolution(server_id=record.server_id, known=record)
+    return _Resolution(record=record, known=record)
 
 
-def _exception_origin(exc: BaseException) -> str:
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ContextForgeTimeout)):
-        return ORIGIN_TIMEOUT
-    name = type(exc).__name__.casefold()
-    if any(marker in name for marker in ("timeout", "timedout", "deadline")):
-        return ORIGIN_TIMEOUT
-    if any(marker in _exception_text(exc).casefold() for marker in _TIMEOUT_MARKERS):
-        return ORIGIN_TIMEOUT
-    return ORIGIN_TRANSPORT_ERROR
+async def _server_id_for(
+    execution: Any, call_name: str, owner: str | None
+) -> str:
+    """The id of the server a call name names, when this owner has one.
 
-
-def _exception_text(exc: BaseException) -> str:
-    detail = str(exc).strip()
-    return f"{type(exc).__name__}: {detail[:300]}" if detail else type(exc).__name__
-
-
-def _failure_origin(text: str) -> str:
-    """An isError we neither refresh nor retry, named for the audit trail."""
-    folded = text.casefold()
-    if any(marker in folded for marker in _TIMEOUT_MARKERS):
-        return ORIGIN_TIMEOUT
-    return ORIGIN_TOOL_ERROR
-
-
-def _upstream_origin(text: str) -> str:
-    """Name an upstream failure that was already retried once."""
-    kind = classify_tool_error(text)
-    if kind is RefreshableToolError.NOT_FOUND:
-        return ORIGIN_TOOL_NOT_FOUND
-    if kind is RefreshableToolError.INVALID_ARGUMENTS:
-        return ORIGIN_INVALID_ARGUMENTS
-    return _failure_origin(text)
-
-
-# --------------------------------------------------------------------------- #
-# Refresh + re-read, and the schema-change comparison
-# --------------------------------------------------------------------------- #
+    A call name is all a missing row still tells us, and a sync is per server, so
+    this is what a not-found refresh targets.  A call name that names no server of
+    this owner yields "" - nothing to refresh, and nothing refreshed.
+    """
+    server_name = _server_name_from_call_name(call_name)
+    if not server_name:
+        return ""
+    try:
+        server = await execution.server_store.get_by_name(owner, server_name)
+    except Exception:  # noqa: BLE001 - no target, so no refresh
+        logger.warning("MCP server lookup failed", exc_info=True)
+        return ""
+    return server.id if server is not None else ""
 
 
 async def _reread_after_refresh(
     execution: Any,
-    store: Any,
     call_name: str,
     owner: str | None,
-) -> tuple[ContextForgeToolRecord | None, str]:
-    """One refresh and the single re-read that follows it.
+    server_id: str,
+) -> tuple[_Resolution, str]:
+    """One refresh of one server, then the single re-read that follows it.
 
     The state is not a "refreshed" boolean.  A re-read that *raises* is a third
-    outcome: the sync succeeded and the catalog read failed afterwards, so we
-    know neither that the row exists nor that it does not.  Returning True there
-    used to make a database failure back a "refreshed, therefore not found"
-    answer.
+    outcome: the sync succeeded and the catalog read failed afterwards, so this
+    process knows neither that the row exists nor that it does not.  Returning
+    "refreshed" there used to make a database failure back a "refreshed,
+    therefore not found" answer; it is `mcp_unavailable` instead.
     """
     if not _retry_on_tool_error(execution):
-        return None, REREAD_DISABLED
-    if not await _refresh_catalog(execution):
-        return None, REREAD_NOT_REFRESHED
-    try:
-        return await store.get_by_call_name(call_name, owner), REREAD_REFRESHED
-    except Exception:  # noqa: BLE001 - reported as unavailable, never as not found
-        logger.warning("ContextForge catalog re-read failed", exc_info=True)
-        return None, REREAD_UNAVAILABLE
+        return _Resolution(server_id=server_id), REREAD_DISABLED
+    if not server_id:
+        return _Resolution(), REREAD_UNKNOWN_SERVER
+    if not await _refresh_server(execution, server_id):
+        return _Resolution(server_id=server_id), REREAD_NOT_REFRESHED
+    return await _resolve(execution, call_name, owner), REREAD_REFRESHED
 
 
-async def _refresh_catalog(execution: Any) -> bool:
-    """One awaited, bounded refresh; False means the caller keeps its error."""
-    refresh = getattr(execution, "refresh_now", None)
-    if refresh is not None:
-        call = refresh(REFRESH_REASON)
-    else:
-        request = getattr(execution, "request_refresh", None)
-        if request is None:
-            return False
-        call = request(REFRESH_REASON)
+async def _refresh_server(execution: Any, server_id: str) -> bool:
+    """One awaited, bounded refresh of one server; False means it did not happen."""
+    refresh = getattr(execution, "refresh_server", None)
+    if not callable(refresh):
+        return False
     try:
-        stats = await asyncio.wait_for(call, timeout=_refresh_timeout(execution))
-    except Exception:  # noqa: BLE001 - a failed fallback is not a run failure
-        logger.warning(
-            "ContextForge refresh after %s failed", REFRESH_REASON, exc_info=True
+        stats = await asyncio.wait_for(
+            refresh(server_id), timeout=DEFAULT_REFRESH_TIMEOUT_SECONDS
         )
+    except Exception:  # noqa: BLE001 - a failed fallback is not a run failure
+        logger.warning("MCP server refresh failed", exc_info=True)
         return False
     if _refresh_failed(stats):
-        # refresh_now reports an upstream/database failure as stats.error instead
-        # of raising, so returning normally is not evidence the snapshot changed.
+        # A sync that reports its failure in stats instead of raising did not
+        # replace the snapshot, so returning normally is not evidence it changed.
         logger.warning(
-            "ContextForge refresh after %s failed: %s",
-            REFRESH_REASON,
-            getattr(stats, "error", None),
+            "MCP server refresh reported a failure: %s", getattr(stats, "error", None)
         )
         return False
-    logger.info("ContextForge catalog refreshed after %s", REFRESH_REASON)
+    logger.info("MCP server %s refreshed after a failed execution", server_id)
     return True
 
 
 def _refresh_failed(stats: Any) -> bool:
     """Did this sync leave the stored snapshot in place?
 
-    ``ContextForgeSyncStats.error`` means the snapshot was not replaced, so the
-    re-read that follows would only see the stale row.  An ``index_failed``
-    error is the exception: the DB snapshot was committed and only the derived
-    Milvus index failed, so the catalog tool_execute reads is already fresh.
+    `error` means the snapshot was not replaced, so the re-read that follows would
+    only see the stale row.  An `index_failed` error is the exception: the
+    database snapshot was committed and only the derived vector index failed, so
+    the catalog tool_execute reads is already fresh.
     """
     error = getattr(stats, "error", None)
     if not error:
@@ -559,31 +520,17 @@ def _refresh_failed(stats: Any) -> bool:
 
 
 def _retry_on_tool_error(execution: Any) -> bool:
-    """Whether a failed call may refresh the catalog and retry (sync policy).
+    """Whether a failed call may refresh its server and retry once (design 7).
 
-    An absent runtime or field keeps the design default (true); only an explicit
-    false turns the fallback off.
+    The design makes this a switch ("若配置开启"), and the switch lives on the
+    runtime because the `mcp_servers` config block carries no retry policy.  An
+    absent field keeps the design default (on): only an explicit false turns the
+    fallback off.
     """
-    sync = getattr(getattr(execution, "config", None), "sync", None)
-    return bool(getattr(sync, "retry_on_tool_error", True))
+    return bool(getattr(execution, "retry_on_tool_error", True))
 
 
-def _refresh_timeout(execution: Any) -> float:
-    config = getattr(execution, "config", None)
-    sync = getattr(config, "sync", None)
-    value = getattr(sync, "tool_error_refresh_timeout_seconds", None)
-    try:
-        timeout = (
-            float(value) if value is not None else DEFAULT_REFRESH_TIMEOUT_SECONDS
-        )
-    except (TypeError, ValueError):
-        return DEFAULT_REFRESH_TIMEOUT_SECONDS
-    return timeout if timeout > 0 else DEFAULT_REFRESH_TIMEOUT_SECONDS
-
-
-def _schema_changed(
-    before: ContextForgeToolRecord, after: ContextForgeToolRecord
-) -> bool:
+def _schema_changed(before: McpToolRecord, after: McpToolRecord) -> bool:
     if before.schema_hash and after.schema_hash:
         return before.schema_hash != after.schema_hash
     return schema_hash_for(before.input_schema) != schema_hash_for(after.input_schema)
@@ -600,6 +547,277 @@ def _record_retry(execution: Any, call_name: str, ok: bool) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Replies for a lookup that produced no callable row
+# --------------------------------------------------------------------------- #
+
+
+def _unresolved_reply(
+    tool_call_id: str,
+    *,
+    call_name: str,
+    resolution: _Resolution,
+    state: str,
+) -> ToolMessage:
+    """The reply for a lookup that produced no callable row: refused or missing."""
+    if resolution.origin is not None:
+        return _error_reply(
+            tool_call_id,
+            call_name=call_name,
+            origin=resolution.origin,
+            message=resolution.message,
+            record=resolution.known,
+        )
+    return _missing_reply(
+        tool_call_id, call_name=call_name, state=state, record=resolution.known
+    )
+
+
+def _missing_reply(
+    tool_call_id: str,
+    *,
+    call_name: str,
+    state: str,
+    record: McpToolRecord | None = None,
+) -> ToolMessage:
+    """A call name this process could not resolve to a callable row."""
+    if state == REREAD_DISABLED:
+        message = _retry_disabled_message(call_name)
+    elif state == REREAD_UNKNOWN_SERVER:
+        message = _unknown_server_message(call_name)
+    else:
+        message = _not_found_message(call_name, refreshed=state == REREAD_REFRESHED)
+    return _error_reply(
+        tool_call_id,
+        call_name=call_name,
+        origin=ORIGIN_TOOL_NOT_FOUND,
+        message=message,
+        record=record,
+    )
+
+
+async def _validation_reply(
+    execution: Any,
+    owner: str | None,
+    call_name: str,
+    record: McpToolRecord,
+    problem: str,
+    tool_call_id: str,
+) -> ToolMessage:
+    """Design 9.1 A: refresh, then answer with the new schema - no retry, no call."""
+    fresh, _state = await _reread_after_refresh(
+        execution, call_name, owner, record.server_id
+    )
+    if fresh.record is not None and _schema_changed(record, fresh.record):
+        return _error_reply(
+            tool_call_id,
+            call_name=call_name,
+            origin=ORIGIN_LOCAL_VALIDATION,
+            message=problem,
+            record=fresh.record,
+            schema=fresh.record.input_schema,
+        )
+    return _error_reply(
+        tool_call_id,
+        call_name=call_name,
+        origin=ORIGIN_LOCAL_VALIDATION,
+        message=problem,
+        record=record,
+    )
+
+
+async def _upstream_error_reply(
+    execution: Any,
+    owner: str | None,
+    call_name: str,
+    record: McpToolRecord,
+    args: dict[str, Any],
+    outcome: _CallOutcome,
+    tool_call_id: str,
+) -> ToolMessage:
+    """Design 9.1 B/C: what the owning server answering isError entitles us to."""
+    text = _result_text(outcome.result)
+    kind = _classify_upstream(text)
+    if kind is _UpstreamError.NOT_FOUND:
+        fresh, state = await _reread_after_refresh(
+            execution, call_name, owner, record.server_id
+        )
+        if fresh.origin is not None or fresh.record is None:
+            return _unresolved_reply(
+                tool_call_id, call_name=call_name, resolution=fresh, state=state
+            )
+        retry = await _call_tool(execution, fresh.record, args)
+        if retry.origin is not None:
+            _record_retry(execution, call_name, False)
+            return _error_reply(
+                tool_call_id,
+                call_name=call_name,
+                origin=retry.origin,
+                message=retry.message,
+                record=fresh.record,
+            )
+        if bool(getattr(retry.result, "isError", False)):
+            _record_retry(execution, call_name, False)
+            retry_text = _result_text(retry.result)
+            return _error_reply(
+                tool_call_id,
+                call_name=call_name,
+                origin=_upstream_origin(retry_text),
+                message=retry_text[:MAX_ERROR_CHARS],
+                record=fresh.record,
+            )
+        _record_retry(execution, call_name, True)
+        return _success_reply(tool_call_id, fresh.record, retry.result)
+
+    if kind is _UpstreamError.INVALID_ARGUMENTS:
+        fresh, _state = await _reread_after_refresh(
+            execution, call_name, owner, record.server_id
+        )
+        if fresh.record is not None and _schema_changed(record, fresh.record):
+            return _error_reply(
+                tool_call_id,
+                call_name=call_name,
+                origin=ORIGIN_SCHEMA_MISMATCH,
+                message=text,
+                record=fresh.record,
+                schema=fresh.record.input_schema,
+            )
+        return _error_reply(
+            tool_call_id,
+            call_name=call_name,
+            origin=ORIGIN_INVALID_ARGUMENTS,
+            message=text,
+            record=record,
+        )
+
+    # Timeout, 5xx, auth, or any other execution error: the call may have run
+    # upstream, so this is reported as-is and never repeated.
+    return _error_reply(
+        tool_call_id,
+        call_name=call_name,
+        origin=_failure_origin(text),
+        message=text,
+        record=record,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The MCP call
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class _CallOutcome:
+    """Either a CallToolResult, or the origin and text of a call that failed."""
+
+    result: Any = None
+    origin: str | None = None
+    message: str = ""
+
+
+async def _call_tool(
+    execution: Any, record: McpToolRecord, args: dict[str, Any]
+) -> _CallOutcome:
+    """One tools/call on the owning server, by the original (unprefixed) name."""
+    try:
+        result = await execution.call_tool(record, dict(args))
+    except McpToolError as exc:
+        # The JSON-RPC/protocol path: the call produced no result, so it is
+        # reported as tool_error and never retried.  A carried CallToolResult is
+        # the server's own text; either way the text is scrubbed of credentials
+        # before it can reach the model.
+        logger.warning("MCP tools/call failed for %s (tool_error)", record.name)
+        return _CallOutcome(origin=ORIGIN_TOOL_ERROR, message=_tool_error_text(exc))
+    except Exception as exc:  # noqa: BLE001 - classified, then reported as a result
+        origin = _exception_origin(exc)
+        logger.warning("MCP tools/call failed for %s (%s)", record.name, origin)
+        message = (
+            f"MCP tools/call failed for {record.name} ({origin}): "
+            f"{_exception_text(exc)}"
+        )
+        return _CallOutcome(origin=origin, message=message[:MAX_ERROR_CHARS])
+    return _CallOutcome(result=result)
+
+
+def _tool_error_text(exc: McpToolError) -> str:
+    """An McpToolError's own text, with any credential scrubbed out of it."""
+    result = getattr(exc, "result", None)
+    text = _result_text(result) if result is not None else ""
+    if text:
+        return sanitize_error_text(text)[:MAX_ERROR_CHARS]
+    return (sanitize_error_text(str(exc)) or type(exc).__name__)[:MAX_ERROR_CHARS]
+
+
+def _exception_text(exc: BaseException) -> str:
+    """The part of a failure this process may show: never a URL or a header.
+
+    The MCP client builds its messages from fixed text plus the server id, so an
+    McpServerError's own text is the useful part and is kept (scrubbed once more
+    here); any other exception is reduced to its class name, because its text - a
+    proxy body, a database error - is not ours to trust.
+    """
+    if isinstance(exc, McpServerError):
+        return sanitize_error_text(str(exc)) or type(exc).__name__
+    return type(exc).__name__
+
+
+def _exception_origin(exc: BaseException) -> str:
+    """Which origin a tools/call exception deserves.
+
+    A timeout or an unreachable server never justifies a refresh: the call may
+    already have run and repeating it is exactly what the design forbids.
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, McpServerTimeout)):
+        return ORIGIN_TIMEOUT
+    if isinstance(exc, McpServerUnavailable):
+        return ORIGIN_SERVER_UNAVAILABLE
+    name = type(exc).__name__.casefold()
+    if any(marker in name for marker in ("timeout", "timedout", "deadline")):
+        return ORIGIN_TIMEOUT
+    if any(marker in str(exc).casefold() for marker in _TIMEOUT_MARKERS):
+        return ORIGIN_TIMEOUT
+    # An McpProtocolError, or any other unexpected exception: no result exists and
+    # the call may or may not have run, so this is final for the call.
+    return ORIGIN_TRANSPORT_ERROR
+
+
+def _failure_origin(text: str) -> str:
+    """An isError we neither refresh nor retry, named for the audit trail."""
+    folded = text.casefold()
+    if any(marker in folded for marker in _TIMEOUT_MARKERS):
+        return ORIGIN_TIMEOUT
+    return ORIGIN_TOOL_ERROR
+
+
+def _upstream_origin(text: str) -> str:
+    """Name an upstream failure that was already retried once."""
+    kind = _classify_upstream(text)
+    if kind is _UpstreamError.NOT_FOUND:
+        return ORIGIN_TOOL_NOT_FOUND
+    if kind is _UpstreamError.INVALID_ARGUMENTS:
+        return ORIGIN_INVALID_ARGUMENTS
+    return _failure_origin(text)
+
+
+def _classify_upstream(value: Any) -> _UpstreamError:
+    """Does this upstream error text argue for one refresh and one retry?
+
+    The "never retry" markers outrank the rest: an error that also mentions a
+    timeout, a 5xx or an auth failure may have run upstream, and "tool not found:
+    503" must not turn into a refresh.
+    """
+    text = str(value or "").casefold()
+    if not text:
+        return _UpstreamError.NONE
+    if any(marker in text for marker in _NEVER_RETRY_MARKERS):
+        return _UpstreamError.NONE
+    if any(marker in text for marker in _NOT_FOUND_MARKERS):
+        return _UpstreamError.NOT_FOUND
+    if any(marker in text for marker in _INVALID_ARGUMENT_MARKERS):
+        return _UpstreamError.INVALID_ARGUMENTS
+    return _UpstreamError.NONE
+
+
+# --------------------------------------------------------------------------- #
 # Local validation
 # --------------------------------------------------------------------------- #
 
@@ -608,9 +826,9 @@ def _record_retry(execution: Any, call_name: str, ok: bool) -> None:
 class _ValidationCheck:
     """What the local schema check found: a mismatch, or a schema it cannot use.
 
-    ``unusable`` is the fail-closed outcome of design 9.3.  "I could not compile
-    or resolve this schema" is not "the arguments are fine": validation is the
-    only thing standing between the model's arguments and ContextForge, so the
+    `unusable` is the fail-closed outcome of design 9.3.  "I could not compile or
+    resolve this schema" is not "the arguments are fine": validation is the only
+    thing standing between the model's arguments and the upstream server, so the
     executor refuses instead of forwarding the call unvalidated.
     """
 
@@ -619,12 +837,12 @@ class _ValidationCheck:
 
 
 def _validate_arguments(
-    record: ContextForgeToolRecord, args: dict[str, Any]
+    record: McpToolRecord, args: dict[str, Any]
 ) -> _ValidationCheck:
     """The local argument/schema mismatch, a schema we cannot use, or neither."""
     schema = record.input_schema if isinstance(record.input_schema, dict) else {}
     if not schema:
-        # No schema at all is not a broken schema: ContextForge is authoritative.
+        # No schema at all is not a broken schema: the server is authoritative.
         return _ValidationCheck()
     try:
         validator = (
@@ -662,7 +880,7 @@ def _describe_errors(errors: list[Any]) -> str:
 
 def _success_reply(
     tool_call_id: str,
-    record: ContextForgeToolRecord,
+    record: McpToolRecord,
     result: Any,
 ) -> ToolMessage:
     message = ToolMessage(
@@ -681,7 +899,7 @@ def _error_reply(
     call_name: str,
     origin: str,
     message: str,
-    record: ContextForgeToolRecord | None = None,
+    record: McpToolRecord | None = None,
     schema: dict[str, Any] | None = None,
 ) -> ToolMessage:
     payload: dict[str, Any] = {
@@ -712,15 +930,15 @@ def _error_reply(
 def _stamp(
     message: ToolMessage,
     *,
-    record: ContextForgeToolRecord | None,
+    record: McpToolRecord | None,
     origin: str | None,
     call_name: str = "",
 ) -> ToolMessage:
     """myflow_tool_meta must name the tool that ran, not tool_execute.
 
-    The status/error classification is the middleware's own function, reused
-    here so a tool_execute reply and a normal tool reply describe failures the
-    same way; the identity fields ride along in the same dict.
+    The status/error classification is the middleware's own function, reused here
+    so a tool_execute reply and a normal tool reply describe failures the same
+    way; the identity fields ride along in the same dict.
     """
     normalized = normalize_tool_message(message)
     meta = dict(normalized.additional_kwargs.get(TOOL_META_KEY) or {})
@@ -834,27 +1052,53 @@ def _artifact(result: Any) -> Any:
     return None if structured is None else {"structured_content": structured}
 
 
+# --------------------------------------------------------------------------- #
+# Wording: what the model reads, and the two policies it is gated by
+# --------------------------------------------------------------------------- #
+
+
 def _retry_disabled_message(call_name: str) -> str:
     return (
-        f"{call_name} is not in the ContextForge catalog for this user, and the "
-        "automatic catalog refresh is disabled by "
-        "contextforge.sync.retry_on_tool_error. Do not repeat this call; search "
-        "again with tool_search or tell the user."
+        f"{call_name} is not callable for this user, and the automatic server "
+        "refresh is disabled by retry_on_tool_error. Do not repeat this call; "
+        "search again with tool_search or tell the user."
+    )
+
+
+def _unknown_server_message(call_name: str) -> str:
+    return (
+        f"{call_name} is not in the MCP catalog for this user, and its call name "
+        "names no MCP server of yours, so there is nothing to refresh. Do not "
+        "repeat this call; search again with tool_search or tell the user."
     )
 
 
 def _not_found_message(call_name: str, refreshed: bool) -> str:
     if refreshed:
         return (
-            f"{call_name} is not in the ContextForge catalog for this user: it "
-            "does not exist, or it is disabled, unreachable, unowned or otherwise "
-            "not callable. The catalog was just refreshed. Do not repeat this "
-            "call; search again with tool_search or tell the user."
+            f"{call_name} is not callable for this user: the tool does not exist, "
+            "or its server no longer lists it, or it is disabled upstream. The "
+            "server was just refreshed. Do not repeat this call; search again with "
+            "tool_search or tell the user."
         )
     return (
-        f"{call_name} is not in the ContextForge catalog for this user and the "
-        "catalog refresh did not complete. Do not guess another call name; "
-        "search again with tool_search or tell the user."
+        f"{call_name} is not callable for this user and the server refresh did not "
+        "complete. Do not guess another call name; search again with tool_search "
+        "or tell the user."
+    )
+
+
+def _server_disabled_message(call_name: str, server: McpServerRecord) -> str:
+    return (
+        f"{call_name} belongs to MCP server {server.name!r}, which is disabled. "
+        "Do not retry; enable that server or tell the user."
+    )
+
+
+def _server_unavailable_message(call_name: str, server: McpServerRecord) -> str:
+    return (
+        f"{call_name} belongs to MCP server {server.name!r}, which is unreachable "
+        "right now. Do not repeat this call; check the server or tell the user."
     )
 
 
@@ -864,14 +1108,34 @@ def _inner_name(call_name: str) -> str:
     return call_name
 
 
+def _server_name_from_call_name(call_name: str) -> str:
+    """The server slug a call name names, or "" when it is not one.
+
+    Mirrors the store's own derivation (a slug is [a-z0-9-]+ and therefore cannot
+    contain the "__" separator), which is what makes the first segment after the
+    prefix the server name even when the tool name contains "__" itself.
+    """
+    text = str(call_name or "")
+    if not text.startswith(CALL_NAME_PREFIX):
+        return ""
+    server_name, separator, tool_name = text[len(CALL_NAME_PREFIX) :].partition("__")
+    if not separator or not tool_name:
+        return ""
+    return server_name
+
+
 def _require_retrieved(execution: Any) -> bool:
     """Whether this process gates execution on the run's retrieval set.
 
-    The policy lives in `contextforge.search.require_retrieved` so a deployment
-    can loosen it deliberately; an absent runtime or an absent field keeps the
-    design default (true), because an unreadable policy is not permission.
+    The policy is tool_search.require_retrieved so a deployment can loosen it
+    deliberately; a runtime that publishes `require_retrieved` itself wins, and an
+    absent runtime or field keeps the design default (true), because an unreadable
+    policy is not permission.
     """
-    search = getattr(getattr(execution, "config", None), "search", None)
+    explicit = getattr(execution, "require_retrieved", None)
+    if isinstance(explicit, bool):
+        return explicit
+    search = getattr(getattr(execution, "config", None), "tool_search", None)
     return bool(getattr(search, "require_retrieved", True))
 
 
