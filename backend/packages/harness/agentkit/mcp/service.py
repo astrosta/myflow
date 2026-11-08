@@ -31,13 +31,12 @@ from agentkit.mcp.crypto import (
 from agentkit.mcp.errors import (
     McpServerConfigurationError,
     McpServerConflict,
-    McpServerError,
     McpServerNotFound,
     McpServerValidationError,
+    sanitize_error_message,
 )
 from agentkit.mcp.models import (
     McpServerRecord,
-    truncate_error,
     validate_server_name,
     validate_transport,
 )
@@ -600,7 +599,7 @@ class McpServerService:
                 owner_user_id,
                 status="error",
                 reachable=False,
-                last_error=_sanitize_sync_error(exc),
+                last_error=sanitize_error_message(exc),
             )
             if failed is None:
                 raise McpServerNotFound("MCP server not found") from None
@@ -661,29 +660,6 @@ def _text(value: Any) -> str:
 def _optional_text(value: Any) -> str | None:
     text = "" if value is None else str(value).strip()
     return text or None
-
-
-def _sanitize_sync_error(exc: BaseException) -> str:
-    """A stored failure message that cannot contain a credential.
-
-    Client errors are already built from fixed text; a fake or unexpected
-    exception is reduced to its class. Header-shaped and bearer text is redacted
-    as a second line of defense, because this string is shown in the UI.
-    """
-    if isinstance(exc, McpServerError):
-        text = str(exc)
-    else:
-        text = f"MCP server sync failed ({type(exc).__name__})"
-    text = re.sub(
-        r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|"
-        r"api-key|x-auth-token|x-access-token)\b\s*[:=][^\r\n]*",
-        r"\1: ****",
-        text,
-    )
-    text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer ****", text)
-    text = re.sub(r"(?i)\b(token|secret|password|api[_-]?key)\s*[:=]\s*\S+", r"\1=****", text)
-    text = _CONTROL.sub(" ", text)
-    return truncate_error(text) or "MCP server sync failed"
 
 
 __all__ = [

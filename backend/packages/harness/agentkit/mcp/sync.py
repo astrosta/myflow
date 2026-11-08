@@ -22,9 +22,15 @@ callability.  That single property decides the shape of this module:
   committed catalog; an index failure sets index_failed and leaves the commit.
 
 Secrets: the sync decrypts a server's headers to build the connection (the client
-never sees a cipher), and every failure note it stores is reduced to the server slug
-plus an exception class - a credential, a bearer token or a URL with a query string
-must never reach last_error, a log line or the API.
+never sees a cipher), and every failure note it stores goes through
+errors.sanitize_error_message, the same scrubber the management service uses for
+mcp_servers.last_error - a credential, a bearer token or a URL with a query string
+must never reach the database, a log line or the API.
+
+Per-server outcomes: aggregate counters cannot tell the runtime which server to
+stamp, and a server slug is unique per owner, never globally.  failed_servers
+therefore names each failed server by (server_id, owner_user_id, sanitized note),
+which is exactly the pair McpServerStore.set_status takes.
 
 What this module deliberately does not do: it does not write mcp_servers.status (the
 refresh that owns the run stamps that, from this sync's stats), it does not build the
@@ -35,7 +41,6 @@ dependencies are protocols, so a test can substitute any of them.
 from __future__ import annotations
 
 import logging
-import re
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -46,13 +51,14 @@ from mcp import types as mcp_types
 from agentkit.mcp.catalog import DEFAULT_MAX_DOCUMENT_CHARS, build_tool_document
 from agentkit.mcp.client import McpServerConnection
 from agentkit.mcp.crypto import HeaderCipher
-from agentkit.mcp.errors import McpServerConfigurationError, McpServerError
+from agentkit.mcp.errors import (
+    McpServerConfigurationError,
+    sanitize_error_message,
+)
 from agentkit.mcp.models import McpServerRecord, truncate_error
 from agentkit.mcp.store.tool_repository import (
     McpToolRecord,
     call_name_for,
-    content_hash_for,
-    schema_hash_for,
     tool_id_for,
 )
 
@@ -109,13 +115,34 @@ class McpConnectionFactory(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class McpServerFailure:
+    """One server a sync could not read, keyed the way the runtime stamps it.
+
+    The slug alone is not an identity - two users may each own an "anysearch" - so a
+    failure carries the (server_id, owner_user_id) pair McpServerStore.set_status
+    takes, plus the sanitized note that belongs in last_error.  This is what lets the
+    refresh mark status=error/reachable=False even for a server that never had a tool
+    row to carry.
+    """
+
+    server_id: str = ""
+    owner_user_id: str = ""
+    #: Sanitized one-line reason, the same text reported in McpSyncStats.error.
+    error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class McpSyncStats:
     """What one discovery sync did.
 
-    scanned counts the tool rows the snapshot carried (discovered plus carried),
-    servers_scanned the servers walked (enabled or not), and changed the rows whose
-    definition actually changed (inserted + updated); upserted/deleted are the
-    vector-index work lists the store reported.
+    scanned counts the tool rows the snapshot carried (discovered plus carried) and
+    servers_scanned the servers walked (enabled or not).  changed counts the rows the
+    store rewrote (inserted + updated): it is a *flag-inclusive* count, because a row
+    whose only difference is enabled/reachable/callable is an update too, and the
+    store does not separate a definition edit from an availability change.
+    upserted/deleted are the vector-index work lists the store reported, seen/skipped
+    the rows the store saw and refused, and failed_servers names each server that
+    could not be read.
     """
 
     scanned: int = 0
@@ -130,50 +157,18 @@ class McpSyncStats:
     duration_ms: int = 0
     #: Call names skipped because their stored row belongs to another user.
     conflicts: tuple[str, ...] = ()
-
-
-#: These run over failure text that is stored and shown in the UI, so they scrub
-#: anything that could carry a credential or an endpoint the user never published.
-_URL = re.compile(r"(?i)[a-z][a-z0-9+.\-]*://[^\s]+")
-_CREDENTIAL_HEADER = re.compile(
-    r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|"
-    r"api-key|x-auth-token|x-access-token)\b\s*[:=][^\r\n]*"
-)
-_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
-_SECRET_FIELD = re.compile(
-    r"(?i)\b(token|secret|password|passwd|api[_-]?key)\s*[:=]\s*\S+"
-)
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+    #: Every failed/undecryptable server, in walk order: what the runtime stamps.
+    failed_servers: tuple[McpServerFailure, ...] = ()
+    #: Tool ids this snapshot observed upstream (the size of seen_ids).
+    seen: int = 0
+    #: Records the store refused as unstorable, so a malformed upstream tool shows.
+    skipped: int = 0
 
 
 def _server_label(server: McpServerRecord) -> str:
     """A stable, non-secret way to name one server in a message."""
     name = str(getattr(server, "name", "") or "").strip()
-    if name:
-        return "MCP server {0!r}".format(name)
-    return "MCP server {0!r}".format(getattr(server, "id", ""))
-
-
-def sanitize_sync_error(text: str | None) -> str:
-    """Scrub an upstream message of endpoints, credentials and control characters."""
-    cleaned = _CREDENTIAL_HEADER.sub(r"\1: ****", str(text or ""))
-    cleaned = _BEARER.sub("Bearer ****", cleaned)
-    cleaned = _SECRET_FIELD.sub(r"\1=****", cleaned)
-    cleaned = _URL.sub("[redacted endpoint]", cleaned)
-    return _CONTROL.sub(" ", cleaned).strip()
-
-
-def _failure_note(server: McpServerRecord, exc: BaseException) -> str:
-    """One sanitized line about one failed server: slug plus exception class.
-
-    Client errors are already built from fixed text and the server id, so their text
-    is worth keeping; anything else is reduced to its class name, and every note is
-    redacted again before it is handed back.
-    """
-    label = _server_label(server)
-    detail = str(exc) if isinstance(exc, McpServerError) else type(exc).__name__
-    note = truncate_error("{0}: {1}".format(label, sanitize_sync_error(detail)))
-    return note or "{0} tool sync failed".format(label)
+    return "MCP server {0!r}".format(name or getattr(server, "id", ""))
 
 
 def _carried(
@@ -281,6 +276,7 @@ class McpCatalogSync:
         seen_ids: set[str] = set()
         notes: list[str] = []
         conflicts: list[str] = []
+        failed_servers: list[McpServerFailure] = []
         servers_failed = 0
 
         for server in servers:
@@ -294,7 +290,15 @@ class McpCatalogSync:
                 tools = list(await self._client.list_tools(connection))
             except Exception as exc:  # noqa: BLE001 - one server must not stop the rest
                 servers_failed += 1
-                notes.append(_failure_note(server, exc))
+                note = sanitize_error_message(exc, label=_server_label(server))
+                notes.append(note)
+                failed_servers.append(
+                    McpServerFailure(
+                        server_id=server.id,
+                        owner_user_id=server.owner_user_id,
+                        error=note,
+                    )
+                )
                 logger.warning(
                     "MCP server %s tool sync failed (%s)",
                     server.id,
@@ -343,6 +347,9 @@ class McpCatalogSync:
             index_failed=index_failed,
             duration_ms=max(0, int((self._clock() - started) * 1000)),
             conflicts=tuple(conflicts),
+            failed_servers=tuple(failed_servers),
+            seen=_count(snapshot, "seen"),
+            skipped=_count(snapshot, "skipped"),
         )
 
     # -- snapshot construction --------------------------------------------- #
@@ -410,12 +417,10 @@ class McpCatalogSync:
             parameters=document.parameters,
             enabled=bool(server.enabled),
             reachable=True,
-            # Callability is the store's call: it depends on seen_ids and its gate.
+            # Callability, content_hash and schema_hash are the store's outputs: it
+            # derives them from these fields (and from seen_ids), so computing them a
+            # second time here would only risk the two disagreeing.
             content=document.content,
-            content_hash=content_hash_for(
-                document.content, server.owner_user_id, call_name
-            ),
-            schema_hash=schema_hash_for(schema),
         )
 
     # -- connections ------------------------------------------------------- #
@@ -458,10 +463,10 @@ class McpCatalogSync:
 __all__ = [
     "McpCatalogSync",
     "McpConnectionFactory",
+    "McpServerFailure",
     "McpServerSource",
     "McpSyncStats",
     "McpToolIndex",
     "McpToolLister",
     "McpToolSink",
-    "sanitize_sync_error",
 ]

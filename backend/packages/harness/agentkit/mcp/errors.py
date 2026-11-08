@@ -5,11 +5,19 @@ service, the runtime and the HTTP layer can map a failure to a status code
 without inspecting SDK internals.  Messages are deliberately built from fixed
 text plus a server id or exception *class*: request headers, tokens and full
 URLs with query strings must never reach a log or an API response.
+
+The sanitizer at the bottom of this module is the one place that turns an
+arbitrary exception into text that may be stored (mcp_servers.last_error) or
+logged.  Both the management service and the discovery sync use it: a second,
+weaker copy is how a URL with a query token survives in a row shown in the UI.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+from agentkit.mcp.models import MAX_ERROR_CHARS, truncate_error
 
 
 class McpServerError(RuntimeError):
@@ -93,7 +101,67 @@ class McpToolError(McpServerError):
         self.result = result
 
 
+#: The stored fallback when an exception carries nothing worth keeping.
+DEFAULT_ERROR_TEXT = "MCP server sync failed"
+
+#: Stored and displayed text is scrubbed before either happens: these patterns cover
+#: the three ways a credential or an unpublished endpoint gets into a message.
+_ENDPOINT = re.compile(r"(?i)[a-z][a-z0-9+.\-]*://[^\s]+")
+_CREDENTIAL_HEADER = re.compile(
+    r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|"
+    r"api-key|x-auth-token|x-access-token)\b\s*[:=][^\r\n]*"
+)
+_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_SECRET_FIELD = re.compile(
+    r"(?i)\b(token|secret|password|passwd|api[_-]?key)\s*[:=]\s*\S+"
+)
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def sanitize_error_text(text: str | None, *, max_chars: int = MAX_ERROR_CHARS) -> str:
+    """Scrub a message of endpoints, credentials and control characters.
+
+    Order matters: the header, bearer and secret-field patterns run first, so the
+    endpoint pattern (which swallows everything up to whitespace, query string
+    included) is not the only thing standing between a token and the database.
+    """
+    cleaned = _CREDENTIAL_HEADER.sub(r"\1: ****", str(text or ""))
+    cleaned = _BEARER.sub("Bearer ****", cleaned)
+    cleaned = _SECRET_FIELD.sub(r"\1=****", cleaned)
+    cleaned = _ENDPOINT.sub("[redacted endpoint]", cleaned)
+    cleaned = _CONTROL.sub(" ", cleaned).strip()
+    return cleaned[: max(1, int(max_chars))]
+
+
+def sanitize_error_message(
+    exc: BaseException,
+    *,
+    label: str = "",
+    fallback: str = DEFAULT_ERROR_TEXT,
+) -> str:
+    """One stored/loggable failure message that cannot contain a credential.
+
+    Client errors (McpServerError) are already built from fixed text plus the
+    server id, so their text is the useful part and is kept.  Any other exception is
+    reduced to its class name, because its text is not ours to trust: an SDK, proxy
+    or database error body can carry the URL and the auth header with it.
+
+    label is prefixed when supplied, which is how the sync names the server
+    ("MCP server 'anysearch': ..."); the result is then scrubbed by
+    sanitize_error_text and bounded to the last_error column.
+    """
+    if isinstance(exc, McpServerError):
+        body = str(exc)
+    elif label:
+        body = "sync failed ({0})".format(type(exc).__name__)
+    else:
+        body = "{0} ({1})".format(DEFAULT_ERROR_TEXT, type(exc).__name__)
+    text = "{0}: {1}".format(label, body) if label else body
+    return truncate_error(sanitize_error_text(text)) or fallback
+
+
 __all__ = [
+    "DEFAULT_ERROR_TEXT",
     "McpProtocolError",
     "McpServerConfigurationError",
     "McpServerConflict",
@@ -103,4 +171,6 @@ __all__ = [
     "McpServerTimeout",
     "McpServerUnavailable",
     "McpToolError",
+    "sanitize_error_message",
+    "sanitize_error_text",
 ]

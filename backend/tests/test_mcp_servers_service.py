@@ -219,6 +219,25 @@ async def test_create_failure_keeps_the_row_and_records_a_sanitized_error(
 
 
 @pytest.mark.asyncio
+async def test_create_failure_redacts_the_endpoint_and_its_query_token(
+    service: McpServerService, store: McpServerStore, sync: FakeSync
+) -> None:
+    sync.failure = McpServerUnavailable(
+        "MCP server 'srv' is unavailable (ConnectError): "
+        "POST https://api.anysearch.com/mcp?api_key=topsecret"
+    )
+
+    record = await service.create_server("u1", write())
+
+    assert record.last_error is not None
+    assert "unavailable" in record.last_error
+    assert "topsecret" not in record.last_error
+    assert "https://" not in record.last_error
+    stored = await store.get(record.id, "u1")
+    assert stored is not None and stored.last_error == record.last_error
+
+
+@pytest.mark.asyncio
 async def test_create_rejects_a_duplicate_name_for_the_same_owner(
     service: McpServerService,
 ) -> None:

@@ -40,7 +40,11 @@ from agentkit.mcp.catalog import (
 )
 from agentkit.mcp.client import McpServerConnection
 from agentkit.mcp.crypto import HeaderCipher
-from agentkit.mcp.errors import McpProtocolError, McpServerUnavailable
+from agentkit.mcp.errors import (
+    McpProtocolError,
+    McpServerUnavailable,
+    sanitize_error_message,
+)
 from agentkit.mcp.models import McpServerRecord
 from agentkit.mcp.store import (
     McpServerStore,
@@ -49,7 +53,7 @@ from agentkit.mcp.store import (
     call_name_for,
     tool_id_for,
 )
-from agentkit.mcp.sync import McpCatalogSync, McpSyncStats
+from agentkit.mcp.sync import McpCatalogSync, McpServerFailure, McpSyncStats
 from agentkit.persistence.base import Base
 
 TABLES = ("mcp_servers", "mcp_tools")
@@ -361,6 +365,8 @@ async def test_a_failed_server_keeps_its_tools_while_another_server_updates(
         tool_id_for(alpha.id, "search"),
         tool_id_for(alpha.id, "describe"),
     }
+    assert stats.seen == 2
+    assert [failure.server_id for failure in stats.failed_servers] == [beta.id]
 
 
 @pytest.mark.asyncio
@@ -405,6 +411,66 @@ async def test_an_empty_server_list_writes_one_empty_snapshot(
     assert stats.index_failed is False
     assert recorder.snapshots == [([], set())]
     assert client.called == []
+
+
+@pytest.mark.asyncio
+async def test_two_owners_with_the_same_slug_are_reported_separately(
+    server_store, tool_store, client, sync
+) -> None:
+    mine = await server_store.create(server_record("anysearch"))
+    theirs = await server_store.create(server_record("anysearch", owner=OTHER_OWNER))
+    client.errors[mine.id] = McpServerUnavailable("down")
+    client.errors[theirs.id] = McpServerUnavailable("timed out")
+
+    stats = await sync.sync("test")
+
+    assert stats.servers_failed == 2
+    # A slug is unique per owner, never globally: the id is what the runtime stamps.
+    assert {
+        (failure.server_id, failure.owner_user_id) for failure in stats.failed_servers
+    } == {(mine.id, OWNER), (theirs.id, OTHER_OWNER)}
+    assert all("anysearch" in failure.error for failure in stats.failed_servers)
+    assert stats.error is not None and stats.error.count("anysearch") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_failed_server_without_prior_tools_is_reported(
+    server_store, tool_store, client, sync
+) -> None:
+    server = await server_store.create(server_record("empty"))
+    client.errors[server.id] = McpServerUnavailable("down")
+
+    stats = await sync.sync("test")
+
+    assert stats.servers_failed == 1
+    assert stats.scanned == 0
+    # Nothing was carried, so no tool row could name the server: the outcome must.
+    assert len(stats.failed_servers) == 1
+    failure = stats.failed_servers[0]
+    assert failure.server_id == server.id
+    assert failure.owner_user_id == OWNER
+    assert "empty" in failure.error and "down" in failure.error
+    assert failure.error == stats.error
+    assert await tool_store.list_all() == []
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_upstream_tool_is_skipped_but_reported(
+    server_store, tool_store, client, sync
+) -> None:
+    server = await server_store.create(server_record("odd"))
+    client.results[server.id] = [mcp_tool("x" * 300), mcp_tool("search")]
+
+    stats = await sync.sync("test")
+
+    # A name past its identity column is dropped, not stored truncated, and the rest
+    # of the server still publishes.
+    assert stats.skipped == 1
+    assert stats.seen == 2
+    assert stats.servers_failed == 0
+    assert stats.failed_servers == ()
+    listed = await tool_store.get_by_call_name("mcp__odd__search", OWNER)
+    assert listed is not None and listed.callable is True
 
 
 @pytest.mark.asyncio
@@ -488,6 +554,8 @@ async def test_headers_that_do_not_decrypt_fail_only_their_server(
     assert "could not be decrypted" in stats.error
     assert token not in stats.error
     assert "s3cr3t" not in stats.error
+    assert [failure.server_id for failure in stats.failed_servers] == [broken.id]
+    assert stats.failed_servers[0].owner_user_id == OWNER
     healthy_row = await tool_store.get_by_call_name("mcp__healthy__search", OWNER)
     assert healthy_row is not None and healthy_row.callable is True
 
@@ -508,6 +576,7 @@ async def test_stored_headers_without_a_cipher_fail_the_server(
     assert stats.error is not None
     assert "no cipher" in stats.error
     assert "fernet-token" not in stats.error
+    assert [failure.server_id for failure in stats.failed_servers] == [server.id]
 
 
 @pytest.mark.asyncio
@@ -528,6 +597,16 @@ async def test_upstream_failure_text_is_sanitized(
     assert "topsecret" not in stats.error
     assert "s3cr3t" not in stats.error
     assert "https://" not in stats.error
+
+
+def test_an_unexpected_exception_is_stored_as_its_class_only() -> None:
+    note = sanitize_error_message(
+        RuntimeError("GET " + URL + "?api_key=topsecret failed"),
+        label="MCP server 'odd'",
+    )
+
+    assert note == "MCP server 'odd': sync failed (RuntimeError)"
+    assert "topsecret" not in note
 
 
 # --------------------------------------------------------------------------- #
