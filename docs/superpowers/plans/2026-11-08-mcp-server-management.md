@@ -525,7 +525,7 @@ git commit -m "feat: execute MCP tools directly against their server"
 **Interfaces:**
 - Produces `McpToolRuntime(config, sync, server_store, tool_store, mcp_client, cipher, index=None, embedder=None, reranker=None, daily_delay=None)` with `start()`, `stop()`, `request_refresh(reason)`, `refresh_now(reason)`, `refresh_server(server_id)`, `remove_server_catalog(server_id)`, `reindex()`, `status(owner_user_id=None)`, and `async call_tool(record, arguments)`.
 - Produces `build_mcp_runtime(config, session_factory) -> McpToolRuntime | None`; it publishes via `set_mcp_runtime()` and clears via `reset_mcp_runtime()` from `runtime_protocol.py`.
-- App startup uses `mcp_servers.enabled`; single-worker guard fails when enabled and workers > 1.
+- App startup calls `app_config.mcp_servers.validate_for_startup()` before building the runtime; an enabled block without a valid Fernet key must fail boot. The single-worker guard fails when enabled and workers > 1.
 - `get_available_tools` hides `tool_search`/`tool_execute` unless `app_config.mcp_servers.enabled`.
 
 - [ ] **Step 1: Write failing runtime tests**
@@ -545,7 +545,7 @@ Adapt `contextforge/runtime.py`: remove admin/subscriber/debounce event logic; k
 
 - [ ] **Step 3: Write failing app/guard tests**
 
-Assert `preflight_mcp_servers` rejects workers > 1 only when enabled, and app startup registers `app.state.mcp_runtime` + mounts `/api/mcp-servers`. Test disabled config publishes no tool search service.
+Assert `preflight_mcp_servers` rejects workers > 1 only when enabled, and app startup registers `app.state.mcp_runtime` + mounts `/api/mcp-servers`. Test disabled config publishes no tool search service. Add a startup test: enabled config with a missing/invalid encryption key raises before the runtime is built; disabled config does not.
 
 - [ ] **Step 4: Wire app startup/stop and errors**
 
