@@ -190,16 +190,30 @@ function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+/**
+ * 客户端也切一刀查询串，不只是信 url_has_query。
+ *
+ * 网关已经保证不回传查询串，但"保证"和"前端状态里真的没有"是两件事：一旦哪天网关
+ * 多回了一个带 ?token=... 的地址，它就会原样进入 DOM、日志与崩溃上报。这里按第一个
+ * ? 截断（同时丢掉 #fragment），并把"有查询串"这个事实交给 url_has_query。
+ */
+function splitQuery(raw: string): { url: string; hasQuery: boolean } {
+  const index = raw.indexOf("?");
+  if (index < 0) return { url: raw, hasQuery: false };
+  return { url: raw.slice(0, index), hasQuery: true };
+}
+
 type WireServer = Record<string, unknown> & { id?: unknown; name?: unknown; url?: unknown };
 
 function toSummary(raw: WireServer): McpServerSummary {
+  const { url, hasQuery } = splitQuery(asString(raw.url, ""));
   return {
     id: asString(raw.id, ""),
     name: asString(raw.name, ""),
     display_name: asNullableString(raw.display_name),
     description: asString(raw.description, ""),
-    url: asString(raw.url, ""),
-    url_has_query: asBoolean(raw.url_has_query, false),
+    url,
+    url_has_query: asBoolean(raw.url_has_query, false) || hasQuery,
     transport: asTransport(raw.transport),
     verify_tls: asBoolean(raw.verify_tls, true),
     enabled: asBoolean(raw.enabled, true),

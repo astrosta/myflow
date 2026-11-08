@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -83,6 +84,39 @@ function renderEditor(props: { serverId?: string | null; initialServer?: { name:
     </QueryClientProvider>,
   );
   return { ...view, onClose, onSaved };
+}
+
+/**
+ * 带触发按钮的 harness：焦点归还要能以"打开它的那个按钮"为锚点断言，
+ * 所以打开/关闭状态必须由外层持有，而不是组件自己。
+ */
+function EditorHarness({ serverId = null }: { serverId?: string | null }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button onClick={() => setOpen(true)} type="button">
+        打开编辑器
+      </button>
+      {open ? (
+        <McpServerEditorDialog
+          onClose={() => setOpen(false)}
+          onSaved={() => setOpen(false)}
+          serverId={serverId}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function renderHarness(serverId: string | null = null) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <EditorHarness serverId={serverId} />
+    </QueryClientProvider>,
+  );
 }
 
 beforeEach(() => {
@@ -232,5 +266,51 @@ describe("编辑 MCP 服务", () => {
     await within(dialog).findByLabelText("服务名称");
 
     expect(within(dialog).queryByText(/查询串/)).toBeNull();
+  });
+});
+describe("对话框焦点", () => {
+  it("打开时焦点落在第一个该填的字段（新建是服务名称）", async () => {
+    const view = renderHarness();
+    const trigger = view.getByRole("button", { name: "打开编辑器" });
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const dialog = await view.findByRole("dialog", { name: "新建 MCP 服务" });
+    expect(document.activeElement).toBe(within(dialog).getByLabelText("服务名称"));
+  });
+
+  it("编辑时焦点落在服务地址（名称只读，聚焦它没有意义）", async () => {
+    const view = renderHarness("srv-1");
+    fireEvent.click(view.getByRole("button", { name: "打开编辑器" }));
+    const dialog = await view.findByRole("dialog", { name: "编辑 MCP 服务" });
+    await within(dialog).findByLabelText("服务地址");
+
+    await waitFor(() =>
+      expect(document.activeElement).toBe(within(dialog).getByLabelText("服务地址")),
+    );
+  });
+
+  it("Tab 在框内循环，Escape 关闭，焦点回到触发按钮", async () => {
+    const view = renderHarness();
+    const trigger = view.getByRole("button", { name: "打开编辑器" });
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const dialog = await view.findByRole("dialog", { name: "新建 MCP 服务" });
+    const close = within(dialog).getByRole("button", { name: "关闭" });
+    const submit = within(dialog).getByRole("button", { name: "创建" });
+
+    // 第一个元素上 Shift+Tab 回卷到最后一个
+    close.focus();
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(submit);
+
+    // 最后一个元素上 Tab 回卷到第一个：焦点不会跑到背后的页面上
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog", { name: "新建 MCP 服务" })).toBeNull());
+    expect(document.activeElement).toBe(trigger);
   });
 });

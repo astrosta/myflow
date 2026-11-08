@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,6 +20,7 @@ import {
   type McpServerSummary,
   type McpServerTool,
 } from "@/core/api/mcp-servers";
+import { useDialogFocus } from "@/lib/dialog-focus";
 import { cn } from "@/lib/utils";
 
 import { McpServerEditorDialog } from "./mcp-server-editor-dialog";
@@ -76,6 +77,11 @@ export function McpServerManagementPage() {
   const queryClient = useQueryClient();
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [deleting, setDeleting] = useState<McpServerSummary | null>(null);
+  /**
+   * 删除失败必须显示在**确认框里面**：确认框是 z-50 的固定层，页面顶部的错误条在它
+   * 后面，等于没有反馈（用户只会看到"点了没反应"）。
+   */
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -147,7 +153,7 @@ export function McpServerManagementPage() {
   const confirmDelete = async () => {
     if (!deleting || busyId) return;
     setBusyId(deleting.id);
-    setActionError(null);
+    setDeleteError(null);
     try {
       await deleteMcpServer(deleting.id);
       const removedId = deleting.id;
@@ -157,7 +163,7 @@ export function McpServerManagementPage() {
       await queryClient.invalidateQueries({ queryKey: LIST_KEY });
       await queryClient.invalidateQueries({ queryKey: STATUS_KEY });
     } catch (cause) {
-      setActionError(readableError(cause));
+      setDeleteError(readableError(cause));
     } finally {
       setBusyId(null);
     }
@@ -268,7 +274,10 @@ export function McpServerManagementPage() {
                 <ServerCard
                   busy={busyId === server.id}
                   expanded={expandedId === server.id}
-                  onDelete={() => setDeleting(server)}
+                  onDelete={() => {
+                    setDeleteError(null);
+                    setDeleting(server);
+                  }}
                   onEdit={() => setEditor({ serverId: server.id, server })}
                   onRefresh={() => void refreshOne(server)}
                   onToggle={() => void toggle(server)}
@@ -299,38 +308,13 @@ export function McpServerManagementPage() {
       ) : null}
 
       {deleting ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-900/40 px-4"
-          onClick={() => setDeleting(null)}
-          role="presentation"
-        >
-          <div
-            aria-label="删除 MCP 服务"
-            aria-modal="true"
-            className="w-full max-w-md rounded-xl border border-neutral-200 bg-white p-5 shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-            role="dialog"
-          >
-            <h2 className="text-sm font-semibold text-neutral-900">删除 MCP 服务</h2>
-            <p className="mt-2 text-xs leading-relaxed text-neutral-600">
-              确定删除 <strong className="text-neutral-900">{deleting.name}</strong> 吗？它的工具与索引文档会一起移除；服务器本身不会被改动。
-            </p>
-            <div className="mt-5 flex justify-end gap-2">
-              <Button onClick={() => setDeleting(null)} size="sm" type="button">
-                取消
-              </Button>
-              <Button
-                disabled={busyId === deleting.id}
-                onClick={() => void confirmDelete()}
-                size="sm"
-                type="button"
-                variant="danger"
-              >
-                {busyId === deleting.id ? "删除中…" : "确认删除"}
-              </Button>
-            </div>
-          </div>
-        </div>
+        <DeleteServerDialog
+          busy={busyId === deleting.id}
+          error={deleteError}
+          onCancel={() => setDeleting(null)}
+          onConfirm={() => void confirmDelete()}
+          server={deleting}
+        />
       ) : null}
     </div>
   );
@@ -350,7 +334,7 @@ function StatusBar({ error, loading, status }: StatusBarProps) {
     >
       <div className="flex flex-wrap items-center gap-1.5">
         <Badge variant={status?.enabled ? "success" : "neutral"}>
-          {status?.enabled ? "MCP 已启用" : "MCP 未启用"}
+          {status ? (status.enabled ? "MCP 已启用" : "MCP 未启用") : "MCP 状态读取中"}
         </Badge>
         <Badge variant={status && status.servers_error > 0 ? "danger" : "neutral"}>
           {`可达 ${status?.servers_reachable ?? 0}`}
@@ -453,9 +437,12 @@ function ServerCard({
           >
             删除
           </Button>
+          {/**
+           * 读屏器把每个开关都读成同一个"停用服务"就没法用了：标签必须带上目标。
+           */}
           <button
             aria-checked={server.enabled}
-            aria-label={server.enabled ? "停用服务" : "启用服务"}
+            aria-label={(server.enabled ? "停用 " : "启用 ") + server.name}
             className={cn(
               "relative h-5 w-9 shrink-0 rounded-full transition-colors",
               server.enabled ? "bg-emerald-500" : "bg-neutral-300",
@@ -592,5 +579,70 @@ function ToolRow({ tool }: { tool: McpServerTool }) {
         </span>
       </span>
     </li>
+  );
+}
+interface DeleteServerDialogProps {
+  busy: boolean;
+  /** 删除失败就显示在框里：页面顶部的错误条在固定遮罩后面，用户看不见。 */
+  error: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+  server: McpServerSummary;
+}
+
+function DeleteServerDialog({
+  busy,
+  error,
+  onCancel,
+  onConfirm,
+  server,
+}: DeleteServerDialogProps) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  // 初始焦点给"确认删除"（这是用户刚刚要求的事），Escape 取消，关闭后焦点回到删除按钮。
+  useDialogFocus(dialogRef, { onEscape: busy ? undefined : onCancel });
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-900/40 px-4"
+      onClick={busy ? undefined : onCancel}
+      role="presentation"
+    >
+      <div
+        aria-label="删除 MCP 服务"
+        aria-modal="true"
+        className="w-full max-w-md rounded-xl border border-neutral-200 bg-white p-5 shadow-xl"
+        onClick={(event) => event.stopPropagation()}
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
+        <h2 className="text-sm font-semibold text-neutral-900">删除 MCP 服务</h2>
+        <p className="mt-2 text-xs leading-relaxed text-neutral-600">
+          确定删除 <strong className="text-neutral-900">{server.name}</strong> 吗？它的工具与索引文档会一起移除；服务器本身不会被改动。
+        </p>
+
+        {error ? (
+          <p className={cn(PAGE_ERROR_CLASS, "mt-3")} role="alert">
+            {error}
+          </p>
+        ) : null}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <Button disabled={busy} onClick={onCancel} size="sm" type="button">
+            取消
+          </Button>
+          <Button
+            data-initial-focus
+            disabled={busy}
+            onClick={onConfirm}
+            size="sm"
+            type="button"
+            variant="danger"
+          >
+            {busy ? "删除中…" : "确认删除"}
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

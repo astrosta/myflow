@@ -189,6 +189,23 @@ describe("mcp-servers API contract", () => {
     expect(page.servers[0]).not.toHaveProperty("headers");
   });
 
+  it("strips a query string out of the URL and flags it", async () => {
+    stubFetch(
+      jsonResponse({
+        servers: [
+          { id: "srv-1", name: "anysearch", url: "https://x.test/mcp?token=abc&x=1", url_has_query: false },
+        ],
+        count: 1,
+      }),
+    );
+
+    const page = await listMcpServers();
+
+    // 查询串永远不进前端状态：即使网关漏了 url_has_query，客户端也不留明文参数。
+    expect(page.servers[0]?.url).toBe("https://x.test/mcp");
+    expect(page.servers[0]?.url_has_query).toBe(true);
+  });
+
   it("deleteMcpServer resolves on 204", async () => {
     const mockedFetch = stubFetch(new Response(null, { status: 204 }));
 

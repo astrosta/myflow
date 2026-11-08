@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  McpServerApiError,
   createMcpServer,
   deleteMcpServer,
   getMcpServerStatus,
@@ -199,6 +200,15 @@ describe("MCP 服务列表", () => {
     expect(view.getByRole("button", { name: "新建服务" })).toBeTruthy();
   });
 
+  it("状态还没回来时不说成「未启用」", async () => {
+    mockedStatus.mockReturnValue(new Promise<McpServerStatus>(() => {}));
+    const view = renderPage();
+
+    const status = await view.findByRole("region", { name: "MCP 服务状态" });
+    expect(within(status).getByText("MCP 状态读取中")).toBeTruthy();
+    expect(within(status).queryByText("MCP 未启用")).toBeNull();
+  });
+
   it("列表请求失败时显示错误文案", async () => {
     mockedList.mockRejectedValue(new Error("网关 502"));
     const view = renderPage();
@@ -212,9 +222,26 @@ describe("MCP 服务操作", () => {
     const view = renderPage();
     const card = await view.findByRole("article", { name: "anysearch" });
 
-    fireEvent.click(within(card).getByRole("switch", { name: "停用服务" }));
+    fireEvent.click(within(card).getByRole("switch", { name: "停用 anysearch" }));
 
     await waitFor(() => expect(mockedSetEnabled).toHaveBeenCalledWith("srv-1", false));
+  });
+
+  it("启停开关的标签带上服务器名，多个服务之间读屏也能区分", async () => {
+    mockedList.mockResolvedValue({
+      servers: [
+        makeServer(),
+        makeServer({ id: "srv-2", name: "another", display_name: "Another", enabled: false }),
+      ],
+      count: 2,
+    });
+    const view = renderPage();
+
+    await view.findByRole("article", { name: "anysearch" });
+    // 逐个叫名字，而不是二十个一模一样的"停用服务"
+    expect(view.getByRole("switch", { name: "停用 anysearch" })).toBeTruthy();
+    expect(view.getByRole("switch", { name: "启用 another" })).toBeTruthy();
+    expect(view.queryByRole("switch", { name: "停用服务" })).toBeNull();
   });
 
   it("单个服务刷新后失效工具与状态", async () => {
@@ -255,6 +282,41 @@ describe("MCP 服务操作", () => {
 
     await waitFor(() => expect(mockedDelete).toHaveBeenCalledWith("srv-1"));
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["mcp-servers"] }));
+  });
+
+  it("删除失败时错误显示在确认框里（遮罩后面没人看得见）", async () => {
+    mockedDelete.mockRejectedValueOnce(
+      new McpServerApiError(409, "mcp_server_busy", "服务器正在同步，请稍后再试", "trace-7"),
+    );
+    const view = renderPage();
+    const card = await view.findByRole("article", { name: "anysearch" });
+
+    fireEvent.click(within(card).getByRole("button", { name: "删除 anysearch" }));
+    const dialog = await view.findByRole("dialog", { name: "删除 MCP 服务" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "确认删除" }));
+
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toBe("服务器正在同步，请稍后再试");
+    // 框还开着，用户可以直接重试或取消
+    expect(view.getByRole("dialog", { name: "删除 MCP 服务" })).toBeTruthy();
+  });
+
+  it("删除确认框聚焦确认按钮，Escape 取消后焦点回到删除按钮", async () => {
+    const view = renderPage();
+    const card = await view.findByRole("article", { name: "anysearch" });
+    const deleteButton = within(card).getByRole("button", { name: "删除 anysearch" });
+
+    deleteButton.focus();
+    fireEvent.click(deleteButton);
+    const dialog = await view.findByRole("dialog", { name: "删除 MCP 服务" });
+    const confirm = within(dialog).getByRole("button", { name: "确认删除" });
+    await waitFor(() => expect(document.activeElement).toBe(confirm));
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    await waitFor(() => expect(view.queryByRole("dialog", { name: "删除 MCP 服务" })).toBeNull());
+    expect(mockedDelete).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(deleteButton);
   });
 });
 

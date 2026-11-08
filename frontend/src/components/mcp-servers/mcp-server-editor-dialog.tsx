@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { CloseIcon } from "@/components/ui/icons";
@@ -16,6 +16,7 @@ import {
   type McpServerUpdateInput,
   type McpTransport,
 } from "@/core/api/mcp-servers";
+import { useDialogFocus } from "@/lib/dialog-focus";
 
 /**
  * 新建/编辑 MCP 服务。
@@ -123,20 +124,15 @@ export function McpServerEditorDialog({
   onSaved,
 }: McpServerEditorDialogProps) {
   const editing = Boolean(serverId);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useDialogFocus(dialogRef, { onEscape: onClose });
+
   const detailQuery = useQuery({
     queryKey: ["mcp-servers", serverId],
     queryFn: () => getMcpServer(serverId as string),
     enabled: editing,
     staleTime: 5_000,
   });
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
 
   const title = editing ? "编辑 MCP 服务" : "新建 MCP 服务";
   const titleName = detailQuery.data?.name ?? initialServer?.name ?? serverId ?? "";
@@ -152,7 +148,9 @@ export function McpServerEditorDialog({
         aria-modal="true"
         className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-xl"
         onClick={(event) => event.stopPropagation()}
+        ref={dialogRef}
         role="dialog"
+        tabIndex={-1}
       >
         <header className="flex shrink-0 items-center border-b border-neutral-200 px-5 py-3">
           <div className="min-w-0">
@@ -220,10 +218,19 @@ interface McpServerEditorFormProps {
 
 function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerEditorFormProps) {
   const baseId = useId();
+  const formRef = useRef<HTMLFormElement | null>(null);
   const [form, setForm] = useState<FormState>(() => formFromServer(initial));
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  /**
+   * 初始焦点交给第一个该填的字段：新建是 name，编辑是 url（name 只读，聚焦它没有意义）。
+   * 编辑模式的表单要等详情回来才渲染，所以这条 effect 必须在表单自己身上，而不是对话框上。
+   */
+  useEffect(() => {
+    formRef.current?.querySelector<HTMLElement>("[data-initial-focus]")?.focus();
+  }, []);
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm((current) => ({ ...current, [key]: value }));
@@ -316,6 +323,7 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
   return (
     <form
       className="min-h-0 flex-1 space-y-5 overflow-y-auto px-5 py-5"
+      ref={formRef}
       onSubmit={(event) => {
         event.preventDefault();
         void submit();
@@ -329,6 +337,7 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
               aria-describedby={fieldErrors.name ? baseId + "-name-error" : undefined}
               aria-invalid={Boolean(fieldErrors.name)}
               className={INPUT_CLASS}
+              data-initial-focus={serverId ? undefined : true}
               disabled={busy || Boolean(serverId)}
               maxLength={128}
               onChange={(event) => set("name", event.target.value)}
@@ -381,6 +390,7 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
               aria-describedby={fieldErrors.url ? baseId + "-url-error" : undefined}
               aria-invalid={Boolean(fieldErrors.url)}
               className={INPUT_CLASS}
+              data-initial-focus={serverId ? true : undefined}
               disabled={busy}
               onChange={(event) => set("url", event.target.value)}
               placeholder="https://api.example.com/mcp"
