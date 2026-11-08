@@ -62,9 +62,11 @@ from agentkit.mcp.crypto import HeaderCipher
 from agentkit.mcp.errors import (
     McpServerConfigurationError,
     McpServerNotFound,
+    McpServerTimeout,
     McpServerUnavailable,
     McpServerValidationError,
     McpToolError,
+    sanitize_error_message,
 )
 from agentkit.mcp.models import McpServerRecord
 from agentkit.mcp.runtime_protocol import (
@@ -81,6 +83,14 @@ from agentkit.persistence.engine import get_session_factory
 logger = logging.getLogger(__name__)
 
 DailyDelay = Callable[[], float]
+#: Call failures that say "the server is not usable right now" rather than "this
+#: tool call failed".  They degrade the stored server row; a McpToolError does not,
+#: because the server answered and only the call was refused.
+_DEGRADING_ERRORS = (
+    McpServerUnavailable,
+    McpServerTimeout,
+    McpServerConfigurationError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +185,9 @@ class McpToolRuntime:
         self._lock = asyncio.Lock()
         self._stop = asyncio.Event()
         self._started = False
+        #: Set by stop().  A pass started after shutdown would touch a database
+        #: the lifespan is about to close, so every trigger answers "not now".
+        self._stopped = False
         self._dirty = False
         self._pending_reason = "manual"
         self._refresh_task: asyncio.Task[None] | None = None
@@ -201,6 +214,10 @@ class McpToolRuntime:
         """Whether a call name must have been retrieved in this run (design 8)."""
         return bool(getattr(self.tool_search, "require_retrieved", True))
 
+    def _wants_passes(self) -> bool:
+        """Whether a trigger should start a pass at all (enabled and not stopped)."""
+        return bool(self.config.enabled) and not self._stopped
+
     def record_retry(self, *, tool_name: str, result: str) -> None:
         """Book one refresh-and-retry outcome, for the catalog-wide status."""
         self._last_retry_at = _utc_now().isoformat()
@@ -214,15 +231,9 @@ class McpToolRuntime:
         if self._started or not self.config.enabled:
             return
         self._started = True
+        self._stopped = False
         self._stop.clear()
-        if self.index is not None:
-            try:
-                await self.index.ensure_collection(self._dimensions())
-            except Exception as exc:  # noqa: BLE001 - retrieval degrades, tools stay
-                self._index_error = type(exc).__name__
-                logger.warning(
-                    "MCP tool index collection check failed: %s", type(exc).__name__
-                )
+        await self._ensure_index()
         # Always one startup pass: `mcp_servers` has no sync block, and a catalog
         # that is only built at the first management write is a catalog the first
         # request cannot search.
@@ -234,19 +245,20 @@ class McpToolRuntime:
         if not self.config.enabled:
             return
         self._started = False
+        self._stopped = True
         self._stop.set()
         await self._cancel(self._daily_task)
         self._daily_task = None
         await self._cancel(self._refresh_task)
         self._refresh_task = None
         self._dirty = False
-        if self.index is not None:
-            with suppress(Exception):
-                await self.index.aclose()
-        close = getattr(self.mcp_client, "aclose", None)
-        if callable(close):
-            with suppress(Exception):
-                await close()
+        # The whole retrieval stack is this runtime's to release: an embedder and
+        # a reranker hold HTTP clients bound to this loop, and closing only the
+        # Milvus client would leak them until the loop shuts down.
+        await self._close_resource(self.index)
+        await self._close_resource(self.embedder)
+        await self._close_resource(self.reranker)
+        await self._close_resource(self.mcp_client)
         # Only retire the process-global handles if this runtime still owns them:
         # stopping an old runtime must not clear a newer one that replaced it.
         if get_mcp_runtime() is self:
@@ -261,6 +273,18 @@ class McpToolRuntime:
         with suppress(asyncio.CancelledError, Exception):
             await task
 
+    @staticmethod
+    async def _close_resource(resource: Any | None) -> None:
+        """Close one owned resource if it is closeable; never raise on the way out."""
+        if resource is None:
+            return
+        for name in ("aclose", "close"):
+            close = getattr(resource, name, None)
+            if callable(close):
+                with suppress(Exception):
+                    await close()
+                return
+
     # -- triggers ---------------------------------------------------------- #
 
     async def request_refresh(self, reason: str) -> None:
@@ -270,7 +294,7 @@ class McpToolRuntime:
         never blocks on the sync and never raises: an upstream or index problem
         is a status, not an error the router has to translate.
         """
-        if not self.config.enabled:
+        if not self._wants_passes():
             return
         self._dirty = True
         self._pending_reason = reason or self._pending_reason
@@ -284,9 +308,11 @@ class McpToolRuntime:
 
         `tool_execute`'s fallback cannot hand the sync to the background worker:
         it has to see the refreshed catalog before it retries, so it would race
-        its own re-read.
+        its own re-read.  After `stop()` there is no process runtime to refresh
+        against - the database is on its way out - so it answers an empty pass
+        instead of a failing one.
         """
-        if not self.config.enabled:
+        if not self._wants_passes():
             return McpSyncStats()
         return (await self._sync_pass(reason)).stats
 
@@ -311,6 +337,10 @@ class McpToolRuntime:
         """
         if not self.config.enabled:
             return McpServerSyncResult(server_id=server_id, error="mcp_disabled")
+        if self._stopped:
+            # "Not refreshed" is the honest answer: nothing ran, so a caller must
+            # not treat the stored snapshot as fresh.
+            return McpServerSyncResult(server_id=server_id, error="mcp_stopped")
         pass_ = await self._sync_pass(reason)
         return self._target_result(pass_, server_id)
 
@@ -321,18 +351,27 @@ class McpToolRuntime:
         because they are the authority; the derived index then drops the same ids,
         and an index failure is logged instead of raised - the database row that
         would have listed those tools is already gone either way.
+
+        The delete runs **under the pass lock**.  A sync that was already walking
+        the server list still holds that server's rows in its snapshot and will
+        rewrite them at commit time, so deleting outside the lock lets an in-flight
+        pass resurrect a catalog this call just removed.  Taking the lock makes the
+        two orders the only two possible ones: a pass commits first and this delete
+        removes what it wrote, or this delete runs first and the next pass no
+        longer sees the server at all.
         """
-        ids = tuple(await self.tool_store.delete_by_server(server_id))
-        if ids and self.index is not None:
-            try:
-                await self.index.delete_by_ids(list(ids))
-            except Exception as exc:  # noqa: BLE001 - the catalog is already clean
-                logger.warning(
-                    "MCP tool index cleanup failed for server %s (%s)",
-                    server_id,
-                    type(exc).__name__,
-                )
-        return ids
+        async with self._lock:
+            ids = tuple(await self.tool_store.delete_by_server(server_id))
+            if ids and self.index is not None:
+                try:
+                    await self.index.delete_by_ids(list(ids))
+                except Exception as exc:  # noqa: BLE001 - the catalog is clean
+                    logger.warning(
+                        "MCP tool index cleanup failed for server %s (%s)",
+                        server_id,
+                        type(exc).__name__,
+                    )
+            return ids
 
     async def reindex(self, owner_user_id: str | None = None) -> McpServerReindexStats:
         """Manual full reindex: one pass with `full=True` for the index rebuild.
@@ -393,6 +432,15 @@ class McpToolRuntime:
         async with self._lock:
             started = asyncio.get_running_loop().time()
             self._sync_state = "syncing"
+            if self._index_error is not None:
+                # A collection check that failed at startup is not evidence the
+                # index is still broken: retry it here, so the flag can only be
+                # cleared by a check that actually succeeded.
+                await self._ensure_index()
+            # The rows this pass is responsible for, read *before* the sync walks
+            # them: a server created while the pass runs was never contacted by it,
+            # so it must not be stamped from this pass's result.
+            servers = await self._server_rows()
             aborted = False
             try:
                 stats = await self.sync.sync(reason, full=full)
@@ -407,8 +455,8 @@ class McpToolRuntime:
                     "MCP tool sync (%s) raised %s", reason, type(exc).__name__
                 )
             if not aborted:
-                await self._stamp_servers(stats)
-            self._record(reason, stats, started, aborted=aborted)
+                await self._stamp_servers(stats, servers)
+            self._record(reason, stats, started)
             logger.info(
                 "MCP tool sync (%s) done: %d servers, %d failed, %d tools",
                 reason,
@@ -418,9 +466,7 @@ class McpToolRuntime:
             )
             return _Pass(stats=stats, aborted=aborted)
 
-    def _record(
-        self, reason: str, stats: McpSyncStats, started: float, *, aborted: bool
-    ) -> None:
+    def _record(self, reason: str, stats: McpSyncStats, started: float) -> None:
         """Remember what this pass did, for the status surface."""
         self._last_sync_at = _utc_now().isoformat()
         self._last_sync_reason = reason
@@ -430,10 +476,11 @@ class McpToolRuntime:
             # The database commit went through and only Milvus failed, so the
             # catalog is live; the index is what degrades.
             self._index_error = stats.error or "index_failed"
-        elif not aborted:
-            # The index step either ran cleanly or had nothing to do, so a failure
-            # from an earlier pass is no longer the truth.
-            self._index_error = None
+        # A pass that reports no index failure does not clear an index error: a
+        # pass without a retrieval stack never touches Milvus, and the index step
+        # swallows its own failures, so "no error reported" is not "the index
+        # recovered".  Only _ensure_index() clears the flag, on a check that
+        # actually succeeded.
         self._sync_state = "ready" if stats.error is None else "degraded"
 
     def _target_result(self, pass_: _Pass, server_id: str) -> McpServerSyncResult:
@@ -466,18 +513,34 @@ class McpToolRuntime:
         # target's rows were rewritten by the same full snapshot.
         return McpServerSyncResult(server_id=server_id)
 
-    async def _stamp_servers(self, stats: McpSyncStats) -> None:
+    async def _server_rows(self) -> list[McpServerRecord]:
+        """Every server row, for the pass to stamp; empty when unreadable.
+
+        Best effort on purpose: if the rows cannot be read the catalog pass will
+        fail on its own, and an empty list means "stamp nothing", which never
+        claims a server this process did not contact.
+        """
+        try:
+            return list(await self.server_store.list_all())
+        except Exception as exc:  # noqa: BLE001 - the pass reports the failure
+            logger.warning("MCP server read for stamping failed (%s)", type(exc).__name__)
+            return []
+
+    async def _stamp_servers(
+        self, stats: McpSyncStats, servers: list[McpServerRecord]
+    ) -> None:
         """Write each server's status from the pass that just ran.
 
-        Success is derived, not reported: the pass walks every server, so any
-        enabled server it did not name as failed was contacted and answered.
+        Success is derived, not reported: the pass walked every row it snapshotted,
+        so any enabled server in that snapshot it did not name as failed was
+        contacted and answered.
+
+        `servers` is the snapshot the pass was responsible for, taken before the
+        sync ran.  A server created *during* the pass is deliberately absent from
+        it: nothing contacted that server, so stamping it "active" would publish a
+        row that was never verified (its own create-triggered pass stamps it).
         """
         failed = {item.server_id: item.error for item in stats.failed_servers}
-        try:
-            servers = list(await self.server_store.list_all())
-        except Exception as exc:  # noqa: BLE001 - the catalog is committed already
-            logger.warning("MCP server status stamp skipped (%s)", type(exc).__name__)
-            return
         stamp = _utc_now()
         for server in servers:
             error = failed.get(server.id)
@@ -530,6 +593,10 @@ class McpToolRuntime:
         first_server_error = next(
             (row.last_error for row in servers if row.last_error), None
         )
+        # The process-wide error belongs to whoever caused it: a scoped caller may
+        # only see a failure of *their own* rows, because the catalog-wide note
+        # names another user's server and the upstream reason it failed.
+        scoped = owner_user_id is not None
         status: dict[str, Any] = {
             "enabled": bool(self.config.enabled),
             "servers_total": len(servers),
@@ -541,13 +608,17 @@ class McpToolRuntime:
             "tools_total": len(tools),
             "indexed_tools": sum(1 for row in tools if row.callable),
             "last_sync_at": last_sync,
-            "last_error": self._last_error or first_server_error,
+            "last_error": (
+                first_server_error
+                if scoped
+                else (self._last_error or first_server_error)
+            ),
             "sync": self._sync_state,
             "index": self._index_state(catalog_state),
             "last_sync_reason": self._last_sync_reason,
             "last_sync_duration_ms": self._last_sync_duration_ms,
         }
-        if owner_user_id is None:
+        if not scoped:
             # The retry record is process-global (the last tool-error fallback), so
             # it belongs on the catalog-wide view only: a scoped caller must not
             # learn which tool another user's retry touched.
@@ -588,16 +659,43 @@ class McpToolRuntime:
     def _index_state(self, catalog_state: str) -> str:
         if catalog_state != "ready":
             return "degraded"
-        if self.index is None:
-            return "disabled"
         if self._index_error is not None:
             return "degraded"
+        if self.index is None:
+            # "disabled" is the operator's choice (tool_search off).  A search
+            # block that is on while this process has no index is a failed build,
+            # which is degraded - reporting "disabled" would hide the breakage.
+            search_enabled = bool(getattr(self.tool_search, "enabled", False))
+            return "degraded" if search_enabled else "disabled"
         return "ready"
 
     def _dimensions(self) -> int | None:
         embedding = getattr(self.tool_search, "embedding", None)
         dimensions = getattr(embedding, "dimensions", None)
         return int(dimensions) if dimensions else None
+
+    def mark_index_error(self, reason: str) -> None:
+        """Record a retrieval-stack problem found while the runtime was built.
+
+        `build_mcp_runtime` calls this when the embedder/index/reranker could not
+        be constructed: the catalog still works, so the runtime must run, but the
+        status has to say "degraded" instead of pretending retrieval is simply off.
+        """
+        self._index_error = reason or "index_unavailable"
+
+    async def _ensure_index(self) -> None:
+        """Check the collection, and only then decide whether the index is healthy."""
+        if self.index is None:
+            return
+        try:
+            await self.index.ensure_collection(self._dimensions())
+        except Exception as exc:  # noqa: BLE001 - retrieval degrades, tools stay
+            self._index_error = type(exc).__name__
+            logger.warning(
+                "MCP tool index collection check failed: %s", type(exc).__name__
+            )
+        else:
+            self._index_error = None
 
     # -- the call ---------------------------------------------------------- #
 
@@ -615,18 +713,22 @@ class McpToolRuntime:
         does not have.
         """
         server = await self._callable_server(record)
-        connection = McpServerConnection(
-            server_id=server.id,
-            url=server.url,
-            transport=server.transport,  # type: ignore[arg-type]
-            headers=self._headers_for(server),
-            verify_tls=bool(server.verify_tls),
-            request_timeout_seconds=float(self.config.request_timeout_seconds),
-            connect_timeout_seconds=float(self.config.connect_timeout_seconds),
-        )
-        return await self.mcp_client.call_tool(
-            connection, record.name, dict(arguments or {})
-        )
+        try:
+            # Building the connection is part of the call: an undecryptable header
+            # map is a broken server row, not a failed tool, and it must degrade
+            # the row exactly like an unreachable endpoint does.
+            connection = self._connection_for(server)
+            return await self.mcp_client.call_tool(
+                connection, record.name, dict(arguments or {})
+            )
+        except _DEGRADING_ERRORS as exc:
+            # The server itself is what failed (unreachable, timed out, or its
+            # stored headers cannot be used), so the row must say so: the next
+            # search/execute sees the state the management page shows.  A tool-level
+            # failure (McpToolError) means the server answered and only that call
+            # failed, so it is deliberately not degraded here.
+            await self._degrade_server(server, exc)
+            raise
 
     async def _callable_server(self, record: McpToolRecord) -> McpServerRecord:
         """The server row behind a call, or the reason this call may not run."""
@@ -647,6 +749,42 @@ class McpToolRuntime:
         if not server.reachable:
             raise McpServerUnavailable(f"MCP server {server.name!r} is unreachable")
         return server
+
+    def _connection_for(self, server: McpServerRecord) -> McpServerConnection:
+        """The session options for one call: URL, decrypted headers, timeouts."""
+        return McpServerConnection(
+            server_id=server.id,
+            url=server.url,
+            transport=server.transport,  # type: ignore[arg-type]
+            headers=self._headers_for(server),
+            verify_tls=bool(server.verify_tls),
+            request_timeout_seconds=float(self.config.request_timeout_seconds),
+            connect_timeout_seconds=float(self.config.connect_timeout_seconds),
+        )
+
+    async def _degrade_server(
+        self, server: McpServerRecord, exc: BaseException
+    ) -> None:
+        """Mark one server error/unreachable after a transport-level failure.
+
+        `last_error` is the shared sanitizer's output, so a message that quotes a
+        URL or a header cannot reach the row.  A failed stamp never masks the tool
+        result: the caller is about to receive the original error anyway.
+        """
+        try:
+            await self.server_store.set_status(
+                server.id,
+                server.owner_user_id,
+                status="error",
+                reachable=False,
+                last_error=sanitize_error_message(exc),
+            )
+        except Exception as stamp_exc:  # noqa: BLE001 - the call result wins
+            logger.warning(
+                "MCP server %s could not be marked unreachable (%s)",
+                server.id,
+                type(stamp_exc).__name__,
+            )
 
     def _headers_for(self, server: McpServerRecord) -> dict[str, str]:
         """The plaintext headers of one server; never logged, never returned."""
@@ -714,6 +852,7 @@ def build_mcp_runtime(
     index: Any | None = None
     embedder: Any | None = None
     reranker: Any | None = None
+    retrieval_error: str | None = None
     if bool(getattr(search, "enabled", False)):
         try:
             from agentkit.knowledge.embedding import OpenAICompatibleEmbedder
@@ -728,10 +867,12 @@ def build_mcp_runtime(
                 rrf_k=search.rrf_k,
             )
             reranker = build_reranker(search.rerank)
-        except Exception:  # noqa: BLE001 - retrieval degrades, the catalog stays
+        except Exception as exc:  # noqa: BLE001 - retrieval degrades, the catalog stays
             logger.warning(
-                "MCP tool index unavailable; tool_search will report it", exc_info=True
+                "MCP tool retrieval stack unavailable; tool_search will report it",
+                exc_info=True,
             )
+            retrieval_error = type(exc).__name__
             index = None
             embedder = None
             reranker = None
@@ -748,6 +889,10 @@ def build_mcp_runtime(
         reranker=reranker,
         tool_search=search,
     )
+    if retrieval_error is not None:
+        # The catalog runs, retrieval does not: status must say "degraded", not
+        # "disabled" (which is the operator's switch, not a build failure).
+        runtime.mark_index_error(retrieval_error)
     set_mcp_runtime(runtime)
     _install_tool_search(
         search,

@@ -35,6 +35,7 @@ from agentkit.mcp.crypto import HeaderCipher
 from agentkit.mcp.errors import (
     McpServerConfigurationError,
     McpServerNotFound,
+    McpServerTimeout,
     McpServerUnavailable,
     McpServerValidationError,
     McpToolError,
@@ -114,9 +115,16 @@ class FakeClient:
         self.calls: list[tuple[McpServerConnection, str, dict[str, Any]]] = []
         self.call_error: BaseException | None = None
         self.closed = False
+        #: Held open to keep a catalog pass in flight, so a test can prove what a
+        #: concurrent delete does while that snapshot is still unwritten.
+        self.gate: asyncio.Event | None = None
+        self.entered = asyncio.Event()
 
     async def list_tools(self, connection: McpServerConnection) -> list[mcp_types.Tool]:
         self.connections.append(connection)
+        self.entered.set()
+        if self.gate is not None:
+            await self.gate.wait()
         error = self.errors.get(connection.server_id)
         if error is not None:
             raise error
@@ -144,14 +152,23 @@ class FakeClient:
 class FakeIndex:
     """The derived index: records the ensure/delete calls the runtime makes."""
 
-    def __init__(self, error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        error: BaseException | None = None,
+        *,
+        ensure_error: BaseException | None = None,
+    ) -> None:
         self.error = error
+        self.ensure_error = ensure_error
         self.ensured: list[int | None] = []
         self.deleted: list[list[str]] = []
         self.closed = False
+        self.synced: list[bool] = []
 
     async def ensure_collection(self, dimensions: int | None = None) -> None:
         self.ensured.append(dimensions)
+        if self.ensure_error is not None:
+            raise self.ensure_error
 
     async def delete_by_ids(self, tool_ids: Any) -> int:
         self.deleted.append(list(tool_ids))
@@ -302,6 +319,8 @@ def _runtime(
     client: Any = None,
     sync: Any = None,
     index: Any = None,
+    embedder: Any = None,
+    reranker: Any = None,
     config: McpServersConfig | None = None,
     tool_search: ToolSearchConfig | None = None,
     daily_delay: Any = None,
@@ -322,7 +341,8 @@ def _runtime(
         resolved_client,
         cipher,
         index=index,
-        embedder=object(),
+        embedder=object() if embedder is None else embedder,
+        reranker=reranker,
         tool_search=tool_search,
         daily_delay=daily_delay,
     )
@@ -482,11 +502,39 @@ async def test_the_daily_task_runs_a_full_pass(stores: Any) -> None:
 
 
 def test_the_daily_delay_targets_the_next_local_midnight() -> None:
-    from datetime import datetime, timedelta, timezone
+    """The schedule is local time, so the fixture is built in local time.
 
-    now = datetime(2026, 11, 8, 23, 0, tzinfo=timezone(timedelta(hours=8)))
+    A fixed +08:00 fixture would only pass on a +08:00 host: the helper normalises
+    whatever it is given to the host's zone (that is the documented "local
+    midnight" semantics), so under TZ=UTC that same fixture is 15:00 local and the
+    delay is 32400s.  Building from `datetime.now().astimezone()` keeps the
+    assertion true in every zone.
+    """
+    from datetime import datetime
+
+    now = datetime.now().astimezone().replace(
+        hour=23, minute=0, second=0, microsecond=0
+    )
 
     assert seconds_until_local_midnight(now) == pytest.approx(3600.0)
+
+
+def test_the_daily_delay_stays_within_one_day() -> None:
+    assert 0.0 < seconds_until_local_midnight() <= 86400.0
+
+
+def test_a_non_local_offset_is_normalised_to_the_host_zone() -> None:
+    """An aware argument is interpreted in *its* zone, then scheduled locally."""
+    from datetime import datetime, timedelta, timezone
+
+    given = datetime(2026, 11, 8, 23, 0, tzinfo=timezone(timedelta(hours=8)))
+    local = given.astimezone()
+    # Independent arithmetic: a day minus the seconds already spent today.
+    since_local_midnight = local.hour * 3600 + local.minute * 60 + local.second
+
+    assert seconds_until_local_midnight(given) == pytest.approx(
+        86400 - since_local_midnight
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1014,3 +1062,311 @@ async def test_a_disabled_tool_search_block_publishes_no_service(
         if runtime is not None:
             await runtime.stop()
         await engine.dispose()
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: scoped errors, the delete race, degradation, shutdown
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_scoped_status_never_reports_another_users_error(stores: Any) -> None:
+    """The catalog-wide error names another user's server, so a scoped read drops it.
+
+    /api/mcp-servers/status is a per-user surface: if it echoed the process-wide
+    last error, every caller would learn that some other user's server exists and
+    why it failed.
+    """
+    server_store, tool_store = stores
+    mine = await _server(server_store, server_id="s1", name="mine", owner=OWNER)
+    theirs = await _server(
+        server_store, server_id="s2", name="theirs", owner=OTHER_OWNER
+    )
+    sync = FakeSync(
+        stats=McpSyncStats(
+            error="MCP server 'theirs': MCP server 'theirs' is unavailable",
+            servers_scanned=2,
+            servers_failed=1,
+        )
+    )
+    runtime = _runtime(server_store, tool_store, sync=sync, daily_delay=lambda: 3600.0)
+    await runtime.refresh_now("manual")  # the pass records the process-wide error
+
+    scoped = await runtime.status(OWNER)
+    other = await runtime.status(OTHER_OWNER)
+    catalog_wide = await runtime.status()
+
+    assert scoped["last_error"] is None, (
+        "a scoped caller must not inherit the catalog-wide error"
+    )
+    assert scoped["servers_total"] == 1
+    assert catalog_wide["last_error"] == (
+        "MCP server 'theirs': MCP server 'theirs' is unavailable"
+    )
+    # A caller whose own row carries a note still sees that note.
+    await server_store.set_status(
+        theirs.id, OTHER_OWNER, status="error", reachable=False, last_error="theirs: boom"
+    )
+    own_error = await runtime.status(OTHER_OWNER)
+    assert own_error["last_error"] == "theirs: boom"
+    assert (await runtime.status(OWNER))["last_error"] is None
+    assert mine.id != theirs.id
+
+
+@pytest.mark.asyncio
+async def test_a_delete_waits_for_the_in_flight_pass_so_rows_stay_deleted(
+    stores: Any,
+) -> None:
+    """The delete and the catalog pass share one lock: no resurrected rows.
+
+    A pass holds the server's rows in the snapshot it is about to write, so a
+    delete that ran while it was in flight would be undone at commit time.  With
+    the lock the pass commits first and the delete removes what it wrote.
+    """
+    server_store, tool_store = stores
+    server = await _server(server_store, server_id="s1", name="anysearch")
+    record = _record(server_id=server.id, server_name=server.name)
+    await tool_store.upsert_snapshot([record], {tool_id_for(record.server_id, "search")})
+    client = FakeClient()
+    client.results[server.id] = [_mcp_tool("search")]
+    client.gate = asyncio.Event()
+    index = FakeIndex()
+    runtime = _runtime(
+        server_store, tool_store, client=client, index=index, daily_delay=lambda: 3600.0
+    )
+
+    pass_task = asyncio.create_task(runtime.refresh_now("manual"))
+    await asyncio.wait_for(client.entered.wait(), timeout=2)
+    delete_task = asyncio.create_task(runtime.remove_server_catalog(server.id))
+    await asyncio.sleep(0.02)
+    assert not delete_task.done(), "the delete must wait for the running pass"
+
+    client.gate.set()
+    await asyncio.wait_for(asyncio.gather(pass_task, delete_task), timeout=5)
+
+    assert await tool_store.list_for_server(server.id, OWNER) == [], (
+        "the delete ran after the pass, so nothing was resurrected"
+    )
+    assert index.deleted and index.deleted[-1] == [tool_id_for(server.id, "search")]
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_degrades_the_owning_server(stores: Any) -> None:
+    server_store, tool_store = stores
+    server = await _server(server_store, server_id="s1", name="anysearch")
+    client = FakeClient()
+    client.call_error = McpServerTimeout(
+        "MCP server 'anysearch' timed out during tools/call"
+    )
+    runtime = _runtime(server_store, tool_store, client=client)
+
+    with pytest.raises(McpServerTimeout):
+        await runtime.call_tool(_record(server_id=server.id), {"query": "x"})
+
+    stored = await server_store.get(server.id, OWNER)
+    assert stored is not None
+    assert (stored.status, stored.reachable) == ("error", False)
+    assert stored.last_error
+    assert "timed out" in stored.last_error
+
+
+@pytest.mark.asyncio
+async def test_a_configuration_failure_degrades_the_owning_server(stores: Any) -> None:
+    server_store, tool_store = stores
+    other_key = HeaderCipher(HeaderCipher.generate_key())
+    server = await _server(
+        server_store,
+        server_id="s1",
+        name="anysearch",
+        headers_encrypted=other_key.encrypt({"Authorization": "Bearer secret"}),
+    )
+    runtime = _runtime(server_store, tool_store)
+
+    with pytest.raises(McpServerConfigurationError):
+        await runtime.call_tool(_record(server_id=server.id), {})
+
+    stored = await server_store.get(server.id, OWNER)
+    assert stored is not None
+    assert (stored.status, stored.reachable) == ("error", False)
+    assert stored.last_error is not None
+    assert "secret" not in stored.last_error
+
+
+@pytest.mark.asyncio
+async def test_a_tool_error_does_not_degrade_the_server(stores: Any) -> None:
+    """The server answered; only that call failed, so the row stays usable."""
+    server_store, tool_store = stores
+    server = await _server(server_store, server_id="s1", name="anysearch")
+    client = FakeClient()
+    client.call_error = McpToolError(
+        "MCP server 'anysearch' rejected the tool call (JSON-RPC error -32000)"
+    )
+    runtime = _runtime(server_store, tool_store, client=client)
+
+    with pytest.raises(McpToolError):
+        await runtime.call_tool(_record(server_id=server.id), {})
+
+    stored = await server_store.get(server.id, OWNER)
+    assert stored is not None
+    assert (stored.status, stored.reachable) == ("active", True)
+    assert stored.last_error is None
+
+
+class _CloseableResource:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_the_whole_retrieval_stack(stores: Any) -> None:
+    server_store, tool_store = stores
+    client = FakeClient()
+    index = FakeIndex()
+    embedder = _CloseableResource()
+    reranker = _CloseableResource()
+    runtime = _runtime(
+        server_store,
+        tool_store,
+        client=client,
+        index=index,
+        embedder=embedder,
+        reranker=reranker,
+        daily_delay=lambda: 3600.0,
+    )
+
+    await runtime.start()
+    await runtime.stop()
+
+    assert index.closed is True
+    assert embedder.closed is True
+    assert reranker.closed is True
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_runtime_refuses_new_passes(stores: Any) -> None:
+    server_store, tool_store = stores
+    server = await _server(server_store, server_id="s1", name="anysearch")
+    sync = FakeSync()
+    runtime = _runtime(
+        server_store, tool_store, sync=sync, daily_delay=lambda: 3600.0
+    )
+
+    await runtime.start()
+    await runtime.stop()
+
+    await runtime.request_refresh("admin")
+    assert await runtime.refresh_now("admin") == McpSyncStats()
+    result = await runtime.refresh_server(server.id)
+
+    assert sync.reasons == ["startup"], "no pass may start after stop()"
+    assert result.error == "mcp_stopped"
+    assert result.index_failed is False
+
+
+@pytest.mark.asyncio
+async def test_a_server_created_during_a_pass_is_not_stamped_by_it(stores: Any) -> None:
+    """A row that appeared mid-pass was never contacted, so it keeps its own state."""
+    server_store, tool_store = stores
+    first = await _server(server_store, server_id="s1", name="first")
+    sync = FakeSync()
+    sync.gate = asyncio.Event()
+    runtime = _runtime(
+        server_store, tool_store, sync=sync, daily_delay=lambda: 3600.0
+    )
+
+    pass_task = asyncio.create_task(runtime.refresh_now("manual"))
+    await asyncio.wait_for(sync.started.wait(), timeout=2)
+    # reachable=False keeps the helper from stamping it active itself: a freshly
+    # created row is pending until some pass actually contacts it.
+    late = await _server(server_store, server_id="s2", name="late", reachable=False)
+    sync.gate.set()
+    await asyncio.wait_for(pass_task, timeout=5)
+
+    stamped = await server_store.get(first.id, OWNER)
+    late_row = await server_store.get(late.id, OWNER)
+    assert stamped is not None and late_row is not None
+    assert (stamped.status, stamped.reachable) == ("active", True)
+    assert (late_row.status, late_row.reachable) == ("pending", False), (
+        "a server that appeared after the snapshot must not be claimed active"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_retrieval_build_reports_degraded_not_disabled(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import agentkit.knowledge.embedding as embedding_module
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("no embedder today")
+
+    monkeypatch.setattr(embedding_module, "OpenAICompatibleEmbedder", _boom)
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///" + (tmp_path / "mcp_degraded.db").as_posix()
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    runtime = build_mcp_runtime(_config(), factory, tool_search=_search())
+    assert runtime is not None
+    try:
+        assert runtime.index is None
+        status = await runtime.status()
+        assert status["index"] == "degraded", (
+            "the search block is on, so a missing index is breakage, not a switch"
+        )
+    finally:
+        reset_mcp_runtime()
+        reset_tool_search_runtime()
+        await runtime.stop()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_startup_index_failure_is_not_cleared_by_a_later_pass(
+    stores: Any,
+) -> None:
+    server_store, tool_store = stores
+    index = FakeIndex(ensure_error=RuntimeError("milvus is down"))
+    sync = FakeSync()
+    runtime = _runtime(
+        server_store, tool_store, sync=sync, index=index, daily_delay=lambda: 3600.0
+    )
+
+    await runtime.start()
+    try:
+        assert (await runtime.status())["index"] == "degraded"
+
+        await runtime.refresh_now("manual")  # a clean pass, but no recovered check
+        status = await runtime.status()
+        assert status["index"] == "degraded", (
+            "a pass reporting no error is not evidence the index recovered"
+        )
+        assert status["sync"] == "ready"
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_later_pass_that_fixes_the_index_clears_the_degradation(
+    stores: Any,
+) -> None:
+    server_store, tool_store = stores
+    index = FakeIndex(ensure_error=RuntimeError("milvus is down"))
+    sync = FakeSync()
+    runtime = _runtime(
+        server_store, tool_store, sync=sync, index=index, daily_delay=lambda: 3600.0
+    )
+
+    await runtime.start()
+    try:
+        assert (await runtime.status())["index"] == "degraded"
+        index.ensure_error = None  # Milvus came back
+        await runtime.refresh_now("manual")
+        assert (await runtime.status())["index"] == "ready"
+    finally:
+        await runtime.stop()
