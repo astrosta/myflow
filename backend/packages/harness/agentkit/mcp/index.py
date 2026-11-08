@@ -676,6 +676,7 @@ def _row(record: McpToolRecord, vector: Sequence[float]) -> dict[str, Any]:
         "tool_name": _text(record.name)[:255],
         "call_name": _text(record.call_name)[:255],
         "description": str(record.description or "")[:65535],
+        # McpToolRecord has no tags; keep the column empty until Task 10 decides.
         "tags": _json_list(getattr(record, "tags", ()))[:2048],
         "parameters": _json_list(record.parameters)[:2048],
         "content": str(record.content or "")[:65535],

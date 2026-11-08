@@ -345,6 +345,8 @@ class McpToolSearchService:
                 str(getattr(record, "description", "") or ""),
                 self.max_description_chars,
             ),
+            # McpToolRecord has no tags; cards read the DB row, so this stays
+            # empty for MCP tools and only supports duck-typed legacy records.
             tags=tuple(getattr(record, "tags", ()) or ()),
             parameters=tuple(getattr(record, "parameters", ()) or ()),
             input_schema=schema,
