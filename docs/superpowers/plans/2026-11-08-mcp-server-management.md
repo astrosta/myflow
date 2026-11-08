@@ -84,7 +84,7 @@ Expected: FAIL because the config module does not exist.
 
 - [ ] **Step 3: Implement the config model and add it to `AppConfig`**
 
-Use `ConfigDict(extra="forbid")`, `enabled=False` default, and a `validate_for_startup()` that checks a valid Fernet key and non-empty `allowed_schemes`. Add `mcp_servers: McpServersConfig = Field(default_factory=McpServersConfig)` and `tool_search: ToolSearchConfig = Field(default_factory=ToolSearchConfig)` to `AppConfig`.
+Use `ConfigDict(extra="forbid")`, `enabled=False` default, and a `validate_for_startup()` that checks a valid Fernet key and non-empty `allowed_schemes`. Add `mcp_servers: McpServersConfig = Field(default_factory=McpServersConfig)` and `tool_search: ToolSearchConfig = Field(default_factory=ToolSearchConfig)` to `AppConfig`. Add `("tool_search", "embedding")`, `("tool_search", "rerank")`, and `("tool_search", "vector_store")` to `_SHARED_SERVICE_PATHS`, replacing the old contextforge entries (Task 10 removes those).
 
 - [ ] **Step 4: Write failing crypto tests**
 
