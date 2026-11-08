@@ -19,6 +19,32 @@ class McpServerError(RuntimeError):
     status_code = 502
 
 
+class McpServerNotFound(McpServerError):
+    """No server with this id belongs to the caller.
+
+    A server is user-private, so another owner's id is deliberately reported as
+    "not found" rather than "forbidden": the response must not reveal that the row
+    exists for somebody else.
+    """
+
+    code = "mcp_server_not_found"
+    status_code = 404
+
+
+class McpServerConflict(McpServerError):
+    """A write conflicts with an existing server or the per-user limit."""
+
+    code = "mcp_server_conflict"
+    status_code = 409
+
+
+class McpServerValidationError(McpServerError, ValueError):
+    """The submitted server configuration is invalid (URL, headers, transport)."""
+
+    code = "mcp_server_invalid"
+    status_code = 422
+
+
 class McpServerUnavailable(McpServerError):
     """DNS, TCP, TLS or HTTP-layer failure: the server could not be reached."""
 
@@ -58,7 +84,10 @@ class McpToolError(McpServerError):
 
 __all__ = [
     "McpProtocolError",
+    "McpServerConflict",
     "McpServerError",
+    "McpServerNotFound",
+    "McpServerValidationError",
     "McpServerTimeout",
     "McpServerUnavailable",
     "McpToolError",

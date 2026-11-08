@@ -30,7 +30,7 @@ from pydantic import SecretStr
 MAX_HEADERS = 32
 MAX_HEADER_NAME_CHARS = 128
 MAX_HEADER_VALUE_CHARS = 4096
-MAX_HEADERS_TOTAL_CHARS = 16384
+MAX_HEADERS_TOTAL_CHARS = 32768
 
 #: RFC 9110 field-name tokens.  No colon, no whitespace, no CR/LF.
 _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^`|~0-9A-Za-z]+$")

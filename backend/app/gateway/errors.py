@@ -21,6 +21,11 @@ from agentkit.contextforge.models import (
     ContextForgeValidationError,
 )
 from agentkit.knowledge.errors import KnowledgeError
+from agentkit.mcp.errors import (
+    McpServerConflict,
+    McpServerNotFound,
+    McpServerValidationError,
+)
 from agentkit.persistence.base import InvalidCursor
 from agentkit.persistence.json_compat import InvalidMetadataFilterError
 from agentkit.persistence.thread_meta.base import ThreadOwnershipConflictError
@@ -158,6 +163,20 @@ class InvalidToolHeaderAPI(Exception):
     code: ClassVar[str] = "invalid_tool_header"
 
 
+class McpServersDisabled(Exception):
+    """The mcp_servers block is disabled or no service was composed."""
+
+    status_code: ClassVar[int] = 503
+    code: ClassVar[str] = "mcp_servers_disabled"
+
+
+class InvalidMcpServerHeaderAPI(Exception):
+    """A masked MCP server header had no stored value to restore."""
+
+    status_code: ClassVar[int] = 422
+    code: ClassVar[str] = "invalid_mcp_server_header"
+
+
 class SkillNotFound(Exception):
     """技能不存在、已被删除，或不属于当前用户。"""
 
@@ -278,6 +297,11 @@ def install_error_handlers(app: FastAPI) -> None:
         ContextForgeTimeout,
         ContextForgeUnavailable,
         ContextForgeValidationError,
+        McpServersDisabled,
+        InvalidMcpServerHeaderAPI,
+        McpServerNotFound,
+        McpServerConflict,
+        McpServerValidationError,
         SkillNotFound,
         SkillRuntimeUnavailable,
         SkillScannerUnavailable,
