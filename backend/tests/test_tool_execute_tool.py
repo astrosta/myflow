@@ -1606,3 +1606,60 @@ def test_every_origin_the_executor_reports_has_a_retryable_decision() -> None:
     assert reported == set(RETRYABLE_BY_ORIGIN), (
         "a new origin needs an explicit retryable decision, not a default"
     )
+
+# --------------------------------------------------------------------------- #
+# Audit: one INFO record per call, success or failure, never the arguments
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_successful_call_writes_one_audit_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, _ok(_text("ok")))
+
+        with caplog.at_level("INFO", logger=executor_module.__name__):
+            message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    records = [r for r in caplog.records if "MCP tool call" in r.getMessage()]
+    assert len(records) == 1
+    line = records[0].getMessage()
+    assert records[0].levelname == "INFO"
+    assert "call_name=" + CALL_NAME in line
+    assert "inner_name=search" in line
+    assert "tool_id=" + tool_id_for(SERVER_ID, "search") in line
+    assert "server_id=" + SERVER_ID in line
+    assert "status=success" in line
+    assert "origin=ok" in line
+    assert "duration_ms=" in line
+    # The owner rides as a fingerprint, and the arguments are never logged.
+    assert "owner=" in line
+    assert "u1" not in line
+    assert "pytest" not in line
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_also_writes_one_audit_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, McpServerUnavailable("down"))
+
+        with caplog.at_level("INFO", logger=executor_module.__name__):
+            message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "error"
+    records = [r for r in caplog.records if "MCP tool call" in r.getMessage()]
+    assert len(records) == 1
+    line = records[0].getMessage()
+    assert "call_name=" + CALL_NAME in line
+    assert "status=error" in line
+    assert "origin=server_unavailable" in line
+    assert "pytest" not in line
+

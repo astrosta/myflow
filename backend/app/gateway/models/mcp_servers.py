@@ -53,7 +53,9 @@ class McpServerCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    display_name: str | None = None
+    #: mcp_servers.display_name is VARCHAR(255); a longer value must be a 422 here
+    #: and not a Postgres error after SQLite let it through.
+    display_name: str | None = Field(default=None, max_length=255)
     description: str = ""
     url: str
     transport: McpTransportName = "streamable_http"
@@ -67,12 +69,15 @@ class McpServerUpdate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    display_name: str | None = None
+    display_name: str | None = Field(default=None, max_length=255)
     description: str | None = None
     url: str | None = None
     transport: McpTransportName | None = None
     headers: dict[str, str] | None = None
     verify_tls: bool | None = None
+    #: Drop the stored URL query string instead of preserving it.  The API never
+    #: returns a query string, so without this a stored one could never be removed.
+    clear_query: bool = False
 
     @field_validator("verify_tls", mode="before")
     @classmethod
@@ -111,7 +116,15 @@ class McpServerToolsResponse(BaseModel):
 
 
 class McpServerStatusResponse(BaseModel):
-    """The caller's server and tool counts; the runtime may add fields later."""
+    """The caller's server and tool counts plus this process's sync state.
+
+    The counts alone (the original Task 3 projection) hid every operational fact:
+    a deployment whose index was broken, or whose last pass failed, looked exactly
+    like a healthy one.  The runtime fills these in; the service fallback leaves
+    them at their defaults when no runtime is published.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
     servers_total: int = 0
@@ -121,9 +134,21 @@ class McpServerStatusResponse(BaseModel):
     servers_disabled: int = 0
     servers_reachable: int = 0
     tools_total: int = 0
+    #: Rows that are actually callable - not a synonym for tools_total.
     indexed_tools: int = 0
     last_sync_at: datetime | None = None
     last_error: str | None = None
+    #: "ready" | "degraded" | "syncing" | "disabled"
+    sync: str | None = None
+    #: "ready" | "degraded" | "disabled"
+    index: str | None = None
+    last_sync_reason: str | None = None
+    last_sync_duration_ms: int | None = None
+    #: Catalog-wide retry record (the last tool-error refresh); scoped reads leave
+    #: these empty so one user never learns about another user's retry.
+    last_retry_at: str | None = None
+    last_retry_tool: str | None = None
+    last_retry_result: str | None = None
 
 
 class McpServerReindexResponse(BaseModel):

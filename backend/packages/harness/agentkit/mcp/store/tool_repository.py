@@ -452,6 +452,7 @@ class McpToolStore:
         self,
         records: Sequence[McpToolRecord],
         seen_ids: Collection[str],
+        preserve_ids: Collection[str] | None = None,
     ) -> McpToolSnapshotStats:
         """Write a full MCP tool snapshot and retire what it did not rewrite.
 
@@ -473,6 +474,11 @@ class McpToolStore:
         than aborting the transaction, and counted in `skipped`; it is never written,
         so it can never be callable, and any stored row of the same tool stops being
         callable through the retire path.
+
+        `preserve_ids` is for a *filtered* snapshot: the rows of servers the caller
+        deliberately did not contact.  Those rows are neither rewritten nor retired -
+        the pass has no evidence about them, and retiring them would silently
+        disable other owners' tools whenever one user refreshed one server.
         """
         if seen_ids is None:
             raise ValueError(
@@ -480,6 +486,7 @@ class McpToolStore:
             )
         stamp = _now()
         observed = {str(tool_id) for tool_id in seen_ids if tool_id}
+        preserved = {str(tool_id) for tool_id in (preserve_ids or ()) if tool_id}
         prepared: list[_Prepared] = []
         skipped = 0
         for record in records:
@@ -543,8 +550,9 @@ class McpToolStore:
 
             # A row this snapshot did not rewrite was not revalidated, so it cannot
             # stay callable: the definition is kept, runtime availability is not.
+            # A preserved row is the exception: the pass never had it in scope.
             for row in rows:
-                if row.id in rewritten or not row.callable:
+                if row.id in rewritten or row.id in preserved or not row.callable:
                     continue
                 row.callable = False
                 disabled += 1

@@ -360,6 +360,12 @@ MCP 工具由 **MyFlow 自己管理**：每个用户把自己的 MCP server 加�
   **绝不写** `myflow_knowledge` / `myflow_skills_active`。
 - server URL 默认只允许 `https`（`allowed_schemes`），私网/loopback 默认拒绝
   （`allow_private_networks=false`）。这是 SSRF 边界，前端勾选不算数。
+- SSRF 还查**解析结果**：create/update 与每次建连前都用系统解析器（`getaddrinfo`，取全部地址）
+  解析主机名，命中私网/loopback/link-local 就拒绝（同一个 `allow_private_networks` 开关）。
+  建连时命中私网按**配置错误**处理：这一次调用失败、server 行被标成 error/unreachable，
+  而不是当成用户提交了坏参数。两个已知边界写在这里而不假装没有：解析不出来的名字放行
+  （离线部署仍要能存 server，连接自己会失败）；DNS rebinding 仍可能（检查在建连之前，
+  不是把解析结果钉进 transport）。
 
 ```bash
 # MCP SDK / cryptography / jsonschema 已在核心依赖里。
@@ -379,11 +385,17 @@ uv sync --all-packages --all-extras
 - `tool_execute` 只接受本轮 `tool_search` 返回过的 `call_name`（`tool_search.require_retrieved`，
   默认开），回 `mcp_tools` 读原始 schema 校验参数，再用 MCP 原名调对应的 server。
 - 预算：单卡 schema `max_schema_chars=3000`，整条工具消息 `max_result_chars=16000`。
+- 每次调用都写一条 INFO 审计日志：`call_name`、内部工具名、`tool_id`、`server_id`、
+  owner 指纹（sha256 前 12 位，不写用户 id）、`status`、`origin`、`duration_ms`。
+  **不记录参数、不记录 header**——成功的调用也有这一行，失败不再是唯一留痕。
 
 目录更新路径：
 
 1. **页面写操作**：`POST/PUT/DELETE /api/mcp-servers` 落库后立即同步该 server；失败保留
    server 行并记 `last_error`，用户修正后点刷新。
+   这一趟是**带 server 过滤的**同步：只连这一个 server，其他 owner 的 server 一行都不碰
+   （它们的行以 `preserve_ids` 传给 store，既不重写也不退休）。停用（`/state`）同样跑一趟，
+   否则 `mcp_tools.callable` 还是 true，`tool_search` 会继续推荐已停用 server 的工具。
 2. **refresh**：`POST /api/mcp-servers/{id}/refresh` 重新 `tools/list` 并同步该 server。
 3. **每日全量 + 启动同步**：进程级任务定期全量；启动时先同步一次。
 4. **工具调用纠错**：MCP 返回 not-found 或参数校验错误时，先刷新该 server 再重试**一次**；
@@ -397,8 +409,19 @@ uv sync --all-packages --all-extras
 
 `/api/mcp-servers` 是**每个用户自己的**接口：server 是 user-private，PAT 需要
 `mcp_servers:read` / `mcp_servers:write`，会话用户放行。header 在库里是 Fernet 密文，
-API 永远只回 `****`；编辑时原样回传，只发 `****` 而没有已存值会被拒绝（422），不会把
-掩码当凭据写库。server URL 的查询串不进 API/日志。
+API **所有** header 值都只回 `****`（不做名字白名单：`X-Custom-Token`、`X-Goog-Api-Key`
+也是凭据，漏一个就等于明文返回）；编辑时原样回传，只发 `****` 而没有已存值会被拒绝（422），
+不会把掩码当凭据写库。
+
+server URL 的查询串**永不回传**（只给 `url_has_query`），因此编辑保存时要小心处理：
+
+- 协议/主机/端口**不变**（同源）且地址没写查询串 → 沿用已保存的那段；
+- 换了主机/端口/协议 → **丢掉**已保存的查询串，旧 token 绝不会被发到新地址；
+- 想主动清掉 → `PUT` 带 `clear_query: true`（页面编辑框里的「删除已保存的查询串」勾选框）；
+  再显式写一个查询串则以新的为准。
+
+`GET /api/mcp-servers/status` 优先读**运行时**的状态（sync/index 状态、上次同步原因与耗时、
+调用纠错记录、真正可调用的 `indexed_tools`），没有运行时才退回服务层的行计数。
 
 | 方法 | 路径 | 作用 |
 |---|---|---|

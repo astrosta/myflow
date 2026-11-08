@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.config.mcp_servers_config import McpServersConfig
 from agentkit.config.tool_search_config import ToolSearchConfig
+from agentkit.mcp import net
 from agentkit.mcp.client import McpServerConnection
 from agentkit.mcp.crypto import HeaderCipher
 from agentkit.mcp.errors import (
@@ -52,7 +53,12 @@ from agentkit.mcp.runtime_protocol import (
     reset_mcp_runtime,
     set_mcp_runtime,
 )
-from agentkit.mcp.service import McpServerReindexStats
+from agentkit.mcp.index import ToolVectorHit
+from agentkit.mcp.service import (
+    McpServerReindexStats,
+    McpServerService,
+    ServerUrlPolicy,
+)
 from agentkit.mcp.store import (
     McpServerStore,
     McpToolRecord,
@@ -202,14 +208,22 @@ class FakeSync:
         self.error = error
         self.reasons: list[str] = []
         self.fulls: list[bool] = []
+        #: One entry per pass: the server filter the runtime asked for, if any.
+        self.filters: list[set[str] | None] = []
         self.active = 0
         self.max_active = 0
         self.started = asyncio.Event()
         self.gate: asyncio.Event | None = None
 
-    async def sync(self, reason: str = "manual", full: bool = False) -> McpSyncStats:
+    async def sync(
+        self,
+        reason: str = "manual",
+        full: bool = False,
+        server_ids: set[str] | None = None,
+    ) -> McpSyncStats:
         self.reasons.append(reason)
         self.fulls.append(full)
+        self.filters.append(None if server_ids is None else set(server_ids))
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         self.started.set()
@@ -664,7 +678,9 @@ async def test_an_aborted_pass_is_not_a_refresh(stores: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_server_stamps_the_servers_it_walked(stores: Any) -> None:
+async def test_a_server_refresh_contacts_and_stamps_only_that_server(stores: Any) -> None:
+    """A write's refresh is one server's business: a stranger's dead endpoint is not
+    contacted, and its row keeps whatever state it had."""
     server_store, tool_store = stores
     good = await _server(server_store, server_id="s1", name="good")
     bad = await _server(server_store, server_id="s2", name="bad")
@@ -677,6 +693,28 @@ async def test_sync_server_stamps_the_servers_it_walked(stores: Any) -> None:
 
     assert isinstance(result, McpServerSyncResult)
     assert result.error is None
+    # Only the named server was contacted.
+    assert [connection.server_id for connection in client.connections] == [good.id]
+    stamped_good = await server_store.get(good.id, OWNER)
+    stamped_bad = await server_store.get(bad.id, OWNER)
+    assert stamped_good is not None and stamped_bad is not None
+    assert (stamped_good.status, stamped_good.reachable) == ("active", True)
+    # Nothing contacted "bad", so nothing may stamp it.
+    assert (stamped_bad.status, stamped_bad.reachable) == ("active", True)
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_wide_pass_stamps_every_server_it_walked(stores: Any) -> None:
+    server_store, tool_store = stores
+    good = await _server(server_store, server_id="s1", name="good")
+    bad = await _server(server_store, server_id="s2", name="bad")
+    client = FakeClient()
+    client.results[good.id] = [_mcp_tool("search")]
+    client.errors[bad.id] = McpServerUnavailable("MCP server 'bad' is unavailable")
+    runtime = _runtime(server_store, tool_store, client=client, daily_delay=lambda: 3600.0)
+
+    await runtime.refresh_now("manual")
+
     stamped_good = await server_store.get(good.id, OWNER)
     stamped_bad = await server_store.get(bad.id, OWNER)
     assert stamped_good is not None and stamped_bad is not None
@@ -799,6 +837,36 @@ async def test_call_tool_routes_to_the_owning_server_with_decrypted_headers(
     # The upstream server gets the bare tool name, never the mcp__ call name.
     assert name == "search"
     assert arguments == {"query": "x"}
+
+
+@pytest.mark.asyncio
+async def test_call_tool_refuses_a_stored_url_that_resolves_privately(
+    stores: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The connection is the last moment the resolution check can run.
+
+    A row written before the guard existed (or before the deployment tightened
+    `allow_private_networks`) must not reach 127.0.0.1 just because it is already
+    stored.
+    """
+    server_store, tool_store = stores
+    server = await _server(server_store, server_id="s1", name="anysearch")
+    record = _record(server_id=server.id, server_name=server.name)
+    client = FakeClient()
+    runtime = _runtime(server_store, tool_store, client=client)
+    monkeypatch.setattr(
+        net, "resolve_host_addresses", lambda host, port=None: ("127.0.0.1",)
+    )
+
+    with pytest.raises(McpServerConfigurationError) as excinfo:
+        await runtime.call_tool(record, {"query": "x"})
+
+    assert "private" in str(excinfo.value)
+    assert client.calls == []
+    # The row is degraded exactly like an unreachable endpoint.
+    degraded = await server_store.get(server.id, OWNER)
+    assert degraded is not None
+    assert (degraded.status, degraded.reachable) == ("error", False)
 
 
 @pytest.mark.asyncio
@@ -1406,3 +1474,76 @@ async def test_a_server_disabled_during_a_pass_stays_disabled(stores: Any) -> No
         "the disable happened during the pass and must survive it"
     )
     assert stored.last_tools_sync_at is None
+
+# --------------------------------------------------------------------------- #
+# Disabling a server retires its tools from retrieval (design 4.2 rule 3)
+# --------------------------------------------------------------------------- #
+
+
+class _RecallIndex:
+    """Keyword-channel index double: always recalls the row it was given."""
+
+    def __init__(self, tool_id: str) -> None:
+        self.tool_id = tool_id
+        self.queries: list[str] = []
+
+    async def ensure_collection(self, dimensions: int | None = None) -> None:
+        return None
+
+    async def keyword_search(self, *, query: str, owner_user_id: str, limit: int):
+        self.queries.append(query)
+        return [ToolVectorHit("search", 0.9, tool_id=self.tool_id)]
+
+
+@pytest.mark.asyncio
+async def test_disabling_a_server_drops_its_tools_from_tool_search(stores: Any) -> None:
+    """A disable is a catalog change, not only a flag on mcp_servers.
+
+    `mcp_tools.callable` is a store output, so until a sync carries the rows the
+    server's tools stay callable: tool_search keeps offering them and tool_execute
+    keeps accepting them.  The service therefore runs one filtered pass on disable.
+    """
+    server_store, tool_store = stores
+    server = await _server(server_store, server_id="s1", name="anysearch")
+    client = FakeClient()
+    client.results[server.id] = [_mcp_tool("search")]
+    runtime = _runtime(server_store, tool_store, client=client, daily_delay=lambda: 3600.0)
+    await runtime.sync_server(server.id)
+
+    row = await tool_store.get_by_call_name(
+        call_name_for("anysearch", "search"), OWNER
+    )
+    assert row is not None and row.callable is True
+    index = _RecallIndex(row.id)
+    search = McpToolSearchService(
+        ToolSearchConfig(
+            enabled=True,
+            embedding={"enabled": False},
+            keyword={"enabled": True},
+            vector_store=dict(VECTOR_STORE),
+        ),
+        index=index,
+        store=tool_store,
+    )
+    before = await search.search(task_query="search the web", user_id=OWNER)
+    assert [card.call_name for card in before.hits] == ["mcp__anysearch__search"]
+
+    service = McpServerService(
+        store=server_store,
+        cipher=runtime.cipher,
+        client=client,
+        sync=runtime,
+        tool_store=tool_store,
+        policy=ServerUrlPolicy(allow_private_networks=True),
+    )
+    disabled = await service.set_enabled(server.id, OWNER, False)
+
+    assert disabled.enabled is False
+    assert disabled.status == "disabled"
+    retired = await tool_store.get_by_call_name(
+        call_name_for("anysearch", "search"), OWNER
+    )
+    assert retired is not None and retired.callable is False
+    after = await search.search(task_query="search the web", user_id=OWNER)
+    assert after.hits == ()
+

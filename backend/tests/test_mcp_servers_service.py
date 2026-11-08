@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from agentkit.mcp import net
 from agentkit.mcp.crypto import HeaderCipher, validate_headers
 from agentkit.mcp.errors import (
     McpServerConfigurationError,
@@ -54,7 +55,9 @@ class FakeSync:
         if self.failure is not None:
             raise self.failure
         row = next((row for row in await self.store.list_all() if row.id == server_id), None)
-        if row is not None:
+        # Mirrors the runtime's stamp rule: a pass never revives a disabled row,
+        # because nothing contacted it.
+        if row is not None and row.enabled:
             await self.store.set_status(
                 server_id, row.owner_user_id, status="active", reachable=True
             )
@@ -618,7 +621,7 @@ async def test_delete_is_owner_scoped_and_never_touches_the_catalog(
 
 
 @pytest.mark.asyncio
-async def test_set_enabled_is_owner_scoped_and_syncs_only_when_enabling(
+async def test_disable_retires_the_catalog_and_enable_syncs_it_again(
     service: McpServerService, sync: FakeSync
 ) -> None:
     created = await service.create_server("u1", write())
@@ -627,15 +630,33 @@ async def test_set_enabled_is_owner_scoped_and_syncs_only_when_enabling(
     disabled = await service.set_enabled(created.id, "u1", False)
     assert disabled.enabled is False
     assert disabled.status == "disabled"
-    assert sync.calls == []
+    # Disabling is a write *and* a catalog change: callable is a store output, so
+    # the rows have to be carried as unreachable before tool_search stops offering
+    # them.  One pass, with its own reason.
+    assert sync.calls == [(created.id, "server_disabled")]
 
     enabled = await service.set_enabled(created.id, "u1", True)
     assert enabled.enabled is True
     assert enabled.status == "active"
-    assert sync.calls == [(created.id, None)]
+    assert sync.calls[-1] == (created.id, None)
 
     with pytest.raises(McpServerNotFound):
         await service.set_enabled(created.id, "u2", True)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_retirement_keeps_the_server_disabled(
+    service: McpServerService, sync: FakeSync
+) -> None:
+    created = await service.create_server("u1", write())
+    sync.failure = RuntimeError("catalog is down")
+
+    disabled = await service.set_enabled(created.id, "u1", False)
+
+    # The disable landed; a sync failure must not flip the row to error and must
+    # not fail the request - the store already refuses every call.
+    assert disabled.enabled is False
+    assert disabled.status == "disabled"
 
 
 @pytest.mark.asyncio
@@ -745,3 +766,295 @@ def test_shared_header_validator_keeps_the_32_kib_budget() -> None:
     headers = {f"X-Custom-{index}": "x" * 3000 for index in range(8)}
 
     assert validate_headers(headers) == headers
+
+# --------------------------------------------------------------------------- #
+# URL query custody: the stored query is a credential
+# --------------------------------------------------------------------------- #
+
+QUERY_URL = "https://api.anysearch.com/mcp?token=old-secret"
+
+
+@pytest.mark.asyncio
+async def test_a_same_origin_path_change_preserves_the_stored_query(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server("u1", write(url=QUERY_URL))
+
+    await service.update_server(
+        created.id, "u1", McpServerWrite(url="https://api.anysearch.com/v2/mcp")
+    )
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert stored.url == "https://api.anysearch.com/v2/mcp?token=old-secret"
+
+
+@pytest.mark.asyncio
+async def test_a_cross_host_edit_drops_the_stored_query(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    """The old token must never be re-attached to a different server."""
+    created = await service.create_server("u1", write(url=QUERY_URL))
+
+    await service.update_server(
+        created.id, "u1", McpServerWrite(url="https://mcp.example.net/mcp")
+    )
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert stored.url == "https://mcp.example.net/mcp"
+    assert "old-secret" not in stored.url
+
+
+@pytest.mark.asyncio
+async def test_a_cross_port_edit_is_a_different_origin_too(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server("u1", write(url=QUERY_URL))
+
+    await service.update_server(
+        created.id, "u1", McpServerWrite(url="https://api.anysearch.com:8443/mcp")
+    )
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert "old-secret" not in stored.url
+
+
+@pytest.mark.asyncio
+async def test_clear_query_removes_a_stored_query_without_changing_the_url(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server("u1", write(url=QUERY_URL))
+
+    await service.update_server(created.id, "u1", McpServerWrite(clear_query=True))
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert stored.url == "https://api.anysearch.com/mcp"
+    assert url_has_query(stored.url) is False
+
+
+@pytest.mark.asyncio
+async def test_clear_query_wins_over_a_query_in_the_incoming_url(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server("u1", write(url=QUERY_URL))
+
+    await service.update_server(
+        created.id,
+        "u1",
+        McpServerWrite(url="https://api.anysearch.com/mcp?token=new", clear_query=True),
+    )
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert stored.url == "https://api.anysearch.com/mcp"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_new_query_replaces_the_stored_one(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server("u1", write(url=QUERY_URL))
+
+    await service.update_server(
+        created.id, "u1", McpServerWrite(url="https://api.anysearch.com/mcp?token=new")
+    )
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert stored.url == "https://api.anysearch.com/mcp?token=new"
+
+
+# --------------------------------------------------------------------------- #
+# Header masking: every value, not a name allowlist
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_every_header_value_is_masked_not_just_known_names(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server(
+        "u1",
+        write(
+            headers={
+                "Authorization": "Bearer secret",
+                "X-Custom-Token": "vendor-secret",
+                "X-Goog-Api-Key": "google-secret",
+                "X-Env": "prod",
+            }
+        ),
+    )
+
+    masked = service.masked_headers(await store.get(created.id, "u1"))
+
+    assert set(masked) == {"Authorization", "X-Custom-Token", "X-Goog-Api-Key", "X-Env"}
+    assert set(masked.values()) == {MASK}
+    assert "vendor-secret" not in repr(masked)
+    assert "google-secret" not in repr(masked)
+    assert "prod" not in repr(masked)
+
+
+@pytest.mark.asyncio
+async def test_masked_headers_round_trip_restores_every_value(
+    service: McpServerService, store: McpServerStore, cipher: HeaderCipher
+) -> None:
+    created = await service.create_server(
+        "u1", write(headers={"X-Custom-Token": "vendor-secret"})
+    )
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+
+    await service.update_server(
+        created.id, "u1", McpServerWrite(headers=service.masked_headers(stored))
+    )
+
+    assert cipher.decrypt((await store.get(created.id, "u1")).headers_encrypted) == {
+        "X-Custom-Token": "vendor-secret"
+    }
+
+
+# --------------------------------------------------------------------------- #
+# display_name is a VARCHAR(255): the service refuses a longer label
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_display_name_longer_than_the_column_is_a_validation_error(
+    service: McpServerService,
+) -> None:
+    with pytest.raises(McpServerValidationError, match="display_name"):
+        await service.create_server("u1", write(display_name="x" * 256))
+
+
+@pytest.mark.asyncio
+async def test_display_name_at_the_column_width_is_accepted(
+    service: McpServerService,
+) -> None:
+    record = await service.create_server("u1", write(display_name="x" * 255))
+
+    assert record.display_name == "x" * 255
+
+
+@pytest.mark.asyncio
+async def test_an_update_cannot_smuggle_a_too_long_display_name(
+    service: McpServerService,
+) -> None:
+    created = await service.create_server("u1", write())
+
+    with pytest.raises(McpServerValidationError, match="display_name"):
+        await service.update_server(
+            created.id, "u1", McpServerWrite(display_name="y" * 256)
+        )
+
+
+# --------------------------------------------------------------------------- #
+# SSRF: the hostname is resolved, not just matched as a literal
+# --------------------------------------------------------------------------- #
+
+
+def _resolves_to(monkeypatch: pytest.MonkeyPatch, *addresses: str) -> list[str]:
+    asked: list[str] = []
+
+    def _resolve(host: str, port: int | None = None) -> tuple[str, ...]:
+        asked.append(host)
+        return tuple(addresses)
+
+    monkeypatch.setattr(net, "resolve_host_addresses", _resolve)
+    return asked
+
+
+@pytest.mark.asyncio
+async def test_a_hostname_resolving_to_loopback_is_rejected(
+    service: McpServerService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _resolves_to(monkeypatch, "127.0.0.1")
+
+    with pytest.raises(McpServerValidationError, match="private"):
+        await service.create_server(
+            "u1", write(url="https://rebind.anysearch.com/mcp")
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_hostname_resolving_to_a_private_range_is_rejected(
+    service: McpServerService, store: McpServerStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _resolves_to(monkeypatch, "93.184.216.34", "10.1.2.3")
+
+    with pytest.raises(McpServerValidationError, match="10.1.2.3"):
+        await service.create_server("u1", write(url="https://mixed.anysearch.com/mcp"))
+
+    assert await store.list_for_owner("u1") == []
+
+
+@pytest.mark.asyncio
+async def test_an_update_cannot_point_a_stored_server_at_a_private_host(
+    service: McpServerService, store: McpServerStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = await service.create_server("u1", write())
+    _resolves_to(monkeypatch, "169.254.169.254")
+
+    with pytest.raises(McpServerValidationError, match="private"):
+        await service.update_server(
+            created.id, "u1", McpServerWrite(url="https://metadata.anysearch.com/mcp")
+        )
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert stored.url == "https://api.anysearch.com/mcp"
+
+
+@pytest.mark.asyncio
+async def test_a_public_resolution_is_accepted(
+    service: McpServerService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked = _resolves_to(monkeypatch, "93.184.216.34")
+
+    record = await service.create_server("u1", write())
+
+    assert record.url == "https://api.anysearch.com/mcp"
+    assert asked == ["api.anysearch.com"]
+
+
+@pytest.mark.asyncio
+async def test_allow_private_networks_skips_the_resolution_check(
+    store: McpServerStore,
+    cipher: HeaderCipher,
+    sync: FakeSync,
+    tool_store: FakeToolStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked = _resolves_to(monkeypatch, "127.0.0.1")
+    service = McpServerService(
+        store=store,
+        cipher=cipher,
+        client=SimpleNamespace(),
+        sync=sync,
+        tool_store=tool_store,
+        policy=ServerUrlPolicy(
+            allowed_schemes=["http", "https"],
+            allow_private_networks=True,
+            max_servers_per_user=3,
+        ),
+    )
+
+    record = await service.create_server("u1", write(url="http://127.0.0.1:8080/mcp"))
+
+    assert record.url == "http://127.0.0.1:8080/mcp"
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_hostname_is_not_rejected_here(
+    service: McpServerService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best effort: an offline deployment must still be able to store a server."""
+    _resolves_to(monkeypatch)
+
+    record = await service.create_server("u1", write())
+
+    assert record.url == "https://api.anysearch.com/mcp"
+

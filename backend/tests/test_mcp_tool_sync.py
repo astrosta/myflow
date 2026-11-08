@@ -32,6 +32,7 @@ import pytest_asyncio
 from mcp import types as mcp_types
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from agentkit.mcp import net
 from agentkit.mcp.catalog import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     build_tool_content,
@@ -115,12 +116,14 @@ class RecordingToolStore:
     """A tool store that records every snapshot the sync asks it to write.
 
     The real store is still the writer - the wrapper only exposes *how* it was
-    called, which is what proves the sync never writes a per-server snapshot.
+    called, which is what proves the sync never writes a per-server snapshot and
+    which rows a filtered pass handed over as preserved.
     """
 
     def __init__(self, store: McpToolStore) -> None:
         self.store = store
         self.snapshots: list[tuple[list[McpToolRecord], set[str]]] = []
+        self.preserved: list[set[str]] = []
 
     async def list_all(self, owner_user_id: str | None = None):
         return await self.store.list_all(owner_user_id)
@@ -128,9 +131,12 @@ class RecordingToolStore:
     async def list_for_server(self, server_id: str, owner_user_id: str):
         return await self.store.list_for_server(server_id, owner_user_id)
 
-    async def upsert_snapshot(self, records, seen_ids):
+    async def upsert_snapshot(self, records, seen_ids, preserve_ids=None):
         self.snapshots.append((list(records), set(seen_ids)))
-        return await self.store.upsert_snapshot(records, seen_ids)
+        self.preserved.append(set(preserve_ids or ()))
+        return await self.store.upsert_snapshot(
+            records, seen_ids, preserve_ids=preserve_ids
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -719,3 +725,128 @@ def test_sync_stats_default_to_a_no_op_run() -> None:
     assert stats.error is None
     assert stats.index_failed is False
     assert stats.conflicts == ()
+
+# --------------------------------------------------------------------------- #
+# Filtered passes: one server's refresh must not walk (or retire) the rest
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_filtered_pass_contacts_only_the_named_servers(
+    server_store, tool_store, client
+) -> None:
+    """A management write is one server's business.
+
+    Contacting every owner's server would make one user's click wait on a
+    stranger's dead endpoint, so the pass takes a server filter.  The snapshot
+    stays complete: the out-of-scope rows are handed over as preserved, which is
+    what keeps their callability intact.
+    """
+    mine = await server_store.create(server_record("mine"))
+    other = await server_store.create(server_record("other", owner=OTHER_OWNER))
+    client.results[mine.id] = [mcp_tool("search")]
+    client.errors[other.id] = McpServerUnavailable("dead endpoint")
+    await seed(tool_store, prior_tool(other, "old"))
+    recording = RecordingToolStore(tool_store)
+    sync = McpCatalogSync(server_store, recording, client)
+
+    stats = await sync.sync("server_refresh", server_ids={mine.id})
+
+    assert client.called == [mine.id]
+    assert stats.servers_scanned == 1
+    assert stats.servers_failed == 0
+    assert stats.error is None
+    # The stranger's row was neither rewritten nor retired.
+    kept = await tool_store.get_by_call_name(
+        call_name_for("other", "old"), OTHER_OWNER
+    )
+    assert kept is not None
+    assert kept.callable is True
+    assert kept.id in recording.preserved[0]
+    # ... and the named server's tools are live.
+    fresh = await tool_store.get_by_call_name(call_name_for("mine", "search"), OWNER)
+    assert fresh is not None and fresh.callable is True
+
+
+@pytest.mark.asyncio
+async def test_a_filtered_pass_carries_a_disabled_servers_rows(
+    server_store, tool_store, client
+) -> None:
+    """The disable path is a filtered pass over a switched-off server.
+
+    Nothing is contacted (the server is off), and its rows come back
+    reachable=False, which is what makes the store drop mcp_tools.callable.
+    """
+    off = await server_store.create(server_record("off", enabled=False))
+    await seed(tool_store, prior_tool(off, "search"))
+    sync = McpCatalogSync(server_store, tool_store, client)
+
+    stats = await sync.sync("server_disabled", server_ids={off.id})
+
+    assert client.called == []
+    assert stats.servers_scanned == 1
+    rows = await tool_store.list_for_server(off.id, OWNER)
+    assert len(rows) == 1
+    assert rows[0].callable is False
+    assert rows[0].enabled is False
+
+
+@pytest.mark.asyncio
+async def test_a_whole_catalog_pass_still_retires_an_unreachable_servers_tools(
+    server_store, tool_store, client, sync
+) -> None:
+    """The filter must not weaken the unfiltered pass it sits next to."""
+    good = await server_store.create(server_record("good"))
+    bad = await server_store.create(server_record("bad"))
+    client.results[good.id] = [mcp_tool("search")]
+    client.errors[bad.id] = McpServerUnavailable("down")
+    await seed(tool_store, prior_tool(bad, "old"))
+
+    await sync.sync("daily", full=True)
+
+    assert sorted(client.called) == sorted([good.id, bad.id])
+    retired = await tool_store.get_by_call_name(call_name_for("bad", "old"), OWNER)
+    assert retired is not None and retired.callable is False
+
+@pytest.mark.asyncio
+async def test_a_stored_url_that_resolves_privately_is_never_contacted(
+    server_store, tool_store, client, monkeypatch
+) -> None:
+    """A stored row can outlive the check that wrote it, so the pass re-resolves."""
+    server = await server_store.create(server_record("rebound"))
+    client.results[server.id] = [mcp_tool("search")]
+    monkeypatch.setattr(
+        net, "resolve_host_addresses", lambda host, port=None: ("127.0.0.1",)
+    )
+    sync = McpCatalogSync(server_store, tool_store, client)
+
+    stats = await sync.sync("daily")
+
+    assert client.called == []
+    assert stats.servers_failed == 1
+    assert [failure.server_id for failure in stats.failed_servers] == [server.id]
+    assert "private" in (stats.failed_servers[0].error or "")
+    assert "rebound" in (stats.failed_servers[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_allow_private_networks_lets_the_pass_reach_a_private_server(
+    server_store, tool_store, client, monkeypatch
+) -> None:
+    server = await server_store.create(
+        server_record("local", url="http://127.0.0.1:8080/mcp")
+    )
+    client.results[server.id] = [mcp_tool("search")]
+    monkeypatch.setattr(
+        net, "resolve_host_addresses", lambda host, port=None: ("127.0.0.1",)
+    )
+    sync = McpCatalogSync(
+        server_store, tool_store, client, allow_private_networks=True
+    )
+
+    stats = await sync.sync("daily")
+
+    assert client.called == [server.id]
+    assert stats.servers_failed == 0
+
+

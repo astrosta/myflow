@@ -326,6 +326,14 @@ interface StatusBarProps {
   status: McpServerStatus | undefined;
 }
 
+/** 运行时的 sync/index 状态 → Badge 颜色；未知值按中性处理。 */
+function syncVariant(value: string): "success" | "warning" | "danger" | "neutral" {
+  if (value === "ready") return "success";
+  if (value === "degraded") return "danger";
+  if (value === "syncing") return "warning";
+  return "neutral";
+}
+
 function StatusBar({ error, loading, status }: StatusBarProps) {
   return (
     <section
@@ -341,6 +349,12 @@ function StatusBar({ error, loading, status }: StatusBarProps) {
         </Badge>
         <Badge variant="outline">{`工具 ${status?.tools_total ?? 0}`}</Badge>
         <Badge variant="outline">{`已索引 ${status?.indexed_tools ?? 0}`}</Badge>
+        {status?.sync ? (
+          <Badge variant={syncVariant(status.sync)}>{`同步 ${status.sync}`}</Badge>
+        ) : null}
+        {status?.index ? (
+          <Badge variant={syncVariant(status.index)}>{`索引 ${status.index}`}</Badge>
+        ) : null}
       </div>
       <p className="mt-2 text-[11px] text-neutral-500">
         {loading
@@ -352,7 +366,19 @@ function StatusBar({ error, loading, status }: StatusBarProps) {
       <p className="mt-1 text-[11px] text-neutral-500">
         {`${status?.tools_total ?? 0} 个工具，已索引 ${status?.indexed_tools ?? 0} 个`}
         {status?.last_sync_at ? ` · 上次同步 ${status.last_sync_at}` : ""}
+        {status?.last_sync_reason
+          ? `（${status.last_sync_reason}${
+              typeof status.last_sync_duration_ms === "number"
+                ? ` · ${status.last_sync_duration_ms}ms`
+                : ""
+            }）`
+          : ""}
       </p>
+      {status?.last_retry_at ? (
+        <p className="mt-1 text-[11px] text-neutral-500">
+          {`最近一次调用纠错 ${status.last_retry_at}：${status.last_retry_tool ?? ""} → ${status.last_retry_result ?? ""}`}
+        </p>
+      ) : null}
       {status?.last_error ? (
         <p className="mt-1 text-[11px] text-red-600">{status.last_error}</p>
       ) : null}

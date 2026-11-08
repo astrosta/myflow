@@ -57,6 +57,7 @@ from mcp import types as mcp_types
 
 from agentkit.config.mcp_servers_config import McpServersConfig
 from agentkit.config.tool_search_config import ToolSearchConfig
+from agentkit.mcp import net
 from agentkit.mcp.client import McpServerClient, McpServerConnection
 from agentkit.mcp.crypto import HeaderCipher
 from agentkit.mcp.errors import (
@@ -341,7 +342,11 @@ class McpToolRuntime:
             # "Not refreshed" is the honest answer: nothing ran, so a caller must
             # not treat the stored snapshot as fresh.
             return McpServerSyncResult(server_id=server_id, error="mcp_stopped")
-        pass_ = await self._sync_pass(reason)
+        # Filtered to the one server: a management write (or tool_execute's retry)
+        # is about this server, and contacting every other owner's server would make
+        # one user's click wait on a stranger's dead endpoint.  The snapshot stays
+        # complete - the sync preserves the out-of-scope rows.
+        pass_ = await self._sync_pass(reason, server_ids={server_id})
         return self._target_result(pass_, server_id)
 
     async def remove_server_catalog(self, server_id: str) -> tuple[str, ...]:
@@ -427,8 +432,18 @@ class McpToolRuntime:
 
     # -- one pass ---------------------------------------------------------- #
 
-    async def _sync_pass(self, reason: str, *, full: bool = False) -> _Pass:
-        """Run exactly one catalog pass under the process lock, then stamp."""
+    async def _sync_pass(
+        self,
+        reason: str,
+        *,
+        full: bool = False,
+        server_ids: set[str] | None = None,
+    ) -> _Pass:
+        """Run exactly one pass under the process lock, then stamp.
+
+        `server_ids` narrows the pass to specific servers (a write's refresh); None
+        is the catalog-wide startup/daily/manual pass.
+        """
         async with self._lock:
             started = asyncio.get_running_loop().time()
             self._sync_state = "syncing"
@@ -443,9 +458,13 @@ class McpToolRuntime:
             # ids are kept - the stamp itself re-reads the rows afterwards, because
             # their enabled flag may have changed while the pass was in flight.
             walked = {row.id for row in await self._server_rows()}
+            if server_ids is not None:
+                walked &= {str(server_id) for server_id in server_ids}
             aborted = False
             try:
-                stats = await self.sync.sync(reason, full=full)
+                stats = await self.sync.sync(
+                    reason, full=full, server_ids=server_ids
+                )
             except Exception as exc:  # noqa: BLE001 - reported as status, never raised
                 # The sync documents no raise; if the database itself is gone it
                 # still must not take a request (or a started gateway) down.
@@ -728,6 +747,16 @@ class McpToolRuntime:
         """
         server = await self._callable_server(record)
         try:
+            # A stored URL is replayed on every call, so the resolution guard runs
+            # here as well as at write time: the row may predate the check, or the
+            # deployment may have tightened allow_private_networks.
+            await net.ensure_public_endpoint(
+                server.url,
+                allow_private_networks=self.config.allow_private_networks,
+                # Configuration, not validation: the row is degraded like an
+                # unreachable endpoint (McpServerConfigurationError is degrading).
+                error=McpServerConfigurationError,
+            )
             # Building the connection is part of the call: an undecryptable header
             # map is a broken server row, not a failed tool, and it must degrade
             # the row exactly like an unreachable endpoint does.
@@ -890,7 +919,15 @@ def build_mcp_runtime(
             index = None
             embedder = None
             reranker = None
-    sync = McpCatalogSync(server_store, tool_store, client, index, embedder, cipher=cipher)
+    sync = McpCatalogSync(
+        server_store,
+        tool_store,
+        client,
+        index,
+        embedder,
+        cipher=cipher,
+        allow_private_networks=config.allow_private_networks,
+    )
     runtime = McpToolRuntime(
         config,
         sync,

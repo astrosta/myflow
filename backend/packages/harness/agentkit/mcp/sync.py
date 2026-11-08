@@ -48,6 +48,7 @@ from typing import Any, Protocol
 
 from mcp import types as mcp_types
 
+from agentkit.mcp import net
 from agentkit.mcp.catalog import DEFAULT_MAX_DOCUMENT_CHARS, build_tool_document
 from agentkit.mcp.client import McpServerConnection
 from agentkit.mcp.crypto import HeaderCipher
@@ -246,6 +247,7 @@ class McpCatalogSync:
         connection_factory: McpConnectionFactory | None = None,
         clock: Callable[[], float] = time.monotonic,
         max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS,
+        allow_private_networks: bool = False,
     ) -> None:
         self._server_store = server_store
         self._tool_store = tool_store
@@ -258,15 +260,36 @@ class McpCatalogSync:
         self._connection_factory = connection_factory
         self._clock = clock
         self._max_document_chars = max_document_chars
+        #: The deployment's SSRF opt-in.  A stored URL is replayed on every pass, so
+        #: the resolution check has to run here too, not only when it was written.
+        self._allow_private_networks = bool(allow_private_networks)
 
-    async def sync(self, reason: str = "manual", full: bool = False) -> McpSyncStats:
-        """Read every server and publish one complete tool snapshot.
+    async def sync(
+        self,
+        reason: str = "manual",
+        full: bool = False,
+        server_ids: Collection[str] | None = None,
+    ) -> McpSyncStats:
+        """Read servers and publish one complete tool snapshot.
 
         reason is for logs only (startup, daily, server_refresh, ...) and full is
         forwarded to the index, which may use it to rebuild from scratch.
+
+        `server_ids` narrows *which servers are contacted* - a management write or a
+        tool-error refresh is about one server, and contacting every owner's server
+        would let one user's click wait on a stranger's dead endpoint.  The snapshot
+        stays complete: the rows of the servers outside the filter are passed to the
+        store as `preserve_ids`, so they are neither rewritten nor retired.  Without
+        that, a per-server pass would disable every other server's tools.
         """
         started = self._clock()
         servers = list(await self._server_store.list_all())
+        selected = (
+            {server.id for server in servers}
+            if server_ids is None
+            else {str(server_id) for server_id in server_ids if server_id}
+        )
+        filtered = server_ids is not None
         rows = list(await self._tool_store.list_all())
         rows_by_server: dict[str, list[McpToolRecord]] = {}
         for row in rows:
@@ -279,13 +302,25 @@ class McpCatalogSync:
         failed_servers: list[McpServerFailure] = []
         servers_failed = 0
 
+        preserve_ids: set[str] = set()
         for server in servers:
             server_rows = rows_by_server.get(server.id, [])
+            if server.id not in selected:
+                # Out of this pass's scope: the rows stay exactly as stored.
+                preserve_ids.update(row.id for row in server_rows)
+                continue
             if not server.enabled:
                 # Switched off: keep what it offered, publish nothing, stay offline.
                 records.extend(_carried(server, server_rows))
                 continue
             try:
+                await net.ensure_public_endpoint(
+                    server.url,
+                    allow_private_networks=self._allow_private_networks,
+                    # A stored row is a deployment fact, not a bad request: the sync
+                    # reports it as this server's failure instead of a 422.
+                    error=McpServerConfigurationError,
+                )
                 connection = self._connection_for(server)
                 tools = list(await self._client.list_tools(connection))
             except Exception as exc:  # noqa: BLE001 - one server must not stop the rest
@@ -312,14 +347,27 @@ class McpCatalogSync:
             seen_ids.update(record.id for record in built)
 
         # One call, one transaction: a per-server snapshot would retire every other
-        # server's tools, so the complete list goes in together.
-        snapshot = await self._tool_store.upsert_snapshot(records, seen_ids)
+        # server's tools, so the complete list goes in together.  A filtered pass
+        # hands the out-of-scope rows over as preserved instead.
+        if preserve_ids:
+            snapshot = await self._tool_store.upsert_snapshot(
+                records, seen_ids, preserve_ids=preserve_ids
+            )
+        else:
+            snapshot = await self._tool_store.upsert_snapshot(records, seen_ids)
 
         index_failed = False
         if self._index is not None and self._embedder is not None:
             try:
+                index_records = list(await self._tool_store.list_all())
+                if filtered:
+                    # The index only needs the rows this pass was responsible for:
+                    # an incremental index sync never touches rows it was not handed.
+                    index_records = [
+                        row for row in index_records if row.server_id in selected
+                    ]
                 await self._index.sync(
-                    await self._tool_store.list_all(),
+                    index_records,
                     embedder=self._embedder,
                     full=full,
                 )
@@ -330,15 +378,16 @@ class McpCatalogSync:
                 logger.warning("MCP tool index sync failed (%s)", type(exc).__name__)
 
         logger.info(
-            "MCP tool sync (%s) scanned %d servers (%d failed) and %d tools",
+            "MCP tool sync (%s) scanned %d servers (%d failed) and %d tools%s",
             reason,
-            len(servers),
+            len(selected),
             servers_failed,
             len(records),
+            f" (filtered to {len(selected)} of {len(servers)})" if filtered else "",
         )
         return McpSyncStats(
             scanned=len(records),
-            servers_scanned=len(servers),
+            servers_scanned=len(selected),
             servers_failed=servers_failed,
             changed=_count(snapshot, "inserted") + _count(snapshot, "updated"),
             upserted=len(_ids(snapshot, "upsert_ids")),

@@ -35,6 +35,7 @@ from agentkit.mcp.errors import (
     McpServerValidationError,
     sanitize_error_message,
 )
+from agentkit.mcp import net
 from agentkit.mcp.models import (
     McpServerRecord,
     validate_server_name,
@@ -45,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 MASK = "****"
 MAX_SERVER_URL_CHARS = 2048
+#: mcp_servers.display_name is VARCHAR(255); the wire model rejects longer input
+#: so SQLite (which does not enforce the length) cannot hide a Postgres 500.
+MAX_DISPLAY_NAME_CHARS = 255
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -91,6 +95,8 @@ class McpServerWrite:
     headers: Mapping[str, str] | None | _UnsetType = UNSET
     verify_tls: bool | _UnsetType = UNSET
     enabled: bool | _UnsetType = UNSET
+    #: Update only: drop the stored URL query string instead of preserving it.
+    clear_query: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,20 +127,49 @@ def url_has_query(url: str | None) -> bool:
     return bool(text and urlsplit(text).query)
 
 
+def _origin(parts: Any) -> tuple[str, str, int | None]:
+    """Scheme + host + port, with the scheme's default port normalised.
+
+    `https://host` and `https://host:443` are the same origin; `https://host` and
+    `https://host:8443` are not.  The host is lower-cased and stripped of a
+    trailing dot, exactly like the URL policy compares it.
+    """
+    scheme = (getattr(parts, "scheme", "") or "").lower()
+    host = (getattr(parts, "hostname", "") or "").rstrip(".").lower()
+    try:
+        port = parts.port
+    except ValueError:  # pragma: no cover - validate_url rejects this first
+        port = None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, host, port
+
+
 def merge_url_query(incoming: str, stored: str | None) -> str:
-    """Keep the stored query when an edit submits a URL without one."""
+    """Keep the stored query when an edit resubmits the same endpoint without one.
+
+    The query string is where many MCP servers carry their credential, and the
+    management API never returns it.  Preserving it is therefore only safe when
+    the incoming URL names the *same origin* (scheme, host and port): pointing the
+    row at another host and silently re-attaching the old token would hand one
+    server's credential to another.  A cross-origin edit drops the stored query;
+    the caller can still submit a new one explicitly, and `clear_query` removes a
+    stored query without changing the URL at all.
+    """
     incoming_parts = urlsplit(incoming)
     if incoming_parts.query:
         return incoming
-    stored_query = urlsplit(str(stored or "")).query
-    if not stored_query:
+    stored_parts = urlsplit(str(stored or ""))
+    if not stored_parts.query:
+        return incoming
+    if _origin(incoming_parts) != _origin(stored_parts):
         return incoming
     return urlunsplit(
         (
             incoming_parts.scheme,
             incoming_parts.netloc,
             incoming_parts.path,
-            stored_query,
+            stored_parts.query,
             "",
         )
     )
@@ -214,6 +249,19 @@ class ServerUrlPolicy:
     check = validate_url
     validate_server_url = validate_url
 
+    async def ensure_public_target(self, url: str) -> None:
+        """Reject a URL whose *hostname* resolves to a private address.
+
+        The literal check above cannot see a name that resolves to 127.0.0.1 or
+        10.x; this is the resolver half of the same SSRF boundary.  Best effort by
+        design (see agentkit.mcp.net): an unresolvable name is left to fail at
+        connection time, and a name that rebinds after this check is the
+        documented residual risk.
+        """
+        await net.ensure_public_endpoint(
+            url, allow_private_networks=self.allow_private_networks
+        )
+
     @staticmethod
     def _is_private_target(host: str) -> bool:
         if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
@@ -265,13 +313,17 @@ def is_sensitive_header(name: str) -> bool:
 
 
 def mask_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
-    """Mask sensitive values while preserving non-secret headers verbatim."""
+    """Mask **every** header value; an empty value stays empty.
+
+    A name allowlist is unusable here: `X-Custom-Token`, `X-Goog-Api-Key` and the
+    next vendor's invention all carry credentials, and a missed name returns the
+    secret in cleartext.  The API therefore shows names and `****` only, and
+    `restore_masked_headers` maps the mask back to the stored value on write.
+    """
     masked: dict[str, str] = {}
     for key, value in (headers or {}).items():
         key_text = str(key)
-        masked[key_text] = (
-            MASK if is_sensitive_header(key_text) and value else str(value)
-        )
+        masked[key_text] = MASK if str(value) else ""
     return masked
 
 
@@ -376,12 +428,15 @@ class McpServerService:
             # client bug and must never be stored as a credential.
             headers = restore_masked_headers(headers, {})
         encrypted = self._encrypt_headers(headers)
+        display_name = _bounded_display_name(
+            None if data.display_name is UNSET else data.display_name
+        )
+        url = self.policy.validate_url("" if data.url is UNSET else data.url)
+        await self.policy.ensure_public_target(url)
         record = McpServerRecord(
             owner_user_id=owner,
             name=name,
-            display_name=_optional_text(
-                None if data.display_name is UNSET else data.display_name
-            ),
+            display_name=display_name,
             description=_text(None if data.description is UNSET else data.description),
             transport=_validated_transport(
                 "streamable_http" if data.transport is UNSET else data.transport
@@ -419,7 +474,7 @@ class McpServerService:
 
         fields: dict[str, Any] = {}
         if data.display_name is not UNSET:
-            fields["display_name"] = _optional_text(data.display_name)
+            fields["display_name"] = _bounded_display_name(data.display_name)
         if data.description is not UNSET:
             fields["description"] = _text(data.description)
         if data.transport is not UNSET:
@@ -427,11 +482,18 @@ class McpServerService:
         if data.url is not UNSET:
             incoming_url = self.policy.validate_url(data.url)
             # The API never exposes the query string, so an edit form sends the
-            # endpoint back without it. Preserve the stored query unless the user
-            # supplied a new one explicitly.
-            fields["url"] = self.policy.validate_url(
-                merge_url_query(incoming_url, current.url)
+            # endpoint back without it.  Preserve the stored query only for the
+            # *same origin*; a host change must never carry the old credential
+            # over.  clear_query is the explicit way to drop it.
+            target = (
+                url_without_query(incoming_url)
+                if data.clear_query
+                else merge_url_query(incoming_url, current.url)
             )
+            fields["url"] = self.policy.validate_url(target)
+        elif data.clear_query:
+            # Explicit clear with no new URL: keep the endpoint, drop the query.
+            fields["url"] = self.policy.validate_url(url_without_query(current.url))
         if data.verify_tls is not UNSET:
             if data.verify_tls is None:
                 raise McpServerValidationError(
@@ -447,6 +509,9 @@ class McpServerService:
                 fields["headers_encrypted"] = self._encrypt_headers(
                     restore_masked_headers(data.headers, stored)
                 )
+
+        if fields.get("url") is not None:
+            await self.policy.ensure_public_target(fields["url"])
 
         updated = await self.store.update(server_id, owner, fields)
         if updated is None:
@@ -481,7 +546,13 @@ class McpServerService:
         if updated is None:
             raise McpServerNotFound("MCP server not found")
         if not updated.enabled:
-            return updated
+            # A disable must also *retire* the catalog: mcp_tools.callable is a
+            # store output, so until a sync carries this server's rows with
+            # reachable=False, tool_search keeps offering its tools and
+            # tool_execute keeps accepting them.  A failed retirement leaves the
+            # row disabled (the store already refused every call), so the sync
+            # error is logged, never raised into the management write.
+            return await self._retire_catalog(updated, owner)
         return await self._sync_and_refresh(updated, owner)
 
     async def refresh_server(
@@ -491,6 +562,21 @@ class McpServerService:
         return await self._sync_and_refresh(
             record, record.owner_user_id, reason="server_refresh"
         )
+
+    async def _retire_catalog(
+        self, record: McpServerRecord, owner_user_id: str, *, reason: str = "server_disabled"
+    ) -> McpServerRecord:
+        """Run the sync pass that marks a disabled server's tools uncallable."""
+        try:
+            await self.sync.sync_server(record.id, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - the disable already landed
+            logger.warning(
+                "MCP server %s catalog retirement failed (%s)",
+                record.id,
+                type(exc).__name__,
+            )
+        refreshed = await self.store.get(record.id, owner_user_id)
+        return refreshed or record
 
     # -- status / catalog -------------------------------------------------- #
 
@@ -503,8 +589,14 @@ class McpServerService:
         """
         records = await self.list_servers(owner_user_id)
         tools_total = 0
+        indexed_tools = 0
         for record in records:
-            tools_total += len(await self.list_tools(record.id, record.owner_user_id))
+            tools = await self.list_tools(record.id, record.owner_user_id)
+            tools_total += len(tools)
+            # indexed_tools is not a synonym for tools_total: only a callable row
+            # can be retrieved and executed, and a disabled or unreachable server
+            # keeps its rows while none of them is indexed.
+            indexed_tools += sum(1 for tool in tools if getattr(tool, "callable", False))
         last_sync = max(
             (record.last_tools_sync_at for record in records if record.last_tools_sync_at),
             default=None,
@@ -521,7 +613,7 @@ class McpServerService:
             "servers_disabled": sum(1 for row in records if row.status == "disabled"),
             "servers_reachable": sum(1 for row in records if row.reachable),
             "tools_total": tools_total,
-            "indexed_tools": tools_total,
+            "indexed_tools": indexed_tools,
             "last_sync_at": last_sync,
             "last_error": first_error,
         }
@@ -662,8 +754,24 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
+def _bounded_display_name(value: Any) -> str | None:
+    """An optional label no longer than the column.
+
+    The wire model already rejects a longer value with 422; this keeps the rule in
+    the layer that writes the row, so a second caller (a script, a migration) is
+    caught before Postgres truncates it into a 500.
+    """
+    text = _optional_text(value)
+    if text is not None and len(text) > MAX_DISPLAY_NAME_CHARS:
+        raise McpServerValidationError(
+            f"mcp_servers.display_name must be at most {MAX_DISPLAY_NAME_CHARS} characters"
+        )
+    return text
+
+
 __all__ = [
     "MASK",
+    "MAX_DISPLAY_NAME_CHARS",
     "MAX_HEADERS_TOTAL_BYTES",
     "McpServerReindexStats",
     "McpServerService",

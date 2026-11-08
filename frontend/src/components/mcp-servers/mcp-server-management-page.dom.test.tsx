@@ -88,6 +88,13 @@ function makeStatus(overrides: Partial<McpServerStatus> = {}): McpServerStatus {
     indexed_tools: 3,
     last_sync_at: "2026-11-02T00:00:00Z",
     last_error: null,
+    sync: "ready",
+    index: "ready",
+    last_sync_reason: "server_refresh",
+    last_sync_duration_ms: 42,
+    last_retry_at: null,
+    last_retry_tool: null,
+    last_retry_result: null,
     ...overrides,
   };
 }
@@ -164,6 +171,33 @@ describe("MCP 服务列表", () => {
     const status = await view.findByRole("region", { name: "MCP 服务状态" });
     expect(within(status).getByText(/2 个服务/)).toBeTruthy();
     expect(within(status).getByText(/4 个工具，已索引 3 个/)).toBeTruthy();
+    // The runtime's sync/index state is part of the summary, not only the counts.
+    expect(within(status).getByText("同步 ready")).toBeTruthy();
+    expect(within(status).getByText("索引 ready")).toBeTruthy();
+    expect(within(status).getByText(/server_refresh · 42ms/)).toBeTruthy();
+  });
+
+  it("运行时报的降级状态和调用纠错都显示在状态栏里", async () => {
+    mockedStatus.mockResolvedValue(
+      makeStatus({
+        sync: "degraded",
+        index: "degraded",
+        last_sync_reason: "tool_error_refresh",
+        last_sync_duration_ms: 7,
+        last_retry_at: "2026-11-01T00:00:00Z",
+        last_retry_tool: "mcp__anysearch__search",
+        last_retry_result: "failed",
+      }),
+    );
+    const view = renderPage();
+
+    const status = await view.findByRole("region", { name: "MCP 服务状态" });
+    expect(await within(status).findByText("同步 degraded")).toBeTruthy();
+    expect(within(status).getByText("索引 degraded")).toBeTruthy();
+    expect(within(status).getByText(/tool_error_refresh/)).toBeTruthy();
+    expect(
+      within(status).getByText(/mcp__anysearch__search → failed/),
+    ).toBeTruthy();
   });
 
   it("last_error 直接展示出来，并标出不可达", async () => {

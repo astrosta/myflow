@@ -46,6 +46,8 @@ interface HeaderRow {
 }
 
 interface FormState {
+  /** 只在编辑时有效：主动删掉已保存 URL 的查询串。 */
+  clearQuery: boolean;
   description: string;
   displayName: string;
   enabled: boolean;
@@ -83,6 +85,7 @@ function rowsFromHeaders(headers: Record<string, string>): HeaderRow[] {
 function formFromServer(server: McpServerDetail | null): FormState {
   if (!server) {
     return {
+      clearQuery: false,
       description: "",
       displayName: "",
       enabled: true,
@@ -94,6 +97,7 @@ function formFromServer(server: McpServerDetail | null): FormState {
     };
   }
   return {
+    clearQuery: false,
     description: server.description,
     displayName: server.display_name ?? "",
     enabled: server.enabled,
@@ -288,6 +292,7 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
             transport: form.transport,
             headers,
             verify_tls: form.verifyTls,
+            clear_query: form.clearQuery,
           } satisfies McpServerUpdateInput)
         : await createMcpServer({
             name,
@@ -315,9 +320,10 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
     }
   };
 
+  const hasStoredQuery = Boolean(initial?.url_has_query);
   const urlHint =
-    initial && initial.url_has_query && !form.url.includes("?")
-      ? "已保存的 URL 带查询串（内容不回传）；这里的地址不写查询串时会沿用已保存的那段。"
+    hasStoredQuery && !form.url.includes("?")
+      ? "已保存的 URL 带查询串（内容不回传）。地址的协议/主机/端口不变时沿用已保存的那段；换了主机就自动丢掉，不会把旧凭据发到新地址。"
       : null;
 
   return (
@@ -399,6 +405,20 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
           </label>
           {urlHint ? (
             <span className="block text-[11px] leading-relaxed text-neutral-500">{urlHint}</span>
+          ) : null}
+          {serverId && hasStoredQuery ? (
+            <label className="flex items-start gap-2 text-[11px] leading-relaxed text-neutral-600">
+              <input
+                checked={form.clearQuery}
+                className="mt-0.5 h-3.5 w-3.5 rounded border-neutral-300"
+                disabled={busy}
+                onChange={(event) => set("clearQuery", event.target.checked)}
+                type="checkbox"
+              />
+              <span>
+                删除已保存的查询串（地址里的 token 只存在网关；勾上并保存后它就会被清掉）
+              </span>
+            </label>
           ) : null}
           {fieldErrors.url ? (
             <span className="block text-[11px] text-red-600" id={baseId + "-url-error"}>

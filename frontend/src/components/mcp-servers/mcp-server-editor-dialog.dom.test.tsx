@@ -246,18 +246,39 @@ describe("编辑 MCP 服务", () => {
       transport: "streamable_http",
       headers: { Authorization: "****", "X-Anysearch-Client": "mcp/1.0.0" },
       verify_tls: true,
+      // 没勾选时不删查询串；只有勾上才会发 clear_query: true（见下面的用例）。
+      clear_query: false,
     });
     await waitFor(() => expect(view.onSaved).toHaveBeenCalledTimes(1));
   });
 
-  it("URL 带着被隐藏的查询串时给出提示", async () => {
+  it("URL 带着被隐藏的查询串时给出提示：同源沿用、换主机自动丢弃", async () => {
     mockedGet.mockResolvedValue(makeDetail({ url_has_query: true }));
     const view = renderEditor({ serverId: "srv-1", initialServer: { name: "anysearch" } });
 
     const dialog = await view.findByRole("dialog", { name: "编辑 MCP 服务" });
-    const hint = await within(dialog).findByText(/查询串/);
+    const hint = await within(dialog).findByText(/沿用已保存的那段/);
 
-    expect(hint.textContent).toContain("沿用");
+    expect(hint.textContent).toContain("主机");
+    expect(hint.textContent).toContain("不会把旧凭据发到新地址");
+  });
+
+  it("勾选“删除已保存的查询串”后保存会发 clear_query: true", async () => {
+    mockedGet.mockResolvedValue(makeDetail({ url_has_query: true }));
+    const view = renderEditor({ serverId: "srv-1", initialServer: { name: "anysearch" } });
+
+    const dialog = await view.findByRole("dialog", { name: "编辑 MCP 服务" });
+    const toggle = await within(dialog).findByRole("checkbox", {
+      name: /删除已保存的查询串/,
+    });
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(toggle);
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(mockedUpdate).toHaveBeenCalledTimes(1));
+    const [, input] = mockedUpdate.mock.calls[0] as [string, Record<string, unknown>];
+    expect(input.clear_query).toBe(true);
+    expect(input.url).toBe("https://api.anysearch.com/mcp");
   });
 
   it("没有查询串的普通 URL 不显示那条提示", async () => {

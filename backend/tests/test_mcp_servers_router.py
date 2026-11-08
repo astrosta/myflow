@@ -315,8 +315,11 @@ def test_detail_masks_headers_and_never_returns_the_ciphertext_or_query(
 
     assert response.status_code == 200
     body = response.json()
+    # Every value is masked, not just the sensitive-looking names: a name
+    # allowlist misses the next vendor's X-Custom-Token.
     assert body["headers"]["Authorization"] == MASK
-    assert body["headers"]["X-Env"] == "prod"
+    assert body["headers"]["X-Env"] == MASK
+    assert "prod" not in response.text
     assert body["tool_count"] == 1
     assert body["status"] == "active"
     assert body["url"] == "https://api.anysearch.com/mcp"
@@ -536,6 +539,144 @@ def test_reindex_returns_the_typed_sync_stats(
         "error": None,
     }
     assert service.reindex_owners == ["u1"]
+
+
+# --------------------------------------------------------------------------- #
+# Status: the runtime's view, not only the service's row counts
+# --------------------------------------------------------------------------- #
+
+
+def _client_with_runtime(service: FakeService, runtime: Any) -> TestClient:
+    app = FastAPI()
+    install_error_handlers(app)
+    app.include_router(router_module.router, prefix="/api")
+    app.state.mcp_server_service = service
+    app.dependency_overrides[mcp_servers_deps.get_mcp_server_service] = lambda: service
+    app.dependency_overrides[mcp_servers_deps.get_mcp_runtime] = lambda: runtime
+    app.dependency_overrides[mcp_servers_deps.require_mcp_reader] = lambda: RunCaller(
+        kind=CallerKind.HTTP, user_id="u1", user_role="user"
+    )
+    app.dependency_overrides[mcp_servers_deps.require_mcp_writer] = lambda: RunCaller(
+        kind=CallerKind.HTTP, user_id="u1", user_role="user"
+    )
+    return TestClient(app)
+
+
+class FakeRuntime:
+    def __init__(self, *, status: dict[str, Any] | None = None, error: BaseException | None = None) -> None:
+        self._status = status or {}
+        self._error = error
+        self.owners: list[str] = []
+
+    async def status(self, owner_user_id: str) -> dict[str, Any]:
+        self.owners.append(owner_user_id)
+        if self._error is not None:
+            raise self._error
+        return dict(self._status)
+
+
+def test_status_prefers_the_runtime_view(service: FakeService) -> None:
+    runtime = FakeRuntime(
+        status={
+            "enabled": True,
+            "servers_total": 1,
+            "servers_active": 1,
+            "servers_pending": 0,
+            "servers_error": 0,
+            "servers_disabled": 0,
+            "servers_reachable": 1,
+            "tools_total": 4,
+            "indexed_tools": 3,
+            "last_sync_at": None,
+            "last_error": None,
+            "sync": "degraded",
+            "index": "ready",
+            "last_sync_reason": "server_refresh",
+            "last_sync_duration_ms": 42,
+            "last_retry_at": "2026-01-01T00:00:00Z",
+            "last_retry_tool": "mcp__anysearch__search",
+            "last_retry_result": "ok",
+        }
+    )
+
+    response = _client_with_runtime(service, runtime).get("/api/mcp-servers/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert runtime.owners == ["u1"]
+    # The service projection reports indexed == total; the runtime knows better.
+    assert body["indexed_tools"] == 3
+    assert body["sync"] == "degraded"
+    assert body["index"] == "ready"
+    assert body["last_sync_reason"] == "server_refresh"
+    assert body["last_sync_duration_ms"] == 42
+    assert body["last_retry_tool"] == "mcp__anysearch__search"
+
+
+def test_status_falls_back_to_the_service_without_a_runtime(
+    client: TestClient,
+) -> None:
+    response = client.get("/api/mcp-servers/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["servers_total"] == 1
+    assert body["sync"] is None
+    assert body["index"] is None
+    assert body["last_sync_reason"] is None
+
+
+def test_a_broken_runtime_status_degrades_to_the_service_view(
+    service: FakeService,
+) -> None:
+    runtime = FakeRuntime(error=RuntimeError("status broke"))
+
+    response = _client_with_runtime(service, runtime).get("/api/mcp-servers/status")
+
+    assert response.status_code == 200
+    assert response.json()["servers_total"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Write bounds: display_name length and the explicit query clear
+# --------------------------------------------------------------------------- #
+
+
+def test_create_rejects_a_display_name_longer_than_the_column(
+    client: TestClient, service: FakeService
+) -> None:
+    response = client.post(
+        "/api/mcp-servers",
+        json={
+            "name": "anysearch",
+            "display_name": "x" * 256,
+            "url": "https://api.anysearch.com/mcp",
+            "headers": {},
+            "verify_tls": True,
+            "enabled": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert service.created == []
+
+
+def test_put_rejects_a_display_name_longer_than_the_column(
+    client: TestClient, service: FakeService
+) -> None:
+    response = client.put("/api/mcp-servers/s1", json={"display_name": "y" * 256})
+
+    assert response.status_code == 422
+    assert service.updated == []
+
+
+def test_put_forwards_clear_query_to_the_service(
+    client: TestClient, service: FakeService
+) -> None:
+    response = client.put("/api/mcp-servers/s1", json={"clear_query": True})
+
+    assert response.status_code == 200
+    assert service.updated[-1].clear_query is True
 
 
 def test_missing_service_is_a_coded_503(monkeypatch) -> None:

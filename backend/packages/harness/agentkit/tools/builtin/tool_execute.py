@@ -52,8 +52,10 @@ exactly like any other result, never as a transport failure.  Only ``McpToolErro
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -241,6 +243,25 @@ async def tool_execute(
     stored schema changed - the new input_schema to reorganise the arguments
     against. Failures that may already have run upstream are never retried.
     """
+    started = time.monotonic()
+    owner = resolve_runtime_user_id(_context(runtime), allow_default=True)
+    reply = await _execute_tool(tool_name, arguments, runtime, tool_call_id, owner)
+    # One audit line per invocation, success or failure: the spec's audit record
+    # (server, tool, call name, owner fingerprint, outcome, duration) belongs on
+    # every call, not only on the failures that already log a warning.  Arguments
+    # and headers are deliberately absent - they are the secret-bearing fields.
+    _audit_tool_call(reply=reply, owner=owner, duration_ms=_elapsed_ms(started))
+    return reply
+
+
+async def _execute_tool(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    runtime: Any,
+    tool_call_id: str,
+    owner: str | None,
+) -> ToolMessage:
+    """The body of tool_execute: every branch returns a stamped reply."""
     call_name = (tool_name or "").strip()
     args = dict(arguments) if isinstance(arguments, Mapping) else {}
     execution = get_mcp_runtime()
@@ -267,7 +288,6 @@ async def tool_execute(
             message=MCP_UNAVAILABLE_MESSAGE,
         )
 
-    owner = resolve_runtime_user_id(_context(runtime), allow_default=True)
     resolution = await _resolve(execution, call_name, owner)
     if resolution.origin is not None:
         return _unresolved_reply(
@@ -819,6 +839,42 @@ async def _call_tool(
     return _CallOutcome(result=result)
 
 
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))
+
+
+def _owner_fingerprint(owner: str | None) -> str:
+    """A stable short fingerprint, so the audit trail never stores a user id."""
+    text = str(owner or "").strip()
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _audit_tool_call(
+    *, reply: ToolMessage, owner: str | None, duration_ms: int
+) -> None:
+    """One INFO record per MCP tool call (design 10: audit without secrets).
+
+    Fields: call_name, inner name, tool id, server id, owner fingerprint, status,
+    origin and duration.  Never the arguments, never a header: the same rule the
+    observability masking applies to spans.
+    """
+    meta = dict((getattr(reply, "additional_kwargs", None) or {}).get(TOOL_META_KEY) or {})
+    logger.info(
+        "MCP tool call call_name=%s inner_name=%s tool_id=%s server_id=%s "
+        "owner=%s status=%s origin=%s duration_ms=%d",
+        meta.get("call_name", ""),
+        meta.get("inner_name", ""),
+        meta.get("tool_id", ""),
+        meta.get("server_id", ""),
+        _owner_fingerprint(owner) or "-",
+        getattr(reply, "status", ""),
+        meta.get("origin", "ok"),
+        duration_ms,
+    )
+
+
 def _result_message(text: str) -> str:
     """Upstream text this tool may show: scrubbed first, then bounded.
 
@@ -1036,6 +1092,9 @@ def _stamp(
     meta = dict(normalized.additional_kwargs.get(TOOL_META_KEY) or {})
     meta["inner_name"] = record.name if record is not None else _inner_name(call_name)
     meta["tool_id"] = record.id if record is not None else ""
+    # The server id is what an audit line needs to name where a call went; it is
+    # an opaque row id, never a URL or a credential.
+    meta["server_id"] = getattr(record, "server_id", "") if record is not None else ""
     meta["call_name"] = record.call_name if record is not None else call_name
     if origin is not None:
         meta["origin"] = origin

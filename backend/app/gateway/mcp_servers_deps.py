@@ -38,6 +38,15 @@ def get_mcp_server_service(request: Request) -> Any:
     )
 
 
+def get_mcp_runtime(request: Request) -> Any | None:
+    """The process runtime the status route prefers; None when it was not built.
+
+    A router must not read `request.app` itself (test_m3_routes pins that rule), so
+    the lookup lives here, next to the service provider.
+    """
+    return getattr(request.app.state, "mcp_runtime", None)
+
+
 def require_mcp_servers_scope(scope: str) -> Callable[[Request], RunCaller]:
     """Any signed-in user may manage their own servers; PATs keep their scopes."""
 
@@ -66,6 +75,7 @@ def require_mcp_writer(request: Request) -> RunCaller:
 __all__ = [
     "MCP_SERVERS_READ",
     "MCP_SERVERS_WRITE",
+    "get_mcp_runtime",
     "get_mcp_server_service",
     "require_mcp_reader",
     "require_mcp_servers_scope",

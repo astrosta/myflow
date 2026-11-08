@@ -76,9 +76,19 @@ export interface McpServerStatus {
   servers_disabled: number;
   servers_reachable: number;
   tools_total: number;
+  /** 真正可调用（callable）的行数，不是 tools_total 的同义词。 */
   indexed_tools: number;
   last_sync_at: string | null;
   last_error: string | null;
+  /** ready | degraded | syncing | disabled；没有运行时（服务端兜底）时为 null。 */
+  sync: string | null;
+  /** ready | degraded | disabled。 */
+  index: string | null;
+  last_sync_reason: string | null;
+  last_sync_duration_ms: number | null;
+  last_retry_at: string | null;
+  last_retry_tool: string | null;
+  last_retry_result: string | null;
 }
 
 export interface McpServerReindexStats {
@@ -109,7 +119,15 @@ export interface McpServerInput {
  * 类型上先挡一层，运行时再挡一层（见 updateMcpServer）——调用方拿一行 summary
  * 展开拼 body 太容易顺手带上这两个键，而 PUT 会直接 422。
  */
-export type McpServerUpdateInput = Partial<Omit<McpServerInput, "name" | "enabled">>;
+export type McpServerUpdateInput = Partial<Omit<McpServerInput, "name" | "enabled">> & {
+  /**
+   * 删掉已保存 URL 的查询串（那里的 token 只存在网关，从不回传）。
+   *
+   * 网关的规则：地址没变（同 scheme/host/port）时沿用已保存的查询串；换主机就
+   * 自动丢掉它——旧 token 绝不能跟着到新主机去。要主动清掉就发这个字段。
+   */
+  clear_query?: boolean;
+};
 
 export class McpServerApiError extends Error {
   readonly status: number;
@@ -180,6 +198,10 @@ function asString(value: unknown, fallback: string): string {
 
 function asNullableString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function asNullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function asNumber(value: unknown, fallback: number): number {
@@ -277,6 +299,7 @@ function updateBody(input: McpServerUpdateInput): Record<string, unknown> {
   if (input.transport !== undefined) body.transport = input.transport;
   if (input.headers !== undefined) body.headers = input.headers;
   if (typeof input.verify_tls === "boolean") body.verify_tls = input.verify_tls;
+  if (input.clear_query === true) body.clear_query = true;
   return body;
 }
 
@@ -356,6 +379,13 @@ export async function getMcpServerStatus(): Promise<McpServerStatus> {
     indexed_tools: asNumber(raw.indexed_tools, 0),
     last_sync_at: asNullableString(raw.last_sync_at),
     last_error: asNullableString(raw.last_error),
+    sync: asNullableString(raw.sync),
+    index: asNullableString(raw.index),
+    last_sync_reason: asNullableString(raw.last_sync_reason),
+    last_sync_duration_ms: asNullableNumber(raw.last_sync_duration_ms),
+    last_retry_at: asNullableString(raw.last_retry_at),
+    last_retry_tool: asNullableString(raw.last_retry_tool),
+    last_retry_result: asNullableString(raw.last_retry_result),
   };
 }
 

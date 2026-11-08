@@ -157,6 +157,25 @@ describe("mcp-servers API contract", () => {
     expect(callBody(mockedFetch)).toEqual({ verify_tls: false });
   });
 
+  it("update sends clear_query only when the user asked to drop it", async () => {
+    const mockedFetch = stubFetch(jsonResponse(DETAIL));
+
+    await updateMcpServer("srv-1", { clear_query: false });
+
+    expect(callBody(mockedFetch)).toEqual({});
+  });
+
+  it("update forwards clear_query: true to the gateway", async () => {
+    const mockedFetch = stubFetch(jsonResponse(DETAIL));
+
+    await updateMcpServer("srv-1", { url: "https://api.anysearch.com/mcp", clear_query: true });
+
+    expect(callBody(mockedFetch)).toEqual({
+      url: "https://api.anysearch.com/mcp",
+      clear_query: true,
+    });
+  });
+
   it("getMcpServer encodes the id and keeps the masked headers", async () => {
     const mockedFetch = stubFetch(jsonResponse(DETAIL));
 
@@ -279,6 +298,42 @@ describe("mcp-servers API contract", () => {
       indexed_tools: 3,
       last_sync_at: null,
       last_error: null,
+      sync: null,
+      index: null,
+      last_sync_reason: null,
+      last_sync_duration_ms: null,
+      last_retry_tool: null,
+    });
+  });
+
+  it("getMcpServerStatus keeps the runtime sync/index fields", async () => {
+    const mockedFetch = stubFetch(
+      jsonResponse({
+        servers_total: 1,
+        tools_total: 4,
+        indexed_tools: 3,
+        sync: "degraded",
+        index: "ready",
+        last_sync_reason: "server_refresh",
+        last_sync_duration_ms: 42,
+        last_retry_at: "2026-01-01T00:00:00Z",
+        last_retry_tool: "mcp__anysearch__search",
+        last_retry_result: "ok",
+      }),
+    );
+
+    const status = await getMcpServerStatus();
+
+    expect(status).toMatchObject({
+      sync: "degraded",
+      index: "ready",
+      last_sync_reason: "server_refresh",
+      last_sync_duration_ms: 42,
+      last_retry_tool: "mcp__anysearch__search",
+      last_retry_result: "ok",
+      // indexed_tools is the callable count, not a copy of tools_total.
+      indexed_tools: 3,
+      tools_total: 4,
     });
   });
 

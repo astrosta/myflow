@@ -11,6 +11,7 @@ request for "status" would be matched as a server id.
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Response
@@ -19,6 +20,7 @@ from agentkit.mcp.errors import McpServerNotFound
 from agentkit.mcp.service import McpServerWrite, url_has_query, url_without_query
 
 from backend.app.gateway.mcp_servers_deps import (
+    get_mcp_runtime,
     get_mcp_server_service,
     require_mcp_reader,
     require_mcp_writer,
@@ -37,11 +39,14 @@ from backend.app.gateway.models.mcp_servers import (
 )
 from backend.app.gateway.run_models import RunCaller
 
+_logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/mcp-servers", tags=["mcp-servers"])
 
 McpReader = Annotated[RunCaller, Depends(require_mcp_reader)]
 McpWriter = Annotated[RunCaller, Depends(require_mcp_writer)]
 Service = Annotated[Any, Depends(get_mcp_server_service)]
+Runtime = Annotated[Any, Depends(get_mcp_runtime)]
 
 
 def _summary(record: Any, tool_count: int = 0) -> McpServerSummary:
@@ -109,9 +114,33 @@ def _update_write(payload: McpServerUpdate) -> McpServerWrite:
 
 
 @router.get("/status", response_model=McpServerStatusResponse)
-async def server_status(caller: McpReader, service: Service) -> McpServerStatusResponse:
-    raw = await service.status(caller.user_id)
+async def server_status(
+    caller: McpReader, service: Service, runtime: Runtime
+) -> McpServerStatusResponse:
+    """Counts plus the *runtime's* sync/index state for this caller.
+
+    The service alone can only count rows, so it cannot see whether the last pass
+    failed, whether the index is degraded, or how many rows are really callable.
+    The runtime is the process that owns those facts; the service projection stays
+    as the fallback for a deployment whose runtime was never published.
+    """
+    raw = await _status_from_runtime(runtime, caller.user_id)
+    if raw is None:
+        raw = await service.status(caller.user_id)
     return McpServerStatusResponse.model_validate(raw)
+
+
+async def _status_from_runtime(
+    runtime: Any, owner_user_id: str
+) -> dict[str, Any] | None:
+    status = getattr(runtime, "status", None)
+    if not callable(status):
+        return None
+    try:
+        return await status(owner_user_id)
+    except Exception:  # noqa: BLE001 - a status read must never 500 the page
+        _logger.warning("MCP runtime status read failed; using the service view")
+        return None
 
 
 @router.post("/reindex", response_model=McpServerReindexResponse)
