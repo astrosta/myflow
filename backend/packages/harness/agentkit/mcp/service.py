@@ -19,12 +19,17 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy.exc import IntegrityError
 
-from agentkit.mcp.crypto import HeaderCipher
+from agentkit.mcp.crypto import (
+    MAX_HEADERS_TOTAL_BYTES,
+    HeaderCipher,
+    validate_headers,
+)
 from agentkit.mcp.errors import (
+    McpServerConfigurationError,
     McpServerConflict,
     McpServerError,
     McpServerNotFound,
@@ -40,15 +45,9 @@ from agentkit.mcp.models import (
 logger = logging.getLogger(__name__)
 
 MASK = "****"
-MAX_HEADERS = 32
-MAX_HEADER_NAME_CHARS = 128
-MAX_HEADERS_TOTAL_BYTES = 32 * 1024
 MAX_SERVER_URL_CHARS = 2048
 
-_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_\`|~0-9A-Za-z]+$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-#: A header value is a single line; horizontal tab is legal whitespace (RFC 9110).
-_HEADER_VALUE_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
 _SENSITIVE_HEADER_NAMES = frozenset(
     {
@@ -93,6 +92,53 @@ class McpServerWrite:
     headers: Mapping[str, str] | None | _UnsetType = UNSET
     verify_tls: bool | _UnsetType = UNSET
     enabled: bool | _UnsetType = UNSET
+
+
+@dataclass(frozen=True, slots=True)
+class McpServerReindexStats:
+    """The sync service's real counters for one owner-scoped reindex."""
+
+    scanned: int = 0
+    changed: int = 0
+    upserted: int = 0
+    deleted: int = 0
+    failed: int = 0
+    duration_ms: int = 0
+    error: str | None = None
+
+
+def url_without_query(url: str | None) -> str:
+    """The endpoint without its query string: what the management API may show."""
+    text = str(url or "")
+    if not text:
+        return ""
+    parts = urlsplit(text)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def url_has_query(url: str | None) -> bool:
+    """True when the stored endpoint carries a query string (never returned)."""
+    text = str(url or "")
+    return bool(text and urlsplit(text).query)
+
+
+def merge_url_query(incoming: str, stored: str | None) -> str:
+    """Keep the stored query when an edit submits a URL without one."""
+    incoming_parts = urlsplit(incoming)
+    if incoming_parts.query:
+        return incoming
+    stored_query = urlsplit(str(stored or "")).query
+    if not stored_query:
+        return incoming
+    return urlunsplit(
+        (
+            incoming_parts.scheme,
+            incoming_parts.netloc,
+            incoming_parts.path,
+            stored_query,
+            "",
+        )
+    )
 
 
 class ServerUrlPolicy:
@@ -203,6 +249,8 @@ class McpServerSync(Protocol):
     ) -> Any: ...
 
     async def remove_server_catalog(self, server_id: str) -> Any: ...
+
+    async def reindex(self, owner_user_id: str) -> McpServerReindexStats: ...
 
 
 class McpToolStore(Protocol):
@@ -319,7 +367,15 @@ class McpServerService:
             )
 
         enabled = True if data.enabled is UNSET else bool(data.enabled)
+        if data.verify_tls is None:
+            raise McpServerValidationError(
+                "mcp_servers.verify_tls must be true or false; omit it to keep the default"
+            )
         headers = None if data.headers is UNSET else data.headers
+        if headers is not None:
+            # A create has no stored row to restore from: a literal **** is a
+            # client bug and must never be stored as a credential.
+            headers = restore_masked_headers(headers, {})
         encrypted = self._encrypt_headers(headers)
         record = McpServerRecord(
             owner_user_id=owner,
@@ -370,8 +426,19 @@ class McpServerService:
         if data.transport is not UNSET:
             fields["transport"] = _validated_transport(data.transport)
         if data.url is not UNSET:
-            fields["url"] = self.policy.validate_url(data.url)
+            incoming_url = self.policy.validate_url(data.url)
+            # The API never exposes the query string, so an edit form sends the
+            # endpoint back without it. Preserve the stored query unless the user
+            # supplied a new one explicitly.
+            fields["url"] = self.policy.validate_url(
+                merge_url_query(incoming_url, current.url)
+            )
         if data.verify_tls is not UNSET:
+            if data.verify_tls is None:
+                raise McpServerValidationError(
+                    "mcp_servers.verify_tls must be true or false; omit it to keep "
+                    "the current value"
+                )
             fields["verify_tls"] = bool(data.verify_tls)
         if data.headers is not UNSET:
             if data.headers is None:
@@ -385,6 +452,8 @@ class McpServerService:
         updated = await self.store.update(server_id, owner, fields)
         if updated is None:
             raise McpServerNotFound("MCP server not found")
+        if not updated.enabled:
+            return updated
         return await self._sync_and_refresh(updated, owner)
 
     async def delete_server(self, server_id: str, owner_user_id: str) -> bool:
@@ -427,7 +496,12 @@ class McpServerService:
     # -- status / catalog -------------------------------------------------- #
 
     async def status(self, owner_user_id: str) -> dict[str, Any]:
-        """The caller's server counts, derived from their own rows."""
+        """The caller's server counts, derived from their own rows.
+
+        This is the Task 3 projection. Task 5's runtime status() replaces it with
+        sync/index details, but the owner scoping and tool counts are the contract
+        the management page already relies on.
+        """
         records = await self.list_servers(owner_user_id)
         tools_total = 0
         for record in records:
@@ -453,38 +527,30 @@ class McpServerService:
             "last_error": first_error,
         }
 
-    async def reindex(
-        self, owner_user_id: str, reason: str = "manual"
-    ) -> dict[str, Any]:
-        """Refresh this user's catalog; the runtime's global reindex takes over later."""
+    async def reindex(self, owner_user_id: str) -> McpServerReindexStats:
+        """Ask the sync service for real counters; never invent them here."""
         owner = _require_owner(owner_user_id)
-        hook = getattr(self.sync, "reindex", None)
-        if callable(hook):
-            try:
-                result = await hook(reason=reason)
-            except TypeError:
-                result = await hook()
-            return _stats_dict(result)
-
-        scanned = changed = failed = 0
-        for record in await self.store.list_for_owner(owner):
-            if not record.enabled:
-                continue
-            scanned += 1
-            try:
-                await self.sync.sync_server(record.id)
-                changed += 1
-            except Exception:  # noqa: BLE001 - one bad server must not stop the rest
-                failed += 1
-        return {
-            "scanned": scanned,
-            "changed": changed,
-            "upserted": changed,
-            "deleted": 0,
-            "failed": failed,
-            "duration_ms": 0,
-            "error": None,
-        }
+        result = await self.sync.reindex(owner)
+        if isinstance(result, McpServerReindexStats):
+            return result
+        if isinstance(result, Mapping):
+            fields = {
+                key: result[key]
+                for key in (
+                    "scanned",
+                    "changed",
+                    "upserted",
+                    "deleted",
+                    "failed",
+                    "duration_ms",
+                    "error",
+                )
+                if key in result
+            }
+            return McpServerReindexStats(**fields)
+        raise TypeError(
+            "McpServerSync.reindex() must return McpServerReindexStats or a mapping"
+        )
 
     # -- headers ----------------------------------------------------------- #
 
@@ -495,7 +561,7 @@ class McpServerService:
         try:
             return self.cipher.decrypt(record.headers_encrypted)
         except ValueError:
-            raise McpServerValidationError(
+            raise McpServerConfigurationError(
                 "stored MCP server headers could not be decrypted with the configured "
                 "encryption key"
             ) from None
@@ -503,7 +569,10 @@ class McpServerService:
     def _encrypt_headers(self, headers: Mapping[str, str] | None) -> str | None:
         if headers is None:
             return None
-        checked = _validate_headers(headers)
+        try:
+            checked = validate_headers(headers)
+        except ValueError as exc:
+            raise McpServerValidationError(str(exc)) from None
         if not checked:
             return None
         try:
@@ -594,56 +663,6 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
-def _validate_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
-    if headers is None:
-        return {}
-    if not isinstance(headers, Mapping):
-        raise McpServerValidationError(
-            "MCP server headers must be a mapping of header name to value"
-        )
-    if len(headers) > MAX_HEADERS:
-        raise McpServerValidationError(
-            f"MCP server headers must hold at most {MAX_HEADERS} entries"
-        )
-    checked: dict[str, str] = {}
-    total_bytes = 0
-    seen: set[str] = set()
-    for raw_name, raw_value in headers.items():
-        name = str(raw_name or "").strip()
-        if (
-            not name
-            or len(name) > MAX_HEADER_NAME_CHARS
-            or not _HEADER_NAME.fullmatch(name)
-        ):
-            raise McpServerValidationError(
-                f"MCP server header name {raw_name!r} is not a valid HTTP header name"
-            )
-        lowered = name.lower()
-        if lowered in seen:
-            raise McpServerValidationError(
-                f"MCP server header {name!r} is repeated with different casing"
-            )
-        seen.add(lowered)
-        if not isinstance(raw_value, str):
-            raise McpServerValidationError(
-                f"MCP server header {name!r} must have a string value"
-            )
-        if _HEADER_VALUE_CONTROL.search(raw_value):
-            raise McpServerValidationError(
-                f"MCP server header {name!r} must not contain CR, LF or other "
-                "control characters"
-            )
-        encoded = raw_value.encode("utf-8")
-        total_bytes += len(encoded)
-        if total_bytes > MAX_HEADERS_TOTAL_BYTES:
-            raise McpServerValidationError(
-                "MCP server headers must be at most "
-                f"{MAX_HEADERS_TOTAL_BYTES} bytes in total"
-            )
-        checked[name] = raw_value
-    return checked
-
-
 def _sanitize_sync_error(exc: BaseException) -> str:
     """A stored failure message that cannot contain a credential.
 
@@ -667,37 +686,10 @@ def _sanitize_sync_error(exc: BaseException) -> str:
     return truncate_error(text) or "MCP server sync failed"
 
 
-def _stats_dict(result: Any) -> dict[str, Any]:
-    if isinstance(result, Mapping):
-        return dict(result)
-    values: dict[str, Any] = {}
-    for key in (
-        "scanned",
-        "servers_scanned",
-        "servers_failed",
-        "changed",
-        "upserted",
-        "deleted",
-        "failed",
-        "duration_ms",
-        "error",
-    ):
-        if hasattr(result, key):
-            values[key] = getattr(result, key)
-    return values or {
-        "scanned": 0,
-        "changed": 0,
-        "upserted": 0,
-        "deleted": 0,
-        "duration_ms": 0,
-        "error": None,
-    }
-
-
 __all__ = [
     "MASK",
-    "MAX_HEADERS",
     "MAX_HEADERS_TOTAL_BYTES",
+    "McpServerReindexStats",
     "McpServerService",
     "McpServerSync",
     "McpServerWrite",
@@ -705,5 +697,8 @@ __all__ = [
     "ServerUrlPolicy",
     "is_sensitive_header",
     "mask_headers",
+    "merge_url_query",
     "restore_masked_headers",
+    "url_has_query",
+    "url_without_query",
 ]

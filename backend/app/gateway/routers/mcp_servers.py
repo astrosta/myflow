@@ -16,7 +16,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Response
 
 from agentkit.mcp.errors import McpServerNotFound
-from agentkit.mcp.service import McpServerWrite
+from agentkit.mcp.service import McpServerWrite, url_has_query, url_without_query
 
 from backend.app.gateway.mcp_servers_deps import (
     get_mcp_server_service,
@@ -50,7 +50,8 @@ def _summary(record: Any, tool_count: int = 0) -> McpServerSummary:
         name=str(record.name),
         display_name=getattr(record, "display_name", None),
         description=str(getattr(record, "description", "") or ""),
-        url=str(getattr(record, "url", "") or ""),
+        url=url_without_query(getattr(record, "url", "")),
+        url_has_query=url_has_query(getattr(record, "url", "")),
         transport=str(getattr(record, "transport", "streamable_http")),
         verify_tls=bool(getattr(record, "verify_tls", True)),
         enabled=bool(getattr(record, "enabled", True)),
@@ -117,11 +118,8 @@ async def server_status(caller: McpReader, service: Service) -> McpServerStatusR
 async def reindex_servers(
     caller: McpWriter, service: Service
 ) -> McpServerReindexResponse:
-    try:
-        raw = await service.reindex(caller.user_id, reason="manual")
-    except TypeError:
-        raw = await service.reindex(caller.user_id)
-    return McpServerReindexResponse.model_validate(raw)
+    stats = await service.reindex(caller.user_id)
+    return McpServerReindexResponse.model_validate(stats)
 
 
 # --------------------------------------------------------------------------- #

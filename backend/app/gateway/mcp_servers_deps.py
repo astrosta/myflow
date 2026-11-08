@@ -23,10 +23,12 @@ MCP_SERVERS_WRITE = "mcp_servers:write"
 
 
 def get_mcp_server_service(request: Request) -> Any:
-    """The process-owned McpServerService, or a test-injected fake."""
+    """The process-owned service at app.state.mcp_server_service.
+
+    That single documented key is what Task 8 publishes and what route tests
+    inject; there is deliberately no second alias to drift from it.
+    """
     service = getattr(request.app.state, "mcp_server_service", None)
-    if service is None:
-        service = getattr(request.app.state, "mcp_servers_service", None)
     if service is not None:
         return service
     if not get_app_config().mcp_servers.enabled:

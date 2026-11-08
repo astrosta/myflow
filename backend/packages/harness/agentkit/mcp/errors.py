@@ -45,6 +45,17 @@ class McpServerValidationError(McpServerError, ValueError):
     status_code = 422
 
 
+class McpServerConfigurationError(McpServerError):
+    """The stored server row cannot be used (for example, headers do not decrypt).
+
+    This is a deployment/data problem, not a bad request: the API must answer a
+    sanitized 500 rather than telling the caller their input was invalid.
+    """
+
+    code = "mcp_server_configuration_error"
+    status_code = 500
+
+
 class McpServerUnavailable(McpServerError):
     """DNS, TCP, TLS or HTTP-layer failure: the server could not be reached."""
 
@@ -84,6 +95,7 @@ class McpToolError(McpServerError):
 
 __all__ = [
     "McpProtocolError",
+    "McpServerConfigurationError",
     "McpServerConflict",
     "McpServerError",
     "McpServerNotFound",

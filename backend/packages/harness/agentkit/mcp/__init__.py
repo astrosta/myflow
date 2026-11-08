@@ -8,6 +8,7 @@ connecting straight to the server that owns the tool.
 from agentkit.mcp.crypto import HeaderCipher
 from agentkit.mcp.errors import (
     McpProtocolError,
+    McpServerConfigurationError,
     McpServerConflict,
     McpServerError,
     McpServerNotFound,
@@ -32,13 +33,17 @@ from agentkit.mcp.models import (
 )
 from agentkit.mcp.service import (
     MASK,
+    McpServerReindexStats,
     McpServerService,
     McpServerSync,
     McpServerWrite,
     ServerUrlPolicy,
     is_sensitive_header,
     mask_headers,
+    merge_url_query,
     restore_masked_headers,
+    url_has_query,
+    url_without_query,
 )
 from agentkit.mcp.store import McpServerRow, McpServerStore
 
@@ -50,10 +55,12 @@ __all__ = [
     "MCP_SERVER_STATUSES",
     "MCP_TRANSPORTS",
     "McpProtocolError",
+    "McpServerConfigurationError",
     "McpServerConflict",
     "McpServerError",
     "McpServerNotFound",
     "McpServerRecord",
+    "McpServerReindexStats",
     "McpServerService",
     "McpServerSync",
     "McpServerValidationError",
@@ -69,8 +76,11 @@ __all__ = [
     "is_sensitive_header",
     "is_valid_server_name",
     "mask_headers",
+    "merge_url_query",
     "restore_masked_headers",
     "truncate_error",
+    "url_has_query",
+    "url_without_query",
     "validate_server_name",
     "validate_server_status",
     "validate_transport",

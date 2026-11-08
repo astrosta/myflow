@@ -30,7 +30,10 @@ from pydantic import SecretStr
 MAX_HEADERS = 32
 MAX_HEADER_NAME_CHARS = 128
 MAX_HEADER_VALUE_CHARS = 4096
-MAX_HEADERS_TOTAL_CHARS = 32768
+#: The Task 3 API and the cipher share one budget: 32 KiB of header values.
+MAX_HEADERS_TOTAL_BYTES = 32 * 1024
+#: Backwards-compatible alias for callers that used the old character-named limit.
+MAX_HEADERS_TOTAL_CHARS = MAX_HEADERS_TOTAL_BYTES
 
 #: RFC 9110 field-name tokens.  No colon, no whitespace, no CR/LF.
 _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^`|~0-9A-Za-z]+$")
@@ -55,7 +58,7 @@ class HeaderCipher:
         empty object instead would make "no auth" indistinguishable from "auth we
         failed to load".
         """
-        checked = _checked_headers(headers)
+        checked = validate_headers(headers)
         if not checked:
             return None
         serialized = json.dumps(
@@ -105,8 +108,13 @@ def _key_bytes(encryption_key: str | bytes | SecretStr) -> bytes:
     return key.encode("utf-8")
 
 
-def _checked_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
-    """Validate a header map at the storage boundary, before it is sealed."""
+def validate_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
+    """Validate a header map at the single storage boundary.
+
+    Both the service and HeaderCipher.encrypt call this function, so the API and
+    the stored token cannot drift on names, CRLF, entry count or the 32 KiB total.
+    """
+
     if headers is None:
         return {}
     if not isinstance(headers, Mapping):
@@ -114,7 +122,8 @@ def _checked_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     if len(headers) > MAX_HEADERS:
         raise ValueError(f"MCP server headers must hold at most {MAX_HEADERS} entries")
     checked: dict[str, str] = {}
-    total = 0
+    total_bytes = 0
+    seen: set[str] = set()
     for raw_name, raw_value in headers.items():
         name = str(raw_name or "").strip()
         if (
@@ -123,6 +132,12 @@ def _checked_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
             or not _HEADER_NAME.fullmatch(name)
         ):
             raise ValueError(f"MCP server header name {raw_name!r} is not a valid HTTP header name")
+        lowered = name.lower()
+        if lowered in seen:
+            raise ValueError(
+                f"MCP server header {name!r} is repeated with different casing"
+            )
+        seen.add(lowered)
         if not isinstance(raw_value, str):
             raise ValueError(f"MCP server header {name!r} must have a string value")
         if _has_control_chars(raw_value):
@@ -134,10 +149,11 @@ def _checked_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
                 f"MCP server header {name!r} must be at most {MAX_HEADER_VALUE_CHARS} characters"
             )
         checked[name] = raw_value
-        total += len(name) + len(raw_value)
-    if total > MAX_HEADERS_TOTAL_CHARS:
+        total_bytes += len(raw_value.encode("utf-8"))
+    if total_bytes > MAX_HEADERS_TOTAL_BYTES:
         raise ValueError(
-            f"MCP server headers must be at most {MAX_HEADERS_TOTAL_CHARS} characters in total"
+            "MCP server headers must be at most "
+            f"{MAX_HEADERS_TOTAL_BYTES} bytes in total"
         )
     return checked
 
@@ -151,6 +167,8 @@ __all__ = [
     "HeaderCipher",
     "MAX_HEADER_NAME_CHARS",
     "MAX_HEADERS",
+    "MAX_HEADERS_TOTAL_BYTES",
     "MAX_HEADERS_TOTAL_CHARS",
     "MAX_HEADER_VALUE_CHARS",
+    "validate_headers",
 ]

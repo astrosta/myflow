@@ -16,8 +16,9 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from agentkit.mcp.crypto import HeaderCipher
+from agentkit.mcp.crypto import HeaderCipher, validate_headers
 from agentkit.mcp.errors import (
+    McpServerConfigurationError,
     McpServerConflict,
     McpServerNotFound,
     McpServerUnavailable,
@@ -26,9 +27,12 @@ from agentkit.mcp.errors import (
 from agentkit.mcp.models import McpServerRecord
 from agentkit.mcp.service import (
     MASK,
+    McpServerReindexStats,
     McpServerService,
     McpServerWrite,
     ServerUrlPolicy,
+    url_has_query,
+    url_without_query,
 )
 from agentkit.mcp.store import McpServerStore
 from agentkit.persistence.base import Base
@@ -42,6 +46,8 @@ class FakeSync:
         self.calls: list[tuple[str, str | None]] = []
         self.removed: list[str] = []
         self.failure: BaseException | None = None
+        self.reindex_stats = McpServerReindexStats()
+        self.reindex_owners: list[str] = []
 
     async def sync_server(self, server_id: str, reason: str | None = None) -> None:
         self.calls.append((server_id, reason))
@@ -55,6 +61,10 @@ class FakeSync:
 
     async def remove_server_catalog(self, server_id: str) -> None:
         self.removed.append(server_id)
+
+    async def reindex(self, owner_user_id: str) -> McpServerReindexStats:
+        self.reindex_owners.append(owner_user_id)
+        return self.reindex_stats
 
 
 class FakeToolStore:
@@ -280,6 +290,24 @@ async def test_a_tab_is_allowed_inside_a_header_value(
     assert cipher.decrypt(stored.headers_encrypted) == {"X-Note": "a\tb"}
 
 
+@pytest.mark.asyncio
+async def test_create_rejects_a_literal_mask_header(service: McpServerService) -> None:
+    with pytest.raises(McpServerValidationError, match="masked"):
+        await service.create_server(
+            "u1", write(name="masked", headers={"Authorization": MASK})
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_explicit_null_verify_tls(
+    service: McpServerService,
+) -> None:
+    with pytest.raises(McpServerValidationError, match="verify_tls"):
+        await service.create_server(
+            "u1", write(name="tls-null", verify_tls=None)
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Owner scoping
 # --------------------------------------------------------------------------- #
@@ -352,6 +380,18 @@ def test_url_policy_can_explicitly_allow_private_networks() -> None:
 
     assert policy.validate_url("http://127.0.0.1:8080/mcp")
     assert policy.validate_url("https://localhost/mcp")
+
+
+def test_url_query_is_redacted_but_reported() -> None:
+    url = "https://mcp.example.com/v1/mcp?tenant=acme&token=query-secret"
+
+    assert url_without_query(url) == "https://mcp.example.com/v1/mcp"
+    assert url_has_query(url) is True
+    assert url_has_query("https://mcp.example.com/v1/mcp") is False
+    assert (
+        url_without_query("https://mcp.example.com/v1/mcp")
+        == "https://mcp.example.com/v1/mcp"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -456,6 +496,80 @@ async def test_update_sync_failure_keeps_the_new_configuration(
     assert updated.reachable is False
 
 
+@pytest.mark.asyncio
+async def test_update_rejects_explicit_null_verify_tls(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server("u1", write())
+
+    with pytest.raises(McpServerValidationError, match="verify_tls"):
+        await service.update_server(
+            created.id, "u1", McpServerWrite(verify_tls=None)
+        )
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None and stored.verify_tls is True
+
+
+@pytest.mark.asyncio
+async def test_update_preserves_the_stored_query_when_incoming_has_none(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server(
+        "u1",
+        write(url="https://api.anysearch.com/mcp?tenant=acme&token=query-secret"),
+    )
+
+    updated = await service.update_server(
+        created.id,
+        "u1",
+        McpServerWrite(url="https://api.anysearch.com/v2/mcp"),
+    )
+
+    assert updated.id == created.id
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert stored.url == "https://api.anysearch.com/v2/mcp?tenant=acme&token=query-secret"
+    assert url_without_query(stored.url) == "https://api.anysearch.com/v2/mcp"
+
+
+@pytest.mark.asyncio
+async def test_update_accepts_an_explicit_new_query(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    created = await service.create_server(
+        "u1", write(url="https://api.anysearch.com/mcp?tenant=acme")
+    )
+
+    await service.update_server(
+        created.id,
+        "u1",
+        McpServerWrite(url="https://api.anysearch.com/mcp?tenant=other"),
+    )
+
+    stored = await store.get(created.id, "u1")
+    assert stored is not None
+    assert stored.url == "https://api.anysearch.com/mcp?tenant=other"
+
+
+@pytest.mark.asyncio
+async def test_update_of_a_disabled_server_does_not_sync(
+    service: McpServerService, sync: FakeSync
+) -> None:
+    created = await service.create_server(
+        "u1", write(name="off", enabled=False)
+    )
+    sync.calls.clear()
+
+    updated = await service.update_server(
+        created.id, "u1", McpServerWrite(display_name="Still off")
+    )
+
+    assert updated.display_name == "Still off"
+    assert updated.status == "disabled"
+    assert sync.calls == []
+
+
 # --------------------------------------------------------------------------- #
 # Delete, state, refresh, tools
 # --------------------------------------------------------------------------- #
@@ -531,3 +645,84 @@ async def test_list_tools_is_owner_scoped_and_returns_store_rows(
     assert tool_store.calls == [(created.id, "u1")]
     with pytest.raises(McpServerNotFound):
         await service.list_tools(created.id, "u2")
+
+
+# --------------------------------------------------------------------------- #
+# Status, reindex and storage failures
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_status_is_owner_scoped_and_reports_real_counts(
+    service: McpServerService,
+    store: McpServerStore,
+    tool_store: FakeToolStore,
+) -> None:
+    active = await service.create_server("u1", write(name="active"))
+    errored = await service.create_server("u1", write(name="errored"))
+    await store.set_status(
+        errored.id, "u1", status="error", reachable=False, last_error="boom"
+    )
+    await service.create_server("u2", write(name="other-owner"))
+    tool_store.tools = [
+        tool_record(server_id=active.id, name="one"),
+        tool_record(server_id=errored.id, name="two"),
+    ]
+
+    stats = await service.status("u1")
+
+    assert stats["servers_total"] == 2
+    assert stats["servers_active"] == 1
+    assert stats["servers_error"] == 1
+    assert stats["servers_pending"] == 0
+    assert stats["servers_disabled"] == 0
+    assert stats["servers_reachable"] == 1
+    assert stats["tools_total"] == 2
+    assert stats["indexed_tools"] == 2
+    assert stats["last_error"] == "boom"
+    assert {call[1] for call in tool_store.calls} == {"u1"}
+
+
+@pytest.mark.asyncio
+async def test_reindex_returns_the_typed_sync_stats(
+    service: McpServerService, sync: FakeSync
+) -> None:
+    sync.reindex_stats = McpServerReindexStats(
+        scanned=2,
+        changed=1,
+        upserted=3,
+        deleted=4,
+        failed=1,
+        duration_ms=12,
+        error="partial",
+    )
+
+    stats = await service.reindex("u1")
+
+    assert stats == sync.reindex_stats
+    assert sync.reindex_owners == ["u1"]
+
+
+@pytest.mark.asyncio
+async def test_masked_headers_reports_a_configuration_error_not_a_422(
+    service: McpServerService, store: McpServerStore
+) -> None:
+    other_cipher = HeaderCipher(HeaderCipher.generate_key())
+    token = other_cipher.encrypt({"Authorization": "Bearer old"})
+    record = await store.create(
+        McpServerRecord(
+            owner_user_id="u1",
+            name="wrong-key",
+            url="https://api.anysearch.com/mcp",
+            headers_encrypted=token,
+        )
+    )
+
+    with pytest.raises(McpServerConfigurationError):
+        service.masked_headers(record)
+
+
+def test_shared_header_validator_keeps_the_32_kib_budget() -> None:
+    headers = {f"X-Custom-{index}": "x" * 3000 for index in range(8)}
+
+    assert validate_headers(headers) == headers

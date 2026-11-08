@@ -1,9 +1,10 @@
 """MCP server API: wire masking, owner-scoped CRUD and error mapping.
 
 These tests mount the router on a bare FastAPI app with a fake service, the same
-way test_tools_router.py does. They pin what the browser can see: no ciphertext or
-raw header value ever appears in a response, PUT cannot rename a server, a server
-owned by somebody else is a 404, and the tools endpoint is read-only.
+way test_tools_router.py does. They pin what the browser can see: no ciphertext,
+raw header value, or URL query string ever appears in a response; PUT cannot
+rename a server or null out verify_tls; a server owned by somebody else is a 404;
+and the tools endpoint is read-only.
 """
 
 from __future__ import annotations
@@ -16,12 +17,21 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from agentkit.mcp.errors import McpServerNotFound
-from agentkit.mcp.service import MASK
+from agentkit.mcp.errors import (
+    McpServerConfigurationError,
+    McpServerConflict,
+    McpServerNotFound,
+    McpServerValidationError,
+)
+from agentkit.mcp.service import (
+    MASK,
+    McpServerReindexStats,
+    mask_headers,
+    restore_masked_headers,
+)
 from backend.app.gateway import mcp_servers_deps
 from backend.app.gateway.auth.result import AuthKind, AuthResult
 from backend.app.gateway.errors import install_error_handlers
-from backend.app.gateway.mcp_servers_wire import mask_headers
 from backend.app.gateway.routers import mcp_servers as router_module
 from backend.app.gateway.run_models import CallerKind, RunCaller
 
@@ -45,7 +55,7 @@ class FakeService:
                 name="anysearch",
                 display_name="AnySearch",
                 description="实时搜索",
-                url="https://api.anysearch.com/mcp",
+                url="https://api.anysearch.com/mcp?tenant=acme&token=url-secret",
                 transport="streamable_http",
                 headers_encrypted="gAAAAA-ciphertext",
                 verify_tls=True,
@@ -83,7 +93,12 @@ class FakeService:
         self.deleted: list[str] = []
         self.enabled_calls: list[tuple[str, bool]] = []
         self.refreshed: list[str] = []
-        self.reindexed: list[str] = []
+        self.reindex_owners: list[str] = []
+        self.reindex_stats = McpServerReindexStats(
+            scanned=2, changed=1, upserted=1, deleted=0, failed=0, duration_ms=5
+        )
+        self.conflict = False
+        self.decrypt_error = False
 
     async def list_servers(self, owner_user_id: str) -> list[Any]:
         return [r for r in self.records.values() if r.owner_user_id == owner_user_id]
@@ -95,6 +110,9 @@ class FakeService:
         return record
 
     async def create_server(self, owner_user_id: str, data: Any) -> Any:
+        if self.conflict:
+            raise McpServerConflict("MCP server name is already used by this user")
+        restore_masked_headers(data.headers or {}, {})
         self.created.append(data)
         record = SimpleNamespace(
             id="new",
@@ -120,6 +138,8 @@ class FakeService:
         return record
 
     async def update_server(self, server_id: str, owner_user_id: str, data: Any) -> Any:
+        if self.conflict:
+            raise McpServerConflict("MCP server update conflicts")
         record = await self.get_server(server_id, owner_user_id)
         self.updated.append(data)
         if data.display_name is not None and not hasattr(data.display_name, "__slots__"):
@@ -167,19 +187,16 @@ class FakeService:
             "last_error": None,
         }
 
-    async def reindex(self, owner_user_id: str, reason: str = "manual") -> dict[str, Any]:
-        self.reindexed.append(reason)
-        records = await self.list_servers(owner_user_id)
-        return {
-            "scanned": len(records),
-            "changed": len(records),
-            "upserted": len(records),
-            "deleted": 0,
-            "duration_ms": 5,
-            "error": None,
-        }
+    async def reindex(self, owner_user_id: str) -> McpServerReindexStats:
+        self.reindex_owners.append(owner_user_id)
+        return self.reindex_stats
 
     def masked_headers(self, record: Any) -> dict[str, str]:
+        if self.decrypt_error:
+            raise McpServerConfigurationError(
+                "stored MCP server headers could not be decrypted with the configured "
+                "encryption key"
+            )
         return mask_headers(self.headers.get(record.id, {}))
 
 
@@ -195,6 +212,19 @@ def client(service: FakeService) -> TestClient:
     app.include_router(router_module.router, prefix="/api")
     app.state.mcp_server_service = service
     app.dependency_overrides[mcp_servers_deps.get_mcp_server_service] = lambda: service
+    app.dependency_overrides[mcp_servers_deps.require_mcp_reader] = lambda: RunCaller(
+        kind=CallerKind.HTTP, user_id="u1", user_role="user"
+    )
+    app.dependency_overrides[mcp_servers_deps.require_mcp_writer] = lambda: RunCaller(
+        kind=CallerKind.HTTP, user_id="u1", user_role="user"
+    )
+    return TestClient(app)
+
+
+def _bare_client() -> TestClient:
+    app = FastAPI()
+    install_error_handlers(app)
+    app.include_router(router_module.router, prefix="/api")
     app.dependency_overrides[mcp_servers_deps.require_mcp_reader] = lambda: RunCaller(
         kind=CallerKind.HTTP, user_id="u1", user_role="user"
     )
@@ -255,7 +285,7 @@ def test_pat_without_the_mcp_scope_is_denied() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Read surfaces never leak ciphertext or raw headers
+# Read surfaces never leak ciphertext, raw headers or URL query strings
 # --------------------------------------------------------------------------- #
 
 
@@ -270,12 +300,15 @@ def test_list_never_serializes_the_encrypted_headers(
     server = body["servers"][0]
     assert server["name"] == "anysearch"
     assert server["tool_count"] == 1
+    assert server["url"] == "https://api.anysearch.com/mcp"
+    assert server["url_has_query"] is True
     assert "headers" not in server
     assert "headers_encrypted" not in response.text
     assert "gAAAAA-ciphertext" not in response.text
+    assert "url-secret" not in response.text
 
 
-def test_detail_masks_headers_and_never_returns_the_ciphertext(
+def test_detail_masks_headers_and_never_returns_the_ciphertext_or_query(
     client: TestClient,
 ) -> None:
     response = client.get("/api/mcp-servers/s1")
@@ -286,8 +319,11 @@ def test_detail_masks_headers_and_never_returns_the_ciphertext(
     assert body["headers"]["X-Env"] == "prod"
     assert body["tool_count"] == 1
     assert body["status"] == "active"
+    assert body["url"] == "https://api.anysearch.com/mcp"
+    assert body["url_has_query"] is True
     assert "gAAAAA-ciphertext" not in response.text
     assert "raw-secret" not in response.text
+    assert "url-secret" not in response.text
 
 
 def test_another_owners_server_is_a_404(
@@ -297,6 +333,18 @@ def test_another_owners_server_is_a_404(
 
     assert response.status_code == 404
     assert response.json()["code"] == "mcp_server_not_found"
+
+
+def test_decrypt_failure_is_a_sanitized_500_not_a_422(
+    client: TestClient, service: FakeService
+) -> None:
+    service.decrypt_error = True
+
+    response = client.get("/api/mcp-servers/s1")
+
+    assert response.status_code == 500
+    assert response.json()["code"] == "mcp_server_configuration_error"
+    assert "raw-secret" not in response.text
 
 
 # --------------------------------------------------------------------------- #
@@ -324,9 +372,41 @@ def test_create_returns_the_masked_detail_and_never_the_ciphertext(
     body = response.json()
     assert body["id"] == "new"
     assert body["headers"]["Authorization"] == MASK
+    assert body["url_has_query"] is False
     assert "gAAAAA-new-ciphertext" not in response.text
     assert "top-secret" not in response.text
     assert service.created[0].name == "brand-new"
+
+
+def test_create_rejects_a_literal_mask_header(
+    client: TestClient, service: FakeService
+) -> None:
+    response = client.post(
+        "/api/mcp-servers",
+        json={
+            "name": "masked",
+            "url": "https://mcp.example.com/v1/mcp",
+            "headers": {"Authorization": MASK},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "mcp_server_invalid"
+    assert service.created == []
+
+
+def test_create_conflict_is_a_409(
+    client: TestClient, service: FakeService
+) -> None:
+    service.conflict = True
+
+    response = client.post(
+        "/api/mcp-servers",
+        json={"name": "duplicate", "url": "https://mcp.example.com/v1/mcp"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mcp_server_conflict"
 
 
 def test_put_cannot_change_the_name(client: TestClient, service: FakeService) -> None:
@@ -346,6 +426,30 @@ def test_put_cannot_change_the_name(client: TestClient, service: FakeService) ->
     assert accepted.status_code == 200
     assert accepted.json()["display_name"] == "Renamed"
     assert service.updated[0].name is None
+
+
+def test_put_rejects_explicit_null_verify_tls(
+    client: TestClient, service: FakeService
+) -> None:
+    response = client.put(
+        "/api/mcp-servers/s1",
+        json={"verify_tls": None},
+    )
+
+    assert response.status_code == 422
+    assert service.updated == []
+
+
+def test_put_conflict_is_a_409(client: TestClient, service: FakeService) -> None:
+    service.conflict = True
+
+    response = client.put(
+        "/api/mcp-servers/s1",
+        json={"display_name": "Conflicting"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mcp_server_conflict"
 
 
 def test_delete_removes_the_server_and_its_catalog(
@@ -416,11 +520,34 @@ def test_status_is_scoped_to_the_caller(client: TestClient) -> None:
     assert body["tools_total"] == 1
 
 
-def test_reindex_is_a_separate_static_route(
+def test_reindex_returns_the_typed_sync_stats(
     client: TestClient, service: FakeService
 ) -> None:
     response = client.post("/api/mcp-servers/reindex")
 
     assert response.status_code == 200
-    assert response.json()["scanned"] == 1
-    assert service.reindexed == ["manual"]
+    assert response.json() == {
+        "scanned": 2,
+        "changed": 1,
+        "upserted": 1,
+        "deleted": 0,
+        "failed": 0,
+        "duration_ms": 5,
+        "error": None,
+    }
+    assert service.reindex_owners == ["u1"]
+
+
+def test_missing_service_is_a_coded_503(monkeypatch) -> None:
+    monkeypatch.setattr(
+        mcp_servers_deps,
+        "get_app_config",
+        lambda: SimpleNamespace(
+            mcp_servers=SimpleNamespace(enabled=False)
+        ),
+    )
+
+    response = _bare_client().get("/api/mcp-servers")
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "mcp_servers_disabled"

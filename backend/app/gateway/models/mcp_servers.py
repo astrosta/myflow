@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 McpTransportName = Literal["streamable_http", "sse"]
 
@@ -23,7 +23,9 @@ class McpServerSummary(BaseModel):
     name: str
     display_name: str | None = None
     description: str = ""
+    #: Query strings are never returned; this says whether the stored URL has one.
     url: str
+    url_has_query: bool = False
     transport: McpTransportName
     verify_tls: bool = True
     enabled: bool = True
@@ -72,6 +74,16 @@ class McpServerUpdate(BaseModel):
     headers: dict[str, str] | None = None
     verify_tls: bool | None = None
 
+    @field_validator("verify_tls", mode="before")
+    @classmethod
+    def _verify_tls_must_be_boolean(cls, value: object) -> object:
+        """An omitted field stays unset; an explicit null is a downgrade attempt."""
+        if value is None:
+            raise ValueError(
+                "verify_tls must be true or false; omit it to keep the current value"
+            )
+        return value
+
 
 class McpServerStateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -115,6 +127,8 @@ class McpServerStatusResponse(BaseModel):
 
 
 class McpServerReindexResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     scanned: int = 0
     changed: int = 0
     upserted: int = 0
