@@ -276,6 +276,28 @@ class UnreadableStore:
         return await self._store.get_by_call_name(call_name, owner_user_id)
 
 
+class UnreadableServerStore:
+    """The real server store, whose slug lookup fails: "could not look", not "none".
+
+    A row that is missing locally leaves only the call name, so the executor asks
+    the server table which server to refresh.  A database that cannot answer that
+    question must not be reported as "no such server of yours".
+    """
+
+    def __init__(self, store: McpServerStore) -> None:
+        self._store = store
+
+    async def get(
+        self, server_id: str, owner_user_id: str
+    ) -> McpServerRecord | None:
+        return await self._store.get(server_id, owner_user_id)
+
+    async def get_by_name(
+        self, owner_user_id: str, name: str
+    ) -> McpServerRecord | None:
+        raise RuntimeError("database connection lost")
+
+
 async def _invoke(
     *,
     call_name: str = CALL_NAME,
@@ -401,10 +423,12 @@ async def test_a_name_that_was_never_retrieved_is_refused(tmp_path: Path) -> Non
     payload = _payload(message)
     assert payload["origin"] == "not_retrieved"
     assert payload["call_name"] == CALL_NAME
+    assert payload["inner_name"] == "search", "the audit names the tool, not a slug"
     assert "tool_search" in payload["error"]
     assert runtime.calls == []
     assert runtime.refreshed == []
     assert _meta(message)["origin"] == "not_retrieved"
+    assert _meta(message)["inner_name"] == "search"
 
 
 @pytest.mark.asyncio
@@ -468,6 +492,7 @@ async def test_an_unpublished_runtime_is_unavailable(tmp_path: Path) -> None:
     payload = _payload(message)
     assert payload["origin"] == "mcp_unavailable"
     assert payload["retryable"] is False
+    assert payload["inner_name"] == "search"
     assert "MCP" in payload["error"]
     assert "ContextForge" not in payload["error"]
 
@@ -823,6 +848,7 @@ async def test_a_missing_tool_is_reported_after_one_refresh(tmp_path: Path) -> N
     payload = _payload(message)
     assert payload["origin"] == "tool_not_found"
     assert CALL_NAME in payload["error"]
+    assert payload["inner_name"] == "search", "parsed out of mcp__<server>__<tool>"
     assert "tool_search" in payload["error"]
     assert payload["retryable"] is False, (
         "the refresh already ran and the reply says do not repeat this call"
@@ -1157,7 +1183,14 @@ async def test_a_protocol_failure_is_neither_refreshed_nor_retried(
 async def test_a_json_rpc_tool_error_is_reported_without_retrying(
     tmp_path: Path,
 ) -> None:
-    """McpToolError is the path where no result exists: tool_error, never retried."""
+    """McpToolError is the path where no result exists: tool_error, never retried.
+
+    Ruling: a JSON-RPC rejection can be a remote -32601 (unknown tool) or -32602
+    (invalid params), but repeating a call the server already refused is exactly
+    what design 9.1 forbids, so it stays final.  The safe refresh paths are the
+    local not-found and the upstream isError ones; cost if wrong: a remote
+    "unknown tool" JSON-RPC error does not auto-refresh.
+    """
     async with catalog(tmp_path) as (store, server_store):
         await _server(server_store)
         await _store_tool(store, _tool())
@@ -1358,6 +1391,175 @@ async def test_a_tool_error_result_is_scrubbed_of_credentials(tmp_path: Path) ->
     error = _payload(message)["error"]
     assert "sk-live-999" not in error
     assert "****" in error
+
+
+# --------------------------------------------------------------------------- #
+# One refresh per call: a recovered row has already spent the budget
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_row_that_fails_validation_does_not_refresh_again(
+    tmp_path: Path,
+) -> None:
+    """Missing row -> refresh -> recovered row -> local validation: re-read only."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+
+        async def refresh() -> None:
+            await _store_tool(store, _tool())
+
+        runtime = FakeRuntime(store, server_store, on_refresh=refresh)
+
+        message = await _run(runtime, arguments={})
+
+    payload = _payload(message)
+    assert payload["origin"] == "local_validation"
+    assert "'query' is a required property" in payload["error"]
+    assert runtime.refreshed == [SERVER_ID], "one refresh per call, never two"
+    assert runtime.calls == []
+    assert "input_schema" not in payload, "the re-read saw the same schema"
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_row_whose_call_fails_does_not_refresh_again(
+    tmp_path: Path,
+) -> None:
+    """Missing row -> refresh -> recovered -> upstream not found: re-read, one retry."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+
+        async def refresh() -> None:
+            await _store_tool(store, _tool())
+
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            _error("tool not found: search"),
+            _ok(_text("ok")),
+            on_refresh=refresh,
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    assert message.status == "success"
+    assert runtime.refreshed == [SERVER_ID], "the second fallback only re-reads"
+    assert len(runtime.calls) == 2, "one call, one retry - no second sync"
+    assert runtime.retries == [(CALL_NAME, "success")]
+
+
+# --------------------------------------------------------------------------- #
+# Upstream text is data, and data is scrubbed before the model reads it
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_an_upstream_error_text_is_scrubbed_before_the_model_sees_it(
+    tmp_path: Path,
+) -> None:
+    """An upstream tool can echo the request it saw: no header, token or URL out."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            _error(
+                "request failed: Authorization: Bearer sk-live-777 at "
+                "https://user:secret@mcp.example.com/mcp?token=sk-live-777"
+            ),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_error"
+    assert "sk-live-777" not in payload["error"]
+    assert "secret@" not in payload["error"]
+    assert "example.com" not in payload["error"]
+    assert "****" in payload["error"], "the credential is redacted, not dropped"
+
+
+@pytest.mark.asyncio
+async def test_a_retried_upstream_error_text_is_scrubbed_too(tmp_path: Path) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(
+            store,
+            server_store,
+            _error("tool not found"),
+            _error(
+                "tool not found: https://user:secret@mcp.example.com/mcp?token=sk-9"
+            ),
+        )
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "tool_not_found"
+    assert "sk-9" not in payload["error"]
+    assert "example.com" not in payload["error"]
+    assert len(runtime.calls) == 2, "the retry still happened; only the text changed"
+
+
+# --------------------------------------------------------------------------- #
+# A missing row's server decides: its state, not just its id
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_missing_tool_on_a_disabled_server_is_refused_without_refreshing(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store, enabled=False)
+        runtime = FakeRuntime(store, server_store)
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "server_disabled"
+    assert payload["inner_name"] == "search"
+    assert runtime.refreshed == [], "a disabled server is not worth a sync"
+    assert runtime.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_missing_tool_on_an_unreachable_server_is_refused_without_refreshing(
+    tmp_path: Path,
+) -> None:
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store, reachable=False)
+        runtime = FakeRuntime(store, server_store)
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "server_unavailable"
+    assert payload["inner_name"] == "search"
+    assert runtime.refreshed == []
+    assert runtime.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_server_lookup_that_raises_is_unavailable_not_unknown_server(
+    tmp_path: Path,
+) -> None:
+    """The missing row's server table could not be read: "could not look" is not
+    "no such server of yours"."""
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        runtime = FakeRuntime(store, UnreadableServerStore(server_store))
+
+        message = await _run(runtime, arguments={"query": "pytest"})
+
+    payload = _payload(message)
+    assert payload["origin"] == "mcp_unavailable"
+    assert "could not be read" in payload["error"]
+    assert "nothing to refresh" not in payload["error"]
+    assert runtime.refreshed == []
+    assert runtime.calls == []
 
 
 # --------------------------------------------------------------------------- #

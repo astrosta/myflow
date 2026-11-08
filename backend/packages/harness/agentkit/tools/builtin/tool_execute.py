@@ -308,7 +308,13 @@ async def tool_execute(
         )
     if check.problem is not None:
         return await _validation_reply(
-            execution, owner, call_name, record, check.problem, tool_call_id
+            execution,
+            owner,
+            call_name,
+            record,
+            check.problem,
+            tool_call_id,
+            refreshed=recovered_from_refresh,
         )
 
     outcome = await _call_tool(execution, record, args)
@@ -324,7 +330,14 @@ async def tool_execute(
         )
     if bool(getattr(outcome.result, "isError", False)):
         return await _upstream_error_reply(
-            execution, owner, call_name, record, args, outcome, tool_call_id
+            execution,
+            owner,
+            call_name,
+            record,
+            args,
+            outcome,
+            tool_call_id,
+            refreshed=recovered_from_refresh,
         )
     if recovered_from_refresh:
         _record_retry(execution, call_name, True)
@@ -385,15 +398,21 @@ async def _resolve(execution: Any, call_name: str, owner: str | None) -> _Resolu
     """
     try:
         record = await execution.tool_store.get_by_call_name(call_name, owner)
-    except Exception:  # noqa: BLE001 - a tool result, not a run failure
-        logger.warning("MCP tool catalog read failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - a tool result, not a run failure
+        logger.warning("MCP tool catalog read failed: %s", _exception_text(exc))
         return _Resolution(
             origin=ORIGIN_MCP_UNAVAILABLE, message=CATALOG_UNAVAILABLE_MESSAGE
         )
     if record is None:
         # Not in this owner's catalog.  One refresh may still find it, so the
-        # server named by the call name is the target when this owner has one.
-        return _Resolution(server_id=await _server_id_for(execution, call_name, owner))
+        # server named by the call name is resolved first - and a catalog read
+        # that fails here is "could not look", never "no such server".
+        server, failed = await _server_for_call_name(execution, call_name, owner)
+        if failed:
+            return _Resolution(
+                origin=ORIGIN_MCP_UNAVAILABLE, message=CATALOG_UNAVAILABLE_MESSAGE
+            )
+        return _missing_tool_resolution(call_name, server)
     if record.owner_user_id and owner and record.owner_user_id != owner:
         # The query is owner-scoped, so this can only be a wiring bug; the call is
         # refused anyway, because a stored row is data and never a capability.
@@ -404,8 +423,8 @@ async def _resolve(execution: Any, call_name: str, owner: str | None) -> _Resolu
         )
     try:
         server = await execution.server_store.get(record.server_id, owner)
-    except Exception:  # noqa: BLE001 - "could not look", not "not there"
-        logger.warning("MCP server read failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - "could not look", not "not there"
+        logger.warning("MCP server read failed: %s", _exception_text(exc))
         return _Resolution(
             origin=ORIGIN_MCP_UNAVAILABLE,
             message=CATALOG_UNAVAILABLE_MESSAGE,
@@ -439,24 +458,50 @@ async def _resolve(execution: Any, call_name: str, owner: str | None) -> _Resolu
     return _Resolution(record=record, known=record)
 
 
-async def _server_id_for(
+def _missing_tool_resolution(
+    call_name: str, server: McpServerRecord | None
+) -> _Resolution:
+    """What an absent row means, given the server its call name names.
+
+    A disabled or unreachable server is a fact about the *server*, and a refresh
+    cannot change it: syncing a switched-off server only costs a round trip and
+    then answers "not found", which reads as if the tool had vanished.  Only a
+    healthy server - or none at all - leaves a question one refresh can answer.
+    """
+    if server is None:
+        return _Resolution()
+    if not server.enabled:
+        return _Resolution(
+            origin=ORIGIN_SERVER_DISABLED,
+            message=_server_disabled_message(call_name, server),
+        )
+    if not server.reachable:
+        return _Resolution(
+            origin=ORIGIN_SERVER_UNAVAILABLE,
+            message=_server_unavailable_message(call_name, server),
+        )
+    return _Resolution(server_id=server.id)
+
+
+async def _server_for_call_name(
     execution: Any, call_name: str, owner: str | None
-) -> str:
-    """The id of the server a call name names, when this owner has one.
+) -> tuple[McpServerRecord | None, bool]:
+    """The server a call name names, and whether that lookup itself failed.
 
     A call name is all a missing row still tells us, and a sync is per server, so
-    this is what a not-found refresh targets.  A call name that names no server of
-    this owner yields "" - nothing to refresh, and nothing refreshed.
+    this is what a not-found refresh targets.  "No such server of yours" and "the
+    server table could not be read" are different answers - the second one is
+    mcp_unavailable, because this process does not know whether the row exists.
     """
     server_name = _server_name_from_call_name(call_name)
     if not server_name:
-        return ""
+        return None, False
     try:
         server = await execution.server_store.get_by_name(owner, server_name)
-    except Exception:  # noqa: BLE001 - no target, so no refresh
-        logger.warning("MCP server lookup failed", exc_info=True)
-        return ""
-    return server.id if server is not None else ""
+    except Exception as exc:  # noqa: BLE001 - reported as unavailable, not not-found
+        logger.warning("MCP server lookup failed: %s", _exception_text(exc))
+        return None, True
+    return server, False
 
 
 async def _reread_after_refresh(
@@ -464,8 +509,15 @@ async def _reread_after_refresh(
     call_name: str,
     owner: str | None,
     server_id: str,
+    *,
+    refreshed: bool = False,
 ) -> tuple[_Resolution, str]:
     """One refresh of one server, then the single re-read that follows it.
+
+    `refreshed=True` means this call already refreshed that server (the row had
+    to be recovered first): the design allows one refresh per user call, so the
+    second fallback only re-reads.  Refreshing again would sync the same server
+    twice for one call - and a server whose sync is slow would pay that twice.
 
     The state is not a "refreshed" boolean.  A re-read that *raises* is a third
     outcome: the sync succeeded and the catalog read failed afterwards, so this
@@ -473,6 +525,8 @@ async def _reread_after_refresh(
     "refreshed" there used to make a database failure back a "refreshed,
     therefore not found" answer; it is `mcp_unavailable` instead.
     """
+    if refreshed:
+        return await _resolve(execution, call_name, owner), REREAD_REFRESHED
     if not _retry_on_tool_error(execution):
         return _Resolution(server_id=server_id), REREAD_DISABLED
     if not server_id:
@@ -483,7 +537,13 @@ async def _reread_after_refresh(
 
 
 async def _refresh_server(execution: Any, server_id: str) -> bool:
-    """One awaited, bounded refresh of one server; False means it did not happen."""
+    """One awaited, bounded refresh of one server; False means it did not happen.
+
+    Task 8's `refresh_server` must return a *per-target* result - an object that
+    exposes `error` and `index_failed` for the server it was given - not a global
+    sync summary: a whole-catalog failure would otherwise veto the retry of one
+    healthy server, and a global success would claim a target that failed.
+    """
     refresh = getattr(execution, "refresh_server", None)
     if not callable(refresh):
         return False
@@ -491,8 +551,10 @@ async def _refresh_server(execution: Any, server_id: str) -> bool:
         stats = await asyncio.wait_for(
             refresh(server_id), timeout=DEFAULT_REFRESH_TIMEOUT_SECONDS
         )
-    except Exception:  # noqa: BLE001 - a failed fallback is not a run failure
-        logger.warning("MCP server refresh failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - a failed fallback is not a run failure
+        logger.warning(
+            "MCP server refresh failed for %s: %s", server_id, _exception_text(exc)
+        )
         return False
     if _refresh_failed(stats):
         # A sync that reports its failure in stats instead of raising did not
@@ -542,8 +604,8 @@ def _record_retry(execution: Any, call_name: str, ok: bool) -> None:
         return
     try:
         record(tool_name=call_name, result="success" if ok else "failed")
-    except Exception:  # noqa: BLE001 - status bookkeeping must not fail the call
-        logger.debug("record_retry failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail the call
+        logger.debug("record_retry failed: %s", type(exc).__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -602,10 +664,16 @@ async def _validation_reply(
     record: McpToolRecord,
     problem: str,
     tool_call_id: str,
+    *,
+    refreshed: bool = False,
 ) -> ToolMessage:
-    """Design 9.1 A: refresh, then answer with the new schema - no retry, no call."""
+    """Design 9.1 A: refresh, then answer with the new schema - no retry, no call.
+
+    A record recovered from a refresh already spent this call's one refresh, so
+    there only the re-read runs (see `_reread_after_refresh`).
+    """
     fresh, _state = await _reread_after_refresh(
-        execution, call_name, owner, record.server_id
+        execution, call_name, owner, record.server_id, refreshed=refreshed
     )
     if fresh.record is not None and _schema_changed(record, fresh.record):
         return _error_reply(
@@ -633,13 +701,22 @@ async def _upstream_error_reply(
     args: dict[str, Any],
     outcome: _CallOutcome,
     tool_call_id: str,
+    *,
+    refreshed: bool = False,
 ) -> ToolMessage:
-    """Design 9.1 B/C: what the owning server answering isError entitles us to."""
-    text = _result_text(outcome.result)
-    kind = _classify_upstream(text)
+    """Design 9.1 B/C: what the owning server answering isError entitles us to.
+
+    The lookup for a refresh-and-retry decision reads the *raw* upstream text, but
+    everything shown to the model goes through `_result_message`: an upstream tool
+    can echo the request it saw, Authorization header and endpoint included, and
+    this reply is the model's.
+    """
+    raw = _result_text(outcome.result)
+    kind = _classify_upstream(raw)
+    text = _result_message(raw)
     if kind is _UpstreamError.NOT_FOUND:
         fresh, state = await _reread_after_refresh(
-            execution, call_name, owner, record.server_id
+            execution, call_name, owner, record.server_id, refreshed=refreshed
         )
         if fresh.origin is not None or fresh.record is None:
             return _unresolved_reply(
@@ -662,7 +739,7 @@ async def _upstream_error_reply(
                 tool_call_id,
                 call_name=call_name,
                 origin=_upstream_origin(retry_text),
-                message=retry_text[:MAX_ERROR_CHARS],
+                message=_result_message(retry_text),
                 record=fresh.record,
             )
         _record_retry(execution, call_name, True)
@@ -670,7 +747,7 @@ async def _upstream_error_reply(
 
     if kind is _UpstreamError.INVALID_ARGUMENTS:
         fresh, _state = await _reread_after_refresh(
-            execution, call_name, owner, record.server_id
+            execution, call_name, owner, record.server_id, refreshed=refreshed
         )
         if fresh.record is not None and _schema_changed(record, fresh.record):
             return _error_reply(
@@ -689,12 +766,13 @@ async def _upstream_error_reply(
             record=record,
         )
 
-    # Timeout, 5xx, auth, or any other execution error: the call may have run
-    # upstream, so this is reported as-is and never repeated.
+    # Timeout, 5xx, auth, or any other execution error: the call may have run, so
+    # this is reported as it came back (scrubbed) and never repeated.  The origin
+    # is named from the raw text, which is what carries the markers.
     return _error_reply(
         tool_call_id,
         call_name=call_name,
-        origin=_failure_origin(text),
+        origin=_failure_origin(raw),
         message=text,
         record=record,
     )
@@ -722,9 +800,12 @@ async def _call_tool(
         result = await execution.call_tool(record, dict(args))
     except McpToolError as exc:
         # The JSON-RPC/protocol path: the call produced no result, so it is
-        # reported as tool_error and never retried.  A carried CallToolResult is
-        # the server's own text; either way the text is scrubbed of credentials
-        # before it can reach the model.
+        # reported as tool_error and never retried.  A JSON-RPC rejection can be a
+        # remote -32601 (unknown tool) or -32602 (invalid params), but repeating a
+        # call the server already refused is exactly what design 9.1 forbids; the
+        # safe refresh paths are the local not-found and the upstream isError text
+        # ones above.  A carried CallToolResult is the server's own text; either
+        # way the text is scrubbed of credentials before it reaches the model.
         logger.warning("MCP tools/call failed for %s (tool_error)", record.name)
         return _CallOutcome(origin=ORIGIN_TOOL_ERROR, message=_tool_error_text(exc))
     except Exception as exc:  # noqa: BLE001 - classified, then reported as a result
@@ -738,13 +819,24 @@ async def _call_tool(
     return _CallOutcome(result=result)
 
 
+def _result_message(text: str) -> str:
+    """Upstream text this tool may show: scrubbed first, then bounded.
+
+    An upstream tool's error text is not ours to trust - it can echo the request
+    it just saw, Authorization header and endpoint included - so the shared
+    sanitizer runs before any of it reaches a reply or the model.
+    """
+    return sanitize_error_text(text)[:MAX_ERROR_CHARS]
+
+
 def _tool_error_text(exc: McpToolError) -> str:
     """An McpToolError's own text, with any credential scrubbed out of it."""
     result = getattr(exc, "result", None)
-    text = _result_text(result) if result is not None else ""
-    if text:
-        return sanitize_error_text(text)[:MAX_ERROR_CHARS]
-    return (sanitize_error_text(str(exc)) or type(exc).__name__)[:MAX_ERROR_CHARS]
+    if result is not None:
+        text = _result_message(_result_text(result))
+        if text:
+            return text
+    return _result_message(str(exc)) or type(exc).__name__
 
 
 def _exception_text(exc: BaseException) -> str:
@@ -1102,26 +1194,37 @@ def _server_unavailable_message(call_name: str, server: McpServerRecord) -> str:
     )
 
 
-def _inner_name(call_name: str) -> str:
-    if call_name.startswith(CALL_NAME_PREFIX):
-        return call_name[len(CALL_NAME_PREFIX) :]
-    return call_name
+def _split_call_name(call_name: str) -> tuple[str, str]:
+    """`(server, tool)` for a `mcp__<server>__<tool>` call name, else `("", "")`.
 
-
-def _server_name_from_call_name(call_name: str) -> str:
-    """The server slug a call name names, or "" when it is not one.
-
-    Mirrors the store's own derivation (a slug is [a-z0-9-]+ and therefore cannot
-    contain the "__" separator), which is what makes the first segment after the
-    prefix the server name even when the tool name contains "__" itself.
+    Mirrors the store's own derivation: a server slug is [a-z0-9-]+ and therefore
+    cannot contain the "__" separator, so the first segment after the prefix is
+    the server name even when the upstream tool name contains "__" itself.
     """
     text = str(call_name or "")
     if not text.startswith(CALL_NAME_PREFIX):
-        return ""
+        return "", ""
     server_name, separator, tool_name = text[len(CALL_NAME_PREFIX) :].partition("__")
     if not separator or not tool_name:
-        return ""
-    return server_name
+        return "", ""
+    return server_name, tool_name
+
+
+def _inner_name(call_name: str) -> str:
+    """The upstream tool name behind a call name, for a reply with no stored row.
+
+    `mcp__anysearch__search` -> `search`.  Stripping only the prefix would report
+    `anysearch__search`, which is neither the remote tool name nor a call name the
+    model ever saw.  A string that is not a call name is returned unchanged:
+    guessing a tool name out of it would be worse than echoing it.
+    """
+    _server_name, tool_name = _split_call_name(call_name)
+    return tool_name or str(call_name or "")
+
+
+def _server_name_from_call_name(call_name: str) -> str:
+    """The server slug a call name names, or "" when it is not one."""
+    return _split_call_name(call_name)[0]
 
 
 def _require_retrieved(execution: Any) -> bool:

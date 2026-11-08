@@ -14,11 +14,14 @@ whatever the application built at startup:
 * an unpublished slot means "this deployment has no MCP execution", which
   ``tool_execute`` reports as ``mcp_unavailable`` instead of guessing.
 
-Two optional members are read defensively by the tool instead of being declared
+Four optional members are read defensively by the tool instead of being declared
 here, because a fake runtime should not have to implement them:
 ``require_retrieved`` (the retrieval gate, falling back to
-``config.tool_search.require_retrieved``) and ``retry_on_tool_error`` (the
-refresh-and-retry switch, default on).
+``config.tool_search.require_retrieved``), ``retry_on_tool_error`` (the
+refresh-and-retry switch, default on), ``record_retry(tool_name=`, `result=)``
+(the sync bookkeeping the retry reports into), and ``config`` (read for the
+retrieval policy).  The runtime must keep all four: the first two decide whether
+the fallback runs at all, and the third is how a recovered call is counted.
 
 ``call_tool`` returns the MCP ``CallToolResult`` even when ``isError`` is true: that
 flag is the tool's own answer, data for the executor to report, not a transport
@@ -44,9 +47,14 @@ class McpRuntimeProtocol(Protocol):
     async def refresh_server(self, server_id: str) -> Any:
         """Re-discover one server's tools and persist the new snapshot.
 
-        The return value is advisory: a sync that reports its failure in the
-        returned stats instead of raising is treated as "did not refresh", and the
-        caller keeps the error it already had.
+        Must return the outcome *for that server* - an object exposing ``error``
+        (the failure this sync hit, or None) and ``index_failed`` (the database
+        snapshot was committed and only the derived index failed).  A global
+        catalog summary is not enough: the executor uses it to decide whether the
+        re-read that follows saw a fresh snapshot, and a whole-catalog failure
+        would otherwise veto (or a whole-catalog success would misreport) the
+        retry of one target.  Raises are caught and treated as "did not refresh";
+        ``None`` means "no failure reported" and is accepted.
         """
         ...
 
