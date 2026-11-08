@@ -111,15 +111,20 @@ class McpServerStore:
         A duplicate `(owner_user_id, name)` raises `IntegrityError`: the API turns it
         into a 409, and swallowing it here would hand the caller a row that does not
         exist.
+
+        `status` and `reachable` are **derived, not accepted**: a server that was just
+        inserted has never answered an `initialize`, so it is `pending` (or `disabled`
+        when created switched off) and unreachable, whatever the incoming record says.
+        An unknown `status` string is still rejected - that is a caller bug - but a valid
+        one is overwritten rather than trusted, so no write path can publish a server
+        that was never contacted.
         """
         owner = _require_owner(record.owner_user_id)
         name = validate_server_name(record.name)
         transport = validate_transport(record.transport)
         enabled = bool(record.enabled)
-        status = validate_server_status(record.status)
-        if not enabled:
-            # A server the user switched off is "disabled" no matter what it was.
-            status = "disabled"
+        validate_server_status(record.status)
+        status = "pending" if enabled else "disabled"
         stamp = _now()
         row = McpServerRow(
             id=(record.id or "").strip() or uuid4().hex,
@@ -133,7 +138,7 @@ class McpServerStore:
             verify_tls=bool(record.verify_tls),
             enabled=enabled,
             status=status,
-            reachable=bool(record.reachable),
+            reachable=False,
             last_error=truncate_error(record.last_error),
             last_connected_at=_utc(record.last_connected_at),
             last_tools_sync_at=_utc(record.last_tools_sync_at),

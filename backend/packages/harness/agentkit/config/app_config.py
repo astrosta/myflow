@@ -195,6 +195,44 @@ class AppConfig(BaseModel):
         return patched
 
     @model_validator(mode="after")
+    def _validate_tool_search_prerequisites(self) -> Self:
+        """MCP servers imply tool discovery, and discovery needs Milvus + an embedder.
+
+        Mirrors ``contextforge.search``: ``tool_search`` and ``mcp_servers`` are
+        independent blocks, so the cross-block prerequisite check has to live with the
+        parent that knows about both.  It fires only when the user actually turned MCP
+        servers on: the default ``AppConfig()`` (and every deployment that has not
+        adopted MCP servers yet) must stay loadable without a vector store.
+        """
+        if not (self.mcp_servers.enabled and self.tool_search.enabled):
+            return self
+        search = self.tool_search
+        if not search.vector_store.uri.strip():
+            raise ValueError(
+                "mcp_servers.enabled=true with tool_search.enabled=true requires "
+                "tool_search.vector_store.uri (the existing Milvus instance)"
+            )
+        if search.embedding.enabled:
+            if not search.embedding.base_url.strip():
+                raise ValueError(
+                    "tool_search.embedding.enabled=true requires embedding.base_url"
+                )
+            if not search.embedding.model.strip():
+                raise ValueError(
+                    "tool_search.embedding.enabled=true requires embedding.model"
+                )
+        if search.rerank.enabled:
+            if not search.rerank.base_url.strip():
+                raise ValueError(
+                    "tool_search.rerank.enabled=true requires rerank.base_url"
+                )
+            if not search.rerank.model.strip():
+                raise ValueError(
+                    "tool_search.rerank.enabled=true requires rerank.model"
+                )
+        return self
+
+    @model_validator(mode="after")
     def _build_name_indexes(self) -> "AppConfig":
         by_name: dict[str, ModelConfig] = {}
         for m in self.models:

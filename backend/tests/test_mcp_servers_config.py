@@ -172,6 +172,8 @@ def test_app_config_holds_both_blocks() -> None:
 def test_app_config_parses_the_deployed_yaml_shape() -> None:
     config = AppConfig.model_validate(
         {
+            "embedding": {"base_url": "http://embedding:8000", "model": "bge-m3"},
+            "vector_store": {"uri": "http://milvus:19530"},
             "mcp_servers": {
                 "enabled": True,
                 "encryption_key": VALID_KEY,
@@ -185,6 +187,73 @@ def test_app_config_parses_the_deployed_yaml_shape() -> None:
     config.mcp_servers.validate_for_startup()
     assert config.mcp_servers.request_timeout_seconds == 45.0
     assert config.tool_search.top_k == 3
+
+
+# --------------------------------------------------------------------------- #
+# tool_search prerequisites (mirrors contextforge.search)
+# --------------------------------------------------------------------------- #
+
+
+def test_enabled_mcp_servers_requires_a_vector_store_uri() -> None:
+    with pytest.raises(ValidationError, match="vector_store.uri"):
+        AppConfig.model_validate(
+            {"mcp_servers": {"enabled": True, "encryption_key": VALID_KEY}}
+        )
+
+
+def test_enabled_mcp_servers_requires_the_embedding_endpoint() -> None:
+    with pytest.raises(ValidationError, match="embedding.base_url"):
+        AppConfig.model_validate(
+            {
+                "mcp_servers": {"enabled": True, "encryption_key": VALID_KEY},
+                "vector_store": {"uri": "http://milvus:19530"},
+            }
+        )
+
+
+def test_enabled_mcp_servers_requires_the_embedding_model() -> None:
+    """`model` ships a code default, so only an explicit blank trips the guard."""
+    with pytest.raises(ValidationError, match="embedding.model"):
+        AppConfig.model_validate(
+            {
+                "mcp_servers": {"enabled": True, "encryption_key": VALID_KEY},
+                "vector_store": {"uri": "http://milvus:19530"},
+                "embedding": {"base_url": "http://embedding:8000", "model": ""},
+            }
+        )
+
+
+def test_enabled_rerank_requires_the_rerank_endpoint() -> None:
+    with pytest.raises(ValidationError, match="rerank.base_url"):
+        AppConfig.model_validate(
+            {
+                "mcp_servers": {"enabled": True, "encryption_key": VALID_KEY},
+                "vector_store": {"uri": "http://milvus:19530"},
+                "embedding": {"base_url": "http://embedding:8000", "model": "bge-m3"},
+                "tool_search": {"rerank": {"enabled": True}},
+            }
+        )
+
+
+def test_disabled_mcp_servers_loads_without_any_vector_store() -> None:
+    """The default AppConfig stays constructible: no MCP server, no Milvus needed."""
+    config = AppConfig.model_validate({"mcp_servers": {"enabled": False}})
+
+    assert config.mcp_servers.enabled is False
+    assert config.tool_search.vector_store.uri == ""
+    assert AppConfig().mcp_servers.enabled is False
+
+
+def test_disabled_tool_search_loads_without_any_vector_store() -> None:
+    config = AppConfig.model_validate(
+        {
+            "mcp_servers": {"enabled": True, "encryption_key": VALID_KEY},
+            "tool_search": {"enabled": False},
+        }
+    )
+
+    assert config.tool_search.enabled is False
+    assert config.tool_search.vector_store.uri == ""
 
 
 def test_app_config_fills_tool_search_from_the_shared_services() -> None:

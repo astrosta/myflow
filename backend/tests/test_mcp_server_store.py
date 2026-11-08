@@ -165,6 +165,28 @@ async def test_a_disabled_server_is_created_as_disabled(store: McpServerStore) -
 
 
 @pytest.mark.asyncio
+async def test_create_does_not_trust_the_caller_derivation_fields(
+    store: McpServerStore,
+) -> None:
+    """status/reachable are what a connect produced, not what a caller claims.
+
+    A freshly created server has never been contacted, so `active`/`reachable=True` on
+    the incoming record are output flags the store overwrites: otherwise any write path
+    could publish a server that never answered an initialize.
+    """
+    created = await store.create(server_record(status="active", reachable=True))
+
+    assert created.status == "pending"
+    assert created.reachable is False
+
+    disabled = await store.create(
+        server_record(name="other", enabled=False, status="active", reachable=True)
+    )
+    assert disabled.status == "disabled"
+    assert disabled.reachable is False
+
+
+@pytest.mark.asyncio
 async def test_get_by_name_is_owner_scoped(store: McpServerStore) -> None:
     mine = await store.create(server_record(owner="u1", name="anysearch"))
 
