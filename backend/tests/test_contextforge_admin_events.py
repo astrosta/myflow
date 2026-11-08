@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import httpx
 import pytest
 
 from agentkit.config.contextforge_config import ContextForgeConfig
 from agentkit.contextforge.admin_events import (
+    AdminEventSubscriber,
     parse_sse_block,
     should_refresh_tool_event,
 )
@@ -37,6 +39,55 @@ def test_tool_and_gateway_events_refresh() -> None:
     assert should_refresh_tool_event("tool_updated") is True
     assert should_refresh_tool_event("gateway_activated") is True
     assert should_refresh_tool_event("tool_executed") is False
+
+
+def _admin_events_config(*, admin_token: str = "") -> ContextForgeConfig:
+    return ContextForgeConfig(
+        enabled=True,
+        base_url="http://cf",
+        admin_token=admin_token,
+        search={"enabled": False},
+        admin_events={"enabled": True},
+    )
+
+
+async def _stream_admin_events_once(
+    config: ContextForgeConfig,
+) -> dict[str, str | None]:
+    """Run one SSE read and return the headers the subscriber sent."""
+    seen: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"",
+        )
+
+    async def ignore(_event: Any) -> None:
+        return None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        subscriber = AdminEventSubscriber(config, ignore, client=client)
+        assert await subscriber._stream_once() is True
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_admin_events_omits_authorization_when_token_is_empty() -> None:
+    # ALLOW_UNAUTHENTICATED_ADMIN deployments leave the token empty.  A blank
+    # "Bearer " header is still a credential-shaped request and must not be sent.
+    headers = await _stream_admin_events_once(_admin_events_config())
+
+    assert headers["authorization"] is None
+
+
+@pytest.mark.asyncio
+async def test_admin_events_sends_the_configured_token() -> None:
+    headers = await _stream_admin_events_once(_admin_events_config(admin_token="adm"))
+
+    assert headers["authorization"] == "Bearer adm"
 
 
 # --------------------------------------------------------------------------- #

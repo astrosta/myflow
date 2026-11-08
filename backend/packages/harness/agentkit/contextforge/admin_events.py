@@ -157,10 +157,14 @@ class AdminEventSubscriber:
 
     async def _stream_once(self) -> bool:
         url = self._config.resolved_admin_events_url()
-        headers = {
-            "Accept": "text/event-stream",
-            "Authorization": f"Bearer {self._config.resolved_admin_events_token()}",
-        }
+        headers = {"Accept": "text/event-stream"}
+        # No-auth deployments (ALLOW_UNAUTHENTICATED_ADMIN) leave the token
+        # empty.  Sending "Bearer " with an empty value is still a malformed
+        # credential and can be rejected by the gateway, so omit the header
+        # entirely instead of sending a blank one.
+        token = self._config.resolved_admin_events_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         self._status = STATUS_CONNECTING
         async with self._client.stream("GET", url, headers=headers) as response:
             if response.status_code == 404:

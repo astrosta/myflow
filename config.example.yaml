@@ -548,7 +548,8 @@ skills:
 contextforge:
   enabled: false
   base_url: ""                    # 例如 http://127.0.0.1:4444
-  admin_token: ""                 # 生产用 $CONTEXTFORGE_ADMIN_TOKEN；需 admin.events 或 *
+  admin_token: ""                 # 生产用 $CONTEXTFORGE_ADMIN_TOKEN；需 admin.events 或 *；
+                                  # 本机 compose 关闭鉴权时必须留空，旧 token 会被拒绝
   agent_token: ""                 # 可留空；默认复用 admin_token
   mcp_url: ""                     # 留空 = <base_url>/mcp；有虚拟服务器时自动加 /servers/<id>/mcp
   virtual_server_id: ""

@@ -66,6 +66,7 @@ async def test_upstream_401_maps_to_auth_error_without_token() -> None:
     with pytest.raises(ContextForgeAuthError) as exc:
         await admin.list_tools()
     assert "secret" not in str(exc.value)
+    assert "HTTP 401" in str(exc.value)
     await admin.aclose()
     await http.aclose()
 

@@ -78,7 +78,12 @@ class ContextForgeAdminClient:
         if response.status_code < 400:
             return response
         if response.status_code in (401, 403):
-            raise ContextForgeAuthError("ContextForge rejected the admin token")
+            # Keep the upstream status: 401 is a bad/expired token, 403 is a
+            # valid identity that lacks tools.read.  The no-auth compose mode
+            # used to produce the latter while the UI called it "bad token".
+            raise ContextForgeAuthError(
+                f"ContextForge rejected the admin credential (HTTP {response.status_code})"
+            )
         if response.status_code == 404:
             raise ContextForgeNotFound("ContextForge tool not found")
         if response.status_code == 409:

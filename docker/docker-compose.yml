@@ -188,8 +188,9 @@ services:
 
   # ContextForge（IBM mcp-context-forge）。管理 API / UI 打开。
   # 网关在同一 Docker 网络里用 http://contextforge:4444；宿主机进程用 127.0.0.1:4444。
-  # 本 compose 默认关掉 MCP/Admin 的 token 校验（仅适合本机/内网联调，生产勿用）。
-  # MyFlow 的 contextforge.admin_token / agent_token 可留空。
+  # 本 compose 默认关闭 token 校验（仅适合本机/内网联调，生产勿用）：
+  # 管理 API 用 platform-admin 匿名上下文，MCP 端点只暴露 public 工具。
+  # MyFlow 的 contextforge.admin_token / agent_token 必须留空。
   #
   # 不用挂卷 SQLite：镜像以 uid 10001 运行，named volume 属主是 root，
   # /health 会因库连不上一直报 unhealthy。库用现有 Postgres 的 mcp 库。
@@ -233,11 +234,15 @@ services:
       # 未设置时镜像默认 changeme（8 位），邮箱登录开启时启动会被拒。
       DEFAULT_USER_PASSWORD: ${CONTEXTFORGE_DEFAULT_USER_PASSWORD:-myflow-user-local}
       PLATFORM_ADMIN_FULL_NAME: Platform Administrator
-      # 不验证 token（本机/内网联调）。AUTH_REQUIRED 只管 UI；MCP 还要关下面两项。
+      # 本机/内网免 token。关键点：
+      # - MCP_CLIENT_AUTH_ENABLED 必须为 true：管理 API 才会走
+      #   “无 token -> ALLOW_UNAUTHENTICATED_ADMIN -> platform admin”的分支。
+      #   设为 false 时 get_current_user_with_permissions 直接返回 anonymous，
+      #   /tools 会因缺少 tools.read 返回 403，MyFlow 侧表现为 502。
+      # - MCP 端点由 MCP_REQUIRE_AUTH=false 放行匿名访问（public-only）。
       AUTH_REQUIRED: "false"
       ALLOW_UNAUTHENTICATED_ADMIN: "true"
-      MCP_CLIENT_AUTH_ENABLED: "false"
-      TRUST_PROXY_AUTH: "true"
+      MCP_CLIENT_AUTH_ENABLED: "true"
       MCP_REQUIRE_AUTH: "false"
     ports:
       - "127.0.0.1:4444:4444"
