@@ -30,7 +30,8 @@ COPY backend backend
 COPY skills skills
 
 # 根项目没有 extras。网关可选依赖在 backend / agentkit 上。
-# --inexact 让第二次 sync 只补 OpenViking 和 MCP，不卸掉第一次装上的包。
+# --inexact 让第二次 sync 只补 OpenViking，不卸掉第一次装上的包。
+# MCP SDK 已归入 contextforge extra（不再有独立的 mcp extra）。
 RUN uv sync --frozen --no-dev --package backend \
         --extra postgres \
         --extra redis \
@@ -38,9 +39,9 @@ RUN uv sync --frozen --no-dev --package backend \
         --extra skills \
         --extra observability \
         --extra opensandbox \
+        --extra contextforge \
     && uv sync --frozen --no-dev --inexact --package agentkit \
         --extra openviking \
-        --extra mcp \
     && uv pip install --python /app/.venv/bin/python "uvicorn[standard]>=0.32"
 
 COPY config.yaml .env ./
