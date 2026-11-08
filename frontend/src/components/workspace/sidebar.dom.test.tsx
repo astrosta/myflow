@@ -8,7 +8,7 @@ import { Sidebar } from "./sidebar";
 
 /**
  * 侧栏版面：品牌行 → 新对话 → 功能导航 → **最近对话**（历史会话挂在它下面）。
- * 功能导航顺序：我的画像 → 记忆管理 → 技能中心 → 知识库。
+ * 功能导航顺序：我的画像 → 记忆管理 → 技能中心 → MCP 服务 → 知识库。
  *
  * `next/link` 在 vitest 里没有路由上下文，这里替换成一个普通 `<a>`：
  * 这条测试要断言的是**结构和文案**，不是 Next 的路由行为。
@@ -85,7 +85,7 @@ describe("侧栏的最近对话栏", () => {
     expect(view.getByText(/还没有会话/)).toBeTruthy();
   });
 
-  it("功能导航按我的画像、记忆管理、技能中心、工具管理、知识库排列", () => {
+  it("功能导航按我的画像、记忆管理、技能中心、MCP 服务、知识库排列", () => {
     const view = render(<Sidebar threads={[]} />);
     const nav = view.getByRole("navigation", { name: "功能导航" });
     const links = Array.from(nav.querySelectorAll("a"));
@@ -94,14 +94,14 @@ describe("侧栏的最近对话栏", () => {
       "我的画像",
       "记忆管理",
       "技能中心",
-      "工具管理",
+      "MCP 服务",
       "知识库",
     ]);
     expect(links.map((link) => link.getAttribute("href"))).toEqual([
       "/workspace/profile",
       "/workspace/memory",
       "/workspace/skills",
-      "/workspace/tools",
+      "/workspace/mcp-servers",
       "/workspace/knowledge",
     ]);
   });
@@ -114,12 +114,15 @@ describe("侧栏的最近对话栏", () => {
     expect(skills.getAttribute("aria-current")).toBe("page");
   });
 
-  it("工具入口叫「工具管理」，按当前路由高亮", () => {
-    const view = render(<Sidebar threads={[]} toolsActive />);
+  it("MCP 入口叫「MCP 服务」，指向 /workspace/mcp-servers 并按当前路由高亮", () => {
+    const view = render(<Sidebar mcpServersActive threads={[]} />);
 
-    const tools = view.getByRole("link", { name: /工具管理/ });
-    expect(tools.getAttribute("href")).toBe("/workspace/tools");
-    expect(tools.getAttribute("aria-current")).toBe("page");
+    const link = view.getByRole("link", { name: /MCP 服务/ });
+    expect(link.getAttribute("href")).toBe("/workspace/mcp-servers");
+    expect(link.getAttribute("aria-current")).toBe("page");
+    // 旧入口不能再以任何形式留着
+    expect(view.queryByRole("link", { name: /工具管理/ })).toBeNull();
+    expect(view.container.querySelector('a[href="/workspace/tools"]')).toBeNull();
   });
 
   it("导航里有「记忆管理」，按当前路由高亮", () => {

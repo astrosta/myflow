@@ -96,7 +96,7 @@ export function SidebarContainer() {
           profileActive={pathname?.startsWith("/workspace/profile") ?? false}
           loading={query.isLoading}
           skillsActive={pathname?.startsWith("/workspace/skills") ?? false}
-          toolsActive={pathname?.startsWith("/workspace/tools") ?? false}
+          mcpServersActive={pathname?.startsWith("/workspace/mcp-servers") ?? false}
           onNewChat={newChat}
           onThreadClick={requestScrollToBottom}
           onRefresh={() => {

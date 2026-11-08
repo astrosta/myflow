@@ -12,7 +12,7 @@ import { cn, formatTimestamp } from "@/lib/utils";
  * 服务端状态，应该由 TanStack Query 在容器里管；这里只负责画出来。
  *
  * 版面从上到下：品牌行 → 新对话 → 功能导航 → **最近对话**（历史会话）。
- * 功能导航固定为：我的画像 → 记忆管理 → 技能中心 → 工具管理 → 知识库。
+ * 功能导航固定为：我的画像 → 记忆管理 → 技能中心 → MCP 服务 → 知识库。
  * 历史会话挂在一个带标题的分区下面，而不是直接铺在导航里——它和上面两个
  * 是不同性质的东西：上面是"去哪"，下面是"回过哪"，中间没有分隔就读成一串
  * 同级的按钮。标题始终渲染（空列表也一样），免得列表加载完再冒出一行字、
@@ -22,7 +22,7 @@ const NEW_CHAT_CLASS =
   "flex h-9 w-full items-center justify-center rounded-md border border-neutral-300 bg-white text-xs font-medium text-neutral-700 transition-colors hover:border-neutral-400 hover:text-neutral-900";
 
 /**
- * 导航项（我的画像 / 记忆管理 / 技能中心 / 工具管理 / 知识库）共用一套形制。
+ * 导航项（我的画像 / 记忆管理 / 技能中心 / MCP 服务 / 知识库）共用一套形制。
  *
  * 四个入口是同一类东西——"去哪"，形状就得一致；各写一份 class 的话，
  * 新增入口时高亮态迟早会跟已有入口不一样。
@@ -54,8 +54,8 @@ export interface SidebarProps {
   knowledgeActive?: boolean;
   /** 当前是否在技能路由（/workspace/skills 及其子路由） */
   skillsActive?: boolean;
-  /** 当前是否在工具管理路由 */
-  toolsActive?: boolean;
+  /** 当前是否在 MCP 服务路由（/workspace/mcp-servers 及其子路由） */
+  mcpServersActive?: boolean;
   /** 当前是否在「我的画像」 */
   profileActive?: boolean;
   /** 当前是否在「记忆管理」 */
@@ -80,7 +80,7 @@ export function Sidebar({
   onNewChat,
   knowledgeActive = false,
   skillsActive = false,
-  toolsActive = false,
+  mcpServersActive = false,
   profileActive = false,
   memoryActive = false,
   onThreadClick,
@@ -155,12 +155,12 @@ export function Sidebar({
           技能中心
         </Link>
         <Link
-          aria-current={toolsActive ? "page" : undefined}
-          className={navItemClass(toolsActive)}
-          href="/workspace/tools"
+          aria-current={mcpServersActive ? "page" : undefined}
+          className={navItemClass(mcpServersActive)}
+          href="/workspace/mcp-servers"
         >
           <WrenchIcon className="shrink-0" size={15} />
-          工具管理
+          MCP 服务
         </Link>
         <Link
           aria-current={knowledgeActive ? "page" : undefined}
