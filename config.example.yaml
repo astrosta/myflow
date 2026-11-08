@@ -512,7 +512,7 @@ skills:
       collection: myflow_skills_active
       metric_type: COSINE
       index_type: AUTOINDEX
-      consistency_level: Strong   # 点击生效后马上要能检索到，不用 Session 的最终一致
+      consistency_level: Bounded  # Bounded Staleness：有界延迟一致
       flush: true
       timeout_seconds: 30
 
@@ -609,7 +609,7 @@ contextforge:
       collection: myflow_contextforge_tools   # 固定值；写成知识库/技能 collection 会报错
       metric_type: COSINE
       index_type: AUTOINDEX
-      consistency_level: Strong
+      consistency_level: Bounded  # Bounded Staleness：有界延迟一致
       flush: true
       timeout_seconds: 30
 
@@ -703,7 +703,7 @@ knowledge_base:
     collection: myflow_knowledge
     metric_type: COSINE
     index_type: AUTOINDEX
-    consistency_level: Session
+    consistency_level: Bounded  # Bounded Staleness：有界延迟一致
     flush: true
     timeout_seconds: 30
 

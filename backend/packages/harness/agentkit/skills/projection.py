@@ -185,12 +185,11 @@ class MilvusSkillProjection:
             if "collection" in config.model_fields_set
             else ACTIVE_COLLECTION
         )
-        # Strong consistency is the projection contract; an explicit deployment
-        # setting still wins.
+        # Bounded Staleness is the default; an explicit deployment setting still wins.
         self._consistency_level = (
             config.consistency_level
             if "consistency_level" in config.model_fields_set
-            else "Strong"
+            else "Bounded"
         )
         self._client = client
 

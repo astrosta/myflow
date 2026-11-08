@@ -70,8 +70,8 @@ def test_shared_services_fill_both_consumers_without_overwriting_policies() -> N
     assert cfg.skills.search.vector_store.db_name == "shared"
     assert cfg.knowledge_base.vector_store.collection == "myflow_knowledge"
     assert cfg.skills.search.vector_store.collection == "myflow_skills_active"
-    assert cfg.knowledge_base.vector_store.consistency_level == "Session"
-    assert cfg.skills.search.vector_store.consistency_level == "Session"
+    assert cfg.knowledge_base.vector_store.consistency_level == "Bounded"
+    assert cfg.skills.search.vector_store.consistency_level == "Bounded"
 
 
 def test_blank_vector_store_credentials_match_config_yaml() -> None:

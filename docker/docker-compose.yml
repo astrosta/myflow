@@ -186,10 +186,10 @@ services:
     volumes:
       - gitea_data:/data
 
-  # ContextForge（IBM mcp-context-forge）。管理 API 打开，UI 打开便于签发 token。
+  # ContextForge（IBM mcp-context-forge）。管理 API / UI 打开。
   # 网关在同一 Docker 网络里用 http://contextforge:4444；宿主机进程用 127.0.0.1:4444。
-  # admin_token 不在这里生成：进 http://127.0.0.1:4444/admin 登录后签发，
-  # 写入 config.yaml 的 contextforge.admin_token（需 admin.events 或 *）。
+  # 本 compose 默认关掉 MCP/Admin 的 token 校验（仅适合本机/内网联调，生产勿用）。
+  # MyFlow 的 contextforge.admin_token / agent_token 可留空。
   #
   # 不用挂卷 SQLite：镜像以 uid 10001 运行，named volume 属主是 root，
   # /health 会因库连不上一直报 unhealthy。库用现有 Postgres 的 mcp 库。
@@ -233,6 +233,12 @@ services:
       # 未设置时镜像默认 changeme（8 位），邮箱登录开启时启动会被拒。
       DEFAULT_USER_PASSWORD: ${CONTEXTFORGE_DEFAULT_USER_PASSWORD:-myflow-user-local}
       PLATFORM_ADMIN_FULL_NAME: Platform Administrator
+      # 不验证 token（本机/内网联调）。AUTH_REQUIRED 只管 UI；MCP 还要关下面两项。
+      AUTH_REQUIRED: "false"
+      ALLOW_UNAUTHENTICATED_ADMIN: "true"
+      MCP_CLIENT_AUTH_ENABLED: "false"
+      TRUST_PROXY_AUTH: "true"
+      MCP_REQUIRE_AUTH: "false"
     ports:
       - "127.0.0.1:4444:4444"
     # 与官方镜像 HEALTHCHECK 对齐：看 HTTP 200，启动宽限 60s。

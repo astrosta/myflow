@@ -254,7 +254,7 @@ class MilvusConfig(VectorStoreServiceConfig):
     collection: str = "myflow_knowledge"
     metric_type: Literal["COSINE", "IP", "L2"] = "COSINE"
     index_type: str = "AUTOINDEX"
-    consistency_level: Literal["Strong", "Session", "Bounded", "Eventually"] = "Session"
+    consistency_level: Literal["Strong", "Session", "Bounded", "Eventually"] = "Bounded"
     flush: bool = True
     timeout_seconds: float = Field(default=30.0, gt=0)
 

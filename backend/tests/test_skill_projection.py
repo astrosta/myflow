@@ -256,7 +256,7 @@ class FlakyLoadMilvus(FakeMilvus):
 
 def _config() -> MilvusConfig:
     # Collection is deliberately unset: the projection owns its active default.
-    return MilvusConfig(uri="http://milvus:19530", consistency_level="Strong")
+    return MilvusConfig(uri="http://milvus:19530", consistency_level="Bounded")
 
 
 def _store(fake: FakeMilvus, *, dimensions: int = 4) -> MilvusSkillProjection:
@@ -337,7 +337,7 @@ async def test_search_filters_by_the_caller_owner_only() -> None:
     assert call["data"] == [[1.0, 0.0, 0.0, 0.0]]
     assert call["limit"] == 5
     assert call["search_params"]["params"] == {}
-    assert call["consistency_level"] == "Strong"
+    assert call["consistency_level"] == "Bounded"
     assert set(call["output_fields"]) == METADATA_FIELDS - {"content"}
     assert hits == [
         ProjectionHit(
@@ -466,7 +466,7 @@ async def test_collection_creation_adds_scalar_indexes_for_projection_filters() 
     assert indexes["sparse"]["metric_type"] == "BM25"
     assert indexes["sparse"]["params"] == {"bm25_k1": 1.2, "bm25_b": 0.75}
     assert fake.created[0]["collection_name"] == "myflow_skills_active"
-    assert fake.created[0]["consistency_level"] == "Strong"
+    assert fake.created[0]["consistency_level"] == "Bounded"
     # 索引显式创建，不塞进 create_collection：那一步失败会留下无法 load 的集合。
     assert "index_params" not in fake.created[0]
     assert [item["indexes"] for item in fake.created_indexes] == [fake.index_params.indexes]
