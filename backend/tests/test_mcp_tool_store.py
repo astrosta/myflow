@@ -558,8 +558,107 @@ async def test_names_and_labels_are_bounded_at_the_storage_boundary(
     # A name longer than the column could hold is not a tool anything can call back.
     assert [row.name for row in rows] == ["search"]
     assert stats.inserted == 1
+    assert stats.skipped == 1
     # A runaway title is cosmetic, so it is truncated instead of rejected.
     assert rows[0].display_name == "T" * 512
+
+
+@pytest.mark.asyncio
+async def test_call_name_provider_budget_boundary_is_exact(store: McpToolStore) -> None:
+    """128 characters may be called, 129 may only be stored.
+
+    `mcp__anysearch__` is 16 characters, so the tool name carries the difference.
+    """
+    at_budget = tool_record(name="a" * 112)
+    over_budget = tool_record(name="a" * 113)
+    assert len(call_name_for("anysearch", at_budget.name)) == 128
+    assert len(call_name_for("anysearch", over_budget.name)) == 129
+
+    await store.upsert_snapshot(
+        [at_budget, over_budget], seen_ids={at_budget.id, over_budget.id}
+    )
+    rows = {row.name: row for row in await store.list_all("u1")}
+
+    assert rows[at_budget.name].callable is True
+    # Stored (the definition is data) but outside every provider's function-name
+    # budget, so it is never offered to the model.
+    assert rows[over_budget.name].callable is False
+    assert len(rows[over_budget.name].call_name) == 129
+
+
+@pytest.mark.asyncio
+async def test_call_name_column_boundary_is_exact(store: McpToolStore) -> None:
+    """A derived call name that fits `String(255)` is stored; one char more is dropped."""
+    fitted = tool_record(name="a" * 239)
+    oversized = tool_record(name="a" * 240)
+    assert len(call_name_for("anysearch", fitted.name)) == 255
+    assert len(call_name_for("anysearch", oversized.name)) == 256
+
+    stats = await store.upsert_snapshot(
+        [fitted, oversized], seen_ids={fitted.id, oversized.id}
+    )
+    rows = {row.name: row for row in await store.list_all("u1")}
+
+    assert set(rows) == {fitted.name}
+    assert rows[fitted.name].call_name == call_name_for("anysearch", fitted.name)
+    assert stats.inserted == 1
+    assert stats.skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_the_name_column_boundary_is_exact(store: McpToolStore) -> None:
+    """The tool name itself is bounded at 255, independent of the call-name bound."""
+    fitted = tool_record(name="a" * 255, call_name="mcp__a__x")
+    oversized = tool_record(name="a" * 256, call_name="mcp__a__x")
+
+    stats = await store.upsert_snapshot(
+        [fitted, oversized], seen_ids={fitted.id, oversized.id}
+    )
+    rows = {row.name for row in await store.list_all("u1")}
+
+    assert rows == {fitted.name}
+    assert stats.skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_the_server_name_column_boundary_is_exact(store: McpToolStore) -> None:
+    """`mcp_tools.server_name` is `String(128)`, the bound a server slug is created with."""
+    fitted = tool_record(server_name="a" * 128, name="search")
+    oversized = tool_record(server_name="a" * 129, name="search")
+
+    stats = await store.upsert_snapshot(
+        [fitted, oversized], seen_ids={fitted.id, oversized.id}
+    )
+    stored = await store.list_all("u1")
+
+    assert [row.server_name for row in stored] == ["a" * 128]
+    assert stats.inserted == 1
+    assert stats.skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_one_unstorable_record_does_not_abort_the_snapshot(
+    store: McpToolStore,
+) -> None:
+    """Fail closed, one record at a time: a malformed tool never sinks the sync."""
+    good = tool_record(name="search")
+    await store.upsert_snapshot([good], seen_ids={good.id})
+    assert (await store.get_by_call_name(good.call_name, "u1")).callable is True
+
+    # The same tool now arrives with a server name that cannot be stored, next to a
+    # healthy server's tool.
+    broken = tool_record(name="search", server_name="a" * 129)
+    other = tool_record(server_id="s2", server_name="beta", name="list")
+    stats = await store.upsert_snapshot([broken, other], seen_ids={broken.id, other.id})
+
+    rows = {row.name: row for row in await store.list_all("u1")}
+    # The healthy record is published...
+    assert rows["list"].callable is True
+    # ... the unstorable one was dropped (nothing is written for it) ...
+    assert stats.skipped == 1
+    # ... and the row it would have rewritten is retired, not left callable.
+    assert rows["search"].callable is False
+    assert stats.delete_ids == (good.id,)
 
 
 @pytest.mark.asyncio

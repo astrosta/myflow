@@ -61,7 +61,16 @@ MAX_CALL_NAME_CHARS = 128
 MAX_TOOL_NAME_CHARS = 128
 #: Column bounds. PostgreSQL enforces them and SQLite does not, so the store applies
 #: them itself instead of letting one backend accept a row the other rejects.
+#:  * `name`, `call_name` and `server_name` are *identity*: a record that does not fit
+#:    its column is dropped - the snapshot keeps going and the tool simply stays
+#:    unpublished - because truncating an identity would silently point the row (and
+#:    the Milvus pk derived from `name`) somewhere else;
+#:  * `display_name` is a label: it is truncated.
 MAX_STORED_NAME_CHARS = 255
+MAX_STORED_CALL_NAME_CHARS = 255
+#: `mcp_tools.server_name` is `String(128)`, the same bound a server slug is created
+#: with, so the two can never disagree.
+MAX_STORED_SERVER_NAME_CHARS = MAX_SERVER_NAME_CHARS
 MAX_DISPLAY_NAME_CHARS = 512
 
 #: A server slug cannot contain "_", which is what makes the call name unambiguous.
@@ -191,6 +200,10 @@ class McpToolSnapshotStats:
 
     #: Tool ids this snapshot observed upstream (the size of `seen_ids`).
     seen: int = 0
+    #: Records dropped because they cannot be stored faithfully (see `_prepare`).
+    #: Dropped records are never written and therefore never callable; the counter
+    #: exists so a malformed upstream tool is visible instead of silent.
+    skipped: int = 0
     inserted: int = 0
     #: Existing rows whose definition changed.
     updated: int = 0
@@ -244,12 +257,21 @@ class _Prepared:
 def _prepare(record: McpToolRecord) -> _Prepared | None:
     """Resolve one record's identity, or refuse it.
 
-    A tool without a name - or with one longer than the column can hold, which MCP
-    itself caps at 128 characters - is not a tool anything could call back: it is
-    dropped silently, like the retired catalog dropped nameless tools.  A tool
-    without a server or an owner cannot be stored at all (`server_id` and
-    `owner_user_id` are NOT NULL), so that is a caller bug and fails loudly instead
-    of writing a row nobody can reach.
+    Two different kinds of refusal, on purpose:
+
+    * **dropped (`None`)** - the record cannot be stored faithfully, so it is not a
+      row at all.  That covers a blank name (the retired catalog dropped those too),
+      a name longer than its column, a server name longer than its column, and a
+      derived `call_name` longer than `String(255)`.  Truncating any of them would
+      rewrite the identity the Milvus pk and the model-facing name are built from.
+      One malformed upstream tool must not abort a whole snapshot, so this is a drop
+      and not an exception: the record is never written, therefore never callable,
+      and `McpToolSnapshotStats.skipped` counts it.  A record whose call name fits
+      the column but not the provider budget (129..255 chars) is *stored* and stays
+      non-callable - the definition is data, availability is not;
+    * **refused (`ValueError`)** - the (server_id, owner_user_id) pair it needs is
+      missing, which no upstream tool can cause, so it is a caller bug and fails
+      loudly instead of writing a row nobody can reach.
     """
     name = str(record.name or "").strip()
     if not name or len(name) > MAX_STORED_NAME_CHARS:
@@ -267,6 +289,8 @@ def _prepare(record: McpToolRecord) -> _Prepared | None:
     server_name = str(record.server_name or "").strip() or _server_name_from_call_name(
         call_name
     )
+    if len(server_name) > MAX_STORED_SERVER_NAME_CHARS:
+        return None
     if not call_name:
         if not server_name:
             raise ValueError(
@@ -274,6 +298,11 @@ def _prepare(record: McpToolRecord) -> _Prepared | None:
                 "the tool is published under"
             )
         call_name = call_name_for(server_name, name)
+    # The derived call name may still outgrow its column: "mcp__" + a 128-char slug +
+    # "__" + a 255-char tool name is 390 characters, and PostgreSQL would reject the
+    # insert (SQLite would not), aborting the whole snapshot.
+    if len(call_name) > MAX_STORED_CALL_NAME_CHARS:
+        return None
     return _Prepared(
         record=record,
         id=tool_id_for(server_id, name),
@@ -439,6 +468,11 @@ class McpToolStore:
         other servers' tools.  Rows are matched by `(server_id, name)`, which is also
         what `tool_id_for` derives the id from, so a re-sync reuses its row; if one
         snapshot carries the same tool twice, the last record wins.
+
+        A record whose identity cannot be stored (see `_prepare`) is dropped rather
+        than aborting the transaction, and counted in `skipped`; it is never written,
+        so it can never be callable, and any stored row of the same tool stops being
+        callable through the retire path.
         """
         if seen_ids is None:
             raise ValueError(
@@ -446,7 +480,16 @@ class McpToolStore:
             )
         stamp = _now()
         observed = {str(tool_id) for tool_id in seen_ids if tool_id}
-        prepared = [item for item in map(_prepare, records) if item is not None]
+        prepared: list[_Prepared] = []
+        skipped = 0
+        for record in records:
+            item = _prepare(record)
+            if item is None:
+                # Unstorable identity: dropped, so it is never written and never
+                # callable, and the rest of the snapshot is unaffected.
+                skipped += 1
+            else:
+                prepared.append(item)
         inserted = updated = unchanged = disabled = 0
         upsert_ids: list[str] = []
         delete_ids: list[str] = []
@@ -511,6 +554,7 @@ class McpToolStore:
 
         return McpToolSnapshotStats(
             seen=len(observed),
+            skipped=skipped,
             inserted=inserted,
             updated=updated,
             unchanged=unchanged,
@@ -648,7 +692,9 @@ __all__ = [
     "CALL_NAME_PREFIX",
     "MAX_CALL_NAME_CHARS",
     "MAX_DISPLAY_NAME_CHARS",
+    "MAX_STORED_CALL_NAME_CHARS",
     "MAX_STORED_NAME_CHARS",
+    "MAX_STORED_SERVER_NAME_CHARS",
     "MAX_TOOL_NAME_CHARS",
     "McpToolRecord",
     "McpToolSnapshotStats",
