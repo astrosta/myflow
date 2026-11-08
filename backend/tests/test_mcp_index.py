@@ -643,29 +643,46 @@ async def test_delete_by_ids_removes_the_rows_and_reports_the_count() -> None:
 
 
 @pytest.mark.asyncio
-async def test_owner_or_call_name_change_reupserts_the_row() -> None:
+async def test_an_owner_change_reupserts_the_row() -> None:
+    """Only the owner moves: content and call name stay byte-identical."""
     content = "search AnySearch web search"
-    tool_id = _record(content=content).id
-    fake = FakeMilvus(stored={tool_id: content_hash_for(content, "u1", "mcp__anysearch__search")})
-    index = _index(fake)
-    embedder = Embedder()
-
+    before = _record(content=content)
     moved = _record(content=content, owner_user_id="u2")
-    moved_stats = await index.sync([moved], embedder=embedder)
 
-    assert (moved_stats.changed, moved_stats.upserted) == (1, 1)
+    # Isolation: content and call name are identical, so the owner is the only
+    # hash input that can make the stored row look up to date.
+    assert moved.call_name == before.call_name == "mcp__anysearch__search"
+
+    fake = FakeMilvus(stored={before.id: before.content_hash})
+    index = _index(fake)
+
+    stats = await index.sync([moved], embedder=Embedder())
+
+    assert (stats.changed, stats.upserted) == (1, 1)
     assert fake.written[-1]["owner_user_id"] == "u2"
-    assert fake.written[-1]["content_hash"] == content_hash_for(
-        content, "u2", "mcp__anysearch__search"
-    )
+    assert fake.written[-1]["content_hash"] == moved.content_hash
 
-    # The call name is inside the hash too: a namespace change re-embeds the row
-    # even though the text is identical.
-    renamed = _record(content=content, call_name="mcp__anysearch__v2")
-    renamed_stats = await index.sync([renamed], embedder=embedder)
 
-    assert (renamed_stats.changed, renamed_stats.upserted) == (1, 1)
-    assert fake.written[-1]["call_name"] == "mcp__anysearch__v2"
+@pytest.mark.asyncio
+async def test_a_call_name_change_reupserts_the_row() -> None:
+    """Only the call name moves: content and owner stay byte-identical."""
+    content = "search AnySearch web search"
+    before = _record(content=content, call_name="mcp__alpha__search")
+    renamed = _record(content=content, call_name="mcp__beta__search")
+
+    # Isolation: content and owner are identical (u1), so the call name is the
+    # only hash input that can make the stored row look up to date.
+    assert renamed.owner_user_id == before.owner_user_id == "u1"
+
+    fake = FakeMilvus(stored={before.id: before.content_hash})
+    index = _index(fake)
+
+    stats = await index.sync([renamed], embedder=Embedder())
+
+    assert (stats.changed, stats.upserted) == (1, 1)
+    assert fake.written[-1]["call_name"] == "mcp__beta__search"
+    assert fake.written[-1]["owner_user_id"] == "u1"
+    assert fake.written[-1]["content_hash"] == renamed.content_hash
 
 
 @pytest.mark.asyncio
