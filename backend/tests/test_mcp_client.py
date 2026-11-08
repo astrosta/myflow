@@ -459,6 +459,17 @@ async def test_malformed_initialize_result_is_a_protocol_error(
 
 
 @pytest.mark.asyncio
+async def test_none_initialize_result_is_a_protocol_error(
+    fake_transport: FakeTransport,
+) -> None:
+    fake_transport._session._initialize_result = None
+    client = McpServerClient(session_factory=fake_transport.factory)
+
+    with pytest.raises(McpProtocolError):
+        await client.list_tools(connection())
+
+
+@pytest.mark.asyncio
 async def test_malformed_list_page_is_a_protocol_error(
     fake_transport: FakeTransport,
 ) -> None:
@@ -496,17 +507,18 @@ async def test_unexpected_call_failure_is_a_tool_error(
 
 
 @pytest.mark.asyncio
-async def test_is_error_result_is_a_tool_error_that_keeps_the_result(
+async def test_is_error_result_is_returned_as_data(
     fake_transport: FakeTransport,
 ) -> None:
     result = _call_result(is_error=True)
     fake_transport._session._call_result = result
     client = McpServerClient(session_factory=fake_transport.factory)
 
-    with pytest.raises(McpToolError) as raised:
-        await client.call_tool(connection(), "search", {"q": "x"})
+    returned = await client.call_tool(connection(), "search", {"q": "x"})
 
-    assert raised.value.result is result
+    assert returned is result
+    assert returned.isError is True
+    assert returned.content
 
 
 @pytest.mark.asyncio
@@ -540,6 +552,21 @@ async def test_transport_open_timeout_is_reported_as_a_timeout(
     with pytest.raises(McpServerTimeout):
         async with mcp_client.open_mcp_session(request):
             pass
+
+
+@pytest.mark.asyncio
+async def test_consumer_exception_from_open_session_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _RecordedTransport(tuple_size=3)
+    monkeypatch.setattr(mcp_client, "streamablehttp_client", transport)
+    request = McpSessionRequest(
+        url="https://mcp.example.com/mcp", server_id="srv-1"
+    )
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        async with mcp_client.open_mcp_session(request):
+            raise RuntimeError("consumer failed")
 
 
 @pytest.mark.asyncio

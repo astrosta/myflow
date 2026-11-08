@@ -216,36 +216,48 @@ async def open_mcp_session(request: McpSessionRequest) -> AsyncIterator[ClientSe
     }
     read_timeout = datetime.timedelta(seconds=request.read_timeout)
 
-    try:
-        if request.transport == "streamable_http":
-            async with streamablehttp_client(request.url, **options) as (
-                read_stream,
-                write_stream,
-                _get_session_id,
-            ):
-                async with ClientSession(
+    async with AsyncExitStack() as stack:
+        try:
+            if request.transport == "streamable_http":
+                read_stream, write_stream, _ = await stack.enter_async_context(
+                    streamablehttp_client(request.url, **options)
+                )
+            else:
+                read_stream, write_stream = await stack.enter_async_context(
+                    sse_client(request.url, **options)
+                )
+            session = await stack.enter_async_context(
+                ClientSession(
                     read_stream,
                     write_stream,
                     read_timeout_seconds=read_timeout,
-                ) as session:
-                    yield session
-            return
+                )
+            )
+        except McpServerError:
+            raise
+        except Exception as exc:
+            raise _classify(
+                exc,
+                server_id=request.server_id,
+                stage="initialize",
+            ) from exc
 
-        async with sse_client(request.url, **options) as (read_stream, write_stream):
-            async with ClientSession(
-                read_stream,
-                write_stream,
-                read_timeout_seconds=read_timeout,
-            ) as session:
-                yield session
-    except McpServerError:
-        raise
-    except Exception as exc:
-        raise _classify(
-            exc,
-            server_id=request.server_id,
-            stage="initialize",
-        ) from exc
+        # Close the stack after a consumer failure without feeding that
+        # failure back through ClientSession.__aexit__: anyio would re-wrap it
+        # in an ExceptionGroup, and the caller's exception must stay unchanged.
+        body_error: BaseException | None = None
+        try:
+            yield session
+        except BaseException as exc:
+            body_error = exc
+        finally:
+            try:
+                await stack.aclose()
+            except BaseException:
+                if body_error is None:
+                    raise
+        if body_error is not None:
+            raise body_error
 
 
 class McpServerClient:
@@ -301,11 +313,7 @@ class McpServerClient:
         try:
             try:
                 initialized = await session.initialize()
-                # A real ClientSession always returns InitializeResult; None is
-                # tolerated only because minimal test doubles return it.
-                if initialized is not None and not isinstance(
-                    initialized, mcp_types.InitializeResult
-                ):
+                if not isinstance(initialized, mcp_types.InitializeResult):
                     raise McpProtocolError(
                         f"{_server_label(connection.server_id)} returned a "
                         "malformed initialize response"
@@ -392,12 +400,6 @@ class McpServerClient:
                     raise McpProtocolError(
                         f"{_server_label(connection.server_id)} returned a "
                         "malformed tools/call response"
-                    )
-                if result.isError:
-                    raise McpToolError(
-                        f"{_server_label(connection.server_id)} reported that tool "
-                        f"{name!r} failed",
-                        result=result,
                     )
                 return result
         except McpServerError:
