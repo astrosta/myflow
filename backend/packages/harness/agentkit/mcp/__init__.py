@@ -6,6 +6,13 @@ connecting straight to the server that owns the tool.
 """
 
 from agentkit.mcp.crypto import HeaderCipher
+from agentkit.mcp.errors import (
+    McpProtocolError,
+    McpServerError,
+    McpServerTimeout,
+    McpServerUnavailable,
+    McpToolError,
+)
 from agentkit.mcp.models import (
     MAX_ERROR_CHARS,
     MAX_SERVER_NAME_CHARS,
@@ -28,10 +35,15 @@ __all__ = [
     "MAX_SERVER_NAME_CHARS",
     "MCP_SERVER_STATUSES",
     "MCP_TRANSPORTS",
+    "McpProtocolError",
+    "McpServerError",
     "McpServerRecord",
     "McpServerRow",
     "McpServerStatus",
     "McpServerStore",
+    "McpServerTimeout",
+    "McpServerUnavailable",
+    "McpToolError",
     "McpTransport",
     "is_valid_server_name",
     "truncate_error",
