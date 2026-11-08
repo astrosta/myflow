@@ -245,13 +245,25 @@ async def tool_execute(
     """
     started = time.monotonic()
     owner = resolve_runtime_user_id(_context(runtime), allow_default=True)
-    reply = await _execute_tool(tool_name, arguments, runtime, tool_call_id, owner)
-    # One audit line per invocation, success or failure: the spec's audit record
-    # (server, tool, call name, owner fingerprint, outcome, duration) belongs on
-    # every call, not only on the failures that already log a warning.  Arguments
-    # and headers are deliberately absent - they are the secret-bearing fields.
-    _audit_tool_call(reply=reply, owner=owner, duration_ms=_elapsed_ms(started))
-    return reply
+    reply: ToolMessage | None = None
+    try:
+        reply = await _execute_tool(
+            tool_name, arguments, runtime, tool_call_id, owner
+        )
+        return reply
+    finally:
+        # One audit line per invocation, success or failure: the spec's audit
+        # record (server, tool, call name, owner fingerprint, outcome, duration)
+        # belongs on every call, not only on the failures that already log a
+        # warning.  The finally also covers an unexpected exception or a
+        # cancellation, which has no reply to read the metadata from.  Arguments
+        # and headers are deliberately absent - they are the secret-bearing fields.
+        _audit_tool_call(
+            reply=reply,
+            owner=owner,
+            duration_ms=_elapsed_ms(started),
+            call_name=tool_name,
+        )
 
 
 async def _execute_tool(
@@ -852,25 +864,36 @@ def _owner_fingerprint(owner: str | None) -> str:
 
 
 def _audit_tool_call(
-    *, reply: ToolMessage, owner: str | None, duration_ms: int
+    *,
+    reply: ToolMessage | None,
+    owner: str | None,
+    duration_ms: int,
+    call_name: str = "",
 ) -> None:
     """One INFO record per MCP tool call (design 10: audit without secrets).
 
     Fields: call_name, inner name, tool id, server id, owner fingerprint, status,
-    origin and duration.  Never the arguments, never a header: the same rule the
+    origin and duration.  A missing reply means the call raised or was cancelled
+    before producing one: it still gets a line, with status=error and
+    origin=exception, and with the requested call name as the only tool identity
+    available.  Never the arguments, never a header: the same rule the
     observability masking applies to spans.
     """
-    meta = dict((getattr(reply, "additional_kwargs", None) or {}).get(TOOL_META_KEY) or {})
+    meta = (
+        dict((getattr(reply, "additional_kwargs", None) or {}).get(TOOL_META_KEY) or {})
+        if reply is not None
+        else {}
+    )
     logger.info(
         "MCP tool call call_name=%s inner_name=%s tool_id=%s server_id=%s "
         "owner=%s status=%s origin=%s duration_ms=%d",
-        meta.get("call_name", ""),
+        meta.get("call_name") or call_name,
         meta.get("inner_name", ""),
         meta.get("tool_id", ""),
         meta.get("server_id", ""),
         _owner_fingerprint(owner) or "-",
-        getattr(reply, "status", ""),
-        meta.get("origin", "ok"),
+        getattr(reply, "status", "") if reply is not None else "error",
+        meta.get("origin", "ok") if reply is not None else "exception",
         duration_ms,
     )
 

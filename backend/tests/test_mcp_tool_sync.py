@@ -647,6 +647,35 @@ async def test_index_failure_keeps_the_database_commit(
 
 
 @pytest.mark.asyncio
+async def test_a_filtered_full_pass_never_asks_the_index_for_a_full_rebuild(
+    server_store, tool_store, client
+) -> None:
+    """A full rebuild is "delete every vector not in this list".
+
+    A filtered pass only hands the index its own server's rows, so forwarding
+    full=True would delete every other owner's vectors.  The filter therefore
+    forces an incremental index sync.
+    """
+    mine = await server_store.create(server_record("mine"))
+    other = await server_store.create(server_record("other", owner=OTHER_OWNER))
+    client.results[mine.id] = [mcp_tool("search")]
+    await seed(tool_store, prior_tool(other, "old"))
+    index = FakeIndex()
+    sync = McpCatalogSync(
+        server_store, tool_store, client, index=index, embedder=object()
+    )
+
+    await sync.sync("daily", full=True, server_ids={mine.id})
+
+    assert index.calls[-1]["full"] is False
+    assert [record.server_id for record in index.calls[-1]["records"]] == [mine.id]
+    kept = await tool_store.get_by_call_name(
+        call_name_for("other", "old"), OTHER_OWNER
+    )
+    assert kept is not None and kept.callable is True
+
+
+@pytest.mark.asyncio
 async def test_index_is_skipped_when_no_embedder_is_configured(
     server_store, tool_store, client
 ) -> None:
@@ -827,6 +856,26 @@ async def test_a_stored_url_that_resolves_privately_is_never_contacted(
     assert [failure.server_id for failure in stats.failed_servers] == [server.id]
     assert "private" in (stats.failed_servers[0].error or "")
     assert "rebound" in (stats.failed_servers[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_stored_cgnat_url_is_never_contacted(
+    server_store, tool_store, client, monkeypatch
+) -> None:
+    """CGNAT (100.64.0.0/10) is not globally routable, even though ipaddress
+    does not classify it as private - 100.100.100.200 is a metadata endpoint."""
+    server = await server_store.create(server_record("cgnat"))
+    client.results[server.id] = [mcp_tool("search")]
+    monkeypatch.setattr(
+        net, "resolve_host_addresses", lambda host, port=None: ("100.100.100.200",)
+    )
+    sync = McpCatalogSync(server_store, tool_store, client)
+
+    stats = await sync.sync("daily")
+
+    assert client.called == []
+    assert stats.servers_failed == 1
+    assert "100.100.100.200" in (stats.failed_servers[0].error or "")
 
 
 @pytest.mark.asyncio

@@ -572,7 +572,14 @@ class FakeRuntime:
         self.owners.append(owner_user_id)
         if self._error is not None:
             raise self._error
-        return dict(self._status)
+        # The real runtime only exposes the retry record on the catalog-wide view
+        # (owner_user_id=None); every route call is owner-scoped, so this fake must
+        # not invent fields the route can never receive.
+        return {
+            key: value
+            for key, value in self._status.items()
+            if key not in ("last_retry_at", "last_retry_tool", "last_retry_result")
+        }
 
 
 def test_status_prefers_the_runtime_view(service: FakeService) -> None:
@@ -593,9 +600,6 @@ def test_status_prefers_the_runtime_view(service: FakeService) -> None:
             "index": "ready",
             "last_sync_reason": "server_refresh",
             "last_sync_duration_ms": 42,
-            "last_retry_at": "2026-01-01T00:00:00Z",
-            "last_retry_tool": "mcp__anysearch__search",
-            "last_retry_result": "ok",
         }
     )
 
@@ -610,7 +614,10 @@ def test_status_prefers_the_runtime_view(service: FakeService) -> None:
     assert body["index"] == "ready"
     assert body["last_sync_reason"] == "server_refresh"
     assert body["last_sync_duration_ms"] == 42
-    assert body["last_retry_tool"] == "mcp__anysearch__search"
+    # The retry record is process-wide only; a scoped status must not promise it.
+    assert "last_retry_at" not in body
+    assert "last_retry_tool" not in body
+    assert "last_retry_result" not in body
 
 
 def test_status_falls_back_to_the_service_without_a_runtime(

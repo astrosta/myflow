@@ -49,7 +49,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 
 from agentkit.mcp.models import MAX_SERVER_NAME_CHARS
-from agentkit.mcp.store.model import McpToolRow
+from agentkit.mcp.store.model import McpServerRow, McpToolRow
 
 #: Model/policy namespace; the upstream server still receives the bare `name`.
 CALL_NAME_PREFIX = "mcp__"
@@ -631,7 +631,9 @@ class McpToolStore:
 
         This is the database join behind tool_search, so it filters on `callable` as
         well as the owner: a row that dropped out of the runtime must not come back
-        through a stale vector id.
+        through a stale vector id.  It also joins the owning server's enabled flag,
+        because a retirement sync can fail after the disable itself has landed; the
+        DB, not the derived index, is what keeps that server's tools out of search.
         """
         owner = _require_owner(owner_user_id)
         wanted: list[str] = []
@@ -640,10 +642,16 @@ class McpToolStore:
                 wanted.append(str(item))
         if not wanted:
             return []
-        stmt = select(McpToolRow).where(
-            McpToolRow.id.in_(wanted),
-            McpToolRow.callable.is_(True),
-            McpToolRow.owner_user_id == owner,
+        stmt = (
+            select(McpToolRow)
+            .join(McpServerRow, McpServerRow.id == McpToolRow.server_id)
+            .where(
+                McpToolRow.id.in_(wanted),
+                McpToolRow.callable.is_(True),
+                McpToolRow.owner_user_id == owner,
+                McpServerRow.owner_user_id == owner,
+                McpServerRow.enabled.is_(True),
+            )
         )
         async with self._sf() as session:
             rows = (await session.scalars(stmt)).all()

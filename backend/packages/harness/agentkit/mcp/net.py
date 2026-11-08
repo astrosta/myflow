@@ -47,19 +47,18 @@ def _port_of(url: str) -> int | None:
         return None
 
 
-@lru_cache(maxsize=256)
-def resolve_host_addresses(host: str, port: int | None = None) -> tuple[str, ...]:
-    """Every address the platform resolver reports for one host (cached).
+class _UnresolvedHost(LookupError):
+    """A cached lookup that produced nothing.
 
-    An empty tuple means "not resolvable now" - the caller must not read it as
-    "public".  Tests replace this function (the cache lives inside the original
-    wrapper, so a patch is always honoured).
+    lru_cache stores return values, not raised exceptions, so raising is what keeps
+    a failed or empty resolution out of the cache.
     """
-    text = str(host or "").strip().strip("[]").rstrip(".").lower()
-    if not text:
-        return ()
+
+
+def _lookup_host_addresses(host: str, port: int | None) -> tuple[str, ...]:
+    """Every address the platform resolver reports, or () when it reports none."""
     try:
-        infos = socket.getaddrinfo(text, port or 0, type=socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(host, port or 0, type=socket.SOCK_STREAM)
     except (OSError, UnicodeError):
         return ()
     addresses: list[str] = []
@@ -72,21 +71,53 @@ def resolve_host_addresses(host: str, port: int | None = None) -> tuple[str, ...
     return tuple(addresses)
 
 
+@lru_cache(maxsize=256)
+def _cached_host_addresses(host: str, port: int | None) -> tuple[str, ...]:
+    """The expensive, stable case: a successful non-empty resolution.
+
+    A failed lookup is deliberately *not* cached.  A server row can be written while
+    its hostname is temporarily unresolvable, and a cached () would then mask the
+    address it resolves to during every later sync/call - including 127.0.0.1.
+    """
+    addresses = _lookup_host_addresses(host, port)
+    if not addresses:
+        raise _UnresolvedHost(host)
+    return addresses
+
+
+def resolve_host_addresses(host: str, port: int | None = None) -> tuple[str, ...]:
+    """Every address the platform resolver reports for one host.
+
+    Only successful, non-empty resolutions are cached: they are the expensive and
+    stable case, while a failed or empty lookup must be retried so the SSRF guard
+    can see a name that starts resolving.  An empty tuple means "not resolvable
+    now" - the caller must not read it as "public".  Tests replace this function
+    (the cache lives in the private helper, so a patch is always honoured).
+    """
+    text = str(host or "").strip().strip("[]").rstrip(".").lower()
+    if not text:
+        return ()
+    try:
+        return _cached_host_addresses(text, port)
+    except _UnresolvedHost:
+        return ()
+
+
 def is_private_address(address: str) -> bool:
-    """True for loopback, link-local, private, reserved, unspecified or multicast."""
+    """True for any address that is not globally routable.
+
+    This is the resolver-side classifier; ServerUrlPolicy._is_private_target makes
+    the same decision for a literal when the URL is written.  The two exist because
+    one check must run without DNS (a fast 422) and the other only after resolution
+    (a stored hostname can rebind), and they must agree: a non-global address is
+    never reachable through either path.
+    """
     text = str(address or "").split("%", 1)[0].strip()
     try:
         parsed = ipaddress.ip_address(text)
     except ValueError:
         return False
-    return bool(
-        parsed.is_private
-        or parsed.is_loopback
-        or parsed.is_link_local
-        or parsed.is_unspecified
-        or parsed.is_reserved
-        or parsed.is_multicast
-    )
+    return not parsed.is_global
 
 
 def private_addresses(host: str, port: int | None = None) -> tuple[str, ...]:
@@ -109,8 +140,9 @@ def private_addresses_of_url(url: str) -> tuple[str, ...]:
 def private_target_message(offending: tuple[str, ...]) -> str:
     """One fixed sentence plus the addresses; never the URL or a credential."""
     return (
-        "MCP server url resolves to a private, loopback or link-local address "
-        f"({', '.join(offending)}); set mcp_servers.allow_private_networks=true "
+        "MCP server url resolves to a private, loopback, link-local or otherwise "
+        f"non-global address ({', '.join(offending)}); "
+        "set mcp_servers.allow_private_networks=true "
         "to allow it"
     )
 

@@ -323,7 +323,7 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
   const hasStoredQuery = Boolean(initial?.url_has_query);
   const urlHint =
     hasStoredQuery && !form.url.includes("?")
-      ? "已保存的 URL 带查询串（内容不回传）。地址的协议/主机/端口不变时沿用已保存的那段；换了主机就自动丢掉，不会把旧凭据发到新地址。"
+      ? "已保存的 URL 带查询串（内容不回传）。地址的协议/主机/端口不变时沿用已保存的那段；换了主机就自动丢掉，不会把旧凭据发到新地址。勾选下方删除后，新地址里写的查询串也会被丢弃。"
       : null;
 
   return (
@@ -416,7 +416,7 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
                 type="checkbox"
               />
               <span>
-                删除已保存的查询串（地址里的 token 只存在网关；勾上并保存后它就会被清掉）
+                删除已保存的查询串（地址里的 token 只存在网关；勾上并保存后它就会被清掉，新写的查询串也不保留）
               </span>
             </label>
           ) : null}

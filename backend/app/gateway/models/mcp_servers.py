@@ -144,11 +144,6 @@ class McpServerStatusResponse(BaseModel):
     index: str | None = None
     last_sync_reason: str | None = None
     last_sync_duration_ms: int | None = None
-    #: Catalog-wide retry record (the last tool-error refresh); scoped reads leave
-    #: these empty so one user never learns about another user's retry.
-    last_retry_at: str | None = None
-    last_retry_tool: str | None = None
-    last_retry_result: str | None = None
 
 
 class McpServerReindexResponse(BaseModel):

@@ -302,7 +302,6 @@ describe("mcp-servers API contract", () => {
       index: null,
       last_sync_reason: null,
       last_sync_duration_ms: null,
-      last_retry_tool: null,
     });
   });
 
@@ -316,9 +315,6 @@ describe("mcp-servers API contract", () => {
         index: "ready",
         last_sync_reason: "server_refresh",
         last_sync_duration_ms: 42,
-        last_retry_at: "2026-01-01T00:00:00Z",
-        last_retry_tool: "mcp__anysearch__search",
-        last_retry_result: "ok",
       }),
     );
 
@@ -329,8 +325,6 @@ describe("mcp-servers API contract", () => {
       index: "ready",
       last_sync_reason: "server_refresh",
       last_sync_duration_ms: 42,
-      last_retry_tool: "mcp__anysearch__search",
-      last_retry_result: "ok",
       // indexed_tools is the callable count, not a copy of tools_total.
       indexed_tools: 3,
       tools_total: 4,

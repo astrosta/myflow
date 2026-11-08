@@ -95,7 +95,7 @@ class McpServerWrite:
     headers: Mapping[str, str] | None | _UnsetType = UNSET
     verify_tls: bool | _UnsetType = UNSET
     enabled: bool | _UnsetType = UNSET
-    #: Update only: drop the stored URL query string instead of preserving it.
+    #: Update only: drop every URL query string, stored or written in this edit.
     clear_query: bool = False
 
 
@@ -153,8 +153,9 @@ def merge_url_query(incoming: str, stored: str | None) -> str:
     the incoming URL names the *same origin* (scheme, host and port): pointing the
     row at another host and silently re-attaching the old token would hand one
     server's credential to another.  A cross-origin edit drops the stored query;
-    the caller can still submit a new one explicitly, and `clear_query` removes a
-    stored query without changing the URL at all.
+    the caller can still submit a new one explicitly, except when `clear_query`
+    is set: that is the explicit "no query" intent, so it wins over an incoming
+    query and over the stored one.
     """
     incoming_parts = urlsplit(incoming)
     if incoming_parts.query:
@@ -238,9 +239,9 @@ class ServerUrlPolicy:
             raise McpServerValidationError("MCP server url must include a host")
         if not self.allow_private_networks and self._is_private_target(host):
             raise McpServerValidationError(
-                "MCP server url points at localhost, a loopback/link-local address "
-                "or a private network; set mcp_servers.allow_private_networks=true "
-                "to allow it"
+                "MCP server url points at a non-global address (localhost, a "
+                "loopback/link-local, private or reserved network); set "
+                "mcp_servers.allow_private_networks=true to allow it"
             )
         return text
 
@@ -264,6 +265,14 @@ class ServerUrlPolicy:
 
     @staticmethod
     def _is_private_target(host: str) -> bool:
+        """The literal half of the SSRF gate; net.is_private_address is the other.
+
+        They are duplicated on purpose: this runs before any DNS lookup so a bad
+        literal URL is a fast 422, while the resolver-side check in agentkit.mcp.net
+        catches a public-looking name that resolves privately.  The two must agree -
+        every non-global address is rejected by both, including CGNAT space such as
+        100.64.0.0/10, where a cloud metadata endpoint may live.
+        """
         if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
             return True
         if "%" in host:  # IPv6 zone id: link-local by definition
@@ -278,14 +287,7 @@ class ServerUrlPolicy:
             return bool(labels) and all(
                 re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", label) for label in labels
             )
-        return bool(
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_unspecified
-            or address.is_reserved
-            or address.is_multicast
-        )
+        return not address.is_global
 
 
 class McpServerSync(Protocol):

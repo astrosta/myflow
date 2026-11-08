@@ -86,9 +86,6 @@ export interface McpServerStatus {
   index: string | null;
   last_sync_reason: string | null;
   last_sync_duration_ms: number | null;
-  last_retry_at: string | null;
-  last_retry_tool: string | null;
-  last_retry_result: string | null;
 }
 
 export interface McpServerReindexStats {
@@ -383,9 +380,6 @@ export async function getMcpServerStatus(): Promise<McpServerStatus> {
     index: asNullableString(raw.index),
     last_sync_reason: asNullableString(raw.last_sync_reason),
     last_sync_duration_ms: asNullableNumber(raw.last_sync_duration_ms),
-    last_retry_at: asNullableString(raw.last_retry_at),
-    last_retry_tool: asNullableString(raw.last_retry_tool),
-    last_retry_result: asNullableString(raw.last_retry_result),
   };
 }
 

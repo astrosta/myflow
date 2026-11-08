@@ -22,7 +22,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agentkit.agents.thread_state import merge_retrieved_tool_names
 from agentkit.config.tool_search_config import ToolSearchConfig
+from agentkit.mcp.crypto import HeaderCipher
 from agentkit.mcp.index import ToolVectorHit
+from agentkit.mcp.models import McpServerRecord
+from agentkit.mcp.runtime import McpServerSyncResult
+from agentkit.mcp.service import McpServerService, ServerUrlPolicy
+from agentkit.mcp.store import McpServerStore
 from agentkit.mcp.store.tool_repository import (
     McpToolRecord,
     McpToolStore,
@@ -112,6 +117,23 @@ def _record(
 async def _store_catalog(
     store: McpToolStore, records: Sequence[McpToolRecord]
 ) -> None:
+    """Store the tools behind their server rows, as a real sync would.
+
+    tool_search now joins mcp_servers for the enabled flag, so a tool without its
+    owning server is exactly the orphan the join must reject.
+    """
+    servers = McpServerStore(store._sf)
+    for record in records:
+        if await servers.get(record.server_id, record.owner_user_id) is not None:
+            continue
+        await servers.create(
+            McpServerRecord(
+                id=record.server_id,
+                owner_user_id=record.owner_user_id,
+                name=record.server_name,
+                url="https://mcp.example.test/mcp",
+            )
+        )
     await store.upsert_snapshot(list(records), [record.id for record in records])
 
 
@@ -255,6 +277,66 @@ def test_the_tool_description_speaks_about_mcp_tools() -> None:
     assert "MCP" in (tool_search.description or "")
 
 
+class FailingRetirementSync:
+    """A retirement pass that either raises or reports its failure in the result."""
+
+    def __init__(self, *, raises: bool) -> None:
+        self.raises = raises
+        self.calls: list[tuple[str, str | None]] = []
+
+    async def sync_server(self, server_id: str, reason: str | None = None) -> Any:
+        self.calls.append((server_id, reason))
+        if self.raises:
+            raise RuntimeError("catalog is down")
+        return McpServerSyncResult(server_id=server_id, error="catalog is down")
+
+
+@pytest.mark.parametrize("failure", ["raises", "result_error"])
+@pytest.mark.asyncio
+async def test_a_disabled_server_is_not_searchable_when_retirement_fails(
+    tmp_path: Path, failure: str
+) -> None:
+    """The DB join, not a successful sync, is what retires a disabled server.
+
+    Both shapes of a failed retirement leave mcp_tools.callable=True, so a stale
+    Milvus id can still arrive.  tool_search must drop it because the owning server
+    is disabled, otherwise the model is offered a tool it cannot execute.
+    """
+    async with catalog(tmp_path) as tools:
+        servers = McpServerStore(tools._sf)
+        server = await servers.create(
+            McpServerRecord(
+                id="server-anysearch",
+                owner_user_id="u1",
+                name="anysearch",
+                url="https://mcp.example.test/mcp",
+            )
+        )
+        record = _record()
+        await _store_catalog(tools, [record])
+        sync = FailingRetirementSync(raises=failure == "raises")
+        service = McpServerService(
+            store=servers,
+            cipher=HeaderCipher(HeaderCipher.generate_key()),
+            client=object(),
+            sync=sync,
+            tool_store=tools,
+            policy=ServerUrlPolicy(),
+        )
+
+        disabled = await service.set_enabled(server.id, "u1", False)
+
+        assert disabled.enabled is False
+        assert sync.calls == [(server.id, "server_disabled")]
+        # The retirement did not rewrite the row; the join has to do the work.
+        assert (await tools.list_for_server(server.id, "u1"))[0].callable is True
+        index = HitIndex([ToolVectorHit("search", 0.9, tool_id=record.id)])
+        update = await _run(_service(store=tools, index=index))
+
+    assert _payload(update)["tools"] == []
+    assert update["retrieved_tool_names"] == []
+
+
 @pytest.mark.asyncio
 async def test_card_uses_mcp_namespace_and_server_name(tmp_path: Path) -> None:
     record = _record()
@@ -342,6 +424,15 @@ async def test_tool_search_drops_hits_the_store_does_not_confirm(
 ) -> None:
     retired = _record("retired", callable_=False)
     async with catalog(tmp_path) as store:
+        servers = McpServerStore(store._sf)
+        await servers.create(
+            McpServerRecord(
+                id="server-anysearch",
+                owner_user_id="u1",
+                name="anysearch",
+                url="https://mcp.example.test/mcp",
+            )
+        )
         # The retired tool exists but was not seen upstream, so the store keeps
         # the row non-callable; a stale Milvus id must not revive it.
         await store.upsert_snapshot([_record(), retired], [_record().id])

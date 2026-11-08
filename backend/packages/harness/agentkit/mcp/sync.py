@@ -273,7 +273,9 @@ class McpCatalogSync:
         """Read servers and publish one complete tool snapshot.
 
         reason is for logs only (startup, daily, server_refresh, ...) and full is
-        forwarded to the index, which may use it to rebuild from scratch.
+        forwarded to the index, which may use it to rebuild from scratch.  A
+        filtered pass forces full=False: the index would otherwise delete every
+        vector outside this pass's server list, wiping other owners' rows.
 
         `server_ids` narrows *which servers are contacted* - a management write or a
         tool-error refresh is about one server, and contacting every owner's server
@@ -369,7 +371,10 @@ class McpCatalogSync:
                 await self._index.sync(
                     index_records,
                     embedder=self._embedder,
-                    full=full,
+                    # The index treats full=True as "delete every vector not in
+                    # this list"; a filtered list would therefore wipe the other
+                    # servers.  Filtered passes are always incremental.
+                    full=bool(full and not filtered),
                 )
             except Exception as exc:  # noqa: BLE001 - the commit already happened
                 index_failed = True

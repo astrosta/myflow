@@ -374,11 +374,6 @@ function StatusBar({ error, loading, status }: StatusBarProps) {
             }）`
           : ""}
       </p>
-      {status?.last_retry_at ? (
-        <p className="mt-1 text-[11px] text-neutral-500">
-          {`最近一次调用纠错 ${status.last_retry_at}：${status.last_retry_tool ?? ""} → ${status.last_retry_result ?? ""}`}
-        </p>
-      ) : null}
       {status?.last_error ? (
         <p className="mt-1 text-[11px] text-red-600">{status.last_error}</p>
       ) : null}

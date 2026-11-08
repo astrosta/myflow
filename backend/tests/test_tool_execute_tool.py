@@ -1663,3 +1663,30 @@ async def test_a_failed_call_also_writes_one_audit_line(
     assert "origin=server_unavailable" in line
     assert "pytest" not in line
 
+
+@pytest.mark.asyncio
+async def test_a_cancelled_call_still_writes_one_audit_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An exception with no reply still leaves the audit record.
+
+    _execute_tool normally turns every failure into a reply; a cancellation (or an
+    unexpected non-Exception) can escape it.  The finally must emit exactly one
+    INFO line, with the failure status and without the arguments.
+    """
+    async with catalog(tmp_path) as (store, server_store):
+        await _server(server_store)
+        await _store_tool(store, _tool())
+        runtime = FakeRuntime(store, server_store, asyncio.CancelledError())
+
+        with caplog.at_level("INFO", logger=executor_module.__name__):
+            with pytest.raises(asyncio.CancelledError):
+                await _run(runtime, arguments={"query": "secret-value"})
+
+    records = [r for r in caplog.records if "MCP tool call" in r.getMessage()]
+    assert len(records) == 1
+    line = records[0].getMessage()
+    assert "call_name=" + CALL_NAME in line
+    assert "status=error" in line
+    assert "origin=exception" in line
+    assert "secret-value" not in line

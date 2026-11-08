@@ -9,6 +9,7 @@ row instead of losing the user's configuration.
 
 from __future__ import annotations
 
+import socket
 from types import SimpleNamespace
 from typing import Any
 
@@ -35,7 +36,12 @@ from agentkit.mcp.service import (
     url_has_query,
     url_without_query,
 )
-from agentkit.mcp.store import McpServerStore
+from agentkit.mcp.store import (
+    McpServerStore,
+    McpToolRecord,
+    McpToolStore,
+    tool_id_for,
+)
 from agentkit.persistence.base import Base
 
 
@@ -112,18 +118,32 @@ def write(**overrides: Any) -> McpServerWrite:
 
 
 @pytest_asyncio.fixture
-async def store(tmp_path):
+async def session_factory(tmp_path):
     engine = create_async_engine(
         "sqlite+aiosqlite:///" + (tmp_path / "mcp-service.db").as_posix()
     )
     async with engine.begin() as conn:
         await conn.run_sync(
             lambda sync_conn: Base.metadata.create_all(
-                sync_conn, tables=[Base.metadata.tables["mcp_servers"]]
+                sync_conn,
+                tables=[
+                    Base.metadata.tables["mcp_servers"],
+                    Base.metadata.tables["mcp_tools"],
+                ],
             )
         )
-    yield McpServerStore(async_sessionmaker(engine, expire_on_commit=False))
+    yield async_sessionmaker(engine, expire_on_commit=False)
     await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def store(session_factory):
+    return McpServerStore(session_factory)
+
+
+@pytest_asyncio.fixture
+async def real_tool_store(session_factory):
+    return McpToolStore(session_factory)
 
 
 @pytest.fixture
@@ -377,6 +397,9 @@ def test_url_policy_accepts_https_with_path_and_query(policy: ServerUrlPolicy) -
         "https://[::1]/mcp",
         "https://10.0.0.1/mcp",
         "https://169.254.169.254/latest/meta-data/",
+        # CGNAT space: not is_private/is_reserved under ipaddress, but not globally
+        # routable either - this is where a cloud metadata endpoint can live.
+        "https://100.100.100.200/latest/meta-data/",
         "https://0.0.0.0/mcp",
         "https://127.1/mcp",
         "https://0177.0.0.1/mcp",
@@ -645,18 +668,41 @@ async def test_disable_retires_the_catalog_and_enable_syncs_it_again(
 
 
 @pytest.mark.asyncio
-async def test_a_failed_retirement_keeps_the_server_disabled(
-    service: McpServerService, sync: FakeSync
+async def test_a_failed_retirement_keeps_the_server_disabled_and_uncallable(
+    service: McpServerService,
+    sync: FakeSync,
+    real_tool_store: McpToolStore,
 ) -> None:
     created = await service.create_server("u1", write())
+    await real_tool_store.upsert_snapshot(
+        [
+            McpToolRecord(
+                server_id=created.id,
+                server_name="anysearch",
+                owner_user_id="u1",
+                name="search",
+                description="search tool",
+                input_schema={"type": "object"},
+                content="search anysearch",
+            )
+        ],
+        seen_ids={tool_id_for(created.id, "search")},
+    )
+    tool_id = (await real_tool_store.list_for_server(created.id, "u1"))[0].id
+    service.tool_store = real_tool_store
+    sync.calls.clear()
     sync.failure = RuntimeError("catalog is down")
 
     disabled = await service.set_enabled(created.id, "u1", False)
 
     # The disable landed; a sync failure must not flip the row to error and must
-    # not fail the request - the store already refuses every call.
+    # not fail the request.  The pass was actually attempted, and the DB join in
+    # get_by_ids keeps the still-callable row out of tool_search.
+    assert sync.calls == [(created.id, "server_disabled")]
     assert disabled.enabled is False
     assert disabled.status == "disabled"
+    assert (await real_tool_store.list_for_server(created.id, "u1"))[0].callable is True
+    assert await real_tool_store.get_by_ids([tool_id], "u1") == []
 
 
 @pytest.mark.asyncio
@@ -1045,6 +1091,41 @@ async def test_allow_private_networks_skips_the_resolution_check(
 
     assert record.url == "http://127.0.0.1:8080/mcp"
     assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_resolution_is_retried_instead_of_cached_as_public(
+    service: McpServerService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure must not mask the address the host starts resolving to.
+
+    The first lookup fails (an empty tuple to the guard), the second returns
+    loopback.  Caching the empty result would keep accepting this host forever and
+    silently defeat the re-check on every later sync/call.
+    """
+    calls: list[str] = []
+
+    def _flaky(host: str, port: int, *args: Any, **kwargs: Any) -> list[Any]:
+        calls.append(host)
+        if len(calls) == 1:
+            raise socket.gaierror("temporary failure")
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))
+        ]
+
+    monkeypatch.setattr(net.socket, "getaddrinfo", _flaky)
+
+    await service.create_server(
+        "u1",
+        write(name="first-lookup", url="https://retry-once.anysearch.com/mcp"),
+    )
+    with pytest.raises(McpServerValidationError, match="127.0.0.1"):
+        await service.create_server(
+            "u1",
+            write(name="second-lookup", url="https://retry-once.anysearch.com/mcp"),
+        )
+
+    assert calls == ["retry-once.anysearch.com", "retry-once.anysearch.com"]
 
 
 @pytest.mark.asyncio

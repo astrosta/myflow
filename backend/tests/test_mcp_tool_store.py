@@ -41,8 +41,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 import agentkit.persistence.schema as schema_module
+from agentkit.mcp.models import McpServerRecord
 from agentkit.mcp.store import (
     CALL_NAME_PREFIX,
+    McpServerStore,
     McpToolRecord,
     McpToolRow,
     McpToolSnapshotStats,
@@ -197,7 +199,11 @@ async def store(tmp_path: Path):
     async with engine.begin() as conn:
         await conn.run_sync(
             lambda sync_conn: Base.metadata.create_all(
-                sync_conn, tables=[Base.metadata.tables[TABLE]]
+                sync_conn,
+                tables=[
+                    Base.metadata.tables[TABLE],
+                    Base.metadata.tables["mcp_servers"],
+                ],
             )
         )
     yield McpToolStore(async_sessionmaker(engine, expire_on_commit=False))
@@ -837,6 +843,23 @@ async def test_the_row_is_reused_across_snapshots(store: McpToolStore) -> None:
 async def test_get_by_ids_returns_only_callable_owned_rows_in_rank_order(
     store: McpToolStore,
 ) -> None:
+    servers = McpServerStore(store._sf)
+    await servers.create(
+        McpServerRecord(
+            id="s1",
+            owner_user_id="u1",
+            name="anysearch",
+            url="https://mcp.example.test/mcp",
+        )
+    )
+    await servers.create(
+        McpServerRecord(
+            id="s9",
+            owner_user_id="u2",
+            name="anysearch",
+            url="https://mcp.example.test/mcp",
+        )
+    )
     public = tool_record(name="search")
     broken = tool_record(name="list", enabled=False)
     foreign = tool_record(server_id="s9", owner="u2")
@@ -854,6 +877,33 @@ async def test_get_by_ids_returns_only_callable_owned_rows_in_rank_order(
     assert [row.id for row in await store.get_by_ids([public.id, public.id], "u1")] == [
         public.id
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_by_ids_hides_a_disabled_servers_tools(store: McpToolStore) -> None:
+    """The DB join, not the index, keeps a failed retirement out of tool_search.
+
+    A disable lands in mcp_servers even when its catalog sync fails, so the tool row
+    can still say callable=True.  get_by_ids must consult the owning server's
+    enabled flag or a stale vector would keep resurrecting the tool.
+    """
+    servers = McpServerStore(store._sf)
+    await servers.create(
+        McpServerRecord(
+            id="s1",
+            owner_user_id="u1",
+            name="anysearch",
+            url="https://mcp.example.test/mcp",
+        )
+    )
+    record = tool_record()
+    await store.upsert_snapshot([record], seen_ids={record.id})
+    assert [row.id for row in await store.get_by_ids([record.id], "u1")] == [record.id]
+
+    await servers.set_enabled("s1", "u1", False)
+
+    assert (await store.list_for_server("s1", "u1"))[0].callable is True
+    assert await store.get_by_ids([record.id], "u1") == []
 
 
 @pytest.mark.asyncio
