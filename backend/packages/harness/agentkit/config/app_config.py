@@ -20,6 +20,7 @@ from agentkit.config.knowledge_config import (
     VectorStoreServiceConfig,
 )
 from agentkit.config.llm_call_config import LlmCallConfig
+from agentkit.config.mcp_servers_config import McpServersConfig
 from agentkit.config.memory_config import MemoryConfig
 from agentkit.config.model_config import ModelConfig
 from agentkit.config.observability_config import ObservabilityConfig
@@ -36,6 +37,7 @@ from agentkit.config.subagents_config import SubagentsConfig, resolve_token_budg
 from agentkit.config.summarization_config import SummarizationConfig
 from agentkit.config.title_config import TitleConfig
 from agentkit.config.tool_config import ToolConfig
+from agentkit.config.tool_search_config import ToolSearchConfig
 from agentkit.subagents.config import INHERIT_MODEL
 
 _BRACED_ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -45,16 +47,19 @@ _SHARED_SERVICE_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
         ("knowledge_base", "embedding"),
         ("skills", "search", "embedding"),
         ("contextforge", "search", "embedding"),
+        ("tool_search", "embedding"),
     ),
     "rerank": (
         ("knowledge_base", "retrieval", "rerank"),
         ("skills", "search", "rerank"),
         ("contextforge", "search", "rerank"),
+        ("tool_search", "rerank"),
     ),
     "vector_store": (
         ("knowledge_base", "vector_store"),
         ("skills", "search", "vector_store"),
         ("contextforge", "search", "vector_store"),
+        ("tool_search", "vector_store"),
     ),
 }
 
@@ -96,6 +101,11 @@ class AppConfig(BaseModel):
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     contextforge: ContextForgeConfig = Field(default_factory=ContextForgeConfig)
+    # MyFlow-owned MCP servers (rev.10): disabled by default; enabling demands a
+    # Fernet key or startup fails.  Replaces the external-gateway tool catalog.
+    mcp_servers: McpServersConfig = Field(default_factory=McpServersConfig)
+    # tool_search budget/channels; the Milvus collection is pinned to myflow_mcp_tools.
+    tool_search: ToolSearchConfig = Field(default_factory=ToolSearchConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     # Shared by knowledge_base and skills.search; each section keeps only its own
     # enabled/collection/timeout/instruction overrides.
