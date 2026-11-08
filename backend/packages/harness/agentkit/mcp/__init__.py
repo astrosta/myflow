@@ -45,7 +45,16 @@ from agentkit.mcp.service import (
     url_has_query,
     url_without_query,
 )
-from agentkit.mcp.store import McpServerRow, McpServerStore
+from agentkit.mcp.store import (
+    McpServerRow,
+    McpServerStore,
+    McpToolRecord,
+    McpToolRow,
+    McpToolSnapshotStats,
+    McpToolStore,
+    call_name_for,
+    tool_id_for,
+)
 
 __all__ = [
     "HeaderCipher",
@@ -71,6 +80,10 @@ __all__ = [
     "McpServerTimeout",
     "McpServerUnavailable",
     "McpToolError",
+    "McpToolRecord",
+    "McpToolRow",
+    "McpToolSnapshotStats",
+    "McpToolStore",
     "McpTransport",
     "ServerUrlPolicy",
     "is_sensitive_header",
@@ -84,4 +97,6 @@ __all__ = [
     "validate_server_name",
     "validate_server_status",
     "validate_transport",
+    "call_name_for",
+    "tool_id_for",
 ]

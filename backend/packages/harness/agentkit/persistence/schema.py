@@ -18,7 +18,7 @@ from agentkit.agents.memory.openviking.models import (
 )
 from agentkit.contextforge.store.model import ContextForgeToolRow
 from agentkit.knowledge.store.model import KnowledgeBaseRow, KnowledgeDocumentRow
-from agentkit.mcp.store.model import McpServerRow
+from agentkit.mcp.store.model import McpServerRow, McpToolRow
 from agentkit.persistence.base import Base
 from agentkit.persistence.events.model import RunEventRow
 from agentkit.persistence.run.model import RunRow
@@ -40,6 +40,7 @@ __all__ = [
     "KnowledgeBaseRow",
     "KnowledgeDocumentRow",
     "McpServerRow",
+    "McpToolRow",
     "MemoryCaptureDedupRow",
     "MemoryProfileDocumentRow",
     "MemoryProfileOnboardingRow",

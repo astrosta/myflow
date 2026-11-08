@@ -16,7 +16,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, inspect, text
 
-from agentkit.persistence.bootstrap import _head_revision
+from agentkit.persistence.bootstrap import _local_revisions
 from agentkit.persistence.migrations import __file__ as migrations_file
 from agentkit.persistence.schema import Base
 
@@ -40,19 +40,21 @@ def _revision_module():
     return module
 
 
-def test_0018_is_the_head_and_follows_0017() -> None:
+def test_0018_follows_0017() -> None:
+    """0018 is a chain member, not the head: later revisions build on it."""
     module = _revision_module()
 
     assert module.revision == "0018_mcp_servers"
     assert module.down_revision == "0017_contextforge_tools"
-    assert _head_revision() == "0018_mcp_servers"
+    # The head moves with every new DDL revision; 0018 only has to be in the chain.
+    assert "0018_mcp_servers" in _local_revisions()
 
 
 def test_0018_creates_and_drops_the_table(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     engine = create_engine(f"sqlite:///{db_path.as_posix()}")
 
-    command.upgrade(_config(db_path), "head")
+    command.upgrade(_config(db_path), "0018_mcp_servers")
     with engine.connect() as conn:
         assert TABLE in set(inspect(conn).get_table_names())
         assert conn.scalar(text("SELECT version_num FROM alembic_version")) == (
@@ -79,7 +81,7 @@ def test_0018_is_reentrant_on_a_created_schema(tmp_path: Path) -> None:
         )
 
     # create_all already built the table; the upgrade must not blow up on it.
-    command.upgrade(_config(db_path), "head")
+    command.upgrade(_config(db_path), "0018_mcp_servers")
 
     with engine.connect() as conn:
         assert TABLE in set(inspect(conn).get_table_names())
