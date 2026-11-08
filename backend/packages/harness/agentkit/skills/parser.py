@@ -56,6 +56,12 @@ def parse_skill_file(path: Path) -> ParsedSkill:
     return parse_skill_text(path.read_text(encoding="utf-8"))  # ★ 显式 UTF-8（§3.1）
 
 
+def strip_frontmatter(text: str) -> str:
+    """Return the body without the YAML frontmatter block."""
+    match = FRONTMATTER_RE.match(text)
+    return (text[match.end() :] if match is not None else text).strip()
+
+
 def parse_skill_text(text: str) -> ParsedSkill:
     """同一套解析吃字符串：DurableContext 从工具结果里认出 SKILL.md 时也走这里（§3.10）。"""
     match = FRONTMATTER_RE.match(text)

@@ -196,11 +196,24 @@ class ToolVectorIndex:
         rows = await asyncio.to_thread(self._dense_search_sync, values, int(limit))
         return self._to_hits(rows)
 
+    async def keyword_search(
+        self,
+        *,
+        query: str,
+        limit: int,
+    ) -> list[ToolVectorHit]:
+        """BM25-only recall; Milvus tokenizes, scores and ranks server-side."""
+        text = query.strip()
+        if not text or limit <= 0:
+            return []
+        rows = await asyncio.to_thread(self._keyword_search_sync, text, int(limit))
+        return self._to_hits(rows)
+
     async def sync(
         self,
         documents: Sequence[ToolCatalogDocument],
         *,
-        embedder: Embedder,
+        embedder: Embedder | None,
         full: bool = False,
     ) -> ToolIndexSyncStats:
         started = time.monotonic()
@@ -214,7 +227,12 @@ class ToolVectorIndex:
             ]
             upserted = 0
             if changed:
-                vectors = await embedder.embed_documents([document.content for document in changed])
+                if embedder is None:
+                    vectors = [self._placeholder_vector() for _ in changed]
+                else:
+                    vectors = await embedder.embed_documents(
+                        [document.content for document in changed]
+                    )
                 upserted = await self.upsert(changed, vectors)
             deleted = await self.delete_not_in([document.name for document in documents]) if full else 0
             return ToolIndexSyncStats(
@@ -244,6 +262,10 @@ class ToolVectorIndex:
     # ------------------------------------------------------------------
     # synchronous Milvus operations
     # ------------------------------------------------------------------
+
+    def _placeholder_vector(self) -> list[float]:
+        """Dense placeholder used when the embedding channel is disabled."""
+        return [1.0, *([0.0] * (self._dimensions - 1))]
 
     def _ensure_collection_sync(self) -> None:
         client = self._client_instance()
@@ -485,6 +507,26 @@ class ToolVectorIndex:
         except Exception as exc:  # noqa: BLE001
             raise ToolIndexUnavailable(
                 f"Milvus tool dense search failed: {type(exc).__name__}"
+            ) from exc
+
+    def _keyword_search_sync(self, query: str, limit: int) -> list[dict[str, Any]]:
+        client = self._client_instance()
+        self._ensure_collection_sync()
+        try:
+            return _first_rows(
+                client.search(
+                    collection_name=self._collection,
+                    data=[query],
+                    anns_field=_SPARSE_FIELD,
+                    search_params={"metric_type": "BM25", "params": {}},
+                    limit=limit,
+                    output_fields=OUTPUT_FIELDS,
+                    consistency_level=self._config.consistency_level,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ToolIndexUnavailable(
+                f"Milvus tool keyword search failed: {type(exc).__name__}"
             ) from exc
 
     def _to_hits(self, rows: list[dict[str, Any]]) -> list[ToolVectorHit]:

@@ -62,13 +62,7 @@ class FakeProjection:
         keys = list(self.rows)[: max(0, int(limit))]
         return keys, len(self.rows) > len(keys)
 
-    async def search(
-        self,
-        *,
-        user_id: str,
-        vector: list[float] | tuple[float, ...],
-        limit: int,
-    ) -> list[ProjectionHit]:
+    def _hits(self, *, user_id: str, limit: int) -> list[ProjectionHit]:
         hits: list[ProjectionHit] = []
         for row in self.rows.values():
             if row.scope != "private" or row.owner_user_id != user_id:
@@ -84,6 +78,35 @@ class FakeProjection:
                 )
             )
         return hits[:limit]
+
+    async def search(
+        self,
+        *,
+        user_id: str,
+        vector: list[float] | tuple[float, ...],
+        limit: int,
+    ) -> list[ProjectionHit]:
+        return self._hits(user_id=user_id, limit=limit)
+
+    async def keyword_search(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        limit: int,
+    ) -> list[ProjectionHit]:
+        return self._hits(user_id=user_id, limit=limit)
+
+    async def hybrid_search(
+        self,
+        *,
+        user_id: str,
+        vector: list[float] | tuple[float, ...],
+        keyword_query: str,
+        limit: int,
+        rrf_k: int = 60,
+    ) -> list[ProjectionHit]:
+        return self._hits(user_id=user_id, limit=limit)
 
 
 class FakeEmbedder:

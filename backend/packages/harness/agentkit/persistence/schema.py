@@ -14,7 +14,6 @@ from agentkit.agents.memory.openviking.models import (
     MemoryCaptureDedupRow,
     MemoryProfileDocumentRow,
     MemoryProfileOnboardingRow,
-    MemoryProfileSuggestionRow,
     MemorySyncStateRow,
 )
 from agentkit.knowledge.store.model import KnowledgeBaseRow, KnowledgeDocumentRow
@@ -40,7 +39,6 @@ __all__ = [
     "MemoryCaptureDedupRow",
     "MemoryProfileDocumentRow",
     "MemoryProfileOnboardingRow",
-    "MemoryProfileSuggestionRow",
     "MemorySyncStateRow",
     "RunEventRow",
     "RunRow",

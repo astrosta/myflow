@@ -28,7 +28,7 @@ from agentkit.skills.package import build_package
 from agentkit.skills.projection import MilvusSkillProjection, ProjectionHit
 from agentkit.skills.search import (
     CONTENT_UNAVAILABLE,
-    LEXICAL_FALLBACK,
+    KEYWORD_UNAVAILABLE,
     RERANK_UNAVAILABLE,
     VECTOR_UNAVAILABLE,
     SkillSearchService,
@@ -51,12 +51,25 @@ def manifest(
 
 
 class FakeProjection:
-    """Records the filter contract without a Milvus server."""
+    """Records the Milvus call contract without a Milvus server."""
 
     def __init__(self) -> None:
         self.searches: list[dict[str, Any]] = []
         self.hits: list[ProjectionHit] = []
         self.fail = False
+
+    def _record(self, mode: str, user_id: str, limit: int, **extra: Any) -> None:
+        self.searches.append(
+            {
+                "mode": mode,
+                "user_id": user_id,
+                "limit": limit,
+                "filter": MilvusSkillProjection._filter(user_id),
+                **extra,
+            }
+        )
+        if self.fail:
+            raise RuntimeError("Milvus is unavailable")
 
     async def search(
         self,
@@ -65,16 +78,36 @@ class FakeProjection:
         vector: list[float] | tuple[float, ...],
         limit: int,
     ) -> list[ProjectionHit]:
-        self.searches.append(
-            {
-                "user_id": user_id,
-                "vector": list(vector),
-                "limit": limit,
-                "filter": MilvusSkillProjection._filter(user_id),
-            }
+        self._record("dense", user_id, limit, vector=list(vector))
+        return list(self.hits)
+
+    async def keyword_search(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        limit: int,
+    ) -> list[ProjectionHit]:
+        self._record("keyword", user_id, limit, query=query)
+        return list(self.hits)
+
+    async def hybrid_search(
+        self,
+        *,
+        user_id: str,
+        vector: list[float] | tuple[float, ...],
+        keyword_query: str,
+        limit: int,
+        rrf_k: int = 60,
+    ) -> list[ProjectionHit]:
+        self._record(
+            "hybrid",
+            user_id,
+            limit,
+            vector=list(vector),
+            query=keyword_query,
+            rrf_k=rrf_k,
         )
-        if self.fail:
-            raise RuntimeError("Milvus is unavailable")
         return list(self.hits)
 
 
@@ -267,10 +300,14 @@ async def test_one_search_with_owner_filter(harness: Harness) -> None:
     outcome = await call(harness)
 
     assert len(harness.projection.searches) == 1
-    assert harness.projection.searches[0]["filter"] == (
+    search = harness.projection.searches[0]
+    assert search["mode"] == "hybrid"
+    assert search["filter"] == (
         'scope == "private" and enabled == true and owner_user_id == "u1"'
     )
-    assert "skill_id not in" not in harness.projection.searches[0]["filter"]
+    assert search["query"] == "pgvector"
+    assert search["rrf_k"] == 60
+    assert "skill_id not in" not in search["filter"]
     assert [item.scope for item in outcome.hits] == ["private"]
     assert outcome.hits[0].skill.skill_id == skill.id
     assert outcome.hits[0].version_id == version.id
@@ -340,7 +377,7 @@ async def test_rerank_failure_falls_back_to_the_fused_order(harness: Harness) ->
 
 
 @pytest.mark.asyncio
-async def test_bm25_recall_adds_candidates_the_vector_search_missed(harness: Harness) -> None:
+async def test_hybrid_search_keeps_both_milvus_channels(harness: Harness) -> None:
     dense, dense_version = await save_private(
         harness, owner="u1", name="dense", description="unrelated", seq=1
     )
@@ -352,28 +389,30 @@ async def test_bm25_recall_adds_candidates_the_vector_search_missed(harness: Har
         seq=2,
     )
     harness.projection.hits = [
-        hit(owner="u1", skill_id=dense.id, version_id=dense_version.id, score=0.9)
+        hit(owner="u1", skill_id=dense.id, version_id=dense_version.id, score=0.9),
+        hit(owner="u1", skill_id=lexical.id, version_id=lexical_version.id, score=0.4),
     ]
 
     outcome = await call(harness, config=search_config(top_k=5, candidate_k=5))
 
     assert {item.skill.skill_id for item in outcome.hits} == {dense.id, lexical.id}
-    assert set(outcome.channels) == {"embedding", "keyword"}
-    assert lexical_version.id
+    assert outcome.channels == ("embedding", "keyword")
+    assert harness.projection.searches[0]["mode"] == "hybrid"
+    assert harness.projection.searches[0]["query"] == "pgvector"
 
 
 @pytest.mark.asyncio
-async def test_min_score_applies_to_the_normalised_fused_score(harness: Harness) -> None:
+async def test_min_score_applies_to_the_raw_milvus_score(harness: Harness) -> None:
     skill, version = await save_private(
         harness, owner="u1", name="pdf-tools", body="# Body\n"
     )
-    workdir = search_config(min_score=1.0, top_k=5, candidate_k=5)
+    config = search_config(min_score=0.8, top_k=5, candidate_k=5)
     harness.projection.hits = [
         hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.9)
     ]
 
-    outcome = await call(harness, config=workdir)
-    assert outcome.hits[0].score == 1.0
+    outcome = await call(harness, config=config)
+    assert outcome.hits[0].score == 0.9
 
 
 @pytest.mark.asyncio
@@ -440,7 +479,7 @@ async def test_a_missing_body_warns_and_is_dropped(harness: Harness) -> None:
 
 
 @pytest.mark.asyncio
-async def test_milvus_failure_falls_back_to_local_lexical_scoring(harness: Harness) -> None:
+async def test_milvus_failure_returns_no_local_hits(harness: Harness) -> None:
     await save_private(
         harness, owner="u1", name="pdf-tools", body="# Body\npgvector 排查\n"
     )
@@ -449,31 +488,54 @@ async def test_milvus_failure_falls_back_to_local_lexical_scoring(harness: Harne
     outcome = await call(harness)
 
     assert VECTOR_UNAVAILABLE in outcome.warnings
-    assert LEXICAL_FALLBACK in outcome.warnings
+    assert outcome.hits == ()
+
+
+@pytest.mark.asyncio
+async def test_embedding_failure_falls_back_to_milvus_bm25(harness: Harness) -> None:
+    skill, version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# Body\npgvector\n"
+    )
+    harness.embedder.fail = True
+    harness.projection.hits = [
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.4)
+    ]
+
+    outcome = await call(harness)
+
+    assert harness.projection.searches[0]["mode"] == "keyword"
+    assert harness.projection.searches[0]["query"] == "pgvector"
+    assert VECTOR_UNAVAILABLE in outcome.warnings
     assert [item.skill.name for item in outcome.hits] == ["pdf-tools"]
 
 
 @pytest.mark.asyncio
-async def test_embedding_failure_skips_the_vector_search(harness: Harness) -> None:
-    await save_private(harness, owner="u1", name="pdf-tools", body="# Body\npgvector\n")
-    harness.embedder.fail = True
-
-    outcome = await call(harness)
-
-    assert harness.projection.searches == []
-    assert LEXICAL_FALLBACK in outcome.warnings
-    assert outcome.hits
-
-
-@pytest.mark.asyncio
-async def test_disabled_embedding_channel_uses_lexical_scoring(harness: Harness) -> None:
-    await save_private(harness, owner="u1", name="pdf-tools", body="# Body\npgvector\n")
+async def test_disabled_embedding_channel_uses_milvus_bm25(harness: Harness) -> None:
+    skill, version = await save_private(
+        harness, owner="u1", name="pdf-tools", body="# Body\npgvector\n"
+    )
     config = search_config(embedding=SkillEmbeddingChannelConfig(enabled=False))
+    harness.projection.hits = [
+        hit(owner="u1", skill_id=skill.id, version_id=version.id, score=0.4)
+    ]
 
     outcome = await call(harness, config=config)
 
-    assert harness.projection.searches == []
+    assert harness.projection.searches[0]["mode"] == "keyword"
     assert outcome.channels == ("keyword",)
+    assert [item.skill.name for item in outcome.hits] == ["pdf-tools"]
+
+
+@pytest.mark.asyncio
+async def test_keyword_milvus_failure_has_its_own_warning(harness: Harness) -> None:
+    await save_private(harness, owner="u1", name="pdf-tools", body="# Body\npgvector\n")
+    config = search_config(embedding=SkillEmbeddingChannelConfig(enabled=False))
+    harness.projection.fail = True
+
+    outcome = await call(harness, config=config)
+
+    assert KEYWORD_UNAVAILABLE in outcome.warnings
+    assert outcome.hits == ()
 
 
 @pytest.mark.asyncio

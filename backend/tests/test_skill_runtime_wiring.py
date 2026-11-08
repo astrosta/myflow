@@ -26,12 +26,7 @@ from agentkit.skills.domain import SkillScope
 from agentkit.skills.git import GitCommandError
 from agentkit.skills.outbox import RepairStats, VerifyStats
 from agentkit.skills.projection import MilvusSkillProjection, ProjectionRow
-from agentkit.skills.search import (
-    LEXICAL_FALLBACK,
-    VECTOR_UNAVAILABLE,
-    SkillSearchService,
-)
-from agentkit.skills.types import Skill, SkillCategory
+from agentkit.skills.search import SkillSearchService
 from pydantic import ValidationError
 from backend.app.gateway import app as gateway_app
 from backend.app.gateway import skills_catalog
@@ -50,7 +45,11 @@ GIT_SKILLS = {
 
 
 def _config(**skills: Any) -> AppConfig:
-    return AppConfig(auth=AuthConfig(enabled=False), skills=skills or GIT_SKILLS)
+    return AppConfig(
+        auth=AuthConfig(enabled=False),
+        skills=skills or GIT_SKILLS,
+        knowledge_base={"vector_store": {"uri": "http://knowledge-milvus:19530"}},
+    )
 
 
 @dataclass
@@ -367,7 +366,15 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
             seen.calls.append(("embedder", config))
 
     class Projection:
-        def __init__(self, config: Any, *, dimensions: int) -> None:
+        def __init__(
+            self,
+            config: Any,
+            *,
+            dimensions: int,
+            analyzer: str = "chinese",
+            bm25_k1: float = 1.2,
+            bm25_b: float = 0.75,
+        ) -> None:
             seen.calls.append(("projection", (config, dimensions)))
 
     class Search:
@@ -392,6 +399,7 @@ def _patch_factory(monkeypatch: pytest.MonkeyPatch, *, embedding: bool) -> _Cons
             projection: Any,
             *,
             poll_seconds: float,
+            dimensions: int | None = None,
             repair_max_attempts: int = 8,
         ) -> None:
             seen.calls.append(("outbox", (poll_seconds, repair_max_attempts)))
@@ -426,14 +434,13 @@ def test_factory_injects_builtin_names_for_the_author_service(
     assert author_reserved() == frozenset({"demo"})
 
 
-def test_shipped_git_config_still_builds_the_lexical_search_service(
+def test_shipped_git_config_still_builds_the_milvus_search_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The shipped config is search.enabled=true + embedding.enabled=false.
+    """search.enabled=true + embedding.enabled=false still needs Milvus BM25.
 
-    Git mode must still wire the search service: the documented local BM25 path
-    is the only retrieval channel there, so a missing embedding endpoint may drop
-    the projection and the outbox but never the service itself.
+    Keyword recall is server-side, so the projection and its outbox must be
+    wired even when no embedder is configured.
     """
     seen = _patch_factory(monkeypatch, embedding=False)
     config = _config(**GIT_SKILLS)
@@ -445,42 +452,21 @@ def test_shipped_git_config_still_builds_the_lexical_search_service(
     assert runtime.store is not None
     assert runtime.author is not None
     assert runtime.catalog is not None
-    # Lexical-only: the service exists, the Milvus projection and its outbox do not.
     assert runtime.search is not None
-    assert runtime.projection is None
-    assert runtime.outbox is None
+    assert runtime.projection is not None
+    assert runtime.outbox is not None
     # reranker 也必须是 None：shipped 配置里 rerank.enabled=false。
-    assert ("search", (None, None, config.skills.search, None)) in seen.calls
+    assert ("search", (runtime.projection, None, config.skills.search, None)) in seen.calls
     assert [name for name, _ in seen.calls] == [
         "store",
         "git",
         "content",
         "author",
         "catalog",
+        "projection",
         "search",
+        "outbox",
     ]
-
-
-@pytest.mark.asyncio
-async def test_keyword_search_answers_without_milvus_or_an_embedder() -> None:
-    """No projection, no embedder: the same query is answered by local BM25."""
-    service = SkillSearchService(
-        store=_LexicalStore(),
-        projection=None,
-        content=_LexicalContent(),
-        embedder=None,
-        config=SkillSearchConfig(),
-    )
-
-    outcome = await service.search(
-        user_id="alice",
-        task_query="pdf report",
-        domain_keywords=(),
-        available_skills=None,
-    )
-
-    assert [hit.skill.name for hit in outcome.hits] == ["pdf-report"]
-    assert outcome.warnings == (VECTOR_UNAVAILABLE, LEXICAL_FALLBACK)
 
 
 def test_factory_builds_projection_outbox_and_search_when_configured(
@@ -1132,53 +1118,6 @@ def test_git_catalog_mode_requires_a_repository(monkeypatch: pytest.MonkeyPatch)
     message = str(excinfo.value)
     assert "skills.git.repository" in message
     assert "SKILLS_GIT_REPOSITORY" in message
-
-
-# ---------------------------------------------------------------------------
-# lexical retrieval really answers without Milvus (Fix 1)
-# ---------------------------------------------------------------------------
-
-
-def _lexical_visible(name: str = "pdf-report") -> Any:
-    skill = Skill(
-        name=name,
-        description="pdf report generator",
-        license=None,
-        skill_dir=Path("cache") / "s1",
-        skill_file=Path("cache") / "s1" / "SKILL.md",
-        relative_path=Path(name),
-        category=SkillCategory.CUSTOM,
-        enabled=True,
-        skill_id="s1",
-        scope=SkillScope.PRIVATE,
-        owner_user_id="alice",
-        version_id="version-s1",
-    )
-    return SimpleNamespace(
-        skill=skill,
-        scope=SkillScope.PRIVATE,
-        version=SimpleNamespace(
-            skill_id="s1",
-            id="version-s1",
-            draft_commit="a" * 40,
-            skill_path="users/alice/s1/SKILL.md",
-        ),
-    )
-
-
-class _LexicalStore:
-    """Only the catalog read SkillSearchService performs for lexical recall."""
-
-    async def visible_for_user(self, user_id: str) -> list[Any]:
-        return [_lexical_visible()]
-
-
-class _LexicalContent:
-    async def read_text(self, commit: str, path: str) -> str:
-        return (
-            "---\nname: pdf-report\ndescription: pdf report generator\n---\n"
-            "Build the pdf report from the template.\n"
-        )
 
 
 # ---------------------------------------------------------------------------

@@ -247,8 +247,6 @@ def field_descriptions() -> list[str]:
             )
         else:
             detail += f"；字符串，最多 {spec.max_length} 字"
-        if spec.explicit_only:
-            detail += "；仅在用户明确要求记录时写入"
         lines.append(f"- {spec.path}（{spec.label}）：{detail}")
     return lines
 

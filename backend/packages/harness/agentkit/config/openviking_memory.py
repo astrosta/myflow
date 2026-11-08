@@ -121,7 +121,6 @@ class RetentionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_days: int = Field(default=30, ge=1)
-    suggestion_days: int = Field(default=7, ge=1)
     dedup_days: int = Field(default=30, ge=1)
 
     @model_validator(mode="after")
@@ -131,13 +130,6 @@ class RetentionConfig(BaseModel):
         if self.dedup_days < self.session_days:
             self.dedup_days = self.session_days
         return self
-
-
-class ProfileSuggesterConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model: str = "agent_default"
-    timeout_seconds: float = Field(default=5.0, gt=0.0)
 
 
 class PersonalizationConfig(BaseModel):
@@ -191,7 +183,6 @@ class OpenVikingMemoryConfig(BaseModel):
     capture_stream: CaptureStreamConfig = Field(default_factory=CaptureStreamConfig)
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
-    profile_suggester: ProfileSuggesterConfig = Field(default_factory=ProfileSuggesterConfig)
     personalization: PersonalizationConfig = Field(default_factory=PersonalizationConfig)
 
     def session_create_options(self) -> dict[str, Any]:

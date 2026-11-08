@@ -133,9 +133,8 @@ def start_profile_services(
 ) -> None:
     """Build the DB-backed profile/onboarding surface even when memory is off.
 
-    The profile is user-owned identity data, not an OpenViking memory type. It
-    stays available with the OpenViking switch disabled; suggestions simply have
-    no memory index to inspect in that mode.
+    The profile is user-owned identity data, not an OpenViking memory type, so it
+    stays available with the OpenViking switch disabled.
     """
 
     if session_factory is None:
@@ -143,12 +142,10 @@ def start_profile_services(
         configure_profile_updater(None)
         app.state.profile_service = None
         app.state.onboarding_service = None
-        app.state.suggestion_service = None
         return
     services = build_profile_services(app_config.memory.openviking, session_factory)
     app.state.profile_service = services.profile
     app.state.onboarding_service = services.onboarding
-    app.state.suggestion_service = services.suggestions
 
     async def prompt(user_id: str) -> str:
         return render_profile_prompt(
@@ -251,7 +248,6 @@ async def start_openviking_memory(
     app.state.openviking_memory = runtime
     app.state.profile_service = runtime.profile
     app.state.onboarding_service = runtime.onboarding
-    app.state.suggestion_service = runtime.suggestions
 
     async def prompt(user_id: str) -> str:
         return render_profile_prompt(
@@ -283,7 +279,6 @@ async def stop_openviking_memory(
         app.state.openviking_memory = None
         app.state.profile_service = None
         app.state.onboarding_service = None
-        app.state.suggestion_service = None
 
 
 @asynccontextmanager
@@ -362,7 +357,6 @@ async def lifespan(app: FastAPI):
                             configure_profile_updater(None)
                             app.state.profile_service = None
                             app.state.onboarding_service = None
-                            app.state.suggestion_service = None
                         await reset_knowledge_service()
                         app.state.knowledge_service = None
                         timeout = app_config.runs.shutdown_timeout_seconds

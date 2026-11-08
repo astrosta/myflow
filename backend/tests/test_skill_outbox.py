@@ -219,9 +219,13 @@ async def test_pending_upsert_embeds_and_marks_the_current_version_ready(
     assert row.package_sha256 == version.package_sha256
     assert row.skill_md_sha256 == version.skill_md_sha256
     assert row.embedding == [1.0, 0.0, 0.0]
-    # 嵌入文本只有元数据：正文改变不影响向量，也不会撞 embedding 的 token 上限。
+    # 嵌入文本只有元数据：正文改变不影响 dense 向量，也不会撞 embedding 的 token 上限。
     assert harness.embedder.calls == [("pdf-tools\npdf-tools description 1",)]
-    assert harness.content.reads == []
+    # 正文单独写进 content，供 Milvus BM25 Function 生成稀疏向量。
+    assert "# pdf-tools body 1" in row.content
+    assert harness.content.reads == [
+        (version.draft_commit, f"users/u1/{skill.id}/SKILL.md")
+    ]
     assert await version_status(harness, version.id) == "ready"
     [event] = await outbox_rows(harness)
     assert event.status == "done"
@@ -379,7 +383,9 @@ async def test_repair_upserts_pending_versions_and_verify_deletes_orphan_keys(
         f"private:u2:{u2_skill.id}",
         f"private:u3:{u3_skill.id}",
     }
-    assert harness.content.reads == []  # 投影文本只有元数据，不读正文
+    # 修复也要重读正文，才能同时重建 dense 与 BM25 两个通道。
+    assert len(harness.content.reads) == 3
+    assert all(row.content for row in upserted.values())
     assert await version_status(harness, u3_version.id) == "ready"
 
     # 巡查：Milvus 少了 u3，多了两条孤儿。巡检自己不 embedding。

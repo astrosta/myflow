@@ -201,7 +201,7 @@ class ContextForgeRuntime:
             max_document_chars=self.config.search.max_document_chars,
         )
         set_contextforge_snapshot(tools=tools, entries=entries)
-        if self.index is None or self.embedder is None:
+        if self.index is None:
             return ToolIndexSyncStats(scanned=len(entries))
         return await self.index.sync(entries, embedder=self.embedder, full=full)
 
@@ -301,7 +301,8 @@ def build_contextforge_runtime(config: ContextForgeConfig) -> ContextForgeRuntim
             from agentkit.knowledge.rerank import build_reranker
             from agentkit.contextforge.index import ToolVectorIndex
 
-            embedder = OpenAICompatibleEmbedder(config.search.embedding)
+            if config.search.embedding.enabled:
+                embedder = OpenAICompatibleEmbedder(config.search.embedding)
             index = ToolVectorIndex(
                 config.search.vector_store,
                 dimensions=config.search.embedding.dimensions,
@@ -309,8 +310,11 @@ def build_contextforge_runtime(config: ContextForgeConfig) -> ContextForgeRuntim
                 rrf_k=config.search.rrf_k,
             )
             reranker = build_reranker(config.search.rerank)
-    except Exception:  # noqa: BLE001 - retrieval degrades to local BM25
-        logger.warning("ContextForge vector index unavailable; using local fallback", exc_info=True)
+    except Exception:  # noqa: BLE001 - tool retrieval is unavailable, never local
+        logger.warning(
+            "ContextForge Milvus index unavailable; search_tools will fail closed",
+            exc_info=True,
+        )
     runtime = ContextForgeRuntime(
         config,
         admin=admin,

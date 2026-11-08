@@ -7,7 +7,6 @@ import {
   getOnboarding,
   getProfile,
   getProfileSchema,
-  listProfileSuggestions,
   patchProfile,
   type ProfileFieldSpec,
   type ProfileView,
@@ -24,7 +23,6 @@ vi.mock("@/core/api/memory", async (importOriginal) => {
     patchProfile: vi.fn(),
     clearProfile: vi.fn(),
     getOnboarding: vi.fn(),
-    listProfileSuggestions: vi.fn(),
   };
 });
 
@@ -33,7 +31,6 @@ const mockedSchema = vi.mocked(getProfileSchema);
 const mockedPatch = vi.mocked(patchProfile);
 const mockedClear = vi.mocked(clearProfile);
 const mockedOnboarding = vi.mocked(getOnboarding);
-const mockedSuggestions = vi.mocked(listProfileSuggestions);
 
 afterEach(() => {
   cleanup();
@@ -112,7 +109,7 @@ function makeSchema(): { schema_version: number; fields: ProfileFieldSpec[] } {
   };
 }
 
-function stubOnboardingAndSuggestions() {
+function stubOnboarding() {
   mockedOnboarding.mockResolvedValue({
     status: "seen",
     should_show: false,
@@ -121,7 +118,6 @@ function stubOnboardingAndSuggestions() {
     dismissed_at: null,
     updated_at: "2026-11-02T00:00:00Z",
   });
-  mockedSuggestions.mockResolvedValue({ items: [] });
 }
 
 function renderPage() {
@@ -147,7 +143,7 @@ describe("我的画像：全字段表单", () => {
   it("画像为空时也渲染全部字段，保存只提交有变化的字段", async () => {
     mockedSchema.mockResolvedValue(makeSchema());
     mockedGet.mockResolvedValue(EMPTY_PROFILE);
-    stubOnboardingAndSuggestions();
+    stubOnboarding();
     mockedPatch.mockResolvedValue({
       ...EMPTY_PROFILE,
       revision: 2,
@@ -213,7 +209,7 @@ describe("我的画像：全字段表单", () => {
 
   it("预填已有值，清空字段保存为 null，撤销可以恢复", async () => {
     mockedSchema.mockResolvedValue(makeSchema());
-    stubOnboardingAndSuggestions();
+    stubOnboarding();
     mockedGet.mockResolvedValue({
       schema_version: 1,
       revision: 4,
@@ -276,7 +272,7 @@ describe("我的画像：全字段表单", () => {
   it("清空画像需要确认", async () => {
     mockedSchema.mockResolvedValue(makeSchema());
     mockedGet.mockResolvedValue(EMPTY_PROFILE);
-    stubOnboardingAndSuggestions();
+    stubOnboarding();
     const confirm = vi.fn(() => false);
     vi.stubGlobal("confirm", confirm);
     mockedClear.mockResolvedValue(EMPTY_PROFILE);

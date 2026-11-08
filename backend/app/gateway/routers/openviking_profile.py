@@ -16,23 +16,15 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from agentkit.agents.memory.openviking.onboarding import OnboardingService
 from agentkit.agents.memory.openviking.profile import ProfileConflict, ProfileService
 from agentkit.agents.memory.profile_schema import PROFILE_FIELD_SPECS, ProfileFieldSpec
-from agentkit.agents.memory.openviking.suggestions import (
-    ProfileSuggester,
-    ProfileSuggestion,
-    SuggestionConflict,
-    SuggestionNotFound,
-)
 from backend.app.gateway.deps import (
     get_openviking_onboarding_service,
     get_openviking_onboarding_service_optional,
     get_openviking_profile_service,
-    get_openviking_suggestion_service,
     has_openviking_active_run,
     require_scope,
 )
 from backend.app.gateway.errors import (
     InvalidMemoryProfile,
-    MemoryNotFoundAPI,
     ProfileConflictAPI,
 )
 from backend.app.gateway.run_models import RunCaller
@@ -117,34 +109,6 @@ class OnboardingActionRequest(BaseModel):
     action: Literal["seen", "snooze", "dismiss", "complete"]
 
 
-class SuggestionResponse(BaseModel):
-    id: str
-    field_path: str
-    value: Any
-    evidence_uri: str
-    evidence_quote: str
-    confidence: float
-    reason: str
-    status: str
-    profile_etag: str
-    expires_at: str
-
-
-class SuggestionPage(BaseModel):
-    items: list[SuggestionResponse] = Field(default_factory=list)
-
-
-class SuggestionActionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    etag: str | None = None
-
-
-class SuggestionAcceptResponse(BaseModel):
-    suggestion: SuggestionResponse
-    profile: ProfileResponse
-
-
 def _user_id(caller: RunCaller) -> str:
     return caller.user_id or "default"
 
@@ -160,21 +124,6 @@ def _revision(etag: str) -> int:
         return int(etag[:8], 16)
     except (TypeError, ValueError):
         return 0
-
-
-def _suggestion_response(item: ProfileSuggestion) -> SuggestionResponse:
-    return SuggestionResponse(
-        id=item.id,
-        field_path=item.field_path,
-        value=item.value,
-        evidence_uri=item.evidence_uri,
-        evidence_quote=item.evidence_quote,
-        confidence=item.confidence,
-        reason=item.reason,
-        status=item.status,
-        profile_etag=item.profile_etag,
-        expires_at=item.expires_at,
-    )
 
 
 def _field_spec_response(spec: ProfileFieldSpec) -> ProfileFieldSpecResponse:
@@ -279,62 +228,6 @@ async def update_onboarding(
     return _onboarding_response(
         await service.update(user_id, body.action)
     )
-
-
-@router.get("/profile/suggestions", response_model=SuggestionPage)
-async def list_profile_suggestions(
-    request: Request,
-    caller: Annotated[RunCaller, Depends(require_scope("memory:read"))],
-    service: Annotated[ProfileSuggester, Depends(get_openviking_suggestion_service)],
-) -> SuggestionPage:
-    items = await service.get(_user_id(caller))
-    return SuggestionPage(items=[_suggestion_response(item) for item in items])
-
-
-@router.post(
-    "/profile/suggestions/{suggestion_id}/accept",
-    response_model=SuggestionAcceptResponse,
-)
-async def accept_profile_suggestion(
-    request: Request,
-    suggestion_id: str,
-    body: SuggestionActionRequest,
-    caller: Annotated[RunCaller, Depends(require_scope("memory:write"))],
-    service: Annotated[ProfileSuggester, Depends(get_openviking_suggestion_service)],
-) -> SuggestionAcceptResponse:
-    try:
-        suggestion, profile = await service.accept(
-            _user_id(caller), suggestion_id, etag=body.etag
-        )
-    except SuggestionNotFound as exc:
-        raise MemoryNotFoundAPI(str(exc)) from exc
-    except SuggestionConflict as exc:
-        raise ProfileConflictAPI(str(exc)) from exc
-    return SuggestionAcceptResponse(
-        suggestion=_suggestion_response(suggestion),
-        profile=_response(profile),
-    )
-
-
-@router.post(
-    "/profile/suggestions/{suggestion_id}/dismiss",
-    response_model=SuggestionResponse,
-)
-async def dismiss_profile_suggestion(
-    request: Request,
-    suggestion_id: str,
-    body: SuggestionActionRequest,
-    caller: Annotated[RunCaller, Depends(require_scope("memory:write"))],
-    service: Annotated[ProfileSuggester, Depends(get_openviking_suggestion_service)],
-) -> SuggestionResponse:
-    del body
-    try:
-        suggestion = await service.dismiss(_user_id(caller), suggestion_id)
-    except SuggestionNotFound as exc:
-        raise MemoryNotFoundAPI(str(exc)) from exc
-    except SuggestionConflict as exc:
-        raise ProfileConflictAPI(str(exc)) from exc
-    return _suggestion_response(suggestion)
 
 
 @router.get("/profile", response_model=ProfileResponse)

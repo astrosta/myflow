@@ -5,8 +5,8 @@ deferred_discovery 被刻意删掉了——两套渲染等于两套提示词契�
 
 `search` 是**按需加载的第二条路径**：技能多到一个都读不完时，模型用
 `search_skills` 按任务意图检索元数据，`load_skills` 再按 skill_id 加载正文。
-默认只有本地 BM25 通道（不依赖任何外部服务）；语义召回与精排要显式配置地址才开，
-和知识库一样——代码里没有默认端点。
+向量召回与 BM25 召回都在 Milvus 服务端完成，融合使用 Milvus 的 RRFRanker；
+应用进程只负责 query embedding、可见性确认和可选精排，不实现检索算法。
 """
 
 from __future__ import annotations
@@ -32,29 +32,21 @@ DEFAULT_SEARCH_TOP_K = 3
 
 
 class SkillKeywordChannelConfig(BaseModel):
-    """本地稀疏通道：BM25，分词在进程内做（中文按二元组）。**不需要任何外部服务。**"""
+    """Milvus 稀疏通道：BM25 由 collection 的 Function 生成，分词与打分都在服务端。"""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
+    analyzer: Literal["chinese", "english", "standard"] = Field(
+        default="chinese",
+        description="BM25 分词器；建 collection 前确定，改后需重建 myflow_skills_active。",
+    )
     bm25_k1: float = Field(default=1.2, gt=0, le=10, description="BM25 词频饱和参数。")
     bm25_b: float = Field(default=0.75, ge=0, le=1, description="BM25 长度归一参数。")
-    keyword_weight: float = Field(
-        default=2.0,
-        gt=0,
-        le=10,
-        description="domain_keywords 里每个词的分数倍数。它是模型给的强信号，比正文里偶然出现一次的词重。",
-    )
-    name_weight: float = Field(
-        default=3.0,
-        gt=0,
-        le=10,
-        description="技能名/描述里命中词的权重倍数。元数据是作者手写的摘要，比正文噪声低。",
-    )
 
 
 class SkillEmbeddingChannelConfig(EmbeddingConfig):
-    """可选的语义召回（bi-encoder）。**默认关**：没配地址就不发请求，直接走 BM25。"""
+    """可选的语义召回（bi-encoder）。默认关；关掉后仍可用 Milvus BM25 检索。"""
 
     enabled: bool = False
     query_instruction: str = (
@@ -116,10 +108,18 @@ class SkillSearchConfig(BaseModel):
         le=20,
         description="最终加载几个技能的正文。每多一个，就是一段常驻上下文。",
     )
-    rrf_k: int = Field(default=60, ge=1, le=1000, description="两路召回融合的 RRF k。")
+    rrf_k: int = Field(
+        default=60,
+        ge=1,
+        le=1000,
+        description="Milvus RRFRanker 的 k；融合在服务端完成。",
+    )
     min_score: float | None = Field(
         default=None,
-        description="融合分数的下限；给定时低于它的命中直接丢弃（宁可空手也不塞不相关的正文）。",
+        description=(
+            "Milvus 返回分数的下限（混合检索是 RRFRanker 原始分，约 1/(k+rank)）；"
+            "给定时低于它的命中直接丢弃。"
+        ),
     )
     max_body_chars: int = Field(
         default=6000, ge=200, le=100000, description="单个技能正文的字符预算，超了从尾部截断。"

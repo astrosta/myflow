@@ -20,10 +20,6 @@ from agentkit.agents.memory.openviking.profile import PersonalizationService, Pr
 from agentkit.agents.memory.openviking.recall import RecallService
 from agentkit.agents.memory.openviking.session import SessionManager
 from agentkit.agents.memory.openviking.store import CaptureDedupStore, MemorySyncStore
-from agentkit.agents.memory.openviking.suggestions import (
-    ProfileSuggester,
-    ProfileSuggestionStore,
-)
 from agentkit.agents.memory.openviking.stream import (
     InMemoryCaptureStream,
     MemoryMessagePublisher,
@@ -36,18 +32,12 @@ from agentkit.skills.session_import import SessionSkillImporter
 logger = logging.getLogger(__name__)
 
 
-class _EmptyFacade:
-    async def search(self, *args: Any, **kwargs: Any) -> list[Any]:
-        return []
-
-
 class ProfileServices:
     """Profile/onboarding surface that does not require the OpenViking runtime."""
 
-    def __init__(self, profile: ProfileService, onboarding: OnboardingService, suggestions: ProfileSuggester):
+    def __init__(self, profile: ProfileService, onboarding: OnboardingService):
         self.profile = profile
         self.onboarding = onboarding
-        self.suggestions = suggestions
 
 
 def build_profile_services(
@@ -63,12 +53,6 @@ def build_profile_services(
     return ProfileServices(
         profile=profile,
         onboarding=OnboardingService(session_factory, profile),
-        suggestions=ProfileSuggester(
-            ProfileSuggestionStore(session_factory),
-            profile,
-            _EmptyFacade(),
-            suggestion_days=config.retention.suggestion_days,
-        ),
     )
 
 
@@ -84,7 +68,6 @@ class OpenVikingMemoryRuntime:
         stream: Any,
         client_factory: Any,
         onboarding: OnboardingService,
-        suggestions: ProfileSuggester,
         redis: Any = None,
         library: MemoryLibraryService | None = None,
     ) -> None:
@@ -92,7 +75,6 @@ class OpenVikingMemoryRuntime:
         self.facade = facade
         self.profile = profile
         self.onboarding = onboarding
-        self.suggestions = suggestions
         self.worker = worker
         self.supervisor = supervisor
         self.stream = stream
@@ -189,12 +171,6 @@ class OpenVikingMemoryRuntime:
             library=library,
         )
         onboarding = OnboardingService(session_factory, profile)
-        suggestions = ProfileSuggester(
-            ProfileSuggestionStore(session_factory),
-            profile,
-            facade,
-            suggestion_days=config.retention.suggestion_days,
-        )
         return cls(
             config=config,
             facade=facade,
@@ -204,7 +180,6 @@ class OpenVikingMemoryRuntime:
             stream=stream,
             client_factory=client_factory,
             onboarding=onboarding,
-            suggestions=suggestions,
             redis=redis,
             library=library,
         )

@@ -25,7 +25,6 @@ _TABLES = (
     "memory_profile_documents",
     "memory_sync_state",
     "memory_profile_onboarding",
-    "memory_profile_suggestions",
     "memory_capture_dedup",
 )
 

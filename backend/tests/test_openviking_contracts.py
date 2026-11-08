@@ -94,7 +94,7 @@ def test_extra_skip_tokens_are_validated_at_config_load() -> None:
 
 def test_retention_dedup_ttl_cannot_be_shorter_than_session_ttl() -> None:
     config = OpenVikingMemoryConfig(
-        retention={"session_days": 30, "dedup_days": 7, "suggestion_days": 7}
+        retention={"session_days": 30, "dedup_days": 7}
     )
 
     assert config.retention.dedup_days == 30

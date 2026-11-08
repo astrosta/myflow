@@ -1,26 +1,28 @@
-"""One-query skill retrieval over the active projection (Task 12).
+"""One-query skill retrieval over the active Milvus projection (Task 12).
 
 The catalog path is deliberately small and linear:
 
-    query -> one embedding -> one Milvus search -> one PostgreSQL confirmation
+    query -> embedding (optional) + BM25 text
+          -> one Milvus dense/BM25/hybrid search (RRFRanker server-side)
+          -> one PostgreSQL confirmation
           -> read bodies from the commit cache -> sort, budget
 
-Milvus only narrows the candidate set.  Every hit that becomes visible has been
-confirmed against the caller's active private pointer, so a stale projection row
-can never leak content.  PostgreSQL is the authority: when the catalog cannot be
-read the request fails closed instead of returning unconfirmed hits.
+Milvus performs both recall channels and the RRF fusion.  The application never
+tokenizes for BM25, computes BM25 scores, computes cosine similarity, or merges
+rankings.  Every hit that becomes visible has been confirmed against the
+caller's active private pointer, so a stale projection row can never leak
+content.  PostgreSQL is the authority: when the catalog cannot be read the
+request fails closed instead of returning unconfirmed hits.
 
 There is no public catalog in v2.  A user's retrieval can only return skills
 whose owner_user_id equals the caller and whose version is currently active.
-A vector outage is not a retrieval outage: when the query embedding or the
-Milvus search fails, the same visibility rules are applied to the active catalog
-and the existing BM25 scorer ranks those skills locally (lexical_fallback).
+A retrieval outage returns no unconfirmed/local fallback hits; the tool reports
+the warning instead.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
@@ -28,15 +30,9 @@ from agentkit.config.skills_config import SkillSearchConfig
 from agentkit.skills.content import SkillContentStore
 from agentkit.skills.domain import SkillScope, VisibleSkill
 from agentkit.skills.loader import MIN_USEFUL_BODY_CHARS, clip_body
-from agentkit.skills.parser import FRONTMATTER_RE
+from agentkit.skills.parser import strip_frontmatter
 from agentkit.skills.projection import ProjectionHit, SkillProjectionStore
-from agentkit.skills.router import (
-    Embedder,
-    Reranker,
-    SkillDocument,
-    lexical_scores,
-    tokenize,
-)
+from agentkit.skills.router import Embedder, Reranker
 from agentkit.skills.store.sql import SqlSkillStore
 from agentkit.skills.types import Skill
 from agentkit.skills.usage import SkillUsageService
@@ -45,7 +41,8 @@ logger = logging.getLogger(__name__)
 
 #: Warnings the tool may hand back to the model.
 VECTOR_UNAVAILABLE = "vector_unavailable"
-LEXICAL_FALLBACK = "lexical_fallback"
+KEYWORD_UNAVAILABLE = "keyword_unavailable"
+RETRIEVAL_UNAVAILABLE = "retrieval_unavailable"
 CONTENT_UNAVAILABLE = "content_unavailable"
 RERANK_UNAVAILABLE = "rerank_unavailable"
 
@@ -76,52 +73,8 @@ class SkillSearchOutcome:
     channels: tuple[str, ...] = ()
 
 
-CHANNEL_EMBEDDING = 'embedding'
-CHANNEL_KEYWORD = 'keyword'
-
-
-def _fuse_ranked(
-    dense: Sequence[tuple[VisibleSkill, float]],
-    sparse: Sequence[tuple[VisibleSkill, float]],
-    *,
-    rrf_k: int,
-) -> list[tuple[VisibleSkill, float, tuple[str, ...]]]:
-    """RRF 融合两路名次；同一 skill_id 只留一条。
-
-    两路的名次各自给 1/(k + rank) 的分，然后**归一化到最高分为 1.0**，这样
-    min_score 仍然是配置里那个 0..1 语义（老 router 也是这么做的）。
-
-    去重发生在这里而不是两路内部：同一技能可能只被向量或只被 BM25 召回，
-    在合并处收敛后才不会出现两条命中。
-    """
-
-    picked: dict[str, VisibleSkill] = {}
-    order: list[str] = []
-    channels: dict[str, list[str]] = {}
-    fused: dict[str, float] = {}
-    k = max(1, int(rrf_k))
-
-    for name, ranked in ((CHANNEL_EMBEDDING, dense), (CHANNEL_KEYWORD, sparse)):
-        for rank, (source, _score) in enumerate(ranked):
-            skill_id = source.version.skill_id
-            if skill_id not in picked:
-                picked[skill_id] = source
-                order.append(skill_id)
-                channels[skill_id] = []
-                fused[skill_id] = 0.0
-            fused[skill_id] += 1.0 / (k + rank + 1)
-            if name not in channels[skill_id]:
-                channels[skill_id].append(name)
-
-    if not order:
-        return []
-    best = max(fused.values())
-    scored = [
-        (picked[skill_id], fused[skill_id] / best, tuple(channels[skill_id]))
-        for skill_id in order
-    ]
-    scored.sort(key=lambda item: (-item[1], item[0].skill.name, item[0].version.skill_id))
-    return scored
+CHANNEL_EMBEDDING = "embedding"
+CHANNEL_KEYWORD = "keyword"
 
 
 def _rerank_text(skill: Skill, body: str, max_chars: int) -> str:
@@ -156,24 +109,6 @@ def _content_location(source: VisibleSkill) -> tuple[str | None, str]:
     return version.draft_commit, version.skill_path
 
 
-def _strip_frontmatter(text: str) -> str:
-    match = FRONTMATTER_RE.match(text)
-    return (text[match.end() :] if match is not None else text).strip()
-
-
-def _document(skill: Skill, body: str) -> SkillDocument:
-    """The router's document shape, built from an already-read catalog body."""
-    head = frozenset(tokenize(f"{skill.name} {skill.description}"))
-    counts = Counter(tokenize(f"{skill.name} {skill.description}\n{body}"))
-    return SkillDocument(
-        skill=skill,
-        body=body,
-        counts=counts,
-        length=sum(counts.values()),
-        head_tokens=head,
-    )
-
-
 class SkillSearchService:
     """Retrieval over the active projection, confirmed by the SQL catalog."""
 
@@ -187,14 +122,13 @@ class SkillSearchService:
         reranker: Reranker | None = None,
         usage: SkillUsageService | None = None,
     ) -> None:
-        """Projection, embedder and reranker are all optional.
+        """Projection and embedder are optional capabilities, not algorithms.
 
-        The shipped configuration is lexical-only (search.enabled=true,
-        embedding.enabled=false), so a missing projection/embedder must mean
-        "local BM25", never "no retrieval service at all".  The reranker is the
-        third stage: it can only reorder candidates that already survived
-        recall, confirmation and private dedupe, and it never decides
-        visibility.
+        Query embedding is skipped when the dense channel is disabled, but the
+        Milvus projection is still the only retrieval index: keyword recall is
+        server-side BM25.  The reranker is the third stage: it can only reorder
+        candidates that already survived recall and confirmation, and it never
+        decides visibility.
         """
         self._store = store
         self._projection = projection
@@ -246,46 +180,24 @@ class SkillSearchService:
             return SkillSearchOutcome(hits=(), candidates=0, warnings=())
 
         warnings: list[str] = []
-        dense = await self._dense_ranked(
-            user_id=user_id,
-            query=query,
-            available_skills=available_skills,
-            warnings=warnings,
-        )
-        sparse = await self._sparse_ranked(
+        ranked, channels = await self._milvus_ranked(
             user_id=user_id,
             query=query,
             domain_keywords=domain_keywords,
-            available_skills=available_skills,
             warnings=warnings,
         )
-        if not dense and not sparse:
-            return SkillSearchOutcome(
-                hits=(), candidates=0, warnings=tuple(dict.fromkeys(warnings))
-            )
-        if not dense:
-            # 只剩词法通道：老名字保留，工具靠它解释“为什么没有向量”。
-            warnings.append(LEXICAL_FALLBACK)
-
-        fused = _fuse_ranked(dense, sparse, rrf_k=self._config.rrf_k)
-        if self._config.min_score is not None:
-            fused = [item for item in fused if item[1] >= self._config.min_score]
-        if not fused:
+        if not ranked:
             return SkillSearchOutcome(
                 hits=(), candidates=0, warnings=tuple(dict.fromkeys(warnings))
             )
 
-        channels = (
-            CHANNEL_EMBEDDING if dense else None,
-            CHANNEL_KEYWORD if sparse else None,
-        )
         # candidates 是“召回规模”：个人偏好/白名单在装载前才生效，它们不该让
         # 调用方以为只召回了一条。
-        candidates = len(fused)
-        head = fused[: max(1, self._config.candidate_k)]
+        candidates = len(ranked)
+        head = ranked[: max(1, self._config.candidate_k)]
         ordered = [
             (source, score)
-            for source, score, _names in head
+            for source, score in head
             if _allows(source.skill, available_skills)
         ]
         bodies: dict[str, str] = {}
@@ -299,17 +211,14 @@ class SkillSearchService:
             bodies=bodies or None,
             reranked=reranked,
         )
-        return replace(
-            outcome,
-            channels=tuple(name for name in channels if name is not None),
-        )
+        return replace(outcome, channels=channels)
 
     # ------------------------------------------------------------------
     # stages
     # ------------------------------------------------------------------
 
     async def _query_vector(self, query: str) -> list[float] | None:
-        """Embed the task intent exactly once; a failure degrades to lexical."""
+        """Embed the task intent exactly once; a failure degrades to BM25."""
         embedding = self._config.embedding
         if self._embedder is None or not embedding.enabled or not embedding.base_url.strip():
             return None
@@ -317,123 +226,113 @@ class SkillSearchService:
             vector = list(await self._embedder.embed_query(query))
         except Exception as exc:  # noqa: BLE001 - BM25 still answers
             logger.warning(
-                "Skill query embedding failed (%s); using lexical scoring",
+                "Skill query embedding failed (%s); using Milvus BM25",
                 type(exc).__name__,
             )
             return None
         return vector or None
 
-    async def _dense_ranked(
-        self,
-        *,
-        user_id: str,
-        query: str,
-        available_skills: frozenset[str] | None,
-        warnings: list[str],
-    ) -> list[tuple[VisibleSkill, float]]:
-        """稠密通道：一次 query embedding + 一次 Milvus search + 一次 PG 确认。
+    def _keyword_query(self, query: str, domain_keywords: Sequence[str]) -> str:
+        """Build the BM25 query string; Milvus does all tokenization/scoring."""
+        if not self._config.keyword.enabled:
+            return ""
+        parts = [query, *(item.strip() for item in domain_keywords)]
+        return " ".join(dict.fromkeys(item for item in parts if item))
 
-        没有向量能力（未配置、embedding 失败、没有投影）或 Milvus 报错时返回空
-        列表并记 vector_unavailable——空列表不是“没有结果”，词法通道还会给候选。
-        """
-        vector = await self._query_vector(query)
-        if vector is None or self._projection is None:
-            warnings.append(VECTOR_UNAVAILABLE)
-            return []
-        try:
-            hits = await self._projection.search(
-                user_id=user_id,
-                vector=vector,
-                limit=self._config.candidate_k,
-            )
-        except Exception as exc:  # noqa: BLE001 - the lexical channel still answers
-            logger.warning(
-                "Skill projection search failed (%s); using lexical scoring",
-                type(exc).__name__,
-            )
-            warnings.append(VECTOR_UNAVAILABLE)
-            return []
-        try:
-            confirmed = await self._store.confirm_hits(user_id, hits)
-        except Exception as exc:  # noqa: BLE001 - never fall back to unconfirmed rows
-            raise SkillSearchUnavailable(
-                "skills catalog confirmation is unavailable"
-            ) from exc
-
-        scores: dict[tuple[str, str, str], float] = {}
-        for hit in hits:
-            key = (_scope_value(hit.scope), hit.skill_id, hit.version_id)
-            scores[key] = max(scores.get(key, 0.0), float(hit.score))
-
-        ranked = [
-            (
-                source,
-                scores.get(
-                    (
-                        _scope_value(source.scope),
-                        source.version.skill_id,
-                        source.version.id,
-                    ),
-                    0.0,
-                ),
-            )
-            for source in confirmed
-        ]
-        ranked.sort(
-            key=lambda item: (-item[1], item[0].skill.name, item[0].version.skill_id)
-        )
-        return ranked
-
-    async def _sparse_ranked(
+    async def _milvus_ranked(
         self,
         *,
         user_id: str,
         query: str,
         domain_keywords: Sequence[str],
-        available_skills: frozenset[str] | None,
         warnings: list[str],
-    ) -> list[tuple[VisibleSkill, float]]:
-        """稀疏通道：对 PG 可见集合做本地 BM25（读正文，不依赖任何外部服务）。
+    ) -> tuple[list[tuple[VisibleSkill, float]], tuple[str, ...]]:
+        """One Milvus recall, one PG confirmation, no client-side fusion.
 
-        正文是“报错原文 / 库名 / 命令”唯一能被字面命中的地方，所以这条通道不是
-        兜底，而是和向量并行的一路；读不出正文只丢该候选，不影响整体。
+        Dense + BM25 uses hybrid_search with Milvus RRFRanker. When only one
+        channel is configured (or the embedding call failed), the remaining
+        channel is still a Milvus search; it is never scored in this process.
         """
-        if not self._config.keyword.enabled:
-            return []
+        if self._projection is None:
+            warnings.append(RETRIEVAL_UNAVAILABLE)
+            return [], ()
+
+        embedding = self._config.embedding
+        vector = await self._query_vector(query)
+        keyword = self._keyword_query(query, domain_keywords)
+        if embedding.enabled and vector is None and keyword:
+            warnings.append(VECTOR_UNAVAILABLE)
+        if vector is None and not keyword:
+            warnings.append(
+                VECTOR_UNAVAILABLE if embedding.enabled else KEYWORD_UNAVAILABLE
+            )
+            return [], ()
+
+        channels: tuple[str, ...]
+        if vector is not None and keyword:
+            channels = (CHANNEL_EMBEDDING, CHANNEL_KEYWORD)
+        elif vector is not None:
+            channels = (CHANNEL_EMBEDDING,)
+        else:
+            channels = (CHANNEL_KEYWORD,)
+
         try:
-            visible = await self._store.visible_for_user(user_id)
-        except Exception as exc:  # noqa: BLE001 - fail closed, not fail open
-            raise SkillSearchUnavailable("skills catalog is unavailable") from exc
+            if vector is not None and keyword:
+                hits = await self._projection.hybrid_search(
+                    user_id=user_id,
+                    vector=vector,
+                    keyword_query=keyword,
+                    limit=self._config.candidate_k,
+                    rrf_k=self._config.rrf_k,
+                )
+            elif vector is not None:
+                hits = await self._projection.search(
+                    user_id=user_id,
+                    vector=vector,
+                    limit=self._config.candidate_k,
+                )
+            else:
+                hits = await self._projection.keyword_search(
+                    user_id=user_id,
+                    query=keyword,
+                    limit=self._config.candidate_k,
+                )
+        except Exception as exc:  # noqa: BLE001 - no local scoring fallback
+            logger.warning(
+                "Skill projection search failed (%s); returning no unconfirmed hits",
+                type(exc).__name__,
+            )
+            warnings.append(
+                KEYWORD_UNAVAILABLE if channels == (CHANNEL_KEYWORD,) else VECTOR_UNAVAILABLE
+            )
+            return [], ()
 
-        chosen = list(visible)
-        documents: list[SkillDocument] = []
-        for source in chosen:
-            body = await self._read_body(source)
-            if body is None:
-                warnings.append(CONTENT_UNAVAILABLE)
+        try:
+            confirmed = await self._store.confirm_hits(user_id, hits)
+        except Exception as exc:  # noqa: BLE001 - never return unconfirmed rows
+            raise SkillSearchUnavailable(
+                "skills catalog confirmation is unavailable"
+            ) from exc
+
+        # PostgreSQL returns a set; Milvus' order is the ranking. Rebuild the
+        # order from the hit list so the server-side RRF order survives confirmation.
+        by_key = {
+            (_scope_value(source.scope), source.version.skill_id, source.version.id): source
+            for source in confirmed
+        }
+        ranked: list[tuple[VisibleSkill, float]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for hit in hits:
+            key = (_scope_value(hit.scope), hit.skill_id, hit.version_id)
+            source = by_key.get(key)
+            if source is None or key in seen:
                 continue
-            documents.append(_document(source.skill, body))
-
-        scores = lexical_scores(
-            documents,
-            task_query=query,
-            domain_keywords=domain_keywords,
-            config=self._config.keyword,
-        )
-        by_id = {source.version.skill_id: source for source in chosen}
-        ranked = sorted(
-            ((document, scores.get(document.key, 0.0)) for document in documents),
-            key=lambda item: (
-                -item[1],
-                item[0].skill.name,
-                item[0].skill.skill_id or "",
-            ),
-        )
-        return [
-            (by_id[document.skill.skill_id], score)
-            for document, score in ranked
-            if score > 0 and document.skill.skill_id is not None
-        ]
+            score = float(hit.score)
+            if self._config.min_score is not None and score < self._config.min_score:
+                continue
+            ranked.append((source, score))
+            seen.add(key)
+        return ranked, channels
 
     async def _rerank_candidates(
         self,
@@ -507,7 +406,7 @@ class SkillSearchService:
                 type(exc).__name__,
             )
             return None
-        return _strip_frontmatter(text)
+        return strip_frontmatter(text)
 
     async def _load(
         self,
@@ -579,7 +478,8 @@ def reset_skill_runtime() -> None:
 
 __all__ = [
     "CONTENT_UNAVAILABLE",
-    "LEXICAL_FALLBACK",
+    "KEYWORD_UNAVAILABLE",
+    "RETRIEVAL_UNAVAILABLE",
     "VECTOR_UNAVAILABLE",
     "SkillSearchHit",
     "SkillSearchOutcome",

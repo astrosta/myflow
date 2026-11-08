@@ -35,6 +35,8 @@ class FakeClient:
         return [[{"entity": {"tool_name": "github_search", "description": "d", "tags": "[]", "parameters": "[]"}, "distance": 0.8}]]
 
     def search(self, **kwargs):
+        self.searches = getattr(self, "searches", [])
+        self.searches.append(kwargs)
         return [[{"entity": {"tool_name": "github_search"}, "distance": 0.7}]]
 
 
@@ -45,6 +47,19 @@ async def test_hybrid_search_passes_dense_and_sparse_requests() -> None:
     hits = await index.hybrid_search(vector=[0.0] * 8, query="github code", limit=5)
     assert hits[0].tool_name == "github_search"
     assert len(client.reqs) == 2
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_uses_milvus_bm25_on_the_sparse_field() -> None:
+    client = FakeClient()
+    index = ToolVectorIndex(ToolVectorStoreConfig(uri="http://milvus"), dimensions=8, client=client)
+    hits = await index.keyword_search(query="github code", limit=5)
+
+    assert hits[0].tool_name == "github_search"
+    call = client.searches[0]
+    assert call["anns_field"] == "sparse"
+    assert call["data"] == ["github code"]
+    assert call["search_params"]["metric_type"] == "BM25"
 
 
 @pytest.mark.asyncio
@@ -86,6 +101,29 @@ async def test_sync_embeds_only_changed_documents(monkeypatch) -> None:
 
 async def _async_none():
     return None
+
+@pytest.mark.asyncio
+async def test_sync_without_an_embedder_indexes_with_placeholder_vectors(monkeypatch) -> None:
+    index = ToolVectorIndex(ToolVectorStoreConfig(uri="http://milvus"), dimensions=8, client=FakeClient())
+    docs = [ToolCatalogDocument("a", "A", "a", (), (), "contextforge", "a", "h", 1)]
+    captured: list[list[float]] = []
+
+    async def fake_hashes(names):
+        return {}
+
+    async def fake_upsert(documents, vectors):
+        captured.extend(vectors)
+        return len(documents)
+
+    monkeypatch.setattr(index, "ensure_collection", lambda dimensions=None: _async_none())
+    monkeypatch.setattr(index, "query_hashes", fake_hashes)
+    monkeypatch.setattr(index, "upsert", fake_upsert)
+
+    stats = await index.sync(docs, embedder=None)
+
+    assert stats.upserted == 1
+    assert captured == [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+
 
 @pytest.mark.asyncio
 async def test_hybrid_search_uses_configured_rrf_k() -> None:

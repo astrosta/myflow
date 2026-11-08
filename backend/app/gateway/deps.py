@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from agentkit.agents.memory.openviking.onboarding import OnboardingService
 from agentkit.agents.memory.openviking.profile import ProfileService
-from agentkit.agents.memory.openviking.suggestions import ProfileSuggester
 from agentkit.config import get_app_config
 from agentkit.config.knowledge_config import KnowledgeBaseConfig
 from agentkit.knowledge.errors import KnowledgeDisabled
@@ -37,7 +36,6 @@ __all__ = [
     "get_openviking_onboarding_service_optional",
     "has_openviking_active_run",
     "get_openviking_profile_service",
-    "get_openviking_suggestion_service",
     "get_skill_author_service",
     "get_request_id",
     "get_run_services",
@@ -138,13 +136,6 @@ def get_openviking_onboarding_service(request: Request) -> OnboardingService:
     service = getattr(request.app.state, "onboarding_service", None)
     if not isinstance(service, OnboardingService):
         raise RuntimeError("OpenViking OnboardingService is not initialized")
-    return service
-
-
-def get_openviking_suggestion_service(request: Request) -> ProfileSuggester:
-    service = getattr(request.app.state, "suggestion_service", None)
-    if not isinstance(service, ProfileSuggester):
-        raise RuntimeError("OpenViking ProfileSuggester is not initialized")
     return service
 
 

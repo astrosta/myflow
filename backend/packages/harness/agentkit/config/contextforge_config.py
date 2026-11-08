@@ -100,8 +100,20 @@ class ToolSearchConfig(BaseModel):
     enabled: bool = True
     candidate_k: int = Field(default=20, ge=1, le=200)
     top_k: int = Field(default=5, ge=1, le=20)
-    rrf_k: int = Field(default=60, ge=1, le=1000)
-    min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    rrf_k: int = Field(
+        default=60,
+        ge=1,
+        le=1000,
+        description="Milvus RRFRanker 的 k；融合在服务端完成。",
+    )
+    min_score: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Milvus 返回分数的下限（混合检索是 RRFRanker 原始分，约 1/(k+rank)）。"
+        ),
+    )
     max_document_chars: int = Field(default=4000, ge=200, le=100000)
     max_description_chars: int = Field(default=500, ge=20, le=10000)
     max_result_chars: int = Field(default=6000, ge=200, le=100000)

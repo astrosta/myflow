@@ -706,31 +706,34 @@ def build_skill_runtime(
     search = None
     outbox = None
     projection = None
-    # 关键词（BM25）通道不依赖任何外部服务，而 shipped 配置正是
-    # search.enabled=true + embedding.enabled=false。检索服务必须无条件建起来，
-    # 否则 git 来源在默认部署下根本没有检索——投影与 outbox 才是可选的那部分。
+    # Every skill recall channel (dense, BM25, RRF) is a Milvus operation, so the
+    # active projection and its outbox are required even when embedding is off.
     if skills.search.enabled:
         embedding = skills.search.embedding
+        keyword = skills.search.keyword
         reranker = _build_skill_reranker(skills)
+        vector_store = skills.search.active_vector_store(
+            app_config.knowledge_base.vector_store
+        )
+        if not vector_store.uri.strip():
+            # Empty is not "temporarily unreachable": it means no BM25 index either.
+            raise RuntimeError(
+                "skills.search.enabled=true requires a Milvus endpoint: set "
+                "skills.search.vector_store.uri, or borrow one with "
+                "knowledge_base.vector_store.uri."
+            )
         embedder = None
         if embedding.enabled and embedding.base_url.strip():
-            vector_store = skills.search.active_vector_store(
-                app_config.knowledge_base.vector_store
-            )
-            if not vector_store.uri.strip():
-                # 空地址不会在启动时炸，只会在第一次 upsert 时变成一个沉默的超时。
-                raise RuntimeError(
-                    "skills.search.embedding.enabled=true but no Milvus endpoint is "
-                    "configured: set skills.search.vector_store.uri, or borrow one with "
-                    "knowledge_base.vector_store.uri."
-                )
             embedder = OpenAICompatibleEmbedder(embedding)
-            projection = MilvusSkillProjection(
-                # The skills projection owns its collection (myflow_skills_active);
-                # only the Milvus connection may be borrowed from the knowledge base.
-                vector_store,
-                dimensions=embedding.dimensions,
-            )
+        projection = MilvusSkillProjection(
+            # The skills projection owns its collection (myflow_skills_active);
+            # only the Milvus connection may be borrowed from the knowledge base.
+            vector_store,
+            dimensions=embedding.dimensions,
+            analyzer=keyword.analyzer,
+            bm25_k1=keyword.bm25_k1,
+            bm25_b=keyword.bm25_b,
+        )
         search = SkillSearchService(
             store,
             projection,
@@ -740,15 +743,15 @@ def build_skill_runtime(
             reranker,
             usage=usage,
         )
-        if projection is not None:
-            outbox = SkillIndexOutboxWorker(
-                store,
-                content,
-                embedder,
-                projection,
-                poll_seconds=skills.index.outbox_poll_seconds,
-                repair_max_attempts=skills.index.repair_max_attempts,
-            )
+        outbox = SkillIndexOutboxWorker(
+            store,
+            content,
+            embedder,
+            projection,
+            dimensions=embedding.dimensions,
+            poll_seconds=skills.index.outbox_poll_seconds,
+            repair_max_attempts=skills.index.repair_max_attempts,
+        )
 
     return SkillRuntime(
         store=store,

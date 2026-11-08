@@ -1,13 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  acceptProfileSuggestion,
   getOnboarding,
   getProfile,
   getProfileSchema,
-  listProfileSuggestions,
   MemoryApiError,
   patchProfile,
   updateOnboarding,
@@ -23,10 +21,7 @@ vi.mock("@/core/api/memory", async (importOriginal) => {
     getProfile: vi.fn(),
     getProfileSchema: vi.fn(),
     getOnboarding: vi.fn(),
-    listProfileSuggestions: vi.fn(),
     updateOnboarding: vi.fn(),
-    acceptProfileSuggestion: vi.fn(),
-    dismissProfileSuggestion: vi.fn(),
     patchProfile: vi.fn(),
     clearProfile: vi.fn(),
   };
@@ -35,9 +30,7 @@ vi.mock("@/core/api/memory", async (importOriginal) => {
 const mockedProfile = vi.mocked(getProfile);
 const mockedSchema = vi.mocked(getProfileSchema);
 const mockedOnboarding = vi.mocked(getOnboarding);
-const mockedSuggestions = vi.mocked(listProfileSuggestions);
 const mockedUpdate = vi.mocked(updateOnboarding);
-const mockedAccept = vi.mocked(acceptProfileSuggestion);
 const mockedPatch = vi.mocked(patchProfile);
 
 afterEach(() => {
@@ -83,8 +76,8 @@ function renderPage() {
   );
 }
 
-describe("我的画像：引导、建议与错误", () => {
-  it("展示引导和画像建议，并可稍后/接受", async () => {
+describe("我的画像：引导与错误", () => {
+  it("展示引导，并可稍后提醒", async () => {
     mockedSchema.mockResolvedValue({
       schema_version: 1,
       fields: [NAME_FIELD, SCHEMA_FIELD],
@@ -112,22 +105,6 @@ describe("我的画像：引导、建议与错误", () => {
       dismissed_at: null,
       updated_at: "2026-10-30T00:00:00Z",
     });
-    mockedSuggestions.mockResolvedValue({
-      items: [
-        {
-          id: "s1",
-          field_path: "communication.verbosity",
-          value: "简洁",
-          evidence_uri: "viking://user/u/memories/preferences/style.md",
-          evidence_quote: "喜欢简洁",
-          confidence: 0.74,
-          reason: "偏好简洁输出",
-          status: "pending",
-          profile_etag: "etag-1",
-          expires_at: "2026-11-06T00:00:00Z",
-        },
-      ],
-    });
     mockedUpdate.mockResolvedValue({
       status: "snoozed",
       should_show: false,
@@ -136,23 +113,14 @@ describe("我的画像：引导、建议与错误", () => {
       dismissed_at: null,
       updated_at: "2026-10-30T00:00:00Z",
     });
-    mockedAccept.mockResolvedValue({
-      suggestion: { ...(await mockedSuggestions()).items[0]! },
-      profile: { schema_version: 1, revision: 2, etag: "etag-2", fields: {} },
-    });
 
     renderPage();
     expect(await screen.findByText("让助手更懂你")).toBeTruthy();
-    // 建议值直接展示用户可读文本。
-    const suggestionsPanel = await screen.findByRole("region", { name: "画像建议" });
-    expect(within(suggestionsPanel).getByText("详细程度")).toBeTruthy();
-    expect(within(suggestionsPanel).getByText("简洁")).toBeTruthy();
+    // 画像修改建议已由人在回路工具确认取代，页面不再渲染建议面板。
+    expect(screen.queryByRole("region", { name: "画像建议" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "稍后" }));
     await waitFor(() => expect(mockedUpdate).toHaveBeenCalledWith("snooze"));
-
-    fireEvent.click(screen.getByRole("button", { name: "接受" }));
-    await waitFor(() => expect(mockedAccept).toHaveBeenCalled());
   });
 
   it("保存冲突时展示可读错误并保留草稿", async () => {
@@ -171,7 +139,6 @@ describe("我的画像：引导、建议与错误", () => {
       dismissed_at: "2026-10-30T00:00:00Z",
       updated_at: "2026-10-30T00:00:00Z",
     });
-    mockedSuggestions.mockResolvedValue({ items: [] });
     mockedPatch.mockRejectedValue(new MemoryApiError(409, "profile_conflict", "stale etag"));
 
     renderPage();

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import suppress
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
@@ -18,14 +17,11 @@ from pydantic import BaseModel, Field
 from agentkit.runtime.user_context import DEFAULT_USER_ID
 from agentkit.sandbox.runtime import runtime_user_bucket
 from agentkit.sandbox.security import safe_app_config
-from agentkit.skills.loader import build_payload
-from agentkit.skills.router import search_skills as run_search
 from agentkit.skills.search import (
     SkillSearchOutcome,
     SkillSearchUnavailable,
     get_skill_runtime,
 )
-from agentkit.skills.storage import SkillRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +33,7 @@ EMPTY_RESULT_MESSAGE = (
     "不要用本工具重复尝试相似的说法；需要正文时让 lead 用 load_skills。",
 )
 UNAVAILABLE_MESSAGE = (
-    "技能检索暂不可用（技能目录运行时未就绪，或数据库/索引暂时不可达）。",
+    "技能检索暂不可用（技能目录或 Milvus 检索索引未就绪）。",
     "不要用本工具重复尝试相似的说法。",
 )
 
@@ -95,44 +91,13 @@ async def search_skills(
     keywords = _clean_keywords(domain_keywords)
     user_id = runtime_user_bucket(runtime) if runtime is not None else DEFAULT_USER_ID
     service = get_skill_runtime()
-    if service is not None:
-        return await _search_catalog(service, user_id=user_id, query=query, keywords=keywords)
-
-    if getattr(config.skills, "source", "filesystem") != "filesystem":
+    if service is None:
+        # There is no in-process BM25/RRF fallback: without the Milvus-backed
+        # catalog runtime this tool fails closed instead of ranking locally.
         return json.dumps(
             {"skills": [], "message": UNAVAILABLE_MESSAGE}, ensure_ascii=False
         )
-
-    registry = SkillRegistry(
-        config=config.skills,
-        user_id=runtime_user_bucket(runtime) if runtime is not None else None,
-    )
-    skills = registry.visible(include_builtin=False)
-    embedder, reranker = _build_optional_stages(config.skills.search)
-    try:
-        outcome = await run_search(
-            skills,
-            task_query=query,
-            domain_keywords=keywords,
-            config=config.skills.search,
-            embedder=embedder,
-            reranker=reranker,
-        )
-    finally:
-        for stage in (embedder, reranker):
-            if stage is not None:
-                with suppress(Exception):
-                    await stage.aclose()  # type: ignore[union-attr]
-    raw = build_payload(outcome, config=config.skills.search)
-    metadatas = [
-        {
-            "skill_id": item["name"],
-            "name": item["name"],
-            "description": item["description"],
-        }
-        for item in raw["skills"]
-    ]
-    return _metadata_payload(metadatas, raw["retrieval"])
+    return await _search_catalog(service, user_id=user_id, query=query, keywords=keywords)
 
 
 async def _search_catalog(
@@ -203,22 +168,6 @@ def _clean_keywords(domain_keywords: object) -> list[str]:
         if value and value not in cleaned:
             cleaned.append(value)
     return cleaned[:MAX_DOMAIN_KEYWORDS]
-
-
-def _build_optional_stages(search_config: object) -> tuple[object, object]:
-    embedder = None
-    reranker = None
-    embedding = getattr(search_config, "embedding", None)
-    if embedding is not None and getattr(embedding, "enabled", False) and getattr(embedding, "base_url", "").strip():
-        from agentkit.knowledge.embedding import OpenAICompatibleEmbedder
-
-        embedder = OpenAICompatibleEmbedder(embedding)
-    rerank = getattr(search_config, "rerank", None)
-    if rerank is not None and getattr(rerank, "enabled", False):
-        from agentkit.knowledge.rerank import build_reranker
-
-        reranker = build_reranker(rerank)
-    return embedder, reranker
 
 
 __all__ = ["EMPTY_RESULT_MESSAGE", "TOOL_NAME", "UNAVAILABLE_MESSAGE", "search_skills"]

@@ -27,21 +27,19 @@ def test_an_empty_skill_search_tells_the_model_to_stop(monkeypatch) -> None:
 
     from agentkit.tools.builtin import search_skills as module
 
-    class _EmptyRegistry:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        def visible(self, *, include_builtin: bool = True):
-            return []
-
     from agentkit.config.skills_config import SkillSearchConfig
+    from agentkit.skills.search import SkillSearchOutcome
+
+    class _EmptySearch:
+        async def search(self, **_kwargs):
+            return SkillSearchOutcome(hits=(), candidates=0, warnings=())
 
     monkeypatch.setattr(
         module,
         "safe_app_config",
         lambda: SimpleNamespace(skills=SimpleNamespace(search=SkillSearchConfig())),
     )
-    monkeypatch.setattr(module, "SkillRegistry", _EmptyRegistry)
+    monkeypatch.setattr(module, "get_skill_runtime", lambda: _EmptySearch())
 
     result = asyncio.run(
         module.search_skills.ainvoke(

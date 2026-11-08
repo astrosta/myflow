@@ -1,8 +1,8 @@
 """PostgreSQL tables owned by the OpenViking memory adapter.
 
 These tables do not store OpenViking memory bodies. They only hold the
-profile document, session/capture lifecycle, suggestions, onboarding state and
-message-level dedup bookkeeping.
+profile document, session/capture lifecycle, onboarding state and message-level
+dedup bookkeeping.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
-    Float,
     Index,
     Integer,
     String,
@@ -91,41 +90,6 @@ class MemoryProfileOnboardingRow(Base):
     )
 
 
-class MemoryProfileSuggestionRow(Base):
-    __tablename__ = "memory_profile_suggestions"
-
-    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    suggestion_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    field_path: Mapped[str] = mapped_column(String(128), nullable=False)
-    value_json: Mapped[str] = mapped_column(Text, nullable=False)
-    value_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    evidence_uri: Mapped[str] = mapped_column(Text, nullable=False)
-    evidence_quote: Mapped[str] = mapped_column(Text, nullable=False)
-    confidence: Mapped[float] = mapped_column(Float, nullable=False)
-    reason: Mapped[str] = mapped_column(Text, nullable=False)
-    profile_etag: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    acted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-    __table_args__ = (
-        Index("ix_suggestions_user_status_expiry", "user_id", "status", "expires_at"),
-        Index("ix_suggestions_user_profile_etag", "user_id", "profile_etag", "status"),
-        Index("ix_suggestions_user_field_hash", "user_id", "field_path", "value_hash"),
-        Index(
-            "uq_pending_suggestion",
-            "user_id",
-            "field_path",
-            "value_hash",
-            "profile_etag",
-            unique=True,
-            sqlite_where=text("status = 'pending'"),
-            postgresql_where=text("status = 'pending'"),
-        ),
-    )
-
-
 class MemoryCaptureDedupRow(Base):
     __tablename__ = "memory_capture_dedup"
 
@@ -173,6 +137,5 @@ __all__ = [
     "MemoryCaptureDedupRow",
     "MemoryProfileDocumentRow",
     "MemoryProfileOnboardingRow",
-    "MemoryProfileSuggestionRow",
     "MemorySyncStateRow",
 ]

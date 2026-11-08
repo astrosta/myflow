@@ -48,19 +48,6 @@ export interface OnboardingView {
 
 export type OnboardingAction = "seen" | "snooze" | "dismiss" | "complete";
 
-export interface ProfileSuggestion {
-  id: string;
-  field_path: string;
-  value: unknown;
-  evidence_uri: string;
-  evidence_quote: string;
-  confidence: number;
-  reason: string;
-  status: string;
-  profile_etag: string;
-  expires_at: string;
-}
-
 export class MemoryApiError extends Error {
   readonly status: number;
   readonly code: string | null;
@@ -131,36 +118,6 @@ export function updateOnboarding(action: OnboardingAction): Promise<OnboardingVi
     method: "POST",
     body: JSON.stringify({ action }),
   });
-}
-
-export function listProfileSuggestions(): Promise<{ items: ProfileSuggestion[] }> {
-  return memoryRequest<{ items: ProfileSuggestion[] }>("/memory/profile/suggestions");
-}
-
-export function acceptProfileSuggestion(
-  id: string,
-  etag?: string,
-): Promise<{ suggestion: ProfileSuggestion; profile: ProfileView }> {
-  return memoryRequest<{ suggestion: ProfileSuggestion; profile: ProfileView }>(
-    "/memory/profile/suggestions/" + encodeURIComponent(id) + "/accept",
-    {
-      method: "POST",
-      body: JSON.stringify(etag ? { etag } : {}),
-    },
-  );
-}
-
-export function dismissProfileSuggestion(
-  id: string,
-  etag?: string,
-): Promise<ProfileSuggestion> {
-  return memoryRequest<ProfileSuggestion>(
-    "/memory/profile/suggestions/" + encodeURIComponent(id) + "/dismiss",
-    {
-      method: "POST",
-      body: JSON.stringify(etag ? { etag } : {}),
-    },
-  );
 }
 
 export function clearProfileField(fieldPath: string): Promise<ProfileView> {

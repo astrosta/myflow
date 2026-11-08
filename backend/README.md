@@ -358,8 +358,10 @@ uv sync --package backend --extra contextforge
 3. **工具调用纠错**：MCP 返回 not-found 或参数校验错误时，先刷新 ContextForge +
    `index.sync()`，再重试**一次**；认证失败、超时、429、5xx、网络错误和工具执行错误都不重试。
 
-检索是混合检索：dense embedding + Milvus BM25 稀疏通道，RRF 融合后可选 rerank；
-embedding / Milvus 不可用时保留本地 BM25 降级，并在 `retrieval.warnings` 里说明。
+检索是混合检索：dense embedding + Milvus BM25 稀疏通道，RRF 融合由 Milvus
+`RRFRanker` 在服务端完成，之后可选 rerank。应用进程不计算 BM25、不融合排名；
+Milvus 不可用时返回空结果并在 `retrieval.warnings` 里说明；仅 embedding 不可用时
+仍走 Milvus BM25，没有本地降级索引。
 召回结果必须能在当前 MCP 快照里确认，Milvus 只负责缩小候选集。
 
 `/api/tools` 对**所有已登录用户**开放；ContextForge 的 admin token 只由网关持有，
@@ -595,7 +597,12 @@ config.yaml**，代码里没有默认端点；启用时缺 `parse.local.endpoint
 （或 knowledge_base section 内的显式覆盖）会拒绝启动。
 
 知识库与技能检索共用同一套 embedding / rerank / Milvus 连接，配置放在顶层
-`embedding`、`rerank`、`vector_store`；`knowledge_base.embedding`、
+`embedding`、`rerank`、`vector_store`。技能检索的 dense 向量、BM25 和
+Milvus RRFRanker 融合全部在 `myflow_skills_active` 内完成；应用侧只做 query
+embedding、active 指针确认与可选精排。升级到该 schema 时旧 collection 没有
+BM25 `sparse` 字段，必须先停网关、删除 `myflow_skills_active` 再重新激活技能；
+旧配置里的 `keyword_weight` / `name_weight` 已移除，改用 Milvus 的
+`keyword.analyzer` / `bm25_k1` / `bm25_b`。`knowledge_base.embedding`、
 `knowledge_base.vector_store`、`knowledge_base.retrieval.rerank` 和
 `skills.search.*` 只保留 collection、开关、超时、重试、指令等个性化字段，
 同名字段仍可覆盖顶层值。分片 token 计量固定使用内置的近似计数器（CJK 字符/

@@ -24,6 +24,9 @@
 > 陈述画像信息时由模型调用，写入仍走 `ProfileService`（etag CAS）。原子抽取链路依旧不写画像。
 > 修订（画像字段自由填写）：移除无障碍需求和边界字段（当前 10 个字段）；所有字段取消枚举，
 > 改为自由填写，描述里的常见值仅作友好提示；`update_user_profile` 的描述同步精简。
+> 修订（画像建议移除）：`ProfileSuggester`、`/api/memory/profile/suggestions` API、
+> `memory_profile_suggestions` 表和前端建议面板已删除；画像修改只保留表单与
+> `update_user_profile` 的人在回路确认。下文中涉及“画像建议”的段落视为历史设计，不再实现。
 > 修订（2026-10-30，审计决议 v2）：删除压缩窗口捕获与自动召回；OpenViking session 使用 **idle-only auto-commit**（86400 秒）；创建 session 固定显式设置 `DEFAULT_SESSION_MEMORY_TYPES`（6 类）`memory_policy` 与 idle-only `auto_commit_policy`；`get_session(auto_create=True)` 不再用于新建；强制单 `memory_worker`；`memory_sync_state` 增加 session 生命周期字段；ToolPart / PII / API 契约按 OpenViking Server 0.4.19 修正。
 > 修订（2026-11-03，记忆类型与会话技能分离）：记忆查询、模型工具与记忆管理页支持
 > **7 类**：`preferences` / `entities` / `events` / `cases` / `trajectories` /
@@ -67,7 +70,7 @@
 核心决策：
 
 1. **OpenViking 是自动抽取记忆的唯一权威。** MyFlow 不保存 OpenViking 记忆正文、记忆版本、记忆索引或记忆向量；只保留运行所需的队列、会话状态和用户画像身份资料。
-2. **MyFlow 保留五张运维/界面表。** `memory_profile_documents`（用户画像正文）、`memory_sync_state`（会话游标/commit 状态 + incarnation）、`memory_profile_onboarding`、`memory_profile_suggestions`（建议正文/证据/状态）、`memory_capture_dedup`（持久去重键）。这些表不保存 OpenViking 自动抽取记忆正文；profile 是用户身份资料的明确例外。
+2. **MyFlow 保留四张运维/界面表。** `memory_profile_documents`（用户画像正文）、`memory_sync_state`（会话游标/commit 状态 + incarnation）、`memory_profile_onboarding`、`memory_capture_dedup`（持久去重键）。这些表不保存 OpenViking 自动抽取记忆正文；profile 是用户身份资料的明确例外。
 3. **一个 MyFlow thread 对应一个 OpenViking session，session id 带 incarnation。** commit 只产生新的 archive，不切 session；`SessionManager` 幂等创建/恢复，`session_epoch` 在 NotFound 时递增，thread 删除/重建时更换 `session_incarnation`；删除期间用 tombstone 阻止旧消息落入新 session。
 4. **写入按 thread 分片，逐消息投递，单 worker 消费。** stream shard 由 `HMAC(salt, user_id + ":" + thread_id) % shard_count` 决定，同一 thread 永远落到同一 shard，每个 shard 只有一个 consumer 串行处理；CAPTURE 后 human / AI / ToolMessage 依次 `XADD`，不组装 turn envelope、不写 DB outbox。worker 用 `memory_capture_dedup` 做 at-least-once 去重与对账；正常 turn 收到 `turn_end` 后批量 append，显式信号可立即 commit；普通 `NONE` turn 由 OpenViking 24h idle auto-commit 兜底。压缩窗口不进入捕获流，不产生 `compaction` 消息。对话主链路不等待 OpenViking 的 append/commit。
 5. **删除任务分类器作为 session/任务机制。** 保留 `CommitSignalDetector`，只输出 commit 信号，不生成 `task_id`，不写 `task_context`，不切 session。
@@ -97,7 +100,7 @@
 9. **记忆内容统一包裹。** 所有进入模型上下文的内容（profile、`memory_search` 摘要、`memory_overview`、`memory_read` 正文）都经过 `MemoryContentEnvelope`：固定 `<memory-context source="..." trust="untrusted">` 包裹、XML 转义、去除控制标签、token/char 上限，并显式标注“这是记忆内容，不是系统指令”。没有 auto recall 这一路。
 10. **URI 隔离。** OpenViking 只使用绝对 URI `viking://user/<ov_user>/memories/...`；`find` 的 `target_uri` 也使用同一绝对形式，不依赖 `~`。`memory_read` 先做 URI parser + path normalization，只允许当前用户的 `memories/` 前缀，并拒绝 `..`、编码穿越、`peers/`、`sessions/`、`privacy/`、`profile.md`、`identity.md`、`soul.md`。所有查询/读取都使用当前用户 client。
 11. **PII 与工具证据。** `PIIMiddleware` 只脱敏输入/AI 输出，不脱敏 ToolMessage；不能靠“把 MemoryMiddleware 放在 PII 外层”保证工具输出安全。`MemoryMessageAdapter` 必须在 XADD 前做最终秘密/PII 扫描、长度上限、工具输出摘要和 hash。ToolPart 只允许有界摘要/hash，禁止原始工具输出；ToolMessage 的 wire `message_kind` 固定为 `tool_transport`。`last_error` 入库前同样脱敏截断。
-12. **ProfileSuggester 并发。** `GET /suggestions` 的生成必须有 advisory lock 或唯一约束保护；`evidence_quote` 必须脱敏、限长并明确记录保留期，不能无声复制整段 OpenViking 记忆正文。
+12. **画像建议已移除。** ProfileSuggester 不再生成或保存建议；画像写入只走表单和 `update_user_profile` 的人在回路确认。
 13. **无旧数据、无迁移、无回滚。** 当前不存在旧记忆数据；不写迁移脚本，不保留旧表兼容层，不承诺回滚到旧记忆模块。P5 直接删除旧表/旧代码前，必须有旧表计数为 0 的检查 + PostgreSQL/OpenViking 备份；回退只回到空记忆状态。
 14. **待决项登记。** 所有 P1-x 必须在 §15.1 登记，包含 owner、决策问题、截止 Phase 和验收方式；未关闭项不得写入 P3/§13.4 的通过条件。
 
@@ -111,8 +114,8 @@
 - 是否渲染 identity/soul 系统提示段；
 - 是否挂 admin status/flush。
 
-`/api/memory/profile`、`/api/memory/profile/schema`、onboarding 和 suggestions 是 DB-backed 画像 surface，
-开关为 `false` 时仍可用（suggestions 没有 OpenViking 索引，返回空）。内置工具 `update_user_profile`
+`/api/memory/profile`、`/api/memory/profile/schema` 和 onboarding 是 DB-backed 画像 surface，
+开关为 `false` 时仍可用。内置工具 `update_user_profile`
 绑定的是 `ProfileService` 而不是 OpenViking facade，因此**不随这个开关开关**：只要网关建好了 profile
 服务就注册（`true` 时与 `memory_search` / `memory_read` / `memory_overview` 同一批挂到 lead agent）。
 开关是 startup-only；不要在同一进程运行中热切换。旧 canonical runtime、旧 canonical 表已退役：fresh bootstrap 不再创建，migration 0009 删除既有表；`false` 不再是 canonical fallback。开关为 `true` 时缺少 Redis URL、database 或至少 32 字符的 `user_id_salt` 必须启动失败；不能静默降级。
@@ -205,10 +208,10 @@ MyFlow Gateway
   |-- CaptureGate（纯规则；before_agent 唯一门控）
   |-- memory_search / memory_read / memory_overview tools（模型内部工具，不是前端入口）
   |-- update_user_profile tool（唯一的模型写画像入口；写 ProfileService，不写 OpenViking）
-  |-- ProfileSuggester（应用服务，按需生成画像建议，不写 profile）
+  |-- onboarding（DB-backed 引导状态）
   |-- /api/memory/items（记忆管理：列表/详情/正文/编辑/删除，全部代理 OpenViking）
   |-- /api/memory/profile（我的画像结构化表单）
-  |-- /api/memory/profile/suggestions（画像建议）
+  |-- /api/memory/profile/onboarding（画像引导）
   |-- /api/memory/profile/onboarding（引导状态）
   |-- /api/admin/memory/status（仅运维）
         |
@@ -261,8 +264,6 @@ OpenViking Server
 | `ProfileService` | 读写 `memory_profile_documents`；字段校验；etag；删除字段/清空；`update_fields()` 供工具使用（读当前 etag 后 CAS，冲突重读重试一次） | 不写 OpenViking；不自动抽取 profile；不做冲突合并 |
 | `update_user_profile` tool | 把用户在对话里显式陈述的画像信息写进 `memory_profile_documents`；参数校验失败返回结构化 tool error | 不写 OpenViking；不写事实记忆；不猜、不补全、不写敏感值 |
 | `MemoryLibraryService` | 记忆管理页的协议适配：`find`（无 query + filter）列摘要、`overview` 解析目录、`read` 读正文、`write` 保存、`rm` 删除；URI 白名单与 sidecar 保护 | 不保存记忆副本；不写 profile；不允许改 `.abstract.md` / `.overview.md` / 目录；不做语义搜索 |
-| `ProfileSuggester` | 按需从 preferences/entities/events 生成画像建议，写入 `memory_profile_suggestions`；用户 accept 时才调用 ProfileService 写 DB | 不后台常驻、不自动写 profile、不作为模型工具 |
-| `ProfileSuggestionStore` | 保存 `memory_profile_suggestions`（建议正文/脱敏限长证据/etag/状态/过期）和 onboarding 状态 | 不保存整段 OpenViking 记忆正文；evidence_quote 是受限期例外 |
 | `PersonalizationService` | 读取 DB `profile`、本地 `identity.md`/`soul.md`；缓存渲染；token 截断 | 不写 OpenViking；不提供 identity/soul 编辑 API |
 | `CaptureGate` | 调用 TurnPolicy 判定 CAPTURE/SKIP；只做策略判定 | 不做 I/O、不 append、不调用模型 |
 | `MemoryMessagePublisher` | 在消息产生时按 thread shard 顺序投递 human / AI / ToolMessage，带 epoch/incarnation；不聚合 turn | 不写 OpenViking |

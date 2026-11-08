@@ -95,8 +95,8 @@ class SkillContentStore:
         self.git = git
         self.commits_dir = self.cache_dir / "commits"
         self.active_dir = self.cache_dir / "active"
-        # 正文 LRU：提交内容不可变，BM25 通道每次检索都要读可见集合的正文，
-        # 没有这层缓存就是 O(可见技能数) 次磁盘读。
+        # 正文 LRU：提交内容不可变，投影 outbox 需要把正文写进 Milvus 的 BM25
+        # content 字段；没有这层缓存，每次重建投影都要重复读同一批提交。
         self._text_cache: OrderedDict[tuple[str, str], str] = OrderedDict()
 
     # ------------------------------------------------------------------

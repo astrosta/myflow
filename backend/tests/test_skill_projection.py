@@ -27,6 +27,7 @@ METADATA_FIELDS = {
     "description",
     "package_sha256",
     "skill_md_sha256",
+    "content",
 }
 
 
@@ -41,12 +42,13 @@ class FakeMilvus:
         self.upserts: list[dict] = []
         self.deleted: list[dict] = []
         self.searches: list[dict] = []
+        self.hybrid_searches: list[dict] = []
         self.queries: list[dict] = []
         self.flushes = 0
         self.closed = False
         self.extra_fields: list[dict] = []
-        #: 默认是一张健康集合：向量索引已在，load 会成功。
-        self.index_names: list[str] = ["embedding"]
+        #: 默认是一张健康集合：dense + BM25 索引都在，load 会成功。
+        self.index_names: list[str] = ["embedding", "sparse"]
         self.keys: list[str] = ["private:u1:s1"]
         self.iterator_calls: list[dict] = []
         self.iterator: "FakeIterator | None" = None
@@ -114,27 +116,33 @@ class FakeMilvus:
     def flush(self, collection_name: str) -> None:
         self.flushes += 1
 
+    def _row(self, *, distance: float = 0.87) -> dict:
+        return {
+            "id": "private:u1:s1",
+            "distance": distance,
+            "entity": {
+                "pk": "private:u1:s1",
+                "scope": "private",
+                "owner_user_id": "u1",
+                "skill_id": "s1",
+                "version_id": "v1",
+                "skill_version": "2.0.0",
+                "enabled": True,
+                "name": "private skill",
+                "description": "private description",
+                "package_sha256": "p1",
+                "skill_md_sha256": "m1",
+                "content": "private skill\nprivate description",
+            },
+        }
+
     def search(self, collection_name: str, **kwargs):
         self.searches.append({"collection_name": collection_name, **kwargs})
-        return [[
-            {
-                "id": "private:u1:s1",
-                "distance": 0.87,
-                "entity": {
-                    "pk": "private:u1:s1",
-                    "scope": "private",
-                    "owner_user_id": "u1",
-                    "skill_id": "s1",
-                    "version_id": "v1",
-                    "skill_version": "2.0.0",
-                    "enabled": True,
-                    "name": "private skill",
-                    "description": "private description",
-                    "package_sha256": "p1",
-                    "skill_md_sha256": "m1",
-                },
-            },
-        ]]
+        return [[self._row()]]
+
+    def hybrid_search(self, collection_name: str, **kwargs):
+        self.hybrid_searches.append({"collection_name": collection_name, **kwargs})
+        return [[self._row(distance=0.032)]]
 
     def query(self, collection_name: str, **kwargs):
         self.queries.append({"collection_name": collection_name, **kwargs})
@@ -144,6 +152,8 @@ class FakeMilvus:
         return {
             "fields": [
                 {"name": "embedding", "params": {"dim": "4"}},
+                {"name": "content"},
+                {"name": "sparse"},
                 {"name": "scope"},
                 {"name": "owner_user_id"},
                 {"name": "enabled"},
@@ -174,9 +184,20 @@ class FakeIterator:
 class FakeSchema:
     def __init__(self) -> None:
         self.fields: dict[str, dict] = {}
+        self.functions: list[dict] = []
 
     def add_field(self, name: str, dtype, **kwargs) -> None:
         self.fields[name] = {"dtype": dtype, **kwargs}
+
+    def add_function(self, function) -> None:
+        self.functions.append(
+            {
+                "name": getattr(function, "name", ""),
+                "input_field_names": list(getattr(function, "input_field_names", [])),
+                "output_field_names": list(getattr(function, "output_field_names", [])),
+                "function_type": getattr(function, "type", None),
+            }
+        )
 
 
 class FakeIndexParams:
@@ -256,6 +277,7 @@ def _private_row() -> ProjectionRow:
         package_sha256="p1",
         skill_md_sha256="m1",
         embedding=[0.0, 1.0, 0.0, 0.0],
+        content="private skill\nprivate description\nbody",
     )
 
 
@@ -316,7 +338,7 @@ async def test_search_filters_by_the_caller_owner_only() -> None:
     assert call["limit"] == 5
     assert call["search_params"]["params"] == {}
     assert call["consistency_level"] == "Strong"
-    assert set(call["output_fields"]) == METADATA_FIELDS
+    assert set(call["output_fields"]) == METADATA_FIELDS - {"content"}
     assert hits == [
         ProjectionHit(
             projection_key="private:u1:s1",
@@ -327,6 +349,69 @@ async def test_search_filters_by_the_caller_owner_only() -> None:
             score=0.87,
         ),
     ]
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_uses_milvus_rrf_with_the_owner_filter_on_both_channels() -> None:
+    fake = FakeMilvus()
+    store = _store(fake)
+
+    hits = await store.hybrid_search(
+        user_id="u1",
+        vector=[1.0, 0.0, 0.0, 0.0],
+        keyword_query="pgvector 多租户",
+        limit=5,
+        rrf_k=37,
+    )
+
+    assert hits[0].score == 0.032
+    call = fake.hybrid_searches[0]
+    assert "filter" not in call
+    dense, sparse = call["reqs"]
+    expected = 'scope == "private" and enabled == true and owner_user_id == "u1"'
+    assert dense.expr == expected
+    assert sparse.expr == expected
+    assert dense.anns_field == "embedding"
+    assert sparse.anns_field == "sparse"
+    assert sparse.data == ["pgvector 多租户"]
+    assert sparse.param["metric_type"] == "BM25"
+    assert call["ranker"].dict() == {"strategy": "rrf", "params": {"k": 37}}
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_uses_milvus_bm25_on_the_sparse_field() -> None:
+    fake = FakeMilvus()
+    store = _store(fake)
+
+    hits = await store.keyword_search(user_id="u1", query="pgvector", limit=3)
+
+    assert hits[0].score == 0.87
+    call = fake.searches[0]
+    assert call["anns_field"] == "sparse"
+    assert call["data"] == ["pgvector"]
+    assert call["search_params"]["metric_type"] == "BM25"
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_an_old_collection_without_a_sparse_field_is_rejected() -> None:
+    fake = FakeMilvus()
+    original = fake.describe_collection
+
+    def describe_without_sparse(name: str) -> dict:
+        description = original(name)
+        description["fields"] = [
+            field for field in description["fields"] if field["name"] != "sparse"
+        ]
+        return description
+
+    fake.describe_collection = describe_without_sparse  # type: ignore[method-assign]
+    store = _store(fake)
+
+    with pytest.raises(ProjectionUnavailable, match="BM25 sparse"):
+        await store.ensure_collection(4)
     await store.aclose()
 
 
@@ -347,23 +432,29 @@ async def test_search_json_escapes_the_owner_id_in_the_filter() -> None:
 @pytest.mark.asyncio
 async def test_collection_creation_adds_scalar_indexes_for_projection_filters() -> None:
     pytest.importorskip("pymilvus")
-    from pymilvus import DataType
+    from pymilvus import DataType, FunctionType
 
     fake = FakeEmptyMilvus()
     store = _store(fake)
 
     await store.ensure_collection(4)
 
-    assert set(fake.schema.fields) == METADATA_FIELDS | {"embedding"}
+    assert set(fake.schema.fields) == METADATA_FIELDS | {"embedding", "sparse"}
     assert fake.schema.fields["pk"]["is_primary"] is True
     assert fake.schema.fields["pk"]["dtype"] == DataType.VARCHAR
     assert fake.schema.fields["scope"]["dtype"] == DataType.VARCHAR
     assert fake.schema.fields["owner_user_id"]["dtype"] == DataType.VARCHAR
     assert fake.schema.fields["version_id"]["dtype"] == DataType.VARCHAR
     assert fake.schema.fields["enabled"]["dtype"] == DataType.BOOL
+    assert fake.schema.fields["content"]["dtype"] == DataType.VARCHAR
+    assert fake.schema.fields["content"]["enable_analyzer"] is True
+    assert fake.schema.fields["sparse"]["dtype"] == DataType.SPARSE_FLOAT_VECTOR
     assert fake.schema.fields["embedding"]["dtype"] == DataType.FLOAT_VECTOR
     assert fake.schema.fields["embedding"]["dim"] == 4
-    assert "body" not in fake.schema.fields
+    assert any(
+        item.get("function_type") == FunctionType.BM25
+        for item in fake.schema.functions
+    )
 
     indexes = {item["field_name"]: item for item in fake.index_params.indexes}
     for field in ("scope", "owner_user_id", "enabled"):
@@ -371,6 +462,9 @@ async def test_collection_creation_adds_scalar_indexes_for_projection_filters() 
     assert indexes["embedding"]["metric_type"] == "COSINE"
     assert indexes["embedding"]["index_type"] == "AUTOINDEX"
     assert indexes["embedding"]["params"] == {}
+    assert indexes["sparse"]["index_type"] == "SPARSE_INVERTED_INDEX"
+    assert indexes["sparse"]["metric_type"] == "BM25"
+    assert indexes["sparse"]["params"] == {"bm25_k1": 1.2, "bm25_b": 0.75}
     assert fake.created[0]["collection_name"] == "myflow_skills_active"
     assert fake.created[0]["consistency_level"] == "Strong"
     # 索引显式创建，不塞进 create_collection：那一步失败会留下无法 load 的集合。
@@ -393,6 +487,7 @@ async def test_an_existing_collection_without_an_index_gets_one_before_loading()
     assert len(fake.created_indexes) == 1
     created = {item["field_name"]: item for item in fake.created_indexes[0]["indexes"]}
     assert created["embedding"]["index_type"] == "AUTOINDEX"
+    assert created["sparse"]["metric_type"] == "BM25"
     for field in ("scope", "owner_user_id", "enabled"):
         assert created[field]["index_type"] == "INVERTED"
     assert fake.released == ["myflow_skills_active"]  # 已 load 的集合不能建索引

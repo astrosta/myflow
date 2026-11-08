@@ -90,8 +90,9 @@ def test_the_builtin_path_never_runs_the_search_runtime(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("built-in skills must not enter the search pipeline")
 
-    monkeypatch.setattr("agentkit.skills.router.build_documents", forbidden)
-    monkeypatch.setattr("agentkit.skills.router.search_skills", forbidden)
+    monkeypatch.setattr(
+        "agentkit.skills.search.SkillSearchService.search", forbidden
+    )
 
     section = build_skills_section(config=config)
     skill = SkillRegistry(config=config).find("demo")

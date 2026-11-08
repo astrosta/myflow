@@ -25,8 +25,10 @@ def _entry(name: str, description: str, owner: str | None = None) -> ToolCatalog
 class FakeIndex:
     def __init__(self):
         self.fail = False
+        self.calls = []
 
     async def hybrid_search(self, *, vector, query, limit):
+        self.calls.append("hybrid")
         if self.fail:
             raise RuntimeError("milvus down")
         return [
@@ -34,6 +36,18 @@ class FakeIndex:
             ToolVectorHit("gitlab_search", 0.7),
             ToolVectorHit("stale_tool", 0.8),
         ]
+
+    async def dense_search(self, *, vector, limit):
+        self.calls.append("dense")
+        if self.fail:
+            raise RuntimeError("milvus down")
+        return [ToolVectorHit("github_search", 0.9)]
+
+    async def keyword_search(self, *, query, limit):
+        self.calls.append("keyword")
+        if self.fail:
+            raise RuntimeError("milvus down")
+        return [ToolVectorHit("github_search", 0.8)]
 
 
 class FakeEmbedder:
@@ -67,7 +81,7 @@ async def test_search_confirms_hits_and_reranks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_vector_failure_falls_back_to_local_bm25() -> None:
+async def test_milvus_failure_returns_no_local_hits() -> None:
     entries = (_entry("github_search", "search github code"),)
     index = FakeIndex()
     index.fail = True
@@ -83,9 +97,32 @@ async def test_vector_failure_falls_back_to_local_bm25() -> None:
         snapshot_provider=lambda: entries,
     )
     outcome = await service.search(task_query="github")
-    assert outcome.index_kind == "local_bm25"
-    assert outcome.hits[0].entry.name == "github_search"
+    assert outcome.index_kind == "milvus"
+    assert outcome.hits == ()
     assert "vector_unavailable" in outcome.warnings
+
+
+@pytest.mark.asyncio
+async def test_keyword_only_search_uses_milvus_bm25() -> None:
+    entries = (_entry("github_search", "search github code"),)
+    index = FakeIndex()
+    service = ToolSearchService(
+        index=index,
+        embedder=None,
+        reranker=None,
+        config=ToolSearchConfig(
+            candidate_k=5,
+            top_k=2,
+            embedding={"enabled": False},
+        ),
+        snapshot_provider=lambda: entries,
+    )
+
+    outcome = await service.search(task_query="github")
+
+    assert index.calls == ["keyword"]
+    assert outcome.channels == ("keyword",)
+    assert [hit.entry.name for hit in outcome.hits] == ["github_search"]
 
 
 @pytest.mark.asyncio

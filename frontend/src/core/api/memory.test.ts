@@ -7,10 +7,7 @@ vi.mock("./base", () => ({
 
 import { apiFetch } from "./base";
 import {
-  acceptProfileSuggestion,
-  dismissProfileSuggestion,
   getOnboarding,
-  listProfileSuggestions,
   MemoryApiError,
   patchProfile,
   updateOnboarding,
@@ -53,7 +50,7 @@ describe("memory API client", () => {
     });
   });
 
-  it("uses onboarding and suggestion endpoints", async () => {
+  it("uses the onboarding endpoints", async () => {
     mockedFetch.mockResolvedValue(json({ status: "seen", should_show: true }));
     await getOnboarding();
     expect(mockedFetch.mock.calls[0]![0]).toBe("/memory/profile/onboarding");
@@ -63,20 +60,6 @@ describe("memory API client", () => {
     const [, onboardingInit] = mockedFetch.mock.calls[1]!;
     expect(onboardingInit?.method).toBe("POST");
     expect(JSON.parse(String(onboardingInit?.body))).toEqual({ action: "snooze" });
-
-    mockedFetch.mockResolvedValue(json({ items: [] }));
-    await listProfileSuggestions();
-    expect(mockedFetch.mock.calls[2]![0]).toBe("/memory/profile/suggestions");
-
-    mockedFetch.mockResolvedValue(json({ suggestion: {}, profile: {} }));
-    await acceptProfileSuggestion("s1", "etag-1");
-    const [, acceptInit] = mockedFetch.mock.calls[3]!;
-    expect(JSON.parse(String(acceptInit?.body))).toEqual({ etag: "etag-1" });
-
-    mockedFetch.mockResolvedValue(json({ id: "s2", status: "dismissed" }));
-    await dismissProfileSuggestion("s2");
-    const [, dismissInit] = mockedFetch.mock.calls[4]!;
-    expect(JSON.parse(String(dismissInit?.body))).toEqual({});
   });
 });
 

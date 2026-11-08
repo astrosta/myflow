@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from agentkit.skills.content import SkillContentStore
 from agentkit.skills.domain import SkillScope, VisibleSkill
+from agentkit.skills.parser import strip_frontmatter
 from agentkit.skills.projection import ProjectionRow, SkillProjectionStore
 from agentkit.skills.router import Embedder
 from agentkit.skills.store.sql import OutboxEvent, SqlSkillStore
@@ -88,23 +89,42 @@ def _source_for_retention(source: VisibleSkill) -> set[str]:
 
 
 #: 投影文本的语义版本（设计 §7.2）。改格式、换模型或换维度都等于让全部存量
-#: 向量失效，需要运维对 collection 做一次强制重建/对账。
-PROJECTION_TEXT_VERSION = 3
+#: 向量失效，需要运维对 collection 做一次强制重建/对账。v4 起 collection 还带
+#: Milvus 生成的 BM25 sparse 字段，所以旧 collection 必须重建。
+PROJECTION_TEXT_VERSION = 4
 
 
 def projection_text(name: str, description: str) -> str:
-    """参与 embedding 的文本：只有作者手写的元数据。
+    """参与 dense embedding 的文本：只有作者手写的元数据。
 
     正文不进来是刻意的：正文每次改动都会变（等于每次保存都重新 embedding），
-    还可能超出 embedding 的 max_input_tokens，让整条索引直接失败。正文交给
-    BM25 通道与精排去读，它们才真的需要长文本（设计 §7.2 / §7.4）。
+    还可能超出 embedding 的 max_input_tokens，让整条索引直接失败。正文单独写进
+    Milvus 的 content 字段，由服务端 BM25 Function 生成稀疏向量。
     """
     return f"{name}\n{description}".strip()
 
 
+def projection_content(name: str, description: str, body: str) -> str:
+    """BM25 索引文本：名字 + 描述 + 正文。"""
+    head = f"{name}\n{description}".strip()
+    return f"{head}\n\n{body}".strip() if body else head
+
+
+def _placeholder_vector(dimensions: int) -> list[float]:
+    """Dense vector used only when the embedding channel is disabled.
+
+    Milvus still requires the dense field on every row. A unit vector is valid
+    for COSINE and is never queried while embedding.enabled is false.
+    """
+    return [1.0, *([0.0] * (dimensions - 1))]
+
+
 async def _projection_row(
-    embedder: Embedder,
+    embedder: Embedder | None,
+    content: SkillContentStore | None,
     source: VisibleSkill,
+    *,
+    dimensions: int | None = None,
 ) -> ProjectionRow:
     """Build one active row from a freshly read active pointer."""
     version = source.version
@@ -114,13 +134,31 @@ async def _projection_row(
     if not commit:
         raise ValueError("active skill has no content commit")
 
-    text = projection_text(name, source.skill.description)
-    vectors = await embedder.embed_documents([text])
-    if len(vectors) != 1:
-        raise ValueError("embedding provider returned the wrong document count")
-    embedding = list(vectors[0])
-    if not embedding:
-        raise ValueError("embedding provider returned an empty vector")
+    body = ""
+    if content is not None:
+        try:
+            body = strip_frontmatter(
+                await content.read_text(commit, version.skill_path)
+            )
+        except Exception as exc:  # noqa: BLE001 - metadata remains searchable
+            logger.warning(
+                "Could not read skill %s body for BM25 projection (%s)",
+                version.skill_id,
+                type(exc).__name__,
+            )
+
+    if embedder is None:
+        if dimensions is None or dimensions <= 0:
+            raise ValueError("dimensions are required when the embedder is disabled")
+        embedding = _placeholder_vector(int(dimensions))
+    else:
+        text = projection_text(name, source.skill.description)
+        vectors = await embedder.embed_documents([text])
+        if len(vectors) != 1:
+            raise ValueError("embedding provider returned the wrong document count")
+        embedding = list(vectors[0])
+        if not embedding:
+            raise ValueError("embedding provider returned an empty vector")
 
     return ProjectionRow(
         projection_key=_projection_key(source),
@@ -135,6 +173,7 @@ async def _projection_row(
         package_sha256=version.package_sha256,
         skill_md_sha256=version.skill_md_sha256,
         embedding=embedding,
+        content=projection_content(name, source.skill.description, body),
     )
 
 
@@ -163,8 +202,10 @@ async def _active_source(
 async def build_projection_row(
     store: SqlSkillStore,
     content: SkillContentStore,
-    embedder: Embedder,
+    embedder: Embedder | None,
     event: OutboxEvent,
+    *,
+    dimensions: int | None = None,
 ) -> ProjectionRow | None:
     """Return the row for a still-current upsert, or None when it is stale."""
     if event.op != "upsert_active":
@@ -172,7 +213,9 @@ async def build_projection_row(
     source = await _active_source(store, event)
     if source is None or not _matches_event(source, event):
         return None
-    row = await _projection_row(embedder, source)
+    row = await _projection_row(
+        embedder, content, source, dimensions=dimensions
+    )
     # Embedding can take long enough for a newer save to win.  Re-check the
     # authoritative pointer immediately before the caller writes to Milvus.
     if not _matches_event(await _active_source(store, event), event):
@@ -187,9 +230,10 @@ class SkillIndexOutboxWorker:
         self,
         store: SqlSkillStore,
         content: SkillContentStore,
-        embedder: Embedder,
+        embedder: Embedder | None,
         projection: SkillProjectionStore,
         *,
+        dimensions: int | None = None,
         poll_seconds: float = 2.0,
         repair_max_attempts: int = _DEFAULT_REPAIR_MAX_ATTEMPTS,
         retry_base_seconds: float = _DEFAULT_RETRY_BASE_SECONDS,
@@ -201,10 +245,15 @@ class SkillIndexOutboxWorker:
             raise ValueError("repair_max_attempts must be positive")
         if retry_base_seconds <= 0 or retry_cap_seconds <= 0:
             raise ValueError("retry delays must be positive")
+        if embedder is None and (dimensions is None or dimensions <= 0):
+            raise ValueError(
+                "dimensions are required when the embedding channel is disabled"
+            )
         self._store = store
         self._content = content
         self._embedder = embedder
         self._projection = projection
+        self._dimensions = None if dimensions is None else int(dimensions)
         self._poll_seconds = float(poll_seconds)
         self._max_attempts = int(repair_max_attempts)
         self._retry_base_seconds = float(retry_base_seconds)
@@ -259,7 +308,11 @@ class SkillIndexOutboxWorker:
                     await self._projection.delete_active(event.projection_key)
             elif event.op == "upsert_active":
                 row = await build_projection_row(
-                    self._store, self._content, self._embedder, event
+                    self._store,
+                    self._content,
+                    self._embedder,
+                    event,
+                    dimensions=self._dimensions,
                 )
                 if row is None:
                     logger.info(
@@ -346,7 +399,12 @@ class SkillIndexOutboxWorker:
                 break
             attempted += 1
             try:
-                row = await _projection_row(self._embedder, source)
+                row = await _projection_row(
+                    self._embedder,
+                    self._content,
+                    source,
+                    dimensions=self._dimensions,
+                )
                 await self._projection.upsert_active(row)
                 await self._store.mark_version_indexed(source.version.id)
                 repaired += 1

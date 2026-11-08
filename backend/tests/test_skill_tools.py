@@ -20,7 +20,7 @@ from agentkit.skills.search import (
 )
 from agentkit.skills.types import Skill, SkillCategory
 from agentkit.tools.builtin.load_skills import NOT_FOUND_MESSAGE, load_skills
-from agentkit.tools.builtin.search_skills import search_skills
+from agentkit.tools.builtin.search_skills import UNAVAILABLE_MESSAGE, search_skills
 from agentkit.tools.registry import get_available_tools
 from fakes.skill_tree import skills_config, write_skill
 
@@ -182,7 +182,7 @@ def test_load_skills_is_available_when_search_is_disabled(tmp_path) -> None:
     assert "search_skills" not in names
 
 
-def test_filesystem_search_uses_the_name_as_skill_id_and_loads_the_body(tmp_path) -> None:
+def test_filesystem_search_fails_closed_without_a_milvus_runtime(tmp_path) -> None:
     skills = skills_config(tmp_path)
     write_skill(tmp_path, "public", SKILL, description="多租户排查", body=BODY)
     _install(skills)
@@ -196,9 +196,10 @@ def test_filesystem_search_uses_the_name_as_skill_id_and_loads_the_body(tmp_path
             "runtime": _runtime(),
         },
     )
-    assert searched["skills"][0]["skill_id"] == SKILL
-    assert "body" not in searched["skills"][0]
+    assert searched["skills"] == []
+    assert searched["message"] == list(UNAVAILABLE_MESSAGE)
 
+    # load_skills is by id and still works without the search index.
     loaded = _invoke(load_skills, {"skill_id": SKILL, "runtime": _runtime()})
     assert loaded["skill"]["skill_id"] == SKILL
     assert loaded["skill"]["body"].startswith("# 排查")

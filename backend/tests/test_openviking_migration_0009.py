@@ -45,6 +45,10 @@ def test_0009_drops_legacy_tables_and_keeps_openviking_tables(tmp_path: Path) ->
         Base.metadata.create_all(conn)
         for name in LEGACY_CANONICAL_MEMORY_TABLES:
             conn.execute(text(f"CREATE TABLE {name} (id INTEGER)"))
+        # Simulate a deployment that already has the retired suggestion table.
+        conn.execute(
+            text("CREATE TABLE memory_profile_suggestions (suggestion_id VARCHAR(128))")
+        )
         conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
         conn.execute(
             text("INSERT INTO alembic_version (version_num) VALUES ('0008_openviking_memory')")
@@ -58,6 +62,7 @@ def test_0009_drops_legacy_tables_and_keeps_openviking_tables(tmp_path: Path) ->
 
     assert version == _head_revision()
     assert LEGACY_CANONICAL_MEMORY_TABLES.isdisjoint(names)
+    assert "memory_profile_suggestions" not in names
     assert {
         "memory_profile_documents",
         "memory_sync_state",

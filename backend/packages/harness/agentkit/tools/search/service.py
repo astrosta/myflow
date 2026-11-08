@@ -1,22 +1,25 @@
-"""Hybrid tool retrieval: Milvus recall, snapshot confirmation, rerank, BM25 fallback."""
+"""Hybrid tool retrieval: Milvus recall, snapshot confirmation, rerank.
+
+Both recall channels and the RRF fusion run in Milvus.  The process only embeds
+the query, confirms hits against the current tool snapshot, and optionally
+reranks the survivors; there is no in-process BM25 or RRF implementation.
+"""
 
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from agentkit.config.contextforge_config import ToolSearchConfig
 from agentkit.contextforge.catalog import ToolCatalogEntry
 from agentkit.contextforge.ownership import can_call
-from agentkit.retrieval.bm25 import Bm25Document, bm25_scores
-from agentkit.retrieval.tokenize import tokenize
 
 logger = logging.getLogger(__name__)
 
 VECTOR_UNAVAILABLE = "vector_unavailable"
+KEYWORD_UNAVAILABLE = "keyword_unavailable"
 RERANK_UNAVAILABLE = "rerank_unavailable"
 CATALOG_UNAVAILABLE = "catalog_unavailable"
 
@@ -42,7 +45,7 @@ class ToolSearchOutcome:
     candidates: int = 0
     reranked: bool = False
     warnings: tuple[str, ...] = ()
-    index_kind: str = "local_bm25"
+    index_kind: str = "unavailable"
 
 
 class ToolSearchService:
@@ -74,95 +77,101 @@ class ToolSearchService:
         ]
         if not query or not entries:
             return ToolSearchOutcome(channels=self._channels())
+        if self._index is None:
+            return ToolSearchOutcome(
+                channels=self._channels(),
+                warnings=(CATALOG_UNAVAILABLE,),
+                index_kind="unavailable",
+            )
+
         warnings: list[str] = []
         by_name = {entry.name: entry for entry in entries}
-
-        if self._index is not None and self._embedder is not None and self._config.embedding.enabled:
+        keyword_query = self._keyword_query(query, domain_keywords)
+        vector: list[float] | None = None
+        if self._embedder is not None and self._config.embedding.enabled:
             try:
-                vector = await self._embedder.embed_query(query)
-                if self._config.keyword.enabled and hasattr(self._index, "hybrid_search"):
-                    hits = await self._index.hybrid_search(
-                        vector=vector,
-                        query=query,
-                        limit=self._config.candidate_k,
-                    )
-                    channels = ("embedding", "keyword")
-                else:
-                    hits = await self._index.dense_search(
-                        vector=vector,
-                        limit=self._config.candidate_k,
-                    )
-                    channels = ("embedding",)
-                confirmed = [
-                    (by_name[hit.tool_name], float(hit.score))
-                    for hit in hits
-                    if hit.tool_name in by_name
-                ]
-                if confirmed:
-                    return await self._finish(
-                        confirmed,
-                        query=query,
-                        channels=channels,
-                        warnings=warnings,
-                        index_kind="milvus",
-                        normalize=True,
-                    )
-            except Exception as exc:  # noqa: BLE001 - local BM25 still answers
-                logger.warning("Tool vector search failed: %s", type(exc).__name__)
-                warnings.append(VECTOR_UNAVAILABLE)
-
-        return await self._local_bm25(
-            entries,
-            query=query,
-            domain_keywords=domain_keywords,
-            warnings=warnings,
-        )
-
-    async def _local_bm25(
-        self,
-        entries: Sequence[ToolCatalogEntry],
-        *,
-        query: str,
-        domain_keywords: Sequence[str],
-        warnings: list[str],
-    ) -> ToolSearchOutcome:
-        if not self._config.keyword.enabled:
-            return ToolSearchOutcome(warnings=tuple(warnings), index_kind="unavailable")
-        query_terms: Counter[str] = Counter(tokenize(query))
-        for keyword in domain_keywords:
-            for token in tokenize(keyword):
-                query_terms[token] += 2.0
-        documents: list[Bm25Document] = []
-        for entry in entries:
-            tokens = tokenize(entry.content)
-            documents.append(
-                Bm25Document(
-                    key=entry.name,
-                    counts=Counter(tokens),
-                    length=len(tokens),
-                    head_tokens=frozenset(tokenize(f"{entry.name} {entry.display_name}")),
+                vector = list(await self._embedder.embed_query(query))
+            except Exception as exc:  # noqa: BLE001 - Milvus BM25 can still answer
+                logger.warning(
+                    "Tool query embedding failed (%s); using Milvus BM25",
+                    type(exc).__name__,
                 )
+                warnings.append(VECTOR_UNAVAILABLE)
+        if self._config.embedding.enabled and vector is None and keyword_query:
+            warnings.append(VECTOR_UNAVAILABLE)
+        if not vector and not keyword_query:
+            warnings.append(
+                VECTOR_UNAVAILABLE
+                if self._config.embedding.enabled
+                else KEYWORD_UNAVAILABLE
             )
-        scores = bm25_scores(
-            documents,
-            query_terms=query_terms,
-            k1=self._config.keyword.bm25_k1,
-            b=self._config.keyword.bm25_b,
-            name_weight=3.0,
-        )
-        by_name = {entry.name: entry for entry in entries}
-        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
-        ranked = ranked[: self._config.candidate_k]
-        confirmed = [(by_name[name], score) for name, score in ranked if name in by_name]
+            return ToolSearchOutcome(
+                channels=self._channels(),
+                warnings=tuple(dict.fromkeys(warnings)),
+                index_kind="unavailable",
+            )
+
+        if vector is not None and keyword_query:
+            channels = ("embedding", "keyword")
+        elif vector is not None:
+            channels = ("embedding",)
+        else:
+            channels = ("keyword",)
+
+        try:
+            if vector is not None and keyword_query:
+                hits = await self._index.hybrid_search(
+                    vector=vector,
+                    query=keyword_query,
+                    limit=self._config.candidate_k,
+                )
+            elif vector is not None:
+                hits = await self._index.dense_search(
+                    vector=vector,
+                    limit=self._config.candidate_k,
+                )
+            else:
+                hits = await self._index.keyword_search(
+                    query=keyword_query,
+                    limit=self._config.candidate_k,
+                )
+        except Exception as exc:  # noqa: BLE001 - no local BM25 fallback
+            logger.warning(
+                "Tool Milvus search failed (%s); returning no local hits",
+                type(exc).__name__,
+            )
+            warnings.append(
+                KEYWORD_UNAVAILABLE if channels == ("keyword",) else VECTOR_UNAVAILABLE
+            )
+            return ToolSearchOutcome(
+                channels=channels,
+                warnings=tuple(dict.fromkeys(warnings)),
+                index_kind="milvus",
+            )
+
+        confirmed: list[tuple[ToolCatalogEntry, float]] = []
+        seen: set[str] = set()
+        for hit in hits:
+            entry = by_name.get(hit.tool_name)
+            if entry is None or hit.tool_name in seen:
+                continue
+            score = float(hit.score)
+            if self._config.min_score is not None and score < self._config.min_score:
+                continue
+            confirmed.append((entry, score))
+            seen.add(hit.tool_name)
         if not confirmed:
-            return ToolSearchOutcome(warnings=tuple(dict.fromkeys(warnings)), index_kind="local_bm25")
+            return ToolSearchOutcome(
+                channels=channels,
+                warnings=tuple(dict.fromkeys(warnings)),
+                index_kind="milvus",
+            )
         return await self._finish(
             confirmed,
             query=query,
-            channels=("keyword",),
+            channels=channels,
             warnings=warnings,
-            index_kind="local_bm25",
-            normalize=False,
+            index_kind="milvus",
         )
 
     async def _finish(
@@ -173,19 +182,8 @@ class ToolSearchService:
         channels: Sequence[str],
         warnings: list[str],
         index_kind: str,
-        normalize: bool,
     ) -> ToolSearchOutcome:
         ordered = list(confirmed)
-        if normalize:
-            ceiling = max((score for _, score in ordered), default=0.0)
-            if ceiling > 0:
-                ordered = [(entry, score / ceiling) for entry, score in ordered]
-            if self._config.min_score is not None:
-                ordered = [
-                    (entry, score)
-                    for entry, score in ordered
-                    if score >= self._config.min_score
-                ]
         candidates = len(ordered)
         reranked = False
         if self._reranker is not None and len(ordered) >= 2:
@@ -220,6 +218,13 @@ class ToolSearchService:
             warnings=tuple(dict.fromkeys(warnings)),
             index_kind=index_kind,
         )
+
+    def _keyword_query(self, query: str, domain_keywords: Sequence[str]) -> str:
+        """Build the BM25 text; tokenization and scoring stay in Milvus."""
+        if not self._config.keyword.enabled:
+            return ""
+        parts = [query, *(item.strip() for item in domain_keywords)]
+        return " ".join(dict.fromkeys(item for item in parts if item))
 
     def _channels(self) -> tuple[str, ...]:
         channels: list[str] = []
@@ -257,6 +262,7 @@ def reset_tool_search_runtime() -> None:
 
 __all__ = [
     "CATALOG_UNAVAILABLE",
+    "KEYWORD_UNAVAILABLE",
     "RERANK_UNAVAILABLE",
     "VECTOR_UNAVAILABLE",
     "ToolSearchHit",

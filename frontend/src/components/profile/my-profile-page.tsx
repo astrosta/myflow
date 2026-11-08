@@ -6,20 +6,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  acceptProfileSuggestion,
   clearProfile,
-  dismissProfileSuggestion,
   getOnboarding,
   getProfile,
   getProfileSchema,
-  listProfileSuggestions,
   MemoryApiError,
   patchProfile,
   updateOnboarding,
   type OnboardingAction,
   type ProfileFieldSpec,
   type ProfileFieldView,
-  type ProfileSuggestion,
   type ProfileView,
 } from "@/core/api/memory";
 
@@ -31,11 +27,6 @@ function readableError(error: unknown): string {
     return error.detail || "请求失败（HTTP " + error.status + "）";
   }
   return error instanceof Error ? error.message : String(error);
-}
-
-function formatProfileValue(value: unknown): string {
-  if (Array.isArray(value)) return value.map((item) => String(item)).join("、");
-  return String(value ?? "");
 }
 
 function draftValueFromField(value: unknown): string {
@@ -120,12 +111,6 @@ export function MyProfilePage() {
     queryFn: getOnboarding,
     enabled: openviking,
   });
-  const suggestions = useQuery({
-    queryKey: ["memory", "suggestions"],
-    queryFn: listProfileSuggestions,
-    enabled: openviking,
-  });
-
   // 草稿按画像版本（etag/revision）打戳：保存成功后 token 变化，草稿自动回落到
   // 服务端返回的新值，不需要在 effect 里 setState（也避免覆盖用户的并发输入）。
   const [form, setForm] = useState<{ token: string; draft: Record<string, string> } | null>(
@@ -134,10 +119,6 @@ export function MyProfilePage() {
   const [error, setError] = useState<string | null>(null);
 
   const specs = useMemo(() => schemaQuery.data?.fields ?? [], [schemaQuery.data]);
-  const specByPath = useMemo(
-    () => Object.fromEntries(specs.map((spec) => [spec.path, spec])),
-    [specs],
-  );
   const profile = profileQuery.data;
   const profileToken = profile ? profile.etag ?? String(profile.revision) : "";
   const draft = useMemo(
@@ -159,7 +140,6 @@ export function MyProfilePage() {
       queryClient.setQueryData(["memory", "profile"], next);
       setError(null);
       void queryClient.invalidateQueries({ queryKey: ["memory", "onboarding"] });
-      void queryClient.invalidateQueries({ queryKey: ["memory", "suggestions"] });
     },
     onError: (cause) => setError(readableError(cause)),
   });
@@ -169,7 +149,6 @@ export function MyProfilePage() {
     onSuccess: (next: ProfileView) => {
       queryClient.setQueryData(["memory", "profile"], next);
       setError(null);
-      void queryClient.invalidateQueries({ queryKey: ["memory", "suggestions"] });
     },
     onError: (cause) => setError(readableError(cause)),
   });
@@ -178,28 +157,6 @@ export function MyProfilePage() {
     mutationFn: (action: OnboardingAction) => updateOnboarding(action),
     onSuccess: (next) => {
       queryClient.setQueryData(["memory", "onboarding"], next);
-      setError(null);
-    },
-    onError: (cause) => setError(readableError(cause)),
-  });
-
-  const acceptSuggestion = useMutation({
-    mutationFn: (suggestion: ProfileSuggestion) =>
-      acceptProfileSuggestion(suggestion.id, profileQuery.data?.etag),
-    onSuccess: (result) => {
-      queryClient.setQueryData(["memory", "profile"], result.profile);
-      void queryClient.invalidateQueries({ queryKey: ["memory", "suggestions"] });
-      void queryClient.invalidateQueries({ queryKey: ["memory", "onboarding"] });
-      setError(null);
-    },
-    onError: (cause) => setError(readableError(cause)),
-  });
-
-  const dismissSuggestion = useMutation({
-    mutationFn: (suggestion: ProfileSuggestion) =>
-      dismissProfileSuggestion(suggestion.id, profileQuery.data?.etag),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["memory", "suggestions"] });
       setError(null);
     },
     onError: (cause) => setError(readableError(cause)),
@@ -226,7 +183,6 @@ export function MyProfilePage() {
 
   const changes = changedFields(specs, draft, profile?.fields ?? {});
   const dirty = Object.keys(changes).length > 0;
-  const suggestionItems = suggestions.data?.items ?? [];
 
   const resetDraft = () => {
     setForm(null);
@@ -280,57 +236,6 @@ export function MyProfilePage() {
                 不再提醒
               </Button>
             </div>
-          </section>
-        ) : null}
-
-        {suggestionItems.length > 0 ? (
-          <section className="mt-5" aria-label="画像建议">
-            <div className="flex items-baseline justify-between gap-3">
-              <h2 className="text-xs font-medium text-neutral-500">发现的画像信息</h2>
-              <p className="text-[11px] text-neutral-400">确认后才会写入画像</p>
-            </div>
-            <ul className="mt-3 space-y-2">
-              {suggestionItems.map((suggestion) => (
-                <li
-                  className="rounded-lg border border-amber-200 bg-amber-50/40 p-4"
-                  key={suggestion.id}
-                >
-                  <p className="text-xs font-medium text-neutral-500">
-                    {specByPath[suggestion.field_path]?.label ?? suggestion.field_path}
-                  </p>
-                  <p className="mt-1 text-sm text-neutral-900">
-                    {formatProfileValue(suggestion.value)}
-                  </p>
-                  <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">
-                    {suggestion.reason} · 置信度 {Math.round(suggestion.confidence * 100)}%
-                  </p>
-                  {suggestion.evidence_quote ? (
-                    <blockquote className="mt-2 line-clamp-2 border-l-2 border-amber-200 pl-3 text-xs text-neutral-500">
-                      {suggestion.evidence_quote}
-                    </blockquote>
-                  ) : null}
-                  <div className="mt-3 flex gap-2">
-                    <Button
-                      disabled={acceptSuggestion.isPending || dismissSuggestion.isPending}
-                      onClick={() => acceptSuggestion.mutate(suggestion)}
-                      size="sm"
-                      type="button"
-                      variant="primary"
-                    >
-                      接受
-                    </Button>
-                    <Button
-                      disabled={acceptSuggestion.isPending || dismissSuggestion.isPending}
-                      onClick={() => dismissSuggestion.mutate(suggestion)}
-                      size="sm"
-                      type="button"
-                    >
-                      忽略
-                    </Button>
-                  </div>
-                </li>
-              ))}
-            </ul>
           </section>
         ) : null}
 

@@ -1,4 +1,4 @@
-"""Schema registration for the five OpenViking memory tables."""
+"""Schema registration for the OpenViking memory tables."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ def test_openviking_tables_are_registered() -> None:
         "memory_profile_documents",
         "memory_sync_state",
         "memory_profile_onboarding",
-        "memory_profile_suggestions",
         "memory_capture_dedup",
     } <= names
+    assert "memory_profile_suggestions" not in names
 
 
 def test_dedup_state_check_exists() -> None:
@@ -22,9 +22,3 @@ def test_dedup_state_check_exists() -> None:
     checks = [str(c.sqltext) for c in table.constraints if hasattr(c, "sqltext")]
     assert any("state" in sql for sql in checks)
     assert any("appended_at" in sql for sql in checks)
-
-
-def test_suggestion_pending_unique_index() -> None:
-    table = Base.metadata.tables["memory_profile_suggestions"]
-    index_names = {index.name for index in table.indexes}
-    assert "uq_pending_suggestion" in index_names
