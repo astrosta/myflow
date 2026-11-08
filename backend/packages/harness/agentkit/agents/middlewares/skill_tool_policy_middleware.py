@@ -48,9 +48,9 @@ logger = logging.getLogger(__name__)
 
 POLICY_HINT = "请改用其他工具，或者请用户激活一个声明了该工具的技能。"
 
-#: The model-facing ContextForge inner names.  The outer tools are framework
-#: tools, but the names inside their arguments/results are business tools and
-#: must obey the active skill just like a directly declared tool would.
+#: The model-facing MCP inner names (mcp__<server>__<tool>).  The outer tools are
+#: framework tools, but the names inside their arguments/results are business
+#: tools and must obey the active skill just like a directly declared tool would.
 TOOL_SEARCH_NAME = "tool_search"
 TOOL_EXECUTE_NAME = "tool_execute"
 INNER_CALL_NAME_KEYS = ("tool_name", "call_name")
@@ -59,8 +59,8 @@ INNER_CALL_NAME_KEYS = ("tool_name", "call_name")
 #: card list itself is empty; this replaces the "call tool_execute" hint so the
 #: model is not told to execute something that is no longer present.
 FILTERED_EMPTY_MESSAGE = (
-    "当前激活的技能策略不允许本次检索返回的任何 ContextForge 工具。"
-    "请改用其他工具，或者请用户激活一个声明了目标 cf__ 工具的技能。"
+    "当前激活的技能策略不允许本次检索返回的任何 MCP 工具。"
+    "请改用其他工具，或者请用户激活一个声明了目标 mcp__ 工具的技能。"
 )
 
 
@@ -319,7 +319,7 @@ def _tool_call_name(request: ToolCallRequest) -> str:
 
 
 def _inner_tool_name(request: ToolCallRequest) -> str:
-    """tool_execute's model-facing inner name (the cf__ call name)."""
+    """tool_execute's model-facing inner name (the mcp__ call name)."""
     tool_call = getattr(request, "tool_call", None) or {}
     args = tool_call.get("args") if isinstance(tool_call, Mapping) else None
     if not isinstance(args, Mapping):
@@ -397,7 +397,7 @@ def _inner_policy_error_tool_message(
     inner_name: str,
     decision: ToolPolicyDecision | None,
 ) -> ToolMessage:
-    """Refuse a tool_execute whose inner cf__ name the active skill may not run."""
+    """Refuse a tool_execute whose inner mcp__ name the active skill may not run."""
     tool_call = getattr(request, "tool_call", None) or {}
     name = _tool_call_name(request) or TOOL_EXECUTE_NAME
     tool_call_id = (
@@ -408,12 +408,12 @@ def _inner_policy_error_tool_message(
     inner = inner_name or "<missing>"
     if decision is None:
         content = (
-            f"错误：当前激活的技能策略决策缺失，已拒绝执行 ContextForge 工具 '{inner}'"
+            f"错误：当前激活的技能策略决策缺失，已拒绝执行 MCP 工具 '{inner}'"
             f"（fail closed）。{POLICY_HINT}"
         )
     else:
         content = (
-            f"错误：当前激活的技能下不可执行 ContextForge 工具 '{inner}'"
+            f"错误：当前激活的技能下不可执行 MCP 工具 '{inner}'"
             f"（策略模式：{decision.mode}）。{POLICY_HINT}"
         )
     message = ToolMessage(

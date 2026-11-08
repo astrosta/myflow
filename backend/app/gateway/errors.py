@@ -25,7 +25,10 @@ from agentkit.mcp.errors import (
     McpServerConfigurationError,
     McpServerConflict,
     McpServerNotFound,
+    McpServerTimeout,
+    McpServerUnavailable,
     McpServerValidationError,
+    McpToolError,
 )
 from agentkit.persistence.base import InvalidCursor
 from agentkit.persistence.json_compat import InvalidMetadataFilterError
@@ -296,6 +299,11 @@ def install_error_handlers(app: FastAPI) -> None:
         McpServerNotFound,
         McpServerConflict,
         McpServerValidationError,
+        # 一个 server 的传输/工具失败也是编码错误：客户端拿到 502/504 + 稳定 code，
+        # 不用从 detail 里猜是哪个 server 出了什么问题。
+        McpServerUnavailable,
+        McpServerTimeout,
+        McpToolError,
         SkillNotFound,
         SkillRuntimeUnavailable,
         SkillScannerUnavailable,

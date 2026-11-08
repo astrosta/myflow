@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from langchain_core.tools import BaseTool
 
@@ -26,10 +27,12 @@ from agentkit.tools.builtin.tool_search import tool_search
 
 logger = logging.getLogger(__name__)
 
-#: The only external-tool builtins.  ContextForge tools are never bound as
-#: LangChain tool objects: tool_search hands the model a card, tool_execute runs
-#: it (2026-11-07 design §10).
-_CONTEXTFORGE_BUILTIN_TOOL_NAMES = frozenset({"tool_search", "tool_execute"})
+#: The only external-tool builtins.  An MCP tool is never bound as a LangChain
+#: tool object: tool_search hands the model a card, tool_execute runs it
+#: (2026-11-07 design §10).  They exist only when `mcp_servers.enabled` - a
+#: process with no MCP catalog has nothing to discover and nothing to execute, so
+#: advertising the two tools would cost the model a round trip to be told so.
+_MCP_BUILTIN_TOOL_NAMES = frozenset({"tool_search", "tool_execute"})
 
 _BASH_TOOL_NAMES = frozenset({"bash"})
 _HOST_BASH_DISABLED = (
@@ -65,10 +68,10 @@ def get_available_tools(
 ) -> list[BaseTool]:
     """Config tools, then builtins, then MCP. Duplicate ``tool.name`` values are skipped.
 
-    No ContextForge tool object is ever bound: the catalog is reached through the
-    two builtins, and ownership is enforced by tool_execute's owner-scoped store
-    read, not by a per-user tool table.  ``user_id`` stays in the signature for
-    the authorization hook (M9).
+    No MCP tool object is ever bound: the catalog is reached through the two
+    builtins, and ownership is enforced by tool_execute's owner-scoped store read,
+    not by a per-user tool table.  ``user_id`` stays in the signature for the
+    authorization hook (M9).
     """
     del user_id
     resolved = app_config if app_config is not None else get_app_config()
@@ -157,9 +160,8 @@ def _apply_capability_filters(
             continue
         if tool.name == "search_skills" and not skill_search_enabled:
             continue
-        if (
-            tool.name in _CONTEXTFORGE_BUILTIN_TOOL_NAMES
-            and not getattr(app_config.contextforge, "enabled", False)
+        if tool.name in _MCP_BUILTIN_TOOL_NAMES and not _mcp_servers_enabled(
+            app_config
         ):
             continue
         if tool.name == "view_image" and not vision:
@@ -170,6 +172,16 @@ def _apply_capability_filters(
     if hid_bash:
         logger.warning(_HOST_BASH_DISABLED)
     return selected
+
+
+def _mcp_servers_enabled(app_config: Any) -> bool:
+    """Whether this deployment has an MCP tool catalog at all.
+
+    Read defensively: several tests hand in a partially-built config, and a
+    missing section must read as "no MCP servers", which is also the config
+    default.
+    """
+    return bool(getattr(getattr(app_config, "mcp_servers", None), "enabled", False))
 
 
 def _is_bash_tool(name: str) -> bool:

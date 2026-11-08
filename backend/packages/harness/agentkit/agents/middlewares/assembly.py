@@ -121,7 +121,7 @@ def build_runtime_middlewares(
     # PII 工具参数还原必须在 ToolErrorHandling 之内：无法解析的 handle 会被
     # 错误处理收成可恢复的 ToolMessage，而不是把整轮打崩。
     chain.append(PIIMiddleware(app_config=app_config))
-    # 这里不再有 ContextForge 的 ownership / refresh-retry 中间件：catalog 不再
+    # 这里不再有 MCP 目录的 ownership / refresh-retry 中间件：catalog 不再
     # 绑成工具对象，owner 过滤在 tool_execute 的 DB 查询里，not-found 与
     # invalid-args 的刷新重试由 tool_execute 自己按错误分类完成（design 9.1）。
     return chain

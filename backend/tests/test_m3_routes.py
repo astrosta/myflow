@@ -58,6 +58,18 @@ EXPECTED_ROUTES = {
     ("DELETE", "/api/tools/{tool_id}"),
     ("POST", "/api/tools/{tool_id}/claim"),
     ("POST", "/api/tools/{tool_id}/state"),
+    # rev.10：用户自己的 MCP server（/api/mcp-servers）。静态 /status、/reindex
+    # 先于 /{server_id} 注册；server 是 user-private，路由只认调用者的 owner。
+    ("GET", "/api/mcp-servers"),
+    ("POST", "/api/mcp-servers"),
+    ("GET", "/api/mcp-servers/status"),
+    ("POST", "/api/mcp-servers/reindex"),
+    ("GET", "/api/mcp-servers/{server_id}"),
+    ("PUT", "/api/mcp-servers/{server_id}"),
+    ("DELETE", "/api/mcp-servers/{server_id}"),
+    ("POST", "/api/mcp-servers/{server_id}/state"),
+    ("POST", "/api/mcp-servers/{server_id}/refresh"),
+    ("GET", "/api/mcp-servers/{server_id}/tools"),
     # 技能目录（没有 PUT /config：整份替换属"创建"，M7 不注册）
     ("GET", "/api/skills"),
     ("POST", "/api/skills/reload"),

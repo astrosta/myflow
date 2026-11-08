@@ -24,6 +24,7 @@ from agentkit.agents.middlewares.retrieval_scope_middleware import (
 )
 from agentkit.agents.thread_state import ThreadState, merge_retrieved_tool_names
 from agentkit.config import AppConfig, ModelConfig
+from agentkit.mcp.crypto import HeaderCipher
 from agentkit.tools import get_available_tools
 from agentkit.tools.builtin.tool_execute import TOOL_NAME as TOOL_EXECUTE_TOOL_NAME
 from agentkit.tools.builtin.tool_search import TOOL_NAME as TOOL_SEARCH_TOOL_NAME
@@ -154,22 +155,27 @@ def test_assemble_agent_reads_only_assembly_input_keys(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _contextforge_app(*, enabled: bool = True) -> AppConfig:
-    """A ContextForge config that satisfies the search validators."""
+def _mcp_app(*, enabled: bool = True) -> AppConfig:
+    """An MCP-servers config that satisfies the tool_search prerequisite validators.
+
+    ``mcp_servers.enabled`` is the one switch that puts tool_search and
+    tool_execute in the tool table (and the external-tools prompt section), so the
+    fixture carries a Fernet key and a Milvus-backed search block.
+    """
     return AppConfig(
-        contextforge={
+        mcp_servers={
             "enabled": enabled,
-            "base_url": "http://contextforge.local",
-            "search": {
-                "vector_store": {"uri": "http://milvus.local:19530"},
-                "embedding": {"base_url": "http://embed.local", "model": "bge-m3"},
-            },
-        }
+            "encryption_key": HeaderCipher.generate_key(),
+        },
+        tool_search={
+            "vector_store": {"uri": "http://milvus.local:19530"},
+            "embedding": {"base_url": "http://embed.local", "model": "bge-m3"},
+        },
     )
 
 
-def test_tool_search_and_tool_execute_are_bound_instead_of_contextforge_tools() -> None:
-    tools = get_available_tools(app_config=_contextforge_app(), user_id="u1")
+def test_tool_search_and_tool_execute_are_bound_instead_of_mcp_tools() -> None:
+    tools = get_available_tools(app_config=_mcp_app(), user_id="u1")
     names = [tool.name for tool in tools]
 
     assert TOOL_SEARCH_TOOL_NAME in names
@@ -178,7 +184,7 @@ def test_tool_search_and_tool_execute_are_bound_instead_of_contextforge_tools() 
     assert {"load_skills", "read_file"} <= set(names)
     # The catalog cannot reach the table at all any more: the loader, the snapshot
     # cache and the eager/deferred snapshot tool are gone, so nothing in the
-    # builtin table can be a bound ContextForge tool.
+    # builtin table can be a bound MCP tool.
     import agentkit.tools.registry as registry
 
     builtin_names = {tool.name for _, tool in registry._BUILTIN_TOOLS}  # noqa: SLF001
@@ -186,10 +192,10 @@ def test_tool_search_and_tool_execute_are_bound_instead_of_contextforge_tools() 
     assert "search_tools" not in builtin_names
 
 
-def test_the_two_contextforge_builtins_follow_the_contextforge_switch() -> None:
+def test_the_two_mcp_builtins_follow_the_mcp_servers_switch() -> None:
     names = {
         tool.name
-        for tool in get_available_tools(app_config=_contextforge_app(enabled=False))
+        for tool in get_available_tools(app_config=_mcp_app(enabled=False))
     }
 
     assert TOOL_SEARCH_TOOL_NAME not in names
@@ -204,7 +210,7 @@ def test_registry_no_longer_decides_whether_the_catalog_is_deferred() -> None:
 
 
 def test_the_prompt_teaches_tool_search_and_tool_execute() -> None:
-    prompt = apply_prompt_template(app_config=_contextforge_app())
+    prompt = apply_prompt_template(app_config=_mcp_app())
 
     assert "## External tools" in prompt
     assert TOOL_SEARCH_TOOL_NAME in prompt
@@ -216,8 +222,8 @@ def test_the_prompt_teaches_tool_search_and_tool_execute() -> None:
     assert "search_tools" not in prompt
 
 
-def test_the_prompt_omits_the_external_tools_section_when_contextforge_is_off() -> None:
-    prompt = apply_prompt_template(app_config=_contextforge_app(enabled=False))
+def test_the_prompt_omits_the_external_tools_section_when_mcp_servers_are_off() -> None:
+    prompt = apply_prompt_template(app_config=_mcp_app(enabled=False))
 
     assert "## External tools" not in prompt
 
@@ -233,7 +239,7 @@ def test_the_deleted_contextforge_middlewares_cannot_be_imported() -> None:
 
 
 def test_the_lead_chain_resets_retrieval_scope_and_drops_the_tool_middlewares() -> None:
-    chain = build_middlewares({}, "flash", app_config=_contextforge_app())
+    chain = build_middlewares({}, "flash", app_config=_mcp_app())
     registered = {type(middleware).__name__ for middleware in chain}
 
     assert "RetrievalScopeMiddleware" in registered
@@ -322,7 +328,7 @@ def test_a_subagent_never_sees_the_retrieval_tools_in_its_schema() -> None:
 
 
 def test_the_subagent_chain_registers_the_strip() -> None:
-    chain = build_subagent_runtime_middlewares(_contextforge_app())
+    chain = build_subagent_runtime_middlewares(_mcp_app())
 
     assert any(
         isinstance(middleware, SubagentRetrievalToolStripMiddleware)
