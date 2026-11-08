@@ -1370,3 +1370,39 @@ async def test_a_later_pass_that_fixes_the_index_clears_the_degradation(
         assert (await runtime.status())["index"] == "ready"
     finally:
         await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_server_disabled_during_a_pass_stays_disabled(stores: Any) -> None:
+    """A concurrent disable wins over the pass's snapshot.
+
+    The pass read enabled=True before the sync; the user switched the server off
+    while it was in flight.  Stamping the pre-pass copy would flip the row back to
+    active/reachable and silently undo a management write, so the stamp reads the
+    rows *after* the pass and leaves a disabled row exactly as the write left it.
+    """
+    server_store, tool_store = stores
+    # Starts enabled but not yet reachable, so a wrong stamp would show up as
+    # active/reachable=True instead of being hidden by the fixture itself.
+    server = await _server(
+        server_store, server_id="s1", name="anysearch", reachable=False
+    )
+    sync = FakeSync()
+    sync.gate = asyncio.Event()
+    runtime = _runtime(
+        server_store, tool_store, sync=sync, daily_delay=lambda: 3600.0
+    )
+
+    pass_task = asyncio.create_task(runtime.refresh_now("manual"))
+    await asyncio.wait_for(sync.started.wait(), timeout=2)
+    disabled = await server_store.set_enabled(server.id, OWNER, False)
+    assert disabled is not None and disabled.status == "disabled"
+    sync.gate.set()
+    await asyncio.wait_for(pass_task, timeout=5)
+
+    stored = await server_store.get(server.id, OWNER)
+    assert stored is not None
+    assert (stored.status, stored.reachable) == ("disabled", False), (
+        "the disable happened during the pass and must survive it"
+    )
+    assert stored.last_tools_sync_at is None

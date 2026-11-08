@@ -437,10 +437,12 @@ class McpToolRuntime:
                 # index is still broken: retry it here, so the flag can only be
                 # cleared by a check that actually succeeded.
                 await self._ensure_index()
-            # The rows this pass is responsible for, read *before* the sync walks
-            # them: a server created while the pass runs was never contacted by it,
-            # so it must not be stamped from this pass's result.
-            servers = await self._server_rows()
+            # Which servers this pass is responsible for, read *before* the sync
+            # walks them: a server created while the pass runs was never contacted
+            # by it, so it must not be stamped from this pass's result.  Only the
+            # ids are kept - the stamp itself re-reads the rows afterwards, because
+            # their enabled flag may have changed while the pass was in flight.
+            walked = {row.id for row in await self._server_rows()}
             aborted = False
             try:
                 stats = await self.sync.sync(reason, full=full)
@@ -455,7 +457,7 @@ class McpToolRuntime:
                     "MCP tool sync (%s) raised %s", reason, type(exc).__name__
                 )
             if not aborted:
-                await self._stamp_servers(stats, servers)
+                await self._stamp_servers(stats, walked)
             self._record(reason, stats, started)
             logger.info(
                 "MCP tool sync (%s) done: %d servers, %d failed, %d tools",
@@ -527,25 +529,37 @@ class McpToolRuntime:
             return []
 
     async def _stamp_servers(
-        self, stats: McpSyncStats, servers: list[McpServerRecord]
+        self, stats: McpSyncStats, walked_ids: set[str]
     ) -> None:
         """Write each server's status from the pass that just ran.
 
-        Success is derived, not reported: the pass walked every row it snapshotted,
-        so any enabled server in that snapshot it did not name as failed was
-        contacted and answered.
+        Two rules, and they are about two different races around one snapshot:
 
-        `servers` is the snapshot the pass was responsible for, taken before the
-        sync ran.  A server created *during* the pass is deliberately absent from
-        it: nothing contacted that server, so stamping it "active" would publish a
-        row that was never verified (its own create-triggered pass stamps it).
+        * `walked_ids` is what the pass was responsible for, read before the sync
+          ran.  A server created *during* the pass is absent from it, so it is not
+          stamped: nothing contacted it, and claiming "active" would publish a row
+          that was never verified (its own create-triggered pass stamps it);
+        * the rows themselves are read **after** the pass.  A server switched off
+          while the pass was in flight is `enabled=False` by then, and the disable
+          must win: stamping the pre-pass copy would flip a disabled server back to
+          `active`/reachable and undo a management write.  Any row that is not
+          enabled now is left exactly as the write left it.
+
+        Success is derived, not reported: every enabled walked server the pass did
+        not name as failed was contacted and answered.
         """
         failed = {item.server_id: item.error for item in stats.failed_servers}
         stamp = _utc_now()
-        for server in servers:
+        # Fresh read: the pass may have taken a while, and the user's switch is
+        # newer than the snapshot the pass used.
+        for server in await self._server_rows():
+            if server.id not in walked_ids:
+                # Created during the pass; nothing contacted it.
+                continue
             error = failed.get(server.id)
-            if error is None and not server.enabled:
-                # Nothing contacted this server; its "disabled" status stands.
+            if not server.enabled:
+                # Switched off - before or during the pass - so the disable stands:
+                # nothing contacted this server and nothing may revive it.
                 continue
             try:
                 if error is None:
