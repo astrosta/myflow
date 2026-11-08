@@ -13,7 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agentkit.knowledge.config import EmbeddingConfig, MilvusConfig, RerankConfig
 
-TOOLS_COLLECTION = "myflow_tools_catalog"
+#: The one Milvus collection that holds the derived tool documents.  The
+#: authoritative catalog is the contextforge_tools table, so this collection is a
+#: rebuildable projection and never shares the knowledge or skills collections.
+TOOL_COLLECTION = "myflow_contextforge_tools"
 
 
 class ContextForgeSyncConfig(BaseModel):
@@ -23,11 +26,36 @@ class ContextForgeSyncConfig(BaseModel):
 
     admin_refresh_async: bool = True
     startup_sync: bool = True
+    #: Local wall-clock time of the daily full tools/list.  Single worker, so a
+    #: plain process task is enough; jitter only spreads restarts apart.
+    daily_at: str = "00:00"
+    #: "local" means the gateway host zone; anything else is an IANA zone name.
+    timezone: str = "local"
+    daily_jitter_seconds: int = Field(default=60, ge=0, le=3600)
     sync_timeout_seconds: float = Field(default=60.0, gt=0)
     cache_ttl_seconds: int = Field(default=60, ge=5)
     retry_on_tool_error: bool = True
     tool_error_refresh_timeout_seconds: float = Field(default=10.0, gt=0)
     gc_on_manual_reindex: bool = True
+
+    @field_validator("daily_at")
+    @classmethod
+    def _daily_at_shape(cls, value: str) -> str:
+        """Fail at load time, not at 23:59 on the first night."""
+        from agentkit.contextforge.daily import parse_daily_at
+
+        text = str(value or "").strip()
+        parse_daily_at(text)
+        return text
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_shape(cls, value: str) -> str:
+        from agentkit.contextforge.daily import resolve_timezone
+
+        text = str(value or "").strip() or "local"
+        resolve_timezone(text)
+        return text
 
 
 class AdminEventsConfig(BaseModel):
@@ -76,24 +104,24 @@ class ToolVectorStoreConfig(MilvusConfig):
     """One collection in the existing Milvus instance."""
 
     collection: str = Field(
-        default=TOOLS_COLLECTION,
+        default=TOOL_COLLECTION,
         description="Tool catalog collection; never the knowledge or skills collection.",
     )
 
     @field_validator("collection")
     @classmethod
     def _pin_tools_collection(cls, value: str) -> str:
-        if value != TOOLS_COLLECTION:
+        if value != TOOL_COLLECTION:
             raise ValueError(
                 "contextforge.search.vector_store.collection must be "
-                f"{TOOLS_COLLECTION!r}: tool documents never share the knowledge "
+                f"{TOOL_COLLECTION!r}: tool documents never share the knowledge "
                 "or skills collection."
             )
-        return TOOLS_COLLECTION
+        return TOOL_COLLECTION
 
 
 class ToolSearchConfig(BaseModel):
-    """search_tools retrieval policy."""
+    """tool_search retrieval and output-budget policy."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -116,7 +144,17 @@ class ToolSearchConfig(BaseModel):
     )
     max_document_chars: int = Field(default=4000, ge=200, le=100000)
     max_description_chars: int = Field(default=500, ge=20, le=10000)
-    max_result_chars: int = Field(default=6000, ge=200, le=100000)
+    #: One tool card's schema budget.  5 x 3000 stays inside max_result_chars,
+    #: so a full five-card answer never has to be cut for a single fat schema.
+    max_schema_chars: int = Field(default=3000, ge=200, le=100000)
+    #: The whole tool_search ToolMessage: five cards plus their metadata.
+    max_result_chars: int = Field(default=16000, ge=200, le=100000)
+    #: tool_execute refuses a call_name this run did not retrieve.  The design
+    #: default is on; turning it off is a deliberate loosening of the gate.
+    require_retrieved: bool = True
+    #: How many call names one run may hold callable.  The design caps it at five
+    #: so a retrieved set stays a shortlist, never a second tool table.
+    max_retrieved_tools: int = Field(default=5, ge=1, le=5)
     keyword: ToolKeywordConfig = Field(default_factory=ToolKeywordConfig)
     embedding: ToolEmbeddingConfig = Field(default_factory=ToolEmbeddingConfig)
     rerank: ToolRerankConfig = Field(default_factory=ToolRerankConfig)
@@ -149,8 +187,6 @@ class ContextForgeConfig(BaseModel):
     request_timeout_seconds: float = Field(default=15.0, gt=0)
     connect_timeout_seconds: float = Field(default=5.0, gt=0)
     tool_name_prefix: bool = False
-    tool_loading: Literal["auto", "eager", "deferred"] = "auto"
-    deferred_threshold: int = Field(default=24, ge=0)
     sync: ContextForgeSyncConfig = Field(default_factory=ContextForgeSyncConfig)
     admin_events: AdminEventsConfig = Field(default_factory=AdminEventsConfig)
     search: ToolSearchConfig = Field(default_factory=ToolSearchConfig)
@@ -169,26 +205,23 @@ class ContextForgeConfig(BaseModel):
     def _coherent(self) -> Self:
         if self.enabled and not self.base_url:
             raise ValueError("contextforge.enabled=true requires base_url")
-        if self.tool_loading != "eager" and not self.search.enabled:
-            raise ValueError(
-                "contextforge.tool_loading="
-                f"{self.tool_loading!r} requires contextforge.search.enabled=true"
-            )
         if self.search.enabled and self.enabled:
             if not self.search.vector_store.uri.strip():
                 raise ValueError(
                     "contextforge.search.enabled=true requires vector_store.uri "
                     "(the existing Milvus instance)"
                 )
-            if not self.search.embedding.base_url.strip():
-                raise ValueError(
-                    "contextforge.search.enabled=true requires "
-                    "embedding.base_url"
-                )
-            if not self.search.embedding.model.strip():
-                raise ValueError(
-                    "contextforge.search.enabled=true requires embedding.model"
-                )
+            if self.search.embedding.enabled:
+                if not self.search.embedding.base_url.strip():
+                    raise ValueError(
+                        "contextforge.search.embedding.enabled=true requires "
+                        "embedding.base_url"
+                    )
+                if not self.search.embedding.model.strip():
+                    raise ValueError(
+                        "contextforge.search.embedding.enabled=true requires "
+                        "embedding.model"
+                    )
             if self.search.rerank.enabled:
                 if not self.search.rerank.base_url.strip():
                     raise ValueError(
@@ -233,7 +266,7 @@ __all__ = [
     "AdminEventsConfig",
     "ContextForgeConfig",
     "ContextForgeSyncConfig",
-    "TOOLS_COLLECTION",
+    "TOOL_COLLECTION",
     "ToolEmbeddingConfig",
     "ToolKeywordConfig",
     "ToolRerankConfig",

@@ -166,6 +166,8 @@ def test_migration_preserves_private_rows_and_drops_public_state(tmp_path: Path)
         assert conn.scalar(text("SELECT skill_path FROM skill_versions WHERE id = 'v1'")) == (
             "users/u1/s1/SKILL.md"
         )
+        # The chain must land on the current head; the literal revision name is
+        # deliberately not pinned here so a new head revision does not break it.
         assert conn.scalar(text("SELECT version_num FROM alembic_version")) == _head_revision()
         assert conn.scalar(
             text("SELECT index_attempts FROM skill_versions WHERE id = 'v1'")

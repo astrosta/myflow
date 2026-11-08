@@ -43,9 +43,16 @@ def build_entry(
                 display_name = value.strip()
                 break
     display = (display_name or name).strip()
-    parameters = _parameter_names(getattr(tool, "args_schema", None))
+    parameters = parameter_names(getattr(tool, "args_schema", None))
     cleaned_tags = tuple(dict.fromkeys(str(tag).strip() for tag in tags if str(tag).strip()))
-    content = _content(name, display, description, cleaned_tags, parameters, max_document_chars)
+    content = build_tool_content(
+        name=name,
+        display_name=display,
+        description=description,
+        tags=cleaned_tags,
+        parameters=parameters,
+        max_chars=max_document_chars,
+    )
     return ToolCatalogEntry(
         name=name,
         display_name=display,
@@ -85,7 +92,14 @@ def build_entries(
     return entries
 
 
-def _parameter_names(schema: Any) -> tuple[str, ...]:
+def parameter_names(schema: Any) -> tuple[str, ...]:
+    """The declared parameter names of an input schema, in declared order.
+
+    A JSON schema (what the ContextForge MCP endpoint sends) is read from its
+    `properties`; a Pydantic model class is read from its fields.  The result
+    feeds the search text and the result cards, so this never raises: an
+    unreadable schema simply contributes no parameter names.
+    """
     if schema is None:
         return ()
     if isinstance(schema, dict):
@@ -99,15 +113,24 @@ def _parameter_names(schema: Any) -> tuple[str, ...]:
     return ()
 
 
-def _content(
+def build_tool_content(
     name: str,
-    display_name: str,
-    description: str,
-    tags: Sequence[str],
-    parameters: Sequence[str],
-    max_chars: int,
+    display_name: str = "",
+    description: str = "",
+    tags: Sequence[str] = (),
+    parameters: Sequence[str] = (),
+    max_chars: int = DEFAULT_MAX_DOCUMENT_CHARS,
 ) -> str:
-    parts = [name, display_name]
+    """The BM25/embedding text for one tool: names, description, tags, parameters.
+
+    The full input_schema is deliberately absent: it is stored verbatim in the
+    database and never embedded, so a schema-only edit leaves the vector alone.
+    """
+    parts: list[str] = []
+    if name:
+        parts.append(name)
+    if display_name:
+        parts.append(display_name)
     if description:
         parts.append(description)
     if tags:
@@ -123,4 +146,6 @@ __all__ = [
     "ToolCatalogEntry",
     "build_entries",
     "build_entry",
+    "build_tool_content",
+    "parameter_names",
 ]

@@ -321,8 +321,9 @@ observability:
 
 ## ContextForge 工具管理（可选）
 
-ContextForge 是 MCP 工具的**唯一来源和写入目标**：MyFlow 不建工具表，也不复制 CRUD 语义。浏览器只打同源
-`/api/tools`，ContextForge 的 admin token 始终留在网关。
+ContextForge 是 MCP 工具的**管理来源**：MyFlow 把合并后的权威目录存进 `contextforge_tools` 表，
+Milvus 里的 collection 只是可重建的检索投影。浏览器只打同源 `/api/tools`，ContextForge 的
+admin token 始终留在网关。
 
 部署前提（ContextForge 1.1.0）：
 
@@ -331,38 +332,48 @@ ContextForge 是 MCP 工具的**唯一来源和写入目标**：MyFlow 不建工
 - `admin_token` 需要 `admin.events` 或 `*`；事件订阅只发 `Authorization: Bearer ...`，
   GET 不要求 CSRF。
 - ContextForge 多 worker 时，跨进程事件需要它自己的 Redis 配置；否则只有处理写操作的那个
-  worker 能看到事件，MyFlow 会退回"管理动作主动刷新 + 工具调用纠错刷新"。
-- Milvus 复用现有实例，但 collection 固定为 `myflow_tools_catalog`，**绝不写**
-  `myflow_knowledge` / `myflow_skills_active`。不需要数据库迁移。
+  worker 能看到事件，MyFlow 会退回"管理动作主动刷新 + 每日全量 + 工具调用纠错刷新"。
+- MyFlow 固定单 worker：ContextForge runtime 是进程级的（一个 `/admin/events` 订阅器、
+  一个每日任务、一把同步锁），`contextforge.enabled=true` 且 `GATEWAY_WORKERS>1` 时拒绝启动。
+- Milvus 复用现有实例，但 collection 固定为 `myflow_contextforge_tools`，**绝不写**
+  `myflow_knowledge` / `myflow_skills_active`。`contextforge_tools` 由迁移 `0016` 创建。
 
 ```bash
-# MCP 加载器 + pymilvus；knowledge / skills 的 extra 不会自动带上它。
+# 原生 MCP 客户端 + Milvus + jsonschema；knowledge / skills 的 extra 不会自动带上它。
 uv sync --all-packages --all-extras
 # 或只装这一组：
 uv sync --package backend --extra contextforge
 ```
 
 配置见 `config.example.yaml` 的 `contextforge:`。`enabled: false` 时不发任何请求，
-`/api/tools` 返回 503 `contextforge_disabled`；`tool_loading: auto` 在工具数超过
-`deferred_threshold`（默认 24）时把 ContextForge 工具的 schema 藏起来，模型先看到
-`search_tools`，再按任务检索并提升。`eager` 直接把全部工具放进模型 schema；
-`deferred` 强制延迟。`auto` / `deferred` 都要求 `contextforge.search.enabled=true`。
+`/api/tools` 返回 503 `contextforge_disabled`。ContextForge 工具不绑进模型工具表：
+模型只看到 `tool_search` 和 `tool_execute` 两个内建工具。
 
-工具更新有三条路径，都必须知道：
+- `tool_search` 按任务做混合检索，返回最多 5 张卡片；每张带 `cf__<name>` 形式的
+  `call_name`、截断后仍是合法 JSON 的 `input_schema`，并把名字写进本轮 run 的可调用名单。
+- `tool_execute` 只接受本轮 `tool_search` 返回过的 `call_name`（`search.require_retrieved`，
+  默认开），回 `contextforge_tools` 读原始 schema 校验参数，再用未加前缀的名字调 MCP。
+- 预算：单卡 schema `max_schema_chars=3000`，整条工具消息 `max_result_chars=16000`。
+- 旧的 `tool_loading` / `deferred_threshold` 已删除；所有 ContextForge 工具一律按需检索。
+
+工具更新有四条自动路径，外加一次手动全量：
 
 1. **管理页写操作**：`POST/PUT/DELETE /api/tools` 写 ContextForge 后立即返回，网关异步
-   刷新 MCP 快照并 `index.sync()`；`sync.admin_refresh_async=false` 时改成同步等待。
+   刷新目录并更新索引；`sync.admin_refresh_async=false` 时改成同步等待。
 2. **事件订阅**：启动时连 `GET /admin/events`，对 `tool_added / tool_updated / tool_deleted /
    tool_activated / tool_deactivated / tool_offline / tool_removed / gateway_*` 做 debounce
    刷新；断线指数退避重连，状态在 `/api/tools/status` 的 `admin_events` 里可见。
-3. **工具调用纠错**：MCP 返回 not-found 或参数校验错误时，先刷新 ContextForge +
-   `index.sync()`，再重试**一次**；认证失败、超时、429、5xx、网络错误和工具执行错误都不重试。
+3. **每日全量**：按 `sync.daily_at`（本地墙钟，`sync.timezone` 可为 `local` 或 IANA 名）
+   做一次全量同步；`daily_jitter_seconds` 只用来错开重启。
+4. **工具调用纠错**：MCP 返回 not-found 或参数校验错误时，先刷新 ContextForge 并更新
+   索引，再重试**一次**；认证失败、超时、429、5xx、网络错误和工具执行错误都不重试。
+5. **手动全量**：`POST /api/tools/reindex` 立即做一次全量同步并清理不再索引的行。
 
-检索是混合检索：dense embedding + Milvus BM25 稀疏通道，RRF 融合由 Milvus
-`RRFRanker` 在服务端完成，之后可选 rerank。应用进程不计算 BM25、不融合排名；
-Milvus 不可用时返回空结果并在 `retrieval.warnings` 里说明；仅 embedding 不可用时
-仍走 Milvus BM25，没有本地降级索引。
-召回结果必须能在当前 MCP 快照里确认，Milvus 只负责缩小候选集。
+检索是混合检索：dense embedding + Milvus BM25 稀疏通道，RRF 融合后可选 rerank。
+命中只带 `tool_id`，工具定义永远回 `contextforge_tools` 读并重新核对 owner 与
+callable；陈旧文档直接丢掉。索引或数据库不可用时返回空结果并带
+`retrieval.warnings=[catalog_unavailable]`，**没有**本地 BM25 降级——不扫描全表，
+避免绕过 owner 过滤。
 
 `/api/tools` 对**所有已登录用户**开放；ContextForge 的 admin token 只由网关持有，
 浏览器永远拿不到。工具按 MyFlow 用户隔离：每个用户只看到、修改和调用自己创建的工具；
@@ -377,8 +388,8 @@ Milvus 不可用时返回空结果并在 `retrieval.warnings` 里说明；仅 em
 | 方法 | 路径 | 作用 |
 |---|---|---|
 | `GET` | `/api/tools` | 自己的工具 + 未归属工具（可认领），支持分页与过滤 |
-| `GET` | `/api/tools/status` | ContextForge 可达/鉴权、管理事件、同步、索引与三路通道状态（登录用户） |
-| `POST` | `/api/tools/reindex` | 手动刷新 MCP 快照并重建工具索引（登录用户） |
+| `GET` | `/api/tools/status` | ContextForge 可达/鉴权、管理事件、同步、索引与检索通道状态（登录用户） |
+| `POST` | `/api/tools/reindex` | 手动刷新工具目录并重建索引（登录用户） |
 | `GET` | `/api/tools/search?q=...` | 检索预览：命中、通道、候选数、是否重排与 warnings（登录用户） |
 | `POST` | `/api/tools` | 新建工具并触发异步刷新（登录用户） |
 | `GET` | `/api/tools/{id}` | 自己的或未归属工具详情，敏感 header 掩码 |
@@ -388,7 +399,7 @@ Milvus 不可用时返回空结果并在 `retrieval.warnings` 里说明；仅 em
 | `DELETE` | `/api/tools/{id}` | 删除并触发异步刷新（登录用户） |
 
 前端入口是 `/workspace/tools`（侧栏「工具管理」），所有登录用户都能打开；认证关闭的
-单人模式同样放行。写操作后状态栏可能短暂显示旧快照——这是异步刷新的预期表现，
+单人模式同样放行。写操作后状态栏可能短暂显示旧目录——这是异步刷新的预期表现，
 不是数据丢失。
 
 ## 认证（M9 §2）

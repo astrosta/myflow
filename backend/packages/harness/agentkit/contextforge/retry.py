@@ -1,9 +1,32 @@
-"""Strict classification for tool errors that may be fixed by a refresh."""
+"""Strict classification for tool errors that may be fixed by a refresh.
+
+Two callers share this vocabulary.  The tool-error retry middleware uses it to
+decide whether an error may be worth one catalog refresh and one retry;
+``tool_execute`` uses the same classes to pick its own fallback (design 9.1).
+
+That is why ``origin=local_validation`` is here.  When tool_execute's own local
+jsonschema check fails, it has *already* refreshed and answered with the new
+schema, and the model has to reorganise the arguments before anything is sent
+upstream.  A second refresh-and-retry on top of that would run a fallback that
+already ran (and, for a tool that is also invalid upstream, execute it again), so
+the marker is classified as not refreshable - it outranks the generic
+"invalid arguments" wording of the message it carries.
+
+The marker is not enough on its own, because tool_execute reports *every* failure
+in that vocabulary: ``schema_mismatch`` and ``invalid_arguments`` carry the generic
+wording too.  ``owns_retry_fallback`` is the caller-side guard: a tool that runs
+the 9.1 fallback inside its own call must never be refreshed or retried again on
+top of its reply, whatever that reply says.
+"""
 
 from __future__ import annotations
 
 from enum import Enum
 from typing import Any
+
+#: Tools that run the refresh/retry fallback of design 9.1 inside their own call
+#: and report its outcome themselves, so no middleware may repeat it.
+SELF_HEALING_TOOLS = frozenset({"tool_execute"})
 
 
 class RefreshableToolError(Enum):
@@ -32,6 +55,12 @@ _INVALID_ARGUMENT_MARKERS = (
     "缺少必填参数",
     "-32602",
 )
+#: An error tool_execute produced and already handled: the executor owns its
+#: fallback, so a middleware must not refresh or retry on top of it.
+_LOCAL_VALIDATION_MARKERS = (
+    "local_validation",
+    "origin=local_validation",
+)
 _NEVER_RETRY_MARKERS = (
     "unauthorized",
     "forbidden",
@@ -56,11 +85,24 @@ def classify_tool_error(value: Any) -> RefreshableToolError:
         return RefreshableToolError.NONE
     if any(marker in text for marker in _NEVER_RETRY_MARKERS):
         return RefreshableToolError.NONE
+    if any(marker in text for marker in _LOCAL_VALIDATION_MARKERS):
+        return RefreshableToolError.NONE
     if any(marker in text for marker in _NOT_FOUND_MARKERS):
         return RefreshableToolError.NOT_FOUND
     if any(marker in text for marker in _INVALID_ARGUMENT_MARKERS):
         return RefreshableToolError.INVALID_ARGUMENTS
     return RefreshableToolError.NONE
+
+
+def owns_retry_fallback(tool_name: Any) -> bool:
+    """Does this tool own the fallback, so nobody may refresh or retry for it?
+
+    tool_execute refreshes on its own and - only for a missing tool - retries
+    once (design 9.1 B).  Its replies name the origin, the retryable flag and
+    often the new schema; a middleware that treated one as an ordinary tool error
+    would refresh a second time and re-run tools/call, which 9.1 C.6 forbids.
+    """
+    return str(tool_name or "").strip().casefold() in SELF_HEALING_TOOLS
 
 
 def _text(value: Any) -> str:
@@ -80,4 +122,9 @@ def _text(value: Any) -> str:
     return str(content or "")
 
 
-__all__ = ["RefreshableToolError", "classify_tool_error"]
+__all__ = [
+    "RefreshableToolError",
+    "SELF_HEALING_TOOLS",
+    "classify_tool_error",
+    "owns_retry_fallback",
+]

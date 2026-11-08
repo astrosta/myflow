@@ -77,13 +77,18 @@ function makeStatus(overrides: Partial<ToolStatus> = {}): ToolStatus {
     reachable: true,
     auth_ok: true,
     admin_events: "connected",
+    daily: "running",
     sync: "ready",
     index: "ready",
     indexed_tools: 12,
     total_tools: 13,
     last_sync_at: "2026-11-06T10:00:00Z",
     last_sync_reason: "admin",
+    last_sync_duration_ms: 42,
     last_error: null,
+    last_retry_at: null,
+    last_retry_tool: null,
+    last_retry_result: null,
     channels: { keyword: "ready", embedding: "ready", rerank: "degraded" },
     ...overrides,
   };
@@ -112,17 +117,19 @@ beforeEach(() => {
     query: "gitlab",
     results: [
       {
+        tool_id: "tool-1",
         tool_name: "gitlab_search",
-        display_name: "GitLab Search",
+        call_name: "cf__gitlab_search",
         description: "搜索 GitLab 项目",
         tags: ["gitlab"],
-        parameters: ["q"],
+        parameters: ["q", "per_page"],
         score: 0.9,
+        schema_truncated: false,
       },
     ],
     retrieval: {
       index: "milvus",
-      channels: ["dense", "keyword"],
+      channels: ["embedding", "keyword"],
       candidates: 3,
       reranked: false,
       warnings: ["reranker unavailable"],
@@ -181,6 +188,37 @@ describe("工具管理页", () => {
     expect(within(status).getByText("向量 ready")).toBeTruthy();
     expect(within(status).getByText("重排 degraded")).toBeTruthy();
     expect(within(status).getByText("12 / 13 已索引")).toBeTruthy();
+  });
+
+  it("状态栏渲染每日兜底同步、同步耗时与上次重试", async () => {
+    mockedStatus.mockResolvedValue(
+      makeStatus({
+        daily: "stopped",
+        sync: "syncing",
+        index: "degraded",
+        last_sync_duration_ms: 137,
+        last_retry_at: "2026-11-06T11:00:00Z",
+        last_retry_tool: "gitlab_search",
+        last_retry_result: "refreshed",
+      }),
+    );
+
+    renderPage();
+
+    const status = await screen.findByRole("region", { name: "工具状态" });
+    expect(await within(status).findByText("每日同步 stopped")).toBeTruthy();
+    expect(within(status).getByText("同步 syncing")).toBeTruthy();
+    expect(within(status).getByText("索引 degraded")).toBeTruthy();
+    expect(within(status).getByText("耗时 137 ms")).toBeTruthy();
+    expect(within(status).getByText("上次重试 gitlab_search（refreshed）")).toBeTruthy();
+  });
+
+  it("没有重试记录时不渲染重试行", async () => {
+    renderPage();
+
+    const status = await screen.findByRole("region", { name: "工具状态" });
+    await within(status).findByText("同步 ready");
+    expect(within(status).queryByText(/上次重试/)).toBeNull();
   });
 
   it("工具行显示启用、可达、索引与遮蔽状态", async () => {
@@ -280,6 +318,9 @@ describe("工具管理页", () => {
     await waitFor(() => expect(mockedPreview).toHaveBeenCalledWith("gitlab", 5));
     const preview = await screen.findByRole("region", { name: "检索预览结果" });
     expect(within(preview).getByText("gitlab_search")).toBeTruthy();
+    // 命中卡带的是数据库行里的 call_name 与参数，模型看到的就是这两个名字。
+    expect(within(preview).getByText("cf__gitlab_search")).toBeTruthy();
+    expect(within(preview).getByText("参数 2")).toBeTruthy();
     expect(within(preview).getByText("reranker unavailable")).toBeTruthy();
   });
 

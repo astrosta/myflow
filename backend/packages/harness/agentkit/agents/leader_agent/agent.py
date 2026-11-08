@@ -20,7 +20,6 @@ from agentkit.models import create_chat_model
 from agentkit.models.catalog import split_model_name
 from agentkit.runtime.user_context import resolve_runtime_user_id
 from agentkit.tools import get_available_tools
-from agentkit.tools.registry import should_defer_contextforge
 
 from agentkit.subagents.policy import SubagentPolicy
 from agentkit.subagents.registry import get_subagent_config, list_subagent_names
@@ -254,15 +253,12 @@ def assemble_agent(
     # 过滤（将来 M9 的鉴权也在这里）必须看到**完整**的工具表，所以 task 在它之前就位
     tools = apply_tool_filter(tools, cfg=cfg)
 
-    defer_contextforge = should_defer_contextforge(resolved_config, tools)
-
     # 组中间件（M6 §3.2 的顺序；M7 §3.9 的技能槽位在 assembly 里）
     middleware = build_middlewares(
         config,
         app_config=resolved_config,
         user_id=user_id,
         subagent_policy=policy,
-        defer_contextforge_tools=defer_contextforge,
     )
 
     # 渲染系统提示词（§16：委派段读的是同一份快照；没有 task 工具就不出现委派段）
@@ -273,7 +269,6 @@ def assemble_agent(
         user_id=user_id,
         subagent_policy=policy,
         user_profile=profile_text,
-        contextforge_deferred=defer_contextforge,
     )
 
     graph = _compile_agent(model=model, tools=tools, middleware=middleware, system_prompt=system_prompt, state_schema=ThreadState, checkpointer=checkpointer)
@@ -387,7 +382,6 @@ def build_middlewares(
     app_config: AppConfig | None = None,
     user_id: str | None = None,
     subagent_policy: SubagentPolicy | None = None,
-    defer_contextforge_tools: bool = False,
 ) -> list:
     """lead 的完整中间件链。顺序与槽位注释都在 middlewares/assembly.py。"""
     from agentkit.agents.middlewares.assembly import build_middlewares as _assemble
@@ -401,7 +395,6 @@ def build_middlewares(
         app_config=resolved,
         user_id=user_id,
         subagent_policy=subagent_policy,
-        defer_contextforge_tools=defer_contextforge_tools,
     )
 
 

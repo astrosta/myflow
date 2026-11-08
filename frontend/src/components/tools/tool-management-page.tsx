@@ -40,9 +40,25 @@ function readableError(error: unknown): string {
   return String(error);
 }
 
+/** 网关回报的每个状态词都要落到一种颜色，否则运维看不出哪一环退化了。 */
 function statusVariant(value: string): "success" | "warning" | "danger" | "neutral" {
-  if (value === "ready" || value === "connected" || value === "idle") return "success";
-  if (value === "degraded" || value === "connecting" || value === "reconnecting") return "warning";
+  if (
+    value === "ready" ||
+    value === "connected" ||
+    value === "idle" ||
+    value === "running"
+  ) {
+    return "success";
+  }
+  if (
+    value === "degraded" ||
+    value === "connecting" ||
+    value === "reconnecting" ||
+    value === "syncing" ||
+    value === "stopped"
+  ) {
+    return "warning";
+  }
   if (value === "error" || value === "unavailable") return "danger";
   return "neutral";
 }
@@ -272,14 +288,20 @@ export function ToolManagementPage() {
               ) : (
                 <ol className="mt-2 divide-y divide-neutral-200 rounded-md border border-neutral-200 bg-white">
                   {preview.data.results.map((hit) => (
-                    <li className="flex items-start gap-3 px-3 py-2" key={hit.tool_name}>
+                    <li className="flex items-start gap-3 px-3 py-2" key={hit.tool_id || hit.tool_name}>
                       <span className="min-w-0 flex-1">
                         <span className="block text-xs font-medium text-neutral-900">
                           {hit.tool_name}
                         </span>
+                        <span className="mt-0.5 block truncate font-mono text-[11px] text-neutral-500">
+                          {hit.call_name}
+                        </span>
                         <span className="mt-0.5 block text-[11px] leading-relaxed text-neutral-500">
                           {hit.description}
                         </span>
+                      </span>
+                      <span className="shrink-0 text-[11px] tabular-nums text-neutral-400">
+                        {`参数 ${hit.parameters.length}`}
                       </span>
                       <span className="shrink-0 text-[11px] tabular-nums text-neutral-400">
                         {hit.score.toFixed(3)}
@@ -430,6 +452,8 @@ interface ToolStatusBarProps {
 }
 
 function ToolStatusBar({ adminEvents, error, loading, status }: ToolStatusBarProps) {
+  const durationMs = status?.last_sync_duration_ms ?? null;
+  const daily = status?.daily ?? "disabled";
   return (
     <section aria-label="工具状态" className="mt-4 rounded-lg border border-neutral-200 bg-neutral-50/60 p-4">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -440,6 +464,7 @@ function ToolStatusBar({ adminEvents, error, loading, status }: ToolStatusBarPro
         <Badge variant={statusVariant(status?.sync ?? "disabled")}>
           同步 {status?.sync ?? "disabled"}
         </Badge>
+        <Badge variant={statusVariant(daily)}>{`每日同步 ${daily}`}</Badge>
         <Badge variant={statusVariant(status?.index ?? "disabled")}>
           索引 {status?.index ?? "disabled"}
         </Badge>
@@ -467,6 +492,13 @@ function ToolStatusBar({ adminEvents, error, loading, status }: ToolStatusBarPro
             上次同步 {status.last_sync_at}
             {status.last_sync_reason ? "（" + status.last_sync_reason + "）" : ""}
           </span>
+        ) : null}
+        {durationMs !== null ? <span>{`耗时 ${durationMs} ms`}</span> : null}
+        {status?.last_retry_at ? (
+          // 工具调用失败后的自动刷新：让它可见，才不会把"刚刚自愈过"误读成丢数据。
+          <span>{`上次重试 ${status.last_retry_tool ?? "未知工具"}（${
+            status.last_retry_result ?? "未知结论"
+          }）`}</span>
         ) : null}
         {status?.enabled && status.reachable === false ? (
           <span className="text-amber-700">ContextForge 不可达</span>

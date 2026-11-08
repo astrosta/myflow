@@ -1,27 +1,31 @@
-"""Hybrid tool retrieval: Milvus recall, snapshot confirmation, rerank.
+"""Tool retrieval: Milvus recall, database confirmation, rerank, tool cards.
 
-Both recall channels and the RRF fusion run in Milvus.  The process only embeds
-the query, confirms hits against the current tool snapshot, and optionally
-reranks the survivors; there is no in-process BM25 or RRF implementation.
+`contextforge_tools` is the authority and the Milvus collection is derived, so
+there is exactly one service here: a hit is an owner-scoped `tool_id` that the
+store re-checks before its verbatim schema becomes a card for the model.  The
+retired snapshot catalog and its local BM25 fallback are gone with the loader
+that fed them; a process with no index reports the search as unavailable instead
+of answering from a second, stale source.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from agentkit.config.contextforge_config import ToolSearchConfig
-from agentkit.contextforge.catalog import ToolCatalogEntry
-from agentkit.contextforge.ownership import can_call
 
 logger = logging.getLogger(__name__)
 
-VECTOR_UNAVAILABLE = "vector_unavailable"
-KEYWORD_UNAVAILABLE = "keyword_unavailable"
 RERANK_UNAVAILABLE = "rerank_unavailable"
 CATALOG_UNAVAILABLE = "catalog_unavailable"
+#: index_kind of an outcome that reports a failure instead of a result.  Callers
+#: use it to tell "nothing matched" (a real, empty answer) from "retrieval did not
+#: run" - the two must never be confused when writing retrieval state.
+UNAVAILABLE_INDEX_KIND = "unavailable"
 
 
 class Embedder(Protocol):
@@ -33,36 +37,162 @@ class Reranker(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class ToolSearchHit:
-    entry: ToolCatalogEntry
+class ToolSearchCard:
+    """One ContextForge tool card: the authoritative DB row, ready to serialize.
+
+    The Milvus collection stores no schema, so every field here comes from the
+    ``contextforge_tools`` row the hit's ``tool_id`` was joined to.  ``score`` is
+    the retrieval score; ``input_schema`` is verbatim unless it exceeded the card
+    budget, in which case ``schema_truncated`` is True and it is still valid JSON.
+    """
+
+    tool_id: str
+    tool_name: str
+    call_name: str
+    description: str
+    tags: tuple[str, ...]
+    parameters: tuple[str, ...]
+    input_schema: dict[str, Any]
     score: float
+    schema_truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ToolSearchOutcome:
-    hits: tuple[ToolSearchHit, ...] = ()
+    """What one retrieval produced: cards plus how they were found.
+
+    ``channels``, ``candidates``, ``reranked`` and ``warnings`` explain the
+    retrieval; an outcome whose ``index_kind`` is :data:`UNAVAILABLE_INDEX_KIND`
+    reports a failure to retrieve, not an empty match.
+    """
+
+    hits: tuple[ToolSearchCard, ...] = ()
     channels: tuple[str, ...] = ()
     candidates: int = 0
     reranked: bool = False
     warnings: tuple[str, ...] = ()
-    index_kind: str = "unavailable"
+    index_kind: str = UNAVAILABLE_INDEX_KIND
 
 
-class ToolSearchService:
+# --------------------------------------------------------------------------- #
+# ContextForgeToolSearchService: Milvus recall -> DB confirmation -> cards
+# --------------------------------------------------------------------------- #
+
+#: The model sees at most five cards, each schema at most 3000 chars, inside one
+#: 16000-char ToolMessage (design 8).  Five schemas x 3000 leaves room for the
+#: metadata, and max_retrieved_tools follows top_k, capped here.
+MAX_RETRIEVED_TOOLS = 5
+MAX_SCHEMA_CHARS = 3000
+MAX_RESULT_CHARS = 16000
+#: Domain keywords folded into the BM25 half of the hybrid query.
+MAX_KEYWORDS = 8
+
+#: Keys whose values are maps of names, not schema keywords: a property called
+#: "description" is a parameter name and must survive the prune.
+_SCHEMA_MAP_KEYS = ("properties", "patternProperties", "$defs", "definitions")
+
+#: Presentation keys a truncated schema drops first: the model needs the shape,
+#: not the author's prose.  Dropping them keeps most schemas inside the budget
+#: without touching a single validation keyword.
+_SCHEMA_PRESENTATION_KEYS = frozenset({
+    "description",
+    "title",
+    "examples",
+    "example",
+    "$comment",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "externalDocs",
+})
+
+
+class ToolStore(Protocol):
+    """The catalog read tool_search performs: the DB join behind a Milvus hit."""
+
+    async def get_by_ids(
+        self, ids: Sequence[str], owner_user_id: str
+    ) -> Sequence[Any]: ...
+
+
+def truncate_input_schema(
+    schema: Any, max_chars: int = MAX_SCHEMA_CHARS
+) -> tuple[dict[str, Any], bool]:
+    """Fit one tool schema into the card budget while keeping valid JSON.
+
+    A schema that already fits is returned untouched: the database row is the
+    verbatim source, and the model must see exactly what ContextForge published.
+    Over budget, presentation keys go first, then properties are dropped from the
+    tail with required trimmed to match, and the last resort is a typed empty
+    object.  Every step is still a JSON object, so a card can never carry the
+    half-string a naive character cut would produce.
+    """
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}, True
+    if len(_serialize_schema(schema)) <= max_chars:
+        return schema, False
+    pruned = _prune_schema(schema)
+    if len(_serialize_schema(pruned)) <= max_chars:
+        return pruned, True
+    return _clip_properties(pruned, max_chars), True
+
+
+class ContextForgeToolSearchService:
+    """tool_search retrieval: Milvus recall, database confirmation, cards.
+
+    contextforge_tools is the authority and the Milvus collection is derived, so
+    a search is always two steps: recall owner-scoped tool_id hits, then confirm
+    each one through the store, which re-checks the owner and the callable gate
+    and hands back the verbatim schema.  A candidate the store does not confirm
+    is dropped, never substituted from another user's row.  When Milvus or the
+    database is unavailable the result is empty with a catalog_unavailable
+    warning: v1 has no full-table scan fallback, because scanning the catalog to
+    answer one query is exactly the leak the owner filter exists to prevent.
+
+    The recall channel follows the configuration, not a hardcoded pair:
+    embedding + keyword fuse through Milvus hybrid search, embedding alone runs
+    the dense channel, and keyword alone runs BM25 over the stored sparse vector
+    (`keyword_search`), which needs no query embedding.  The reported
+    `channels` are the ones the search actually used.
+    """
+
     def __init__(
         self,
         *,
-        index: Any | None,
-        embedder: Embedder | None,
-        reranker: Reranker | None,
         config: ToolSearchConfig,
-        snapshot_provider: Callable[[], Sequence[ToolCatalogEntry]],
+        index: Any | None = None,
+        store: ToolStore | None = None,
+        embedder: Embedder | None = None,
+        reranker: Reranker | None = None,
     ) -> None:
+        self._config = config
         self._index = index
+        self._store = store
         self._embedder = embedder
         self._reranker = reranker
-        self._config = config
-        self._snapshot_provider = snapshot_provider
+
+    @property
+    def max_cards(self) -> int:
+        return max(
+            1,
+            min(
+                int(self._config.top_k),
+                int(getattr(self._config, "max_retrieved_tools", MAX_RETRIEVED_TOOLS)),
+                MAX_RETRIEVED_TOOLS,
+            ),
+        )
+
+    @property
+    def max_schema_chars(self) -> int:
+        return int(getattr(self._config, "max_schema_chars", MAX_SCHEMA_CHARS))
+
+    @property
+    def max_description_chars(self) -> int:
+        return int(self._config.max_description_chars)
+
+    @property
+    def max_result_chars(self) -> int:
+        return int(getattr(self._config, "max_result_chars", MAX_RESULT_CHARS))
 
     async def search(
         self,
@@ -71,187 +201,276 @@ class ToolSearchService:
         domain_keywords: Sequence[str] = (),
         user_id: str | None = None,
     ) -> ToolSearchOutcome:
+        """Retrieve the caller's tools for one task; never executes anything."""
         query = (task_query or "").strip()
-        entries = [
-            entry for entry in self._snapshot_provider() if can_call(entry.owner, user_id)
-        ]
-        if not query or not entries:
-            return ToolSearchOutcome(channels=self._channels())
-        if self._index is None:
+        owner = (user_id or "").strip()
+        channels = self._channels()
+        if not query or not owner:
+            # The owner filter is mandatory (index and store both refuse an
+            # unscoped read), so an unresolved user is an empty answer, not an
+            # unscoped one.
             return ToolSearchOutcome(
-                channels=self._channels(),
-                warnings=(CATALOG_UNAVAILABLE,),
-                index_kind="unavailable",
+                channels=channels, index_kind=UNAVAILABLE_INDEX_KIND
             )
-
+        if not channels:
+            # The config validator refuses a search block with both recall
+            # channels off, so this only guards a service built by hand: saying
+            # "unavailable" beats inventing a channel it cannot run.
+            return self._unavailable(channels)
+        embedding = bool(self._config.embedding.enabled)
+        keyword = bool(self._config.keyword.enabled)
+        if self._index is None or self._store is None:
+            return self._unavailable(channels)
+        # The embedder is only a prerequisite of the dense half: a keyword-only
+        # deployment must keep answering when no embedding service is wired.
+        if embedding and self._embedder is None:
+            return self._unavailable(channels)
         warnings: list[str] = []
-        by_name = {entry.name: entry for entry in entries}
-        keyword_query = self._keyword_query(query, domain_keywords)
         vector: list[float] | None = None
-        if self._embedder is not None and self._config.embedding.enabled:
+        if embedding:
             try:
-                vector = list(await self._embedder.embed_query(query))
-            except Exception as exc:  # noqa: BLE001 - Milvus BM25 can still answer
-                logger.warning(
-                    "Tool query embedding failed (%s); using Milvus BM25",
-                    type(exc).__name__,
-                )
-                warnings.append(VECTOR_UNAVAILABLE)
-        if self._config.embedding.enabled and vector is None and keyword_query:
-            warnings.append(VECTOR_UNAVAILABLE)
-        if not vector and not keyword_query:
-            warnings.append(
-                VECTOR_UNAVAILABLE
-                if self._config.embedding.enabled
-                else KEYWORD_UNAVAILABLE
-            )
-            return ToolSearchOutcome(
-                channels=self._channels(),
-                warnings=tuple(dict.fromkeys(warnings)),
-                index_kind="unavailable",
-            )
-
-        if vector is not None and keyword_query:
-            channels = ("embedding", "keyword")
-        elif vector is not None:
-            channels = ("embedding",)
-        else:
-            channels = ("keyword",)
-
+                vector = await self._embedder.embed_query(query)
+            except Exception as exc:  # noqa: BLE001 - a tool result, not a run failure
+                logger.warning("Tool query embedding failed: %s", type(exc).__name__)
+                return self._unavailable(channels)
+        text = _keyword_text(query, domain_keywords)
         try:
-            if vector is not None and keyword_query:
+            if embedding and keyword:
                 hits = await self._index.hybrid_search(
                     vector=vector,
-                    query=keyword_query,
+                    query=text,
+                    owner_user_id=owner,
                     limit=self._config.candidate_k,
                 )
-            elif vector is not None:
+            elif embedding:
                 hits = await self._index.dense_search(
                     vector=vector,
+                    owner_user_id=owner,
                     limit=self._config.candidate_k,
                 )
             else:
+                # Sparse-only: BM25 over the stored vector, no query embedding.
                 hits = await self._index.keyword_search(
-                    query=keyword_query,
+                    query=text,
+                    owner_user_id=owner,
                     limit=self._config.candidate_k,
                 )
-        except Exception as exc:  # noqa: BLE001 - no local BM25 fallback
-            logger.warning(
-                "Tool Milvus search failed (%s); returning no local hits",
-                type(exc).__name__,
-            )
-            warnings.append(
-                KEYWORD_UNAVAILABLE if channels == ("keyword",) else VECTOR_UNAVAILABLE
-            )
+        except Exception as exc:  # noqa: BLE001 - no full-scan fallback (design 8)
+            logger.warning("Tool vector search failed: %s", type(exc).__name__)
+            return self._unavailable(channels)
+        scores = {hit.tool_id: float(hit.score) for hit in hits if hit.tool_id}
+        if not scores:
             return ToolSearchOutcome(
-                channels=channels,
-                warnings=tuple(dict.fromkeys(warnings)),
-                index_kind="milvus",
+                channels=channels, candidates=len(hits), index_kind="milvus"
             )
-
-        confirmed: list[tuple[ToolCatalogEntry, float]] = []
-        seen: set[str] = set()
-        for hit in hits:
-            entry = by_name.get(hit.tool_name)
-            if entry is None or hit.tool_name in seen:
-                continue
-            score = float(hit.score)
-            if self._config.min_score is not None and score < self._config.min_score:
-                continue
-            confirmed.append((entry, score))
-            seen.add(hit.tool_name)
-        if not confirmed:
-            return ToolSearchOutcome(
-                channels=channels,
-                warnings=tuple(dict.fromkeys(warnings)),
-                index_kind="milvus",
-            )
-        return await self._finish(
-            confirmed,
-            query=query,
-            channels=channels,
-            warnings=warnings,
-            index_kind="milvus",
-        )
-
-    async def _finish(
-        self,
-        confirmed: Sequence[tuple[ToolCatalogEntry, float]],
-        *,
-        query: str,
-        channels: Sequence[str],
-        warnings: list[str],
-        index_kind: str,
-    ) -> ToolSearchOutcome:
-        ordered = list(confirmed)
+        try:
+            records = await self._store.get_by_ids(list(scores), owner)
+        except Exception as exc:  # noqa: BLE001 - a tool result, not a run failure
+            logger.warning("Tool catalog join failed: %s", type(exc).__name__)
+            return self._unavailable(channels)
+        ordered: list[tuple[Any, float]] = []
+        for record in records:
+            tool_id = str(getattr(record, "id", "") or "")
+            if tool_id in scores:
+                ordered.append((record, scores[tool_id]))
+        if not ordered:
+            return ToolSearchOutcome(channels=channels, index_kind="milvus")
+        ceiling = max((score for _, score in ordered), default=0.0)
+        if ceiling > 0:
+            ordered = [(record, score / ceiling) for record, score in ordered]
+        if self._config.min_score is not None:
+            ordered = [
+                (record, score)
+                for record, score in ordered
+                if score >= self._config.min_score
+            ]
         candidates = len(ordered)
+        if not ordered:
+            return ToolSearchOutcome(
+                channels=channels, candidates=0, index_kind="milvus"
+            )
         reranked = False
         if self._reranker is not None and len(ordered) >= 2:
             try:
                 results = await self._reranker.rerank(
                     query=query,
-                    documents=[_document(entry) for entry, _ in ordered],
+                    documents=[_record_document(record) for record, _ in ordered],
                 )
                 order: list[int] = []
                 for item in results:
-                    index = getattr(item, "index", None)
-                    if isinstance(index, int) and 0 <= index < len(ordered) and index not in order:
-                        order.append(index)
+                    position = getattr(item, "index", None)
+                    if (
+                        isinstance(position, int)
+                        and 0 <= position < len(ordered)
+                        and position not in order
+                    ):
+                        order.append(position)
                 if order:
-                    order += [index for index in range(len(ordered)) if index not in order]
-                    ordered = [ordered[index] for index in order]
+                    order += [
+                        position
+                        for position in range(len(ordered))
+                        if position not in order
+                    ]
+                    ordered = [ordered[position] for position in order]
                     reranked = True
                 else:
                     warnings.append(RERANK_UNAVAILABLE)
             except Exception as exc:  # noqa: BLE001 - fused order still answers
                 logger.warning("Tool rerank failed: %s", type(exc).__name__)
                 warnings.append(RERANK_UNAVAILABLE)
-        hits = tuple(
-            ToolSearchHit(entry=entry, score=round(float(score), 4))
-            for entry, score in ordered[: self._config.top_k]
+        cards = tuple(
+            self._card(record, score) for record, score in ordered[: self.max_cards]
         )
         return ToolSearchOutcome(
-            hits=hits,
-            channels=tuple(channels),
+            hits=cards,
+            channels=channels,
             candidates=candidates,
             reranked=reranked,
             warnings=tuple(dict.fromkeys(warnings)),
-            index_kind=index_kind,
+            index_kind="milvus",
         )
 
-    def _keyword_query(self, query: str, domain_keywords: Sequence[str]) -> str:
-        """Build the BM25 text; tokenization and scoring stay in Milvus."""
-        if not self._config.keyword.enabled:
-            return ""
-        parts = [query, *(item.strip() for item in domain_keywords)]
-        return " ".join(dict.fromkeys(item for item in parts if item))
+    def _card(self, record: Any, score: float) -> ToolSearchCard:
+        schema, truncated = truncate_input_schema(
+            getattr(record, "input_schema", None), self.max_schema_chars
+        )
+        return ToolSearchCard(
+            tool_id=str(getattr(record, "id", "") or ""),
+            tool_name=str(getattr(record, "name", "") or ""),
+            call_name=str(getattr(record, "call_name", "") or ""),
+            description=_clip_text(
+                str(getattr(record, "description", "") or ""),
+                self.max_description_chars,
+            ),
+            tags=tuple(getattr(record, "tags", ()) or ()),
+            parameters=tuple(getattr(record, "parameters", ()) or ()),
+            input_schema=schema,
+            score=round(float(score), 4),
+            schema_truncated=truncated,
+        )
+
+    def _unavailable(self, channels: Sequence[str]) -> ToolSearchOutcome:
+        return ToolSearchOutcome(
+            channels=tuple(channels),
+            warnings=(CATALOG_UNAVAILABLE,),
+            index_kind=UNAVAILABLE_INDEX_KIND,
+        )
 
     def _channels(self) -> tuple[str, ...]:
+        """The recall channels this config enables, in payload order.
+
+        Read from both flags, so the channels an outcome reports are the ones
+        the search could actually run; an empty tuple means there are none.
+        """
         channels: list[str] = []
-        if self._config.keyword.enabled:
-            channels.append("keyword")
         if self._config.embedding.enabled:
             channels.append("embedding")
+        if self._config.keyword.enabled:
+            channels.append("keyword")
         return tuple(channels)
 
 
-def _document(entry: ToolCatalogEntry) -> str:
+def _serialize_schema(document: Any) -> str:
+    # The same serialization the ToolMessage uses, so a schema measured against
+    # max_schema_chars is exactly the text the model receives.
+    return json.dumps(document, ensure_ascii=False)
+
+
+def _prune_schema(node: Any) -> Any:
+    if isinstance(node, dict):
+        pruned: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
+                # These keys are property names, not schema keywords: keep every
+                # one of them and prune only the schemas underneath.
+                pruned[key] = {
+                    name: _prune_schema(sub) for name, sub in value.items()
+                }
+            elif key in _SCHEMA_PRESENTATION_KEYS:
+                continue
+            else:
+                pruned[key] = _prune_schema(value)
+        return pruned
+    if isinstance(node, list):
+        return [_prune_schema(item) for item in node]
+    return node
+
+
+def _clip_properties(schema: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """Drop properties from the tail until it fits; trim required to match."""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        return _schema_skeleton(schema)
+    names = list(properties)
+    for keep in range(len(names) - 1, -1, -1):
+        candidate = {
+            key: value for key, value in schema.items() if key != "properties"
+        }
+        candidate["properties"] = {
+            name: properties[name] for name in names[:keep]
+        }
+        required = schema.get("required")
+        if isinstance(required, list):
+            still_required = [
+                name for name in required if name in candidate["properties"]
+            ]
+            if still_required:
+                candidate["required"] = still_required
+            else:
+                candidate.pop("required", None)
+        if len(_serialize_schema(candidate)) <= max_chars:
+            return candidate
+    return _schema_skeleton(schema)
+
+
+def _schema_skeleton(schema: dict[str, Any]) -> dict[str, Any]:
+    kind = schema.get("type")
+    return {
+        "type": kind if isinstance(kind, str) else "object",
+        "properties": {},
+    }
+
+
+def _clip_text(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit]
+
+
+def _record_document(record: Any) -> str:
     return "\n".join(
         part
-        for part in (entry.display_name, entry.description, ", ".join(entry.tags))
+        for part in (
+            str(getattr(record, "display_name", "") or ""),
+            str(getattr(record, "description", "") or ""),
+            ", ".join(getattr(record, "tags", ()) or ()),
+        )
         if part
     )
 
 
-_service: ToolSearchService | None = None
+def _keyword_text(query: str, domain_keywords: Sequence[str]) -> str:
+    """The BM25 side of the hybrid query: task intent plus domain keywords."""
+    keywords: list[str] = []
+    for item in domain_keywords:
+        if isinstance(item, str):
+            text = item.strip()
+            if text and text not in keywords:
+                keywords.append(text)
+    return " ".join([query, *keywords[:MAX_KEYWORDS]])
 
 
-def set_tool_search_runtime(service: ToolSearchService | None) -> None:
+#: The process-global service the startup hook publishes and tool_search reads.
+#: There is only one implementation: the authoritative catalog plus its derived
+#: index.  A process that cannot build it publishes None, so the tool reports
+#: retrieval as unavailable instead of falling back to a second source.
+_service: ContextForgeToolSearchService | None = None
+
+
+def set_tool_search_runtime(service: ContextForgeToolSearchService | None) -> None:
     global _service
     _service = service
 
 
-def get_tool_search_runtime() -> ToolSearchService | None:
+def get_tool_search_runtime() -> ContextForgeToolSearchService | None:
     return _service
 
 
@@ -262,13 +481,18 @@ def reset_tool_search_runtime() -> None:
 
 __all__ = [
     "CATALOG_UNAVAILABLE",
-    "KEYWORD_UNAVAILABLE",
+    "ContextForgeToolSearchService",
+    "MAX_KEYWORDS",
+    "MAX_RESULT_CHARS",
+    "MAX_RETRIEVED_TOOLS",
+    "MAX_SCHEMA_CHARS",
     "RERANK_UNAVAILABLE",
-    "VECTOR_UNAVAILABLE",
-    "ToolSearchHit",
+    "ToolSearchCard",
     "ToolSearchOutcome",
-    "ToolSearchService",
+    "ToolStore",
+    "UNAVAILABLE_INDEX_KIND",
     "get_tool_search_runtime",
     "reset_tool_search_runtime",
     "set_tool_search_runtime",
+    "truncate_input_schema",
 ]

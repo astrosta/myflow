@@ -18,6 +18,10 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0,<3.0",
     "httpx>=0.27",
     "pygit2>=1.20,<2",
+    # contextforge.sync.timezone="local" 要在配置加载时就解析成本机时区，而默认值
+    # 就是这个哨兵，所以它在核心依赖里：datetime.now().astimezone() 只给固定偏移，
+    # 冬夏令时切换当天午夜会错一小时；tzlocal 读平台时区库，给出真正的 DST zone。
+    "tzlocal>=5.0,<6",
 ]
 
 [project.optional-dependencies]
@@ -29,10 +33,14 @@ postgres = [
 knowledge = [
     "pymilvus>=2.5",
 ]
-# ContextForge：MCP 工具加载 + 工具目录的 Milvus 向量/BM25 collection。
+# ContextForge：原生 MCP 客户端（tools/list + tools/call）+ 工具目录的 Milvus
+# collection + tool_execute 的本地 schema 校验。同步和执行都直接用 mcp SDK
+# （ClientSession / streamablehttp_client），所以 mcp 必须显式声明。
 contextforge = [
-    "langchain-mcp-adapters>=0.3",
+    "mcp>=1.30,<2",
     "pymilvus>=2.5",
+    "jsonschema>=4.23,<5",
+    "cryptography>=43,<51",
 ]
 # Langfuse 可观测性。enabled=false 时不 import；启用前先 uv sync --extra observability。
 observability = [

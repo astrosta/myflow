@@ -15,7 +15,6 @@ def _config(token: str = "adm") -> ContextForgeConfig:
         enabled=True,
         base_url="http://cf",
         admin_token=token,
-        tool_loading="eager",
         search={"enabled": False},
     )
 

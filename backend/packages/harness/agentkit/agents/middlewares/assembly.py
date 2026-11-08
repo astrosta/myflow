@@ -17,15 +17,16 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.runnables import RunnableConfig
 
 from agentkit.agents.memory.openviking.profile_interrupt import make_profile_interrupt_middleware
-from agentkit.agents.middlewares.contextforge_ownership_middleware import (
-    ContextForgeOwnershipMiddleware,
-)
 from agentkit.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 from agentkit.agents.middlewares.durable_context_middleware import DurableContextMiddleware
 from agentkit.agents.middlewares.dynamic_context_middleware import DynamicContextMiddleware
 from agentkit.agents.middlewares.input_sanitization_middleware import InputSanitizationMiddleware
 from agentkit.agents.middlewares.llm_error_handling_middleware import LLMErrorHandlingMiddleware
 from agentkit.agents.middlewares.pii_middleware import PIIMiddleware, PIIOutputMiddleware
+from agentkit.agents.middlewares.retrieval_scope_middleware import (
+    RetrievalScopeMiddleware,
+    SubagentRetrievalToolStripMiddleware,
+)
 from agentkit.agents.middlewares.skill_activation_middleware import SkillActivationMiddleware
 from agentkit.agents.middlewares.skill_tool_policy_middleware import SkillToolPolicyMiddleware
 from agentkit.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
@@ -33,8 +34,6 @@ from agentkit.agents.middlewares.summarization_middleware import create_summariz
 from agentkit.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
 from agentkit.agents.middlewares.title_middleware import TitleMiddleware
 from agentkit.agents.middlewares.tool_error_handling_middleware import ToolErrorHandlingMiddleware
-from agentkit.agents.middlewares.tool_refresh_retry_middleware import ToolRefreshRetryMiddleware
-from agentkit.agents.middlewares.tool_search_middleware import ToolSearchMiddleware
 from agentkit.agents.middlewares.uploads_middleware import UploadsMiddleware
 from agentkit.config import AppConfig, get_app_config
 from agentkit.runtime.secret_context import new_owner_token
@@ -122,16 +121,9 @@ def build_runtime_middlewares(
     # PII 工具参数还原必须在 ToolErrorHandling 之内：无法解析的 handle 会被
     # 错误处理收成可恢复的 ToolMessage，而不是把整轮打崩。
     chain.append(PIIMiddleware(app_config=app_config))
-    from agentkit.contextforge.runtime import get_contextforge_runtime
-
-    chain.append(ContextForgeOwnershipMiddleware())
-    chain.append(
-        ToolRefreshRetryMiddleware(
-            enabled=bool(app_config.contextforge.sync.retry_on_tool_error),
-            refresh_timeout_seconds=app_config.contextforge.sync.tool_error_refresh_timeout_seconds,
-            runtime_provider=get_contextforge_runtime,
-        )
-    )
+    # 这里不再有 ContextForge 的 ownership / refresh-retry 中间件：catalog 不再
+    # 绑成工具对象，owner 过滤在 tool_execute 的 DB 查询里，not-found 与
+    # invalid-args 的刷新重试由 tool_execute 自己按错误分类完成（design 9.1）。
     return chain
 
 
@@ -144,7 +136,6 @@ def build_middlewares(
     user_id: str | None = None,
     available_skills: frozenset[str] | None = None,
     subagent_policy: SubagentPolicy | None = None,
-    defer_contextforge_tools: bool = False,
 ) -> list[AgentMiddleware]:
     """lead 的完整链：基础层 + 上下文投影 + 技能（Activation → Policy → DurableContext）。"""
     resolved = app_config or get_app_config()
@@ -156,6 +147,10 @@ def build_middlewares(
     chain: list[AgentMiddleware] = [make_profile_interrupt_middleware()]
     chain.extend(build_runtime_middlewares(resolved, include_uploads=True, lazy_init=True))
     chain.append(DynamicContextMiddleware(app_config=resolved))
+    # run scope（design 8）：上一轮 tool_search 的卡片不能带进这一轮，否则
+    # "检索过才可执行"会退化成"历史上找到过的都能执行"。lead-only：子代理根本
+    # 拿不到这两个工具（见 build_subagent_runtime_middlewares）。
+    chain.append(RetrievalScopeMiddleware())
 
     # 顺序硬约束（§3.9）：Activation 紧挨 Policy 紧挨 DurableContext。
     # 中间插别的会让共享的 owner token 或 skill_context 对不上。三者固定同一
@@ -169,8 +164,6 @@ def build_middlewares(
             snapshot=snapshot,
         )
     )
-    if defer_contextforge_tools:
-        chain.append(ToolSearchMiddleware(deferred=True))
     chain.append(
         DurableContextMiddleware(
             skills_container_path=resolved.skills.container_path,
@@ -240,6 +233,10 @@ def build_subagent_runtime_middlewares(
     """
     del model_name
     chain = build_runtime_middlewares(app_config, include_uploads=False, lazy_init=lazy_init)
+    # v1 子代理（design 9.2）：tool_search / tool_execute 归 lead。tools=None 的子代理
+    # 继承 lead 的工具表，所以在这一层把两个工具从模型 schema 里摘掉，并在调用侧
+    # 拒绝——否则模型凭上下文里的名字就能执行一个它从未检索过的工具。
+    chain.append(SubagentRetrievalToolStripMiddleware())
     chain.append(DynamicContextMiddleware(app_config=app_config))
     chain.append(PIIOutputMiddleware(app_config=app_config))
     return chain

@@ -534,13 +534,15 @@ skills:
 #   MCPGATEWAY_ADMIN_API_ENABLED=true   # /admin/events 与 /tools 管理 API 才会挂载
 #   MCPGATEWAY_UI_ENABLED 可以保持 false
 #   admin_token 需要 admin.events（或 *）权限；GET /admin/events 不需要 CSRF
-# 多 worker 部署时 ContextForge 需要 Redis，跨进程的事件才会出现在 /admin/events。
+#   ContextForge 侧多 worker 时它需要 Redis，跨进程事件才会出现在 /admin/events。
 #
-# MyFlow 不落工具表：ContextForge 是唯一写入目标；运行时从 MCP 端点加载，
-# 再把文档写进下面这个独立的 Milvus collection。工具更新有三条路径：
-#   1. 管理页写操作 -> 网关异步刷新；
-#   2. 订阅 GET /admin/events；
-#   3. 工具调用 not-found / 参数校验错误 -> 刷新 + index.sync() + 重试一次。
+# 权威数据：contextforge_tools 表（MCP tools/list + Admin /tools 合并）。Milvus
+# 里那个 collection 只是可重建的检索投影，工具定义永远回表读，读不到就丢掉陈旧
+# 的命中文档。工具更新有四条路径：管理页写操作、GET /admin/events、每天本地
+# daily_at 全量、以及工具调用失败后的一次刷新；POST /api/tools/reindex 手动全量。
+#
+# 固定单 worker：GATEWAY_WORKERS 必须为 1。这个 runtime 是进程级的（一个事件
+# 订阅器、一个午夜任务、一把同步锁），enabled=true 且 workers>1 时启动直接拒绝。
 # 安装：uv sync --all-packages --all-extras（或 --extra contextforge）。
 # ------------------------------------------------------------
 contextforge:
@@ -554,13 +556,14 @@ contextforge:
   request_timeout_seconds: 15
   connect_timeout_seconds: 5
   tool_name_prefix: false
-  tool_loading: auto              # auto | eager | deferred；非 eager 需要 search.enabled
-  deferred_threshold: 24          # 工具数超过这个值才藏起 schema，先走 search_tools
 
   sync:
     admin_refresh_async: true     # 管理页写操作立即返回，刷新在后台跑
     startup_sync: true
-    sync_timeout_seconds: 60
+    daily_at: "00:00"             # 本地墙钟时间；格式错了加载时直接报
+    timezone: local               # local = 网关主机时区；也可写 IANA 名（Asia/Shanghai）
+    daily_jitter_seconds: 60      # 只用来错开重启，不改变日期边界
+    sync_timeout_seconds: 60      # 单次同步预算；超时算失败，保留上一版
     cache_ttl_seconds: 60
     retry_on_tool_error: true
     tool_error_refresh_timeout_seconds: 10
@@ -573,10 +576,10 @@ contextforge:
     reconnect_min_seconds: 1
     reconnect_max_seconds: 60
     read_timeout_seconds: 90
-    debounce_ms: 500
+    debounce_ms: 500              # 一阵事件合并成一次同步
     refresh_min_interval_seconds: 5
 
-  search:                         # search_tools 的召回策略
+  search:                         # tool_search 的召回策略与输出预算
     enabled: true
     candidate_k: 20
     top_k: 5
@@ -584,7 +587,10 @@ contextforge:
     min_score: null               # Milvus 返回分下限（RRF 原始分），null = 不过滤
     max_document_chars: 4000
     max_description_chars: 500
-    max_result_chars: 6000
+    max_schema_chars: 3000        # 单张卡片的 schema 预算；截断后仍是合法 JSON
+    max_result_chars: 16000       # 整条 tool_search ToolMessage 的预算
+    require_retrieved: true       # tool_execute 只接受本轮 tool_search 返回过的 call_name
+    max_retrieved_tools: 5        # run-scoped 可调用名单上限，最大 5
 
     keyword:                      # Milvus 内的 BM25 稀疏通道
       enabled: true
@@ -600,7 +606,7 @@ contextforge:
       enabled: false
 
     vector_store:                 # 复用顶层 Milvus 连接，只固定 collection
-      collection: myflow_tools_catalog
+      collection: myflow_contextforge_tools   # 固定值；写成知识库/技能 collection 会报错
       metric_type: COSINE
       index_type: AUTOINDEX
       consistency_level: Strong

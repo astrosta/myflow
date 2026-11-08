@@ -215,7 +215,7 @@ def test_description_names_every_field_and_the_call_gates() -> None:
     for spec in PROFILE_FIELD_SPECS:
         assert spec.path in description
     for phrase in (
-        "以后叫我",
+        "我叫小林",
         "以后都用英文",
         "这次用英文",
         "一次性指令",
