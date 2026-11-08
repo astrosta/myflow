@@ -1,6 +1,7 @@
 # ContextForge 工具目录 rev.9：ContextForge 同步 + tool_search/tool_execute + Milvus 混合检索
 
-> 状态：设计已确认，2026-11-07（rev.9）。
+> 状态：已被 [rev.10](2026-11-08-mcp-server-management-design.md) 取代（2026-11-08）；
+> rev.9 仅作为历史方案保留。
 > 已确认：/admin/events 作为唯一更新信号、不使用 MCP notification、固定单 worker、
 > 保留 /api/tools 和 /workspace/tools、ContextForge 管理 API/token 已配置、午夜使用本地时区。
 > 关系：本文件取代 rev.8（2026-11-07-mcp-gateway-tool-catalog-design.md）。

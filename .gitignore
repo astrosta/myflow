@@ -232,3 +232,6 @@ data/personalization/
 
 # 运维配置（含密钥与本机路径）。模板见 config.example.yaml。
 config.yaml
+
+# 本地隔离 worktree
+.worktrees/
