@@ -14,9 +14,13 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# python:*-slim 已带 ca-certificates。若再跑 apt-get update，默认会打
+# deb.debian.org，国内经常要数分钟；只有真缺系统包时才装，并换国内源：
+#   sed -i -e 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' \
+#          -e 's/security.debian.org/mirrors.tuna.tsinghua.edu.cn/g' \
+#          /etc/apt/sources.list.d/debian.sources \
+#   && apt-get update && apt-get install -y --no-install-recommends <pkg> \
+#   && rm -rf /var/lib/apt/lists/*
 
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
