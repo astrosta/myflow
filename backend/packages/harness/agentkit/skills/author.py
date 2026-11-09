@@ -108,6 +108,14 @@ class SkillAuthorService:
         if self._reserved_names is not None and name in self._reserved_names():
             raise SkillConflict("name is reserved by a built-in skill")
 
+        owned = await self._store.list_owned(owner_user_id)
+        taken = await self._display_names(owned)
+        taken.update(skill.private_name for skill in owned)
+        if name in taken:
+            raise SkillConflict(
+                f"skill name {name!r} is already in use by another of your skills"
+            )
+
         initial = StagedFile(
             path=SKILL_FILE_NAME,
             content=render_skill_md(name, description).encode("utf-8"),
@@ -120,7 +128,6 @@ class SkillAuthorService:
             max_package_bytes=self._creation.max_package_bytes,
         )
 
-        owned = await self._store.list_owned(owner_user_id)
         if len(owned) >= self._creation.max_drafts_per_user:
             raise SkillConflict("draft quota exceeded")
 
@@ -166,9 +173,9 @@ class SkillAuthorService:
         if len(owned) >= self._creation.max_drafts_per_user:
             raise SkillConflict("draft quota exceeded")
 
-        private_name = _unique_skill_name(
-            parsed.name, {skill.private_name for skill in owned}, source_uri
-        )
+        taken = {skill.private_name for skill in owned}
+        taken.update(await self._display_names(owned))
+        private_name = _unique_skill_name(parsed.name, taken, source_uri)
         if private_name != parsed.name:
             skill_md = _rename_skill_md(skill_md, private_name)
         skill = await self._store.create_skill(
@@ -305,6 +312,11 @@ class SkillAuthorService:
             await self._owned_skill(owner_user_id, skill_id)
             files = await self._store.list_draft_files(skill_id)
             manifest = self._build({file.path: file for file in files})
+            await self._ensure_name_available(
+                owner_user_id=owner_user_id,
+                skill_id=skill_id,
+                name=manifest.parsed.name,
+            )
 
             # Never call Git while a database transaction is open.  The store
             # call below opens its own transaction after the commit succeeds.
@@ -419,7 +431,7 @@ class SkillAuthorService:
     ) -> SkillVersionRecord:
         """Activate the latest version only when its latest scan passed."""
         async with self._skill_lock(skill_id):
-            await self._owned_skill(owner_user_id, skill_id)
+            skill = await self._owned_skill(owner_user_id, skill_id)
             version = await self._store.latest_version(skill_id)
             if version is None:
                 raise SkillConflict(f"skill {skill_id!r} has no saved version")
@@ -428,6 +440,11 @@ class SkillAuthorService:
                     f"version {version_id!r} is not the latest saved version"
                 )
 
+            await self._ensure_name_available(
+                owner_user_id=owner_user_id,
+                skill_id=skill_id,
+                name=str(version.metadata.get("name") or skill.private_name),
+            )
             scan = await self._store.latest_security_scan(skill_id, version.id)
             if scan is None:
                 raise SkillConflict("run a security scan before activating this skill")
@@ -492,6 +509,60 @@ class SkillAuthorService:
             # owner must not learn that this draft exists.
             raise SkillConflict(f"skill {skill_id!r} does not exist")
         return skill
+
+    def _ensure_name_not_reserved(self, name: str) -> None:
+        if self._reserved_names is not None and name in self._reserved_names():
+            raise SkillConflict("name is reserved by a built-in skill")
+
+    async def _display_name(self, skill: SkillRecord) -> str:
+        """Return the name users actually see for one owned skill.
+
+        A saved version's frontmatter wins; a never-saved draft falls back to
+        its staged SKILL.md, then to the internal row name.
+        """
+        latest = await self._store.latest_version(skill.id)
+        if latest is not None:
+            return str(latest.metadata.get("name") or skill.private_name)
+        for staged in await self._store.list_draft_files(skill.id):
+            if staged.path != SKILL_FILE_NAME:
+                continue
+            try:
+                parsed = parse_skill_text(staged.content.decode("utf-8"))
+            except (UnicodeDecodeError, SkillParseError, ValueError):
+                break
+            if parsed.name:
+                return parsed.name
+            break
+        return skill.private_name
+
+    async def _display_names(
+        self,
+        owned: list[SkillRecord],
+        *,
+        exclude_skill_id: str | None = None,
+    ) -> set[str]:
+        names: set[str] = set()
+        for skill in owned:
+            if skill.id == exclude_skill_id:
+                continue
+            names.add(await self._display_name(skill))
+        return names
+
+    async def _ensure_name_available(
+        self,
+        *,
+        owner_user_id: str,
+        skill_id: str,
+        name: str,
+    ) -> None:
+        if not name:
+            return
+        self._ensure_name_not_reserved(name)
+        owned = await self._store.list_owned(owner_user_id)
+        if name in await self._display_names(owned, exclude_skill_id=skill_id):
+            raise SkillConflict(
+                f"skill name {name!r} is already in use by another of your skills"
+            )
 
     def _build(self, files: dict[str, StagedFile]):
         return build_package(

@@ -11,6 +11,7 @@ import {
   readDraftFile,
   saveDraft,
   scanSkill,
+  SkillApiError,
   uploadDraftFiles,
   writeDraftFile,
   type DraftFile,
@@ -22,6 +23,7 @@ import {
 } from "@/core/api/skills";
 
 import { SkillEditorPage } from "./skill-editor-page";
+import { clearSkillScanRun } from "./skill-scan-run";
 
 const push = vi.fn();
 
@@ -172,10 +174,13 @@ function makeContent(path: string, content: string): DraftFileContent {
   return { ...makeFile(path), content, encoding: "utf-8" };
 }
 
-function renderPage() {
-  const client = new QueryClient({
+function makeClient() {
+  return new QueryClient({
     defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
   });
+}
+
+function renderPage(client = makeClient()) {
   return render(
     <QueryClientProvider client={client}>
       <SkillEditorPage skillId={SKILL_ID} />
@@ -203,6 +208,7 @@ function primeHappyPath(draft = makeDraft()) {
 
 afterEach(() => {
   cleanup();
+  clearSkillScanRun(SKILL_ID);
   vi.clearAllMocks();
 });
 
@@ -465,6 +471,74 @@ describe("技能编辑器", () => {
     finish(makeScan());
     await waitFor(() => expect(screen.getByText(/安全扫描通过/)).toBeTruthy());
     expect(screen.queryByText("正在做规则检查，并交给模型分析")).toBeNull();
+  });
+
+  it("扫描中切到其他页面再回来仍保留状态，且不会重复发起扫描", async () => {
+    const pending = makeDraft({
+      latest_scan: null,
+      skill: makeSkill({ status: "unscanned" }),
+    });
+    const scanned = makeDraft({
+      latest_scan: makeScan(),
+      skill: makeSkill({ status: "scanned" }),
+    });
+    primeHappyPath(pending);
+    let complete = false;
+    mockedGetDraft.mockImplementation(async () => (complete ? scanned : pending));
+
+    let finish: (scan: ReturnType<typeof makeScan>) => void = () => {};
+    mockedScan.mockImplementation((_skillId, onStatus) => {
+      onStatus?.("正在扫描技能包");
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+
+    const client = makeClient();
+    const first = renderPage(client);
+    fireEvent.click(await screen.findByRole("button", { name: "安全扫描" }));
+    expect(await screen.findByText("正在扫描技能包")).toBeTruthy();
+
+    // 模拟路由切走再回来：编辑器重新挂载，但扫描请求没有取消。
+    first.unmount();
+    renderPage(client);
+
+    const scanningButton = (await screen.findByRole("button", {
+      name: "扫描中…",
+    })) as HTMLButtonElement;
+    expect(scanningButton.disabled).toBe(true);
+    expect(screen.getByText("正在扫描技能包")).toBeTruthy();
+    expect(mockedScan).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(scanningButton);
+    expect(mockedScan).toHaveBeenCalledTimes(1);
+
+    complete = true;
+    finish(makeScan());
+    await waitFor(() => expect(screen.getByLabelText("安全扫描结果")).toBeTruthy());
+    expect(screen.queryByText("正在扫描技能包")).toBeNull();
+  });
+
+  it("扫描失败后切到其他页面再回来仍显示失败原因", async () => {
+    primeHappyPath(
+      makeDraft({ latest_scan: null, skill: makeSkill({ status: "unscanned" }) }),
+    );
+    mockedScan.mockRejectedValue(
+      new SkillApiError(503, "skill_scanner_unavailable", "扫描器暂不可用", null),
+    );
+
+    const client = makeClient();
+    const first = renderPage(client);
+    fireEvent.click(await screen.findByRole("button", { name: "安全扫描" }));
+    expect(await screen.findByText("扫描器暂不可用")).toBeTruthy();
+
+    first.unmount();
+    renderPage(client);
+
+    expect(await screen.findByText("扫描器暂不可用")).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "安全扫描" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 
   it("有未保存修改时安全扫描按钮禁用，避免扫描到旧版本", async () => {

@@ -344,6 +344,44 @@ def test_activation_requires_a_passing_scan_then_points_the_active_pointer(harne
     harness.run(scenario)
 
 
+def test_activation_rejects_a_legacy_draft_with_the_same_name(harness: Harness) -> None:
+    async def scenario() -> None:
+        skill = await harness.service.create_draft(
+            owner_user_id="u1", name="placeholder", description="current"
+        )
+        await harness.service.put_file(
+            owner_user_id="u1",
+            skill_id=skill.id,
+            path="SKILL.md",
+            content=skill_md("shared-report"),
+        )
+        await harness.service.save(owner_user_id="u1", skill_id=skill.id)
+        await harness.service.scan_security(owner_user_id="u1", skill_id=skill.id)
+
+        # Simulate a row created before save-time duplicate checks existed: its
+        # unsaved SKILL.md already claims the same visible name.
+        legacy = await harness.store.create_skill(
+            owner_user_id="u1", private_name="legacy-placeholder"
+        )
+        await harness.store.put_draft_file(
+            legacy.id,
+            "SKILL.md",
+            skill_md("shared-report"),
+            "text",
+        )
+
+        with pytest.raises(SkillConflict, match="already in use"):
+            await harness.service.activate(owner_user_id="u1", skill_id=skill.id)
+        assert (
+            await harness.service.active_version(
+                owner_user_id="u1", skill_id=skill.id
+            )
+            is None
+        )
+
+    harness.run(scenario)
+
+
 def test_activation_without_a_projection_marks_index_disabled(harness: Harness) -> None:
     async def scenario() -> None:
         skill = await harness.service.create_draft(
@@ -462,6 +500,74 @@ def test_create_rejects_a_builtin_name(harness: Harness) -> None:
                 owner_user_id="u1", name="demo", description="demo"
             )
         assert await harness.store.list_owned("u1") == []
+
+    harness.run(scenario)
+
+
+def test_create_rejects_a_name_already_used_by_another_owned_skill(
+    harness: Harness,
+) -> None:
+    async def scenario() -> None:
+        existing = await harness.service.create_draft(
+            owner_user_id="u1", name="placeholder", description="existing"
+        )
+        await harness.service.put_file(
+            owner_user_id="u1",
+            skill_id=existing.id,
+            path="SKILL.md",
+            content=skill_md("shared-report"),
+        )
+        await harness.service.save(owner_user_id="u1", skill_id=existing.id)
+
+        with pytest.raises(SkillConflict, match="already in use"):
+            await harness.service.create_draft(
+                owner_user_id="u1", name="shared-report", description="duplicate"
+            )
+
+        # Another owner's name space is independent.
+        other = await harness.service.create_draft(
+            owner_user_id="u2", name="shared-report", description="other owner"
+        )
+        assert other.owner_user_id == "u2"
+
+    harness.run(scenario)
+
+
+def test_save_rejects_a_name_already_used_by_another_owned_skill(
+    harness: Harness,
+) -> None:
+    async def scenario() -> None:
+        first = await harness.service.create_draft(
+            owner_user_id="u1", name="first", description="first"
+        )
+        await harness.service.put_file(
+            owner_user_id="u1",
+            skill_id=first.id,
+            path="SKILL.md",
+            content=skill_md("shared-report"),
+        )
+        await harness.service.save(owner_user_id="u1", skill_id=first.id)
+
+        second = await harness.service.create_draft(
+            owner_user_id="u1", name="second", description="second"
+        )
+        await harness.service.put_file(
+            owner_user_id="u1",
+            skill_id=second.id,
+            path="SKILL.md",
+            content=skill_md("shared-report"),
+        )
+        with pytest.raises(SkillConflict, match="already in use"):
+            await harness.service.save(owner_user_id="u1", skill_id=second.id)
+
+        # The rejected save did not create a version or commit.
+        assert (
+            await harness.service.latest_version(
+                owner_user_id="u1", skill_id=second.id
+            )
+            is None
+        )
+        assert len(harness.git.save_calls) == 1
 
     harness.run(scenario)
 

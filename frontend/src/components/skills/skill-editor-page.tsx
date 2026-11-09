@@ -15,7 +15,6 @@ import {
   listDraftFiles,
   readDraftFile,
   saveDraft,
-  scanSkill,
   SkillApiError,
   uploadDraftFiles,
   writeDraftFile,
@@ -24,6 +23,11 @@ import {
 } from "@/core/api/skills";
 
 import { SkillEditorActions } from "./skill-editor-actions";
+import {
+  clearSkillScanRun,
+  startSkillScanRun,
+  useSkillScanRun,
+} from "./skill-scan-run";
 import { SkillFileTree } from "./skill-file-tree";
 import { skillIndexStatusLabel } from "./skill-index-status";
 import { SkillStatusBadge } from "./skill-status-badge";
@@ -239,7 +243,6 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   const [busy, setBusy] = useState<Busy>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [scanStatus, setScanStatus] = useState<string | null>(null);
   // 上传会立即写入暂存目录，但只有 save 才生成版本；先记下来，避免上传后
   // 因为没有正文改动而无法保存，也避免扫描/生效越过未保存的附件。
   const [pendingUpload, setPendingUpload] = useState(false);
@@ -268,6 +271,11 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   const pageError = draftQuery.error ?? filesQuery.error;
   const loading = draftQuery.isLoading || filesQuery.isLoading;
   const scan = draft?.latest_scan ?? null;
+  // 扫描状态挂在组件外：切到其他页面再回来时，仍能看见扫描中并阻止重复扫描。
+  const scanRun = useSkillScanRun(skillId);
+  const scanning = scanRun.status === "running";
+  const effectiveBusy = scanning ? "scan" : busy;
+  const scanError = scanRun.status === "failed" ? readableError(scanRun.error) : null;
   const hasUnsavedChanges = dirty || pendingUpload;
   // 新技能还没有任何版本：即使正文没改，也需要第一次保存来生成 v1。
   const canSave = hasUnsavedChanges || !draft?.latest_version;
@@ -286,6 +294,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
     setBusy(kind);
     setActionError(null);
     setNotice(null);
+    clearSkillScanRun(skillId);
   };
 
   const selectPath = (path: string) => {
@@ -296,7 +305,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   };
 
   const save = async () => {
-    if (busy || !canSave) return;
+    if (effectiveBusy || !canSave) return;
     begin("save");
     try {
       if (dirty) {
@@ -315,7 +324,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   };
 
   const upload = async (selected: File[]) => {
-    if (busy) return;
+    if (effectiveBusy) return;
     begin("upload");
     try {
       await uploadDraftFiles(skillId, selected);
@@ -330,7 +339,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   };
 
   const scanNow = async () => {
-    if (busy) return;
+    if (effectiveBusy) return;
     if (hasUnsavedChanges) {
       setNotice(null);
       setActionError("有未保存的修改，请先保存，再运行安全扫描。");
@@ -342,10 +351,9 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
       return;
     }
     begin("scan");
-    setScanStatus(null);
     try {
-      const result = await scanSkill(skillId, setScanStatus);
-      await invalidateDraft();
+      // 扫描任务自己负责跨导航保留状态，并在完成后刷新草稿查询。
+      const result = await startSkillScanRun(skillId, queryClient);
       setNotice(
         result.status === "failed"
           ? "安全扫描执行失败，请查看错误后重试。"
@@ -353,16 +361,15 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
             ? "安全扫描通过，可以点击「生效」。"
             : "安全扫描未通过，请修复发现的问题后重新扫描。",
       );
-    } catch (cause) {
-      setActionError(readableError(cause));
+    } catch {
+      // 失败状态由 skill-scan-run 保留，返回本页后仍能看到原因。
     } finally {
       setBusy(null);
-      setScanStatus(null);
     }
   };
 
   const activate = async () => {
-    if (busy) return;
+    if (effectiveBusy) return;
     if (!draft?.skill.can_activate) {
       setNotice(null);
       setActionError(draft?.skill.activation_blocked_reason || "当前版本还不能生效。");
@@ -387,7 +394,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
   };
 
   const remove = async () => {
-    if (busy) return;
+    if (effectiveBusy) return;
     begin("delete");
     try {
       await deleteSkill(skillId);
@@ -476,12 +483,12 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
               </p>
             ) : null}
 
-            {actionError ? (
+            {actionError || scanError ? (
               <p
                 className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700"
                 role="alert"
               >
-                {actionError}
+                {actionError ?? scanError}
               </p>
             ) : null}
 
@@ -496,12 +503,12 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
 
             <div className="mt-5 grid gap-4 lg:grid-cols-[15rem_minmax(0,1fr)]">
               <SkillFileTree
-                disabled={busy !== null}
+                disabled={effectiveBusy !== null}
                 files={files}
                 onSelect={selectPath}
                 onUpload={(selected) => void upload(selected)}
                 selectedPath={selectedPath}
-                uploading={busy === "upload"}
+                uploading={effectiveBusy === "upload"}
               />
 
               <section className="min-w-0 rounded-lg border border-neutral-200 bg-white p-3">
@@ -531,7 +538,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
                     <Textarea
                       aria-label="文件内容"
                       className="min-h-[24rem] font-mono text-xs"
-                      disabled={busy !== null}
+                      disabled={effectiveBusy !== null}
                       id="skill-file-content"
                       onChange={(event) => setText(event.target.value)}
                       spellCheck={false}
@@ -540,9 +547,9 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
                   </label>
                 )}
 
-                {busy === "scan" && scanStatus ? (
+                {scanning ? (
                   <p className="mt-3 text-xs text-neutral-600" role="status">
-                    {scanStatus}
+                    {scanRun.message ?? "正在准备安全扫描…"}
                   </p>
                 ) : null}
 
@@ -550,7 +557,7 @@ export function SkillEditorPage({ skillId }: SkillEditorPageProps) {
 
                 <div className="mt-3">
                   <SkillEditorActions
-                    busy={busy}
+                    busy={effectiveBusy}
                     canActivate={canActivate}
                     canSave={canSave}
                     canScan={canScan}
