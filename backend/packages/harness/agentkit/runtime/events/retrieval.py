@@ -15,8 +15,9 @@ A reply that says retrieval did not run (``tool_search``'s unavailable index or
 ``catalog_unavailable`` warning, ``search_skills``'s message-only unavailable or
 blank-query reply) also returns ``None``: "could not retrieve" must never be
 recorded as "retrieved nothing".  A successful tool/skill answer therefore has
-to carry a ``retrieval`` mapping, and a KB answer has to carry its query plus
-chunks with non-empty content.  Per-entry validation drops a card or chunk
+to carry a ``retrieval`` mapping, a skill answer has to name at least one
+recall channel that actually answered, and a KB answer has to carry its query
+plus chunks with non-empty content.  Per-entry validation drops a card or chunk
 without its identity key or content rather than salvaging a half-row, and a
 non-empty results list that yields no usable row is malformed, not an empty
 success.
@@ -143,7 +144,7 @@ def _skill_content(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     # Disabled, unavailable and blank-query replies are message-only: no
     # retrieval mapping, so they are not a successful empty search.
     retrieval = _retrieval_marker(payload)
-    if retrieval is None:
+    if retrieval is None or _skill_search_unavailable(retrieval):
         return None
     return {
         "skills": [skill for skill in map(_skill, raw) if skill is not None],
@@ -236,6 +237,20 @@ def _retrieval_unavailable(retrieval: Mapping[str, Any]) -> bool:
     if retrieval.get("index") == UNAVAILABLE_RETRIEVAL_INDEX:
         return True
     return CATALOG_UNAVAILABLE_WARNING in _strings(retrieval.get("warnings"))
+
+
+def _skill_search_unavailable(retrieval: Mapping[str, Any]) -> bool:
+    """A real skill search names the recall channel(s) that answered.
+
+    ``SkillSearchService`` returns empty channels for every service failure
+    (no projection: ``retrieval_unavailable``; Milvus search failed:
+    ``vector_unavailable``/``keyword_unavailable``).  An empty channel list is
+    therefore a failure report, not "searched and found nothing", even when a
+    warning is missing.  A degraded search still names its surviving channel,
+    so it stays a real event.
+    """
+
+    return not _strings(retrieval.get("channels"))
 
 
 def _text(value: object) -> str:

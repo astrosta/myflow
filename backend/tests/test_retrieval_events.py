@@ -243,6 +243,35 @@ def test_real_search_skills_failure_payloads_return_none(payload: dict[str, Any]
     assert _normalize("search_skills", payload) is None
 
 
+@pytest.mark.parametrize(
+    "warnings",
+    [
+        ["retrieval_unavailable"],  # SkillSearchService has no projection
+        ["vector_unavailable"],  # Milvus search failed; no channel answered
+        ["keyword_unavailable"],
+    ],
+)
+def test_real_search_skills_service_failures_return_none(
+    warnings: list[str],
+) -> None:
+    """The service reports an empty hit list with no channels when retrieval failed."""
+
+    payload = {
+        "skills": [],
+        "retrieval": {
+            "channels": [],
+            "candidates": 0,
+            "reranked": False,
+            "warnings": warnings,
+        },
+        "message": [
+            "没有检索到匹配的技能（当前部署可能一个技能都没启用，或技能树为空）。",
+            "不要用本工具重复尝试相似的说法；需要正文时让 lead 用 load_skill(name, id)。",
+        ],
+    }
+    assert _normalize("search_skills", payload) is None
+
+
 def test_real_search_skills_empty_answer_is_an_event() -> None:
     payload = {
         "skills": [],
@@ -271,6 +300,22 @@ def test_search_skills_without_a_retrieval_marker_returns_none(retrieval: Any) -
         "message": ["只返回元数据；需要正文时请调用 load_skill(name, id)。"],
     }
     assert _normalize("search_skills", payload) is None
+
+
+def test_degraded_but_real_search_skills_result_is_still_an_event() -> None:
+    """One recall channel answering is a real search, warning or not."""
+
+    payload = _search_skills_payload()
+    payload["retrieval"]["channels"] = ["keyword"]
+    payload["retrieval"]["warnings"] = ["vector_unavailable"]
+    event = _normalize("search_skills", payload)
+    assert event is not None
+    assert event.content["channels"] == ["keyword"]
+    assert event.content["warnings"] == ["vector_unavailable"]
+    assert [skill["skill_id"] for skill in event.content["skills"]] == [
+        "skill-1",
+        "skill-2",
+    ]
 
 
 def test_skill_score_is_kept_when_present_and_never_defaulted() -> None:
@@ -508,8 +553,8 @@ def test_invalid_entries_are_dropped_and_never_raise() -> None:
             {
                 "skills": [None, {"name": "no-id"}, {"skill_id": "s-1", "name": "ok"}],
                 "retrieval": {
-                    "channels": [],
-                    "candidates": 0,
+                    "channels": ["keyword"],
+                    "candidates": 1,
                     "reranked": False,
                     "warnings": [],
                 },
