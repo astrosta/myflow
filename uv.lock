@@ -15,6 +15,7 @@ members = [
     "agentkit",
     "backend",
     "myflow",
+    "myflow-evals",
 ]
 
 [[package]]
@@ -2394,6 +2395,29 @@ wheels = [
 name = "myflow"
 version = "0.1.0"
 source = { virtual = "." }
+
+[[package]]
+name = "myflow-evals"
+version = "0.1.0"
+source = { editable = "evals" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pyyaml" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pyyaml", specifier = ">=6.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9" }]
 
 [[package]]
 name = "numpy"
