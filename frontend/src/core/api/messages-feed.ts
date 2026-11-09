@@ -108,12 +108,17 @@ export function feedMessageToChatMessage(row: FeedMessage): ChatMessage | null {
     created_at: row.created_at ?? null,
   };
 
-  // 工具结果要挂回 tool_calls 上。账本行本身不带 tool_call_id，
-  // 但 metadata 里可能有（M4 §4.3 的信封允许扩展）。
-  const callId = row.metadata?.tool_call_id;
-  if (typeof callId === "string") message.tool_call_id = callId;
-  const toolName = row.metadata?.name;
-  if (typeof toolName === "string") message.name = toolName;
+  // 工具结果要挂回 tool_calls 上。tool_call_id 优先从**消息正文**取：
+  // journal 落的是 message.model_dump()，它一直都在 content.tool_call_id 里；
+  // 早期只有 row.metadata 的兜底会让刷新后的工具永远停在"运行中"。
+  const callId =
+    (inner && typeof inner.tool_call_id === "string" ? inner.tool_call_id : null) ??
+    (typeof row.metadata?.tool_call_id === "string" ? row.metadata.tool_call_id : null);
+  if (callId) message.tool_call_id = callId;
+  const toolName =
+    (inner && typeof inner.name === "string" ? inner.name : null) ??
+    (typeof row.metadata?.name === "string" ? row.metadata.name : null);
+  if (toolName) message.name = toolName;
 
   // AI 消息的工具调用：content 是 dict 且带 tool_calls 时取出来
   if (isRecord(row.content) && Array.isArray(row.content.tool_calls)) {
@@ -122,6 +127,14 @@ export function feedMessageToChatMessage(row: FeedMessage): ChatMessage | null {
   // 引用、思考等展示元数据随 LangChain 消息一起持久化；历史副本不能丢。
   if (inner && isRecord(inner.additional_kwargs)) {
     message.additional_kwargs = inner.additional_kwargs;
+    // DurableContext / dynamic context / skill activation are request-only
+    // injections. They are journaled, but must never become visible turns.
+    if (
+      inner.additional_kwargs.hide_from_ui === true ||
+      inner.additional_kwargs.durable_context_data === true
+    ) {
+      message.hidden = true;
+    }
   }
   if (inner && isRecord(inner.response_metadata)) {
     message.response_metadata = inner.response_metadata;

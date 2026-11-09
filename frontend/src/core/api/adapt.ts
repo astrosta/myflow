@@ -109,6 +109,13 @@ export function toChatMessage(
   if (toolCalls) out.tool_calls = toolCalls;
   if (typeof bag.additional_kwargs === "object" && bag.additional_kwargs !== null) {
     out.additional_kwargs = bag.additional_kwargs as Record<string, unknown>;
+    // 同一条规则也覆盖 SDK 的 values/messages 快照：隐藏注入不是用户轮次。
+    if (
+      out.additional_kwargs.hide_from_ui === true ||
+      out.additional_kwargs.durable_context_data === true
+    ) {
+      out.hidden = true;
+    }
   }
   if (typeof bag.response_metadata === "object" && bag.response_metadata !== null) {
     out.response_metadata = bag.response_metadata as Record<string, unknown>;

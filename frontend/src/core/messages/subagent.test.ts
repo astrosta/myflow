@@ -105,6 +105,38 @@ describe("子任务卡片数据", () => {
     expect(view.resultText).toBe("已经拿到的部分结论");
   });
 
+  it("最终结论同时出现在步骤尾部时只保留一份", () => {
+    const live: SubagentLiveState = {
+      taskId: "call-1",
+      status: "completed",
+      result: "最终结论",
+      steps: [
+        {
+          key: "id:s1",
+          index: 1,
+          kind: "tool",
+          name: "web_search",
+          text: "搜索资料",
+          toolNames: [],
+        },
+        {
+          key: "id:s2",
+          index: 2,
+          kind: "ai",
+          text: "最终结论",
+          toolNames: [],
+        },
+      ],
+    };
+    const view = buildSubagentView(
+      taskCall({ result: undefined, resultText: "" }),
+      { live },
+    );
+
+    expect(view.resultText).toBe("最终结论");
+    expect(view.steps.map((step) => step.key)).toEqual(["id:s1"]);
+  });
+
   it("状态标签覆盖全部终态", () => {
     expect(subagentStatusLabel("completed")).toBe("已完成");
     expect(subagentStatusLabel("failed")).toBe("失败");

@@ -249,6 +249,28 @@ function argText(args: Record<string, unknown>, key: string): string {
   return textField(args[key]);
 }
 
+function normalizeStepText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** 步骤正文和最终结论文本是否只是同一段答案的两个副本。 */
+function stepTextDuplicatesResult(stepText: string, resultText: string): boolean {
+  const step = normalizeStepText(stepText);
+  const result = normalizeStepText(resultText);
+  if (!step || !result) return false;
+  if (step === result || step.startsWith(result) || result.startsWith(step)) return true;
+  // 工具结果正文可能带「任务成功。结果：……」的外壳；长答案被包在里面也算重复。
+  if (step.length >= 40 && result.includes(step)) return true;
+  // result_brief 是头尾截断（\n...\n）：比较首尾两段。
+  const marker = result.indexOf("...");
+  if (marker > 0) {
+    const head = result.slice(0, marker).trim();
+    const tail = result.slice(marker + 3).trim();
+    if (head && tail && step.startsWith(head) && step.endsWith(tail)) return true;
+  }
+  return false;
+}
+
 /**
  * 组装一个子任务卡片视图。
  *
@@ -300,6 +322,11 @@ export function buildSubagentView(
     textField(delegation?.result_brief) ||
     textField(live?.result);
   const resultText = rawResult || (error ? "" : call.resultText.trim());
+  // 子代理的最后一条 AI 消息既是一个 step，也是它的最终结论。卡片里只保留
+  // 「最终结论」那一份，避免展开后同一段文字出现两遍。
+  const steps = (live?.steps ?? []).filter(
+    (step) => !(step.kind === "ai" && stepTextDuplicatesResult(step.text, resultText)),
+  );
   const modelName = textField(meta.subagent_model_name) || live?.modelName;
   const stopReason =
     textField(meta.subagent_stop_reason) || delegation?.stop_reason || live?.stopReason;
@@ -315,7 +342,7 @@ export function buildSubagentView(
     ...(modelName ? { modelName } : {}),
     ...(stopReason ? { stopReason } : {}),
     ...(usage ? { usage } : {}),
-    steps: live?.steps ?? [],
+    steps,
     resultText,
     ...(error ? { error } : {}),
     ...(delegation?.created_at ? { startedAt: delegation.created_at } : {}),
