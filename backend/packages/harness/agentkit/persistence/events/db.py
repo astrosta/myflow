@@ -82,6 +82,7 @@ class DbRunEventStore(RunEventStore):
         event_types: Sequence[str] | None = None,
         after_seq: int | None = None,
         task_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         statement = select(RunEventRow).where(
             RunEventRow.thread_id == thread_id,
@@ -96,6 +97,8 @@ class DbRunEventStore(RunEventStore):
             # 走的是已有的 (thread_id, run_id, seq) 索引，不改 schema。
             statement = statement.where(RunEventRow.event_metadata["task_id"].as_string() == task_id)
         statement = statement.order_by(RunEventRow.seq.asc())
+        if limit is not None:
+            statement = statement.limit(limit)
         return await self._load(statement)
 
     async def count_messages(self, thread_id: str) -> int:

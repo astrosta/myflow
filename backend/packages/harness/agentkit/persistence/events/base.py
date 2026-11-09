@@ -40,6 +40,7 @@ class RunEventStore(abc.ABC):
         event_types: Sequence[str] | None = None,
         after_seq: int | None = None,
         task_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """该 run 的全部类别，按 seq 升序。
 

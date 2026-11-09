@@ -175,6 +175,16 @@ class MessageResponse(BaseModel):
     created_at: str | None = None
 
 
+class RunEventResponse(BaseModel):
+    seq: int
+    run_id: str
+    event_type: str
+    category: str
+    content: Any
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+
+
 class Page[T](BaseModel):
     data: list[T]
     next_cursor: str | None = None
@@ -221,6 +231,14 @@ def message_to_wire(event: Mapping[str, Any]) -> MessageResponse:
     data["metadata"] = dict(event.get("metadata") or {})
     data["created_at"] = _wire_time(event.get("created_at"))
     return MessageResponse.model_validate(data)
+
+
+def run_event_to_wire(event: Mapping[str, Any]) -> RunEventResponse:
+    """Read-only ledger row. user_id and other persistence columns stay off the wire."""
+    data = {key: event.get(key) for key in RunEventResponse.model_fields}
+    data["metadata"] = dict(event.get("metadata") or {})
+    data["created_at"] = _wire_time(event.get("created_at"))
+    return RunEventResponse.model_validate(data)
 
 
 def model_to_wire(cfg: ModelConfig) -> ModelResponse:

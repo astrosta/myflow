@@ -14,11 +14,19 @@ from backend.app.gateway.models.request import JsonScalar, RunId, ThreadId
 from backend.app.gateway.models.response import (
     CancelResponse,
     Page,
+    RunEventResponse,
     RunResponse,
     RunStateResponse,
+    run_event_to_wire,
     run_to_wire,
 )
-from backend.app.gateway.pagination import PageParams, metadata_filters, page_params, page_response
+from backend.app.gateway.pagination import (
+    MAX_LIMIT,
+    PageParams,
+    metadata_filters,
+    page_params,
+    page_response,
+)
 from backend.app.gateway.run_models import RunCaller, RunCancelRequest, RunCreateRequest, RunLaunch
 from backend.app.gateway.thread_access import require_visible_thread
 from backend.app.gateway.services import (
@@ -145,6 +153,39 @@ async def get_run(
     if record is None or record.thread_id != thread_id:
         raise RunNotFound(f"Run {run_id} not found")
     return run_to_wire(record)
+
+
+@router.get("/{thread_id}/runs/{run_id}/events", response_model=Page[RunEventResponse])
+async def list_run_events(
+    thread_id: ThreadId,
+    run_id: RunId,
+    caller: Annotated[RunCaller, Depends(require_scope("runs:read"))],
+    services: Annotated[RunServices, Depends(get_run_services)],
+    after_seq: Annotated[int | None, Query(ge=0)] = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = 100,
+    event_types: Annotated[str | None, Query(max_length=8192)] = None,
+    task_id: Annotated[str | None, Query(max_length=256)] = None,
+) -> Page[RunEventResponse]:
+    await require_visible_thread(services, thread_id, caller)
+    record = await services.run_manager.get(run_id, user_id=caller.user_id)
+    if record is None or record.thread_id != thread_id:
+        raise RunNotFound(f"Run {run_id} not found")
+
+    types = None
+    if event_types is not None:
+        types = tuple(part.strip() for part in event_types.split(",") if part.strip()) or None
+    rows = await services.event_store.list_events(
+        thread_id,
+        run_id,
+        event_types=types,
+        after_seq=after_seq,
+        task_id=task_id,
+        limit=limit + 1,
+    )
+    page, has_more = rows[:limit], len(rows) > limit
+    wired = [run_event_to_wire(row) for row in page]
+    next_cursor = str(wired[-1].seq) if has_more and wired else None
+    return page_response(wired, has_more=has_more, next_cursor=next_cursor)
 
 
 @router.get("/{thread_id}/runs/{run_id}/join")

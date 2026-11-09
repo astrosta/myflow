@@ -39,6 +39,7 @@ EXPECTED_ROUTES = {
     ("POST", "/api/threads/{thread_id}/runs/wait"),
     ("GET", "/api/threads/{thread_id}/runs"),
     ("GET", "/api/threads/{thread_id}/runs/{run_id}"),
+    ("GET", "/api/threads/{thread_id}/runs/{run_id}/events"),
     ("GET", "/api/threads/{thread_id}/runs/{run_id}/join"),
     ("POST", "/api/threads/{thread_id}/runs/{run_id}/cancel"),
     ("GET", "/api/models"),

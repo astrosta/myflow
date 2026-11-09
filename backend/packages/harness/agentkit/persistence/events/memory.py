@@ -61,6 +61,7 @@ class MemoryRunEventStore(RunEventStore):
         event_types: Sequence[str] | None = None,
         after_seq: int | None = None,
         task_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         rows = [
             row
@@ -69,6 +70,8 @@ class MemoryRunEventStore(RunEventStore):
             and _event_visible(row, event_types, after_seq, task_id)
         ]
         rows.sort(key=lambda row: row["seq"])
+        if limit is not None:
+            rows = rows[:limit]
         return [_copy(row) for row in rows]
 
     async def count_messages(self, thread_id: str) -> int:

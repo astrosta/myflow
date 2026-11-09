@@ -95,11 +95,14 @@ class JsonlRunEventStore(RunEventStore):
         event_types: Sequence[str] | None = None,
         after_seq: int | None = None,
         task_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         path = self._run_file(thread_id, run_id)
         rows = await asyncio.to_thread(self._read_file, path)
         visible = [row for row in rows if _event_visible(row, event_types, after_seq, task_id)]
         visible.sort(key=lambda row: row["seq"])
+        if limit is not None:
+            visible = visible[:limit]
         return visible
 
     async def count_messages(self, thread_id: str) -> int:
