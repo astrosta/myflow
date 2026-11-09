@@ -179,10 +179,10 @@ def load_build_sources(
 ) -> BuildSources:
     """Fetch this account's real tools, private Skills, knowledge documents, and traces.
 
-    limit bounds the work a capped build does: Langfuse paging stops at the limit
-    and only the first limit documents get their chunk fetched. The sources come
-    back capped per kind, but source_totals always records how many sources each
-    kind really has.
+    limit bounds the work a capped build does: only the first limit documents get
+    their chunk fetched, and the returned source lists are capped per kind. Trace
+    reading still pages the whole (page-guarded) trace set, and source_totals
+    always records how many sources each kind really has.
 
     A Gateway failure that makes the account data unusable raises. Everything
     this account cannot use -- an unsupported transport, a disabled or unreachable
