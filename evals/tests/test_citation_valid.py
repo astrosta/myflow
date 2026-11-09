@@ -159,6 +159,17 @@ def test_citation_valid_fails_a_citation_without_a_pair_partner() -> None:
     assert score.value == 0.0
 
 
+def test_citation_valid_is_none_when_only_malformed_citation_rows_exist() -> None:
+    evidence = _evidence(
+        retrieved_chunks=[_chunk("doc-1")],
+        citations=["not-a-mapping", None],
+    )
+
+    assert (
+        citation_valid(expected_output={"expect_kb": True}, evidence=evidence) is None
+    )
+
+
 def test_citation_valid_ignores_malformed_chunk_rows() -> None:
     evidence = _evidence(
         retrieved_chunks=[{"chunk_id": "doc-1:0"}, {"document_id": None}, "junk"],

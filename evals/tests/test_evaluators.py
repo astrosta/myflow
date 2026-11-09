@@ -75,6 +75,11 @@ def _business_call(name: str, args: dict[str, Any] | None = None) -> dict[str, A
     }
 
 
+def _raw_call(name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A raw `tool_calls` row, infrastructure names included."""
+    return _business_call(name, args)
+
+
 def _chunk(document_id: Any, index: int = 0) -> dict[str, Any]:
     return {
         "document_id": document_id,
@@ -180,6 +185,68 @@ def test_tool_hit_returns_none_for_an_expectation_free_sample() -> None:
     assert tool_hit(expected_output={}, evidence=_evidence()) is None
 
 
+def _tool_execute_evidence() -> RunEvidence:
+    """One tool_execute round trip exactly as the run ledger records it."""
+    return collect_evidence(
+        [],
+        [
+            _event(
+                "llm.ai.response",
+                _ai_row(
+                    [
+                        {
+                            "id": "c1",
+                            "name": "tool_execute",
+                            "args": {
+                                "tool_name": "mcp__db__query",
+                                "arguments": {"sql": "select 1"},
+                            },
+                        }
+                    ]
+                ),
+            ),
+            _event(
+                "llm.tool.result",
+                {"tool_call_id": "c1", "content": "1 row"},
+                seq=2,
+            ),
+        ],
+        run_id=RUN_ID,
+    )
+
+
+def test_tool_hit_reads_the_tool_execute_unwrap() -> None:
+    evidence = _tool_execute_evidence()
+    assert [call["name"] for call in evidence.business_tool_calls] == [
+        "mcp__db__query"
+    ]
+
+    score = tool_hit(
+        expected_output={"expected_tools": ["mcp__db__query"]}, evidence=evidence
+    )
+    assert score is not None
+    assert score.value == 1.0
+
+
+def test_args_accuracy_reads_the_tool_execute_arguments() -> None:
+    evidence = _tool_execute_evidence()
+
+    score = args_accuracy(
+        expected_output={
+            "expected_calls": [
+                {
+                    "tool": "mcp__db__query",
+                    "args": {"sql": "select 1"},
+                    "check_keys": ["sql"],
+                }
+            ]
+        },
+        evidence=evidence,
+    )
+    assert score is not None
+    assert score.value == 1.0
+
+
 def test_args_accuracy_matches_check_keys_by_tool_and_value() -> None:
     evidence = _evidence(
         business_tool_calls=[
@@ -216,6 +283,22 @@ def test_args_accuracy_matches_check_keys_by_tool_and_value() -> None:
     )
     assert matched is not None
     assert matched.value == 1.0
+
+
+def test_args_accuracy_does_not_match_a_key_without_a_declared_value() -> None:
+    evidence = _evidence(
+        business_tool_calls=[_business_call("mcp__db__query", {"sql": None})]
+    )
+    expected = {
+        "expected_calls": [
+            {"tool": "mcp__db__query", "args": {}, "check_keys": ["sql"]}
+        ]
+    }
+
+    score = args_accuracy(expected_output=expected, evidence=evidence)
+    assert score is not None
+    assert score.value == 0.0
+    assert "0/1" in score.comment
 
 
 def test_args_accuracy_ignores_calls_to_another_tool() -> None:
@@ -371,8 +454,10 @@ def test_skill_routing_returns_none_when_expectation_is_absent() -> None:
 
 
 def test_routing_metrics_require_a_boolean_declaration() -> None:
-    assert skill_routing(expected_output={"expect_skill": "yes"}, evidence=_evidence()) is None
-    assert kb_routing(expected_output={"expect_kb": 1}, evidence=_evidence()) is None
+    evidence = _evidence()
+
+    assert skill_routing(expected_output={"expect_skill": "yes"}, evidence=evidence) is None
+    assert kb_routing(expected_output={"expect_kb": 1}, evidence=evidence) is None
 
 
 # --- K1 skill retrieval ----------------------------------------------------
@@ -533,6 +618,24 @@ def test_kb_routing_is_not_satisfied_by_a_skill_finder_route() -> None:
     assert score.value == 0.0
 
 
+@pytest.mark.parametrize(
+    ("evaluator", "subagent_type", "flag"),
+    [
+        (skill_routing, "skill-finder", "expect_skill"),
+        (kb_routing, "knowledge-researcher", "expect_kb"),
+    ],
+)
+def test_routing_fails_when_a_subagent_is_routed_but_not_expected(
+    evaluator: Any, subagent_type: str, flag: str
+) -> None:
+    evidence = _evidence(subagent_calls=[_subagent(subagent_type)])
+
+    score = evaluator(expected_output={flag: False}, evidence=evidence)
+    assert score is not None
+    assert score.value == 0.0
+    assert "routed+started" in score.comment
+
+
 def test_kb_routing_returns_none_when_expectation_is_absent() -> None:
     assert kb_routing(expected_output={}, evidence=_evidence()) is None
 
@@ -633,8 +736,11 @@ def test_forbidden_violation_flags_business_calls() -> None:
     assert no_list is None
 
 
-def test_no_tool_ok_scores_an_expectation_free_sample() -> None:
-    ok = no_tool_ok(expected_output={}, evidence=_evidence())
+NO_TOOL_METADATA: dict[str, Any] = {"category": "no_tool", "source": "hand_built"}
+
+
+def test_no_tool_ok_scores_an_explicit_no_tool_sample() -> None:
+    ok = no_tool_ok(expected_output={}, evidence=_evidence(), metadata=NO_TOOL_METADATA)
     assert ok is not None
     assert ok.name == "no_tool_ok"
     assert ok.value == 1.0
@@ -646,24 +752,45 @@ def test_no_tool_ok_scores_an_expectation_free_sample() -> None:
         _evidence(retrieved_tools=["mcp__db__query"]),
         _evidence(retrieved_skills=["deploy"]),
     ):
-        score = no_tool_ok(expected_output={}, evidence=evidence)
+        score = no_tool_ok(
+            expected_output={}, evidence=evidence, metadata=NO_TOOL_METADATA
+        )
         assert score is not None
         assert score.value == 0.0
 
 
-def test_no_tool_ok_is_none_when_the_sample_expects_something() -> None:
+def test_no_tool_ok_fails_a_retrieval_attempt_that_returned_nothing() -> None:
+    evidence = _evidence(
+        tool_calls=[
+            _raw_call("tool_search", {"query": "database"}),
+            _raw_call("knowledge_search", {"query": "refunds"}),
+        ]
+    )
+
+    score = no_tool_ok(expected_output={}, evidence=evidence, metadata=NO_TOOL_METADATA)
+    assert score is not None
+    assert score.value == 0.0
+    assert "tool_search" in score.comment
+
+
+def test_no_tool_ok_is_none_without_the_no_tool_category() -> None:
     evidence = _evidence()
 
-    for expected_output in (
-        {"expected_tools": ["mcp__db__query"]},
-        {"expected_calls": [{"tool": "mcp__db__query", "check_keys": []}]},
-        {"expected_skills": ["deploy"]},
-        {"expected_doc_ids": ["doc-1"]},
-        {"forbidden_tools": ["mcp__db__drop"]},
-        {"expect_kb": True},
-        {"expect_skill": True},
-    ):
-        assert no_tool_ok(expected_output=expected_output, evidence=evidence) is None
+    assert no_tool_ok(expected_output={}, evidence=evidence) is None
+    assert no_tool_ok(expected_output={}, evidence=evidence, metadata=None) is None
+
+    trace = {"user_id": "hashed", "source": "trace", "category": "trace_replay"}
+    assert no_tool_ok(expected_output={}, evidence=evidence, metadata=trace) is None
+
+    tool_item = {"category": "single_tool"}
+    assert no_tool_ok(expected_output={}, evidence=evidence, metadata=tool_item) is None
+
+
+def test_no_tool_ok_is_none_when_the_expected_output_is_missing() -> None:
+    score = no_tool_ok(
+        expected_output=None, evidence=_evidence(), metadata=NO_TOOL_METADATA
+    )
+    assert score is None
 
 
 # --- catalog ---------------------------------------------------------------
@@ -699,6 +826,25 @@ def _rich_evidence() -> RunEvidence:
     )
 
 
+def test_every_evaluator_accepts_item_metadata() -> None:
+    evidence = _rich_evidence()
+    metadata = {"category": "kb_single_hop", "source": "synthetic_from_docs"}
+
+    for name, evaluator in RULE_EVALUATORS.items():
+        if name == "no_tool_ok":
+            continue
+        without = evaluator(expected_output=RICH_EXPECTED, evidence=evidence)
+        with_metadata = evaluator(
+            expected_output=RICH_EXPECTED, evidence=evidence, metadata=metadata
+        )
+        assert with_metadata is not None, name
+        assert (with_metadata.name, with_metadata.value, with_metadata.comment) == (
+            without.name,
+            without.value,
+            without.comment,
+        ), name
+
+
 def test_rule_evaluators_map_the_design_metric_names() -> None:
     assert set(RULE_EVALUATORS) == {
         "retrieval_recall@5",
@@ -725,7 +871,9 @@ def test_every_evaluator_names_itself_after_its_rule() -> None:
 
     for name, evaluator in RULE_EVALUATORS.items():
         if name == "no_tool_ok":
-            result = evaluator(expected_output={}, evidence=_evidence())
+            result = evaluator(
+                expected_output={}, evidence=_evidence(), metadata=NO_TOOL_METADATA
+            )
         else:
             result = evaluator(expected_output=RICH_EXPECTED, evidence=evidence)
         assert result is not None, name

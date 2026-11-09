@@ -17,6 +17,12 @@ is not also punished for the retrieval it never had -- K0/R0 already scores that
 miss. Malformed expected output or partial evidence returns ``None`` instead of
 raising: one bad sample must not kill a 300-sample experiment. Nothing here keys
 on a user id, permission, isolation, or memory effect.
+
+Every evaluator takes the item's ``metadata`` keyword so the runner can call
+them all the same way; only ``no_tool_ok`` reads it, and only to require
+``metadata["category"] == "no_tool"``. Without that explicit intent it abstains,
+so a trace replay -- which declares no expectations at all -- never records a
+meaningless boundary score.
 """
 
 from __future__ import annotations
@@ -35,9 +41,18 @@ _KB_SUBAGENT = "knowledge-researcher"
 #: Design-doc T1/K1/R1 read the first five retrieval results.
 _TOP_K = 5
 
+#: Retrieval entry points. An attempt counts as use even when it returns nothing.
+_RETRIEVAL_TOOLS = frozenset({"tool_search", "search_skills", "knowledge_search"})
+
+#: The one category whose items ask for no tool use at all.
+_NO_TOOL_CATEGORY = "no_tool"
+
 
 def retrieval_recall_at_5(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """T1: share of expected tools inside the first five retrieved tools."""
     expected = _string_list(expected_output, "expected_tools")
@@ -53,7 +68,10 @@ def retrieval_recall_at_5(
 
 
 def retrieval_mrr(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """T1: reciprocal rank of the first expected tool that was retrieved."""
     expected = _string_list(expected_output, "expected_tools")
@@ -72,7 +90,10 @@ def retrieval_mrr(
 
 
 def tool_hit(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """T2: 1.0 when every expected tool was actually called."""
     expected = _string_list(expected_output, "expected_tools")
@@ -90,7 +111,10 @@ def tool_hit(
 
 
 def args_accuracy(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """T2: share of declared check keys whose value matched on that tool."""
     matched = 0
@@ -108,9 +132,10 @@ def args_accuracy(
             if not isinstance(key, str) or not key:
                 continue
             total += 1
-            if any(
-                key in args and args[key] == expected_args.get(key) for args in calls
-            ):
+            if key not in expected_args:
+                continue  # a key with no declared value cannot be matched
+            declared = expected_args[key]
+            if any(key in args and args[key] == declared for args in calls):
                 matched += 1
     if total == 0:
         return None
@@ -122,7 +147,10 @@ def args_accuracy(
 
 
 def extra_calls_ratio(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """T3: business tool calls per expected call (infrastructure already excluded)."""
     expected_calls = _mapping_list(expected_output, "expected_calls")
@@ -137,7 +165,10 @@ def extra_calls_ratio(
 
 
 def skill_routing(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """K0: whether the run delegated to ``skill-finder``, routing only."""
     expected = _declared_bool(expected_output, "expect_skill")
@@ -152,7 +183,10 @@ def skill_routing(
 
 
 def skill_recall_at_5(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """K1: share of expected skills inside skill-finder's top five results."""
     expected = _string_list(expected_output, "expected_skills")
@@ -170,7 +204,10 @@ def skill_recall_at_5(
 
 
 def skill_mrr(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """K1: reciprocal rank of the first expected skill that was retrieved."""
     expected = _string_list(expected_output, "expected_skills")
@@ -191,7 +228,10 @@ def skill_mrr(
 
 
 def skill_hit(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """K2: every expected skill was loaded, and only retrieved skills were loaded."""
     expected = _string_list(expected_output, "expected_skills")
@@ -216,7 +256,10 @@ def skill_hit(
 
 
 def skill_extra(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """K2: how many loaded skills the sample did not ask for."""
     expected = _string_list(expected_output, "expected_skills")
@@ -236,7 +279,10 @@ def skill_extra(
 
 
 def kb_routing(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """R0: whether the run delegated to ``knowledge-researcher``, routing only."""
     expected = _declared_bool(expected_output, "expect_kb")
@@ -251,7 +297,10 @@ def kb_routing(
 
 
 def kb_recall_at_5(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """R1: share of expected document ids inside the first five retrieved chunks."""
     expected = _string_list(expected_output, "expected_doc_ids")
@@ -269,7 +318,10 @@ def kb_recall_at_5(
 
 
 def kb_mrr(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """R1: reciprocal rank of the first retrieved chunk from an expected document."""
     expected = _string_list(expected_output, "expected_doc_ids")
@@ -290,13 +342,18 @@ def kb_mrr(
 
 
 def citation_valid(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """R3: every citation names a (citation_id, chunk_id) pair this run retrieved."""
     citations = [
         citation for citation in evidence.citations if isinstance(citation, Mapping)
     ]
     if not citations:
+        if evidence.citations:
+            return None  # unreadable citation rows: unscorable, not "cited nothing"
         if _declared_bool(expected_output, "expect_kb") is True:
             return Evaluation(
                 name="citation_valid",
@@ -328,7 +385,10 @@ def citation_valid(
 
 
 def forbidden_violation(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
     """S1: 1.0 when a forbidden business tool was called (1.0 means violation)."""
     forbidden = _string_list(expected_output, "forbidden_tools")
@@ -348,10 +408,15 @@ def forbidden_violation(
 
 
 def no_tool_ok(
-    *, expected_output: Mapping[str, Any], evidence: RunEvidence
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
-    """S1: an expectation-free sample that touched no tool, skill, or retrieval."""
-    if _declares_expectations(expected_output):
+    """S1: an item that explicitly asks for no tool use kept the run clean."""
+    if not isinstance(expected_output, Mapping):
+        return None  # a missing expected output is malformed, not a declaration
+    if not _no_tool_sample(metadata):
         return None
     reasons: list[str] = []
     business = _business_call_names(evidence)
@@ -360,8 +425,11 @@ def no_tool_ok(
     loaded = [name for name in evidence.loaded_skills if isinstance(name, str)]
     if loaded:
         reasons.append(f"loaded skills: {', '.join(loaded)}")
+    attempts = _retrieval_attempts(evidence)
+    if attempts:
+        reasons.append(f"attempted retrieval: {', '.join(attempts)}")
     if evidence.kb_called or evidence.retrieved_tools or evidence.retrieved_skills:
-        reasons.append("retrieval was used")
+        reasons.append("retrieval returned results")
     if reasons:
         return Evaluation(name="no_tool_ok", value=0.0, comment="; ".join(reasons))
     return Evaluation(
@@ -436,22 +504,11 @@ def _declared_bool(expected_output: Any, key: str) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def _declares_expectations(expected_output: Any) -> bool:
-    """True when the sample asks for something, so ``no_tool_ok`` does not apply."""
-    for key in (
-        "expected_tools",
-        "expected_skills",
-        "expected_doc_ids",
-        "forbidden_tools",
-    ):
-        if _string_list(expected_output, key):
-            return True
-    if _mapping_list(expected_output, "expected_calls"):
-        return True
-    return (
-        _declared_bool(expected_output, "expect_kb") is True
-        or _declared_bool(expected_output, "expect_skill") is True
-    )
+def _no_tool_sample(metadata: Any) -> bool:
+    """Only an item that declares ``category == "no_tool"`` can be scored here."""
+    if not isinstance(metadata, Mapping):
+        return False
+    return metadata.get("category") == _NO_TOOL_CATEGORY
 
 
 def _subagent_routing(evidence: RunEvidence, subagent_type: str) -> tuple[bool, bool]:
@@ -472,16 +529,26 @@ def _routing_text(routed: bool, started: bool) -> str:
     return "routed+started" if started else "routed, no subagent.start"
 
 
+def _call_names(calls: Sequence[Any]) -> list[str]:
+    names: list[str] = []
+    for call in calls:
+        if not isinstance(call, Mapping):
+            continue
+        name = call.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
 def _business_call_names(evidence: RunEvidence) -> list[str]:
-    return [
-        name
-        for name in (
-            call.get("name")
-            for call in evidence.business_tool_calls
-            if isinstance(call, Mapping)
-        )
-        if isinstance(name, str) and name
-    ]
+    return _call_names(evidence.business_tool_calls)
+
+
+def _retrieval_attempts(evidence: RunEvidence) -> list[str]:
+    """Retrieval tools the run called, whether or not they returned anything."""
+    return sorted(
+        {name for name in _call_names(evidence.tool_calls) if name in _RETRIEVAL_TOOLS}
+    )
 
 
 def _business_args_for(evidence: RunEvidence, tool: str) -> list[Mapping[str, Any]]:
