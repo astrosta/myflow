@@ -16,7 +16,11 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from agentkit.runtime.events.catalog import RETRIEVAL_KB_EVENT, RETRIEVAL_SKILL_EVENT
+from agentkit.runtime.events.catalog import (
+    RETRIEVAL_KB_EVENT,
+    RETRIEVAL_SKILL_EVENT,
+    RETRIEVAL_TOOL_EVENT,
+)
 from agentkit.runtime.runs.worker import _SubagentEventBuffer
 from agentkit.subagents.executor import SubagentExecutor, _RunState
 from agentkit.subagents.results import SubagentResult, SubagentStatus
@@ -232,10 +236,20 @@ def test_the_executor_capture_appends_retrievals_and_keeps_steps_bounded() -> No
 # ---------------------------------------------------------------- frame mapping
 
 
+def _kb_event_content() -> dict[str, Any]:
+    """归一化之后的 KB 载荷：带 query 和 items，不是工具原始报文。"""
+
+    return {
+        "query": "升级到 3.2 需要做哪些准备",
+        "items": [{"document_id": "doc-1", "chunk_id": "chunk-1", "content": LONG_CONTENT}],
+        "truncated": False,
+    }
+
+
 @pytest.mark.parametrize(
     ("event_type", "content", "expected"),
     [
-        ("retrieval.kb", _knowledge_payload(), RETRIEVAL_KB_EVENT),
+        ("retrieval.kb", _kb_event_content(), RETRIEVAL_KB_EVENT),
         (
             "retrieval.skill",
             {
@@ -245,6 +259,11 @@ def test_the_executor_capture_appends_retrievals_and_keeps_steps_bounded() -> No
                 "truncated": False,
             },
             RETRIEVAL_SKILL_EVENT,
+        ),
+        (
+            "retrieval.tool",
+            {"tools": [{"call_name": "read_file", "tool_id": "t-1", "score": 0.5}], "channels": []},
+            RETRIEVAL_TOOL_EVENT,
         ),
     ],
 )
@@ -281,6 +300,68 @@ def test_task_retrieval_maps_to_a_retrieval_row_with_task_id(
 )
 def test_malformed_task_retrieval_frames_are_dropped(chunk: object) -> None:
     assert subagent_run_event(chunk) is None
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        ["retrieval.kb"],
+        {"event_type": "retrieval.skill"},
+        ("retrieval.kb",),
+    ],
+)
+def test_a_non_string_event_type_is_dropped_not_raised(event_type: object) -> None:
+    """非字符串 event_type 不能当 dict key：list/dict 会抛 TypeError，坏帧必须只丢不炸。"""
+
+    chunk = {
+        "type": "task_retrieval",
+        "task_id": TASK_ID,
+        "retrieval": {"event_type": event_type, "content": _kb_event_content()},
+    }
+
+    assert subagent_run_event(chunk) is None
+
+
+@pytest.mark.parametrize(
+    ("event_type", "content"),
+    [
+        # retrieval.kb：必须有非空 query 和 items 列表
+        ("retrieval.kb", {}),
+        ("retrieval.kb", {"query": "升级到 3.2 需要做哪些准备"}),
+        ("retrieval.kb", {"items": []}),
+        ("retrieval.kb", {"query": " ", "items": []}),
+        ("retrieval.kb", {"query": "升级", "items": "nope"}),
+        ("retrieval.kb", {"query": 42, "items": []}),
+        # 工具原始报文（results）不是归一化载荷：形状不对就丢，别把原文当行落库
+        ("retrieval.kb", _knowledge_payload()),
+        # retrieval.skill：必须有 skills 列表
+        ("retrieval.skill", {}),
+        ("retrieval.skill", {"channels": []}),
+        ("retrieval.skill", {"skills": {"skill_id": "skill-1"}}),
+        # retrieval.tool：必须有 tools 列表
+        ("retrieval.tool", {}),
+        ("retrieval.tool", {"tools": {}}),
+        ("retrieval.tool", {"channels": ["keyword"]}),
+    ],
+)
+def test_a_valid_task_id_with_unusable_content_is_dropped(
+    event_type: str, content: dict[str, Any]
+) -> None:
+    """空对象 / 缺载荷键不是"检索到零条"，是坏帧：不构造行，返回 None。"""
+
+    assert subagent_run_event(_retrieval_chunk(event_type, content)) is None
+
+
+def test_an_empty_payload_list_is_still_a_valid_row() -> None:
+    """"检索到了零条"和"没有载荷"不是一回事：空列表配上 query 仍是一行证据。"""
+
+    content = {"query": "升级到 3.2 需要做哪些准备", "items": [], "truncated": False}
+
+    event = subagent_run_event(_retrieval_chunk("retrieval.kb", content))
+
+    assert event is not None
+    assert event.event_type == RETRIEVAL_KB_EVENT.event_type
+    assert event.content["items"] == []
 
 
 def test_the_event_buffer_persists_full_kb_content_with_task_id() -> None:

@@ -28,6 +28,7 @@ from typing import Any
 from agentkit.runtime.events.catalog import (
     RETRIEVAL_KB_EVENT,
     RETRIEVAL_SKILL_EVENT,
+    RETRIEVAL_TOOL_EVENT,
     SUBAGENT_END_EVENT,
     SUBAGENT_START_EVENT,
     SUBAGENT_STEP_EVENT,
@@ -67,9 +68,18 @@ SUBAGENT_RETRIEVAL_TOOL_NAMES = frozenset({
 })
 
 #: 子代理这里只可能产出 skill / kb；``retrieval.tool`` 是 lead 的 ``tool_search``。
+#: 映射仍然留全：词表里三种检索事件都能落库，只是今天没有 emitter 产出 tool 帧。
 _RETRIEVAL_DEFINITION_BY_EVENT_TYPE: dict[str, RunEventDefinition] = {
     RETRIEVAL_SKILL_EVENT.event_type: RETRIEVAL_SKILL_EVENT,
     RETRIEVAL_KB_EVENT.event_type: RETRIEVAL_KB_EVENT,
+    RETRIEVAL_TOOL_EVENT.event_type: RETRIEVAL_TOOL_EVENT,
+}
+
+#: 归一化之后的载荷必须自证形状：这个键在，而且是 list。空 ``{}`` 不是"检索到零条"。
+_RETRIEVAL_PAYLOAD_KEY_BY_EVENT_TYPE: dict[str, str] = {
+    RETRIEVAL_KB_EVENT.event_type: "items",
+    RETRIEVAL_SKILL_EVENT.event_type: "skills",
+    RETRIEVAL_TOOL_EVENT.event_type: "tools",
 }
 
 
@@ -278,10 +288,12 @@ def subagent_run_event(chunk: object) -> SubagentEventRow | None:
 
 
 def _task_retrieval_row(chunk: Mapping[str, Any]) -> SubagentEventRow | None:
-    """`task_retrieval` → `retrieval.skill` / `retrieval.kb`，正文原样保留。
+    """`task_retrieval` → `retrieval.skill` / `retrieval.kb` / `retrieval.tool`，正文原样保留。
 
-    `retrieval` 里带的是归一化后的 `{"event_type": ..., "content": ...}`。这里只校验
-    形状和种类：malformed 帧返回 `None`，和 `task_running` 一样丢弃而不是抛。
+    `retrieval` 里带的是归一化后的 `{"event_type": ..., "content": ...}`。这里校验形状、
+    种类和**载荷**：malformed 帧返回 `None`，和 `task_running` 一样丢弃而不是抛。
+    `event_type` 先过 `isinstance(str)` 再当 dict key——list/dict 当 key 会抛
+    `TypeError`，而坏帧恰恰是最该被安静丢掉的那种输入。
     """
     task_id = chunk.get("task_id")
     if not isinstance(task_id, str) or not task_id.strip():
@@ -289,9 +301,14 @@ def _task_retrieval_row(chunk: Mapping[str, Any]) -> SubagentEventRow | None:
     retrieval = chunk.get("retrieval")
     if not isinstance(retrieval, Mapping):
         return None
-    definition = _RETRIEVAL_DEFINITION_BY_EVENT_TYPE.get(retrieval.get("event_type"))
+    event_type = retrieval.get("event_type")
+    if not isinstance(event_type, str):
+        return None
+    definition = _RETRIEVAL_DEFINITION_BY_EVENT_TYPE.get(event_type)
     content = retrieval.get("content")
     if definition is None or not isinstance(content, Mapping):
+        return None
+    if not _retrieval_content_is_usable(definition.event_type, content):
         return None
     return SubagentEventRow(
         event_type=definition.event_type,
@@ -299,6 +316,23 @@ def _task_retrieval_row(chunk: Mapping[str, Any]) -> SubagentEventRow | None:
         content=dict(content),
         metadata={"task_id": task_id},
     )
+
+
+def _retrieval_content_is_usable(event_type: str, content: Mapping[str, Any]) -> bool:
+    """归一化后的载荷必须自证形状，否则不构造行。
+
+    `content={}` 曾被当成合法行落库——那等于把"坏帧"记成"检索到零条"，正是
+    `retrieval_event_for_tool` 一直在拒的那种谎。判据只有两条：种类对应的载荷键存在
+    且是 list；KB 还要有一个非空 `query`（没有 query 的 KB 结果没法评测）。
+    `items: []` / `skills: []` / `tools: []` 仍然合法——"搜过但零命中"是证据。
+    """
+    payload_key = _RETRIEVAL_PAYLOAD_KEY_BY_EVENT_TYPE.get(event_type)
+    if payload_key is None or not isinstance(content.get(payload_key), list):
+        return False
+    if event_type == RETRIEVAL_KB_EVENT.event_type:
+        query = content.get("query")
+        return isinstance(query, str) and bool(query.strip())
+    return True
 
 
 def _step_content(chunk: Mapping[str, Any]) -> dict[str, Any] | None:
