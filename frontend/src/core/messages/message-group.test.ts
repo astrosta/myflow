@@ -65,6 +65,65 @@ describe("带正文的工具调用消息（§6.1）", () => {
     });
   });
 
+  it("task 调用按 tool_call_id 挂上持久化台账，渲染成子任务而不是普通工具", () => {
+    const messages = [
+      human("u1"),
+      ai("a1", {
+        tool_calls: [
+          {
+            id: "call-task",
+            name: "task",
+            args: {
+              description: "调研竞品",
+              subagent_type: "researcher",
+              prompt: "请调研竞品",
+            },
+          },
+        ],
+      }),
+      tool("t1", "call-task", {
+        content: "任务成功。\n结果：结论",
+        status: "success",
+        additional_kwargs: { subagent_status: "completed", subagent_result_brief: "结论" },
+      }),
+    ];
+
+    const [step] = stepsOf(
+      buildMessageGroups({
+        messages,
+        delegations: [
+          {
+            id: "call-task",
+            description: "台账里的竞品调研",
+            subagent_type: "researcher",
+            status: "completed",
+            created_at: "2026-11-09T00:00:00Z",
+          },
+        ],
+      }),
+    );
+
+    expect(step!.toolCalls[0]!.name).toBe("task");
+    expect(step!.toolCalls[0]!.subagent).toMatchObject({
+      id: "call-task",
+      description: "调研竞品",
+      subagentType: "researcher",
+      status: "completed",
+      resultText: "结论",
+      startedAt: "2026-11-09T00:00:00Z",
+    });
+  });
+
+  it("普通工具不会拿到子任务视图", () => {
+    const messages = [
+      human("u1"),
+      ai("a1", { tool_calls: [{ id: "call-1", name: "read_file", args: { path: "a.py" } }] }),
+    ];
+
+    const [step] = stepsOf(buildMessageGroups({ messages }));
+    expect(step!.toolCalls[0]!.subagent).toBeUndefined();
+  });
+
   it("还没有结果时状态是 pending", () => {
     const messages = [
       human("u1"),

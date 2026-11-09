@@ -1,11 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { captured, streamMock } = vi.hoisted(() => {
+const { captured, streamMock, fetchMessagePageMock } = vi.hoisted(() => {
   const streamMock = {
-    messages: [],
+    messages: [] as unknown[],
     values: {},
     isLoading: false,
     isThreadLoading: false,
@@ -14,7 +14,16 @@ const { captured, streamMock } = vi.hoisted(() => {
     submit: vi.fn(),
     stop: vi.fn(),
   };
-  return { captured: [] as Record<string, unknown>[], streamMock };
+  return {
+    captured: [] as Record<string, unknown>[],
+    streamMock,
+    fetchMessagePageMock: vi.fn(
+      (
+        _threadId: string,
+        _options?: { beforeSeq?: number | null; limit?: number },
+      ) => new Promise(() => {}),
+    ),
+  };
 });
 
 vi.mock("@langchain/langgraph-sdk/react", () => ({
@@ -30,7 +39,8 @@ vi.mock("@/core/api/fetch-with-gap", () => ({
 }));
 vi.mock("@/core/api/messages-feed", () => ({
   DEFAULT_PAGE_SIZE: 30,
-  fetchMessagePage: () => new Promise(() => {}),
+  OLDER_PAGE_SIZE: 10,
+  fetchMessagePage: fetchMessagePageMock,
 }));
 vi.mock("@/core/api/threads", () => ({ createThread: vi.fn(), getThreadState: vi.fn() }));
 vi.mock("@/core/api/uploads", () => ({ uploadFiles: vi.fn() }));
@@ -73,6 +83,121 @@ describe("useChat 的缓存失效", () => {
     });
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["threads"] });
+  });
+});
+
+describe("useChat 的历史翻页", () => {
+  it("加载更早的消息时一次请求 10 条，并从当前最旧的消息继续往前翻", async () => {
+    fetchMessagePageMock.mockReset();
+    const newest = {
+      messages: [{ id: "m30", type: "ai" as const, content: "30", seq: 30 }],
+      hasMoreBefore: true,
+      nextBeforeSeq: 30,
+    };
+    const older = {
+      messages: Array.from({ length: 10 }, (_, index) => ({
+        id: "m" + (20 + index),
+        type: "ai" as const,
+        content: String(20 + index),
+        seq: 20 + index,
+      })),
+      hasMoreBefore: false,
+      nextBeforeSeq: null,
+    };
+    fetchMessagePageMock.mockImplementation(
+      async (
+        _threadId: string,
+        options?: { beforeSeq?: number | null; limit?: number },
+      ) => (options?.beforeSeq === 30 ? older : newest),
+    );
+
+    const { result } = renderHook(() => useChat({ threadId: "t1" }), { wrapper });
+    await waitFor(() => expect(result.current.hasMoreBefore).toBe(true));
+
+    await act(async () => {
+      await result.current.loadOlder();
+    });
+
+    expect(fetchMessagePageMock).toHaveBeenLastCalledWith("t1", {
+      beforeSeq: 30,
+      limit: 10,
+    });
+    expect(result.current.messages.map((message) => message.seq)).toEqual([
+      20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    ]);
+    expect(result.current.hasMoreBefore).toBe(false);
+  });
+});
+
+describe("useChat 的子任务事件", () => {
+  it("task custom 事件驱动子任务卡片，带 namespace 的子代理帧被忽略", () => {
+    streamMock.messages = [
+      { id: "u1", type: "human", content: "调研竞品" },
+      {
+        id: "a1",
+        type: "ai",
+        content: "",
+        tool_calls: [
+          {
+            id: "call-1",
+            name: "task",
+            args: { description: "调研竞品", subagent_type: "researcher" },
+          },
+        ],
+      },
+    ];
+    const { result } = renderHook(() => useChat({ threadId: "t1" }), { wrapper });
+    const options = captured.at(-1) as {
+      onCustomEvent: (
+        data: unknown,
+        context: { namespace?: string[]; mutate: () => void },
+      ) => void;
+    };
+    const taskCall = () =>
+      result.current.groups
+        .flatMap((group) => (group.kind === "steps" ? group.steps : []))
+        .flatMap((step) => step.toolCalls)
+        .find((call) => call.name === "task");
+
+    expect(taskCall()?.subagent?.status).toBe("running");
+
+    act(() => {
+      options.onCustomEvent(
+        {
+          type: "task_started",
+          task_id: "call-1",
+          description: "调研竞品",
+          subagent_type: "researcher",
+        },
+        { namespace: [], mutate: () => {} },
+      );
+    });
+    act(() => {
+      options.onCustomEvent(
+        {
+          type: "task_running",
+          task_id: "call-1",
+          message_index: 1,
+          message: { type: "tool", id: "s1", name: "web_search", content: "搜索结果" },
+        },
+        { namespace: [], mutate: () => {} },
+      );
+    });
+    act(() => {
+      options.onCustomEvent(
+        {
+          type: "task_running",
+          task_id: "call-1",
+          message_index: 2,
+          message: { type: "tool", id: "s2", name: "web_search", content: "重复帧" },
+        },
+        { namespace: ["tools:call-1"], mutate: () => {} },
+      );
+    });
+
+    expect(taskCall()?.subagent?.steps).toHaveLength(1);
+    expect(taskCall()?.subagent?.steps[0]?.text).toBe("搜索结果");
+    streamMock.messages = [];
   });
 });
 

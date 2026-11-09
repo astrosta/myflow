@@ -19,6 +19,9 @@ import { apiFetch, apiUrl } from "./base";
 
 export const DEFAULT_PAGE_SIZE = 50;
 
+/** "加载更早的消息"每次追加的条数：比首屏小，避免一次把视口翻太多。 */
+export const OLDER_PAGE_SIZE = 10;
+
 /** 账本里 category="message" 的三个 event_type（agentkit/runtime/events/catalog.py） */
 export const MESSAGE_EVENT_TYPES: Record<string, MessageType> = {
   "llm.human.input": "human",
@@ -148,13 +151,20 @@ export function parseMessagePage(payload: unknown): MessagePage {
 
   const hasMore = payload.has_more === true;
   const cursor = typeof payload.next_cursor === "string" ? Number(payload.next_cursor) : null;
-  const seqs = messages.map((m) => m.seq).filter((s): s is number => typeof s === "number");
+  // 更旧方向的游标必须取本页**最旧**的 seq（before_seq 是排他的）：
+  // 用最后一条会重新取回当前页，翻页看起来一次只多一条消息。
+  const seqs = rows
+    .map((row) => row.seq)
+    .filter((seq): seq is number => typeof seq === "number" && Number.isFinite(seq));
 
   return {
     messages,
     hasMoreBefore: hasMore,
-    // next_cursor 就是本页最后一条的 seq（后端 message_page 里 str(wired[-1].seq)）
-    nextBeforeSeq: Number.isFinite(cursor) ? cursor : (seqs.length ? Math.max(...seqs) : null),
+    nextBeforeSeq: seqs.length
+      ? Math.min(...seqs)
+      : Number.isFinite(cursor)
+        ? cursor
+        : null,
   };
 }
 

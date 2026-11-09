@@ -1,4 +1,9 @@
-import type { ChatMessage } from "../types";
+import type { ChatMessage, DelegationEntry } from "../types";
+import {
+  buildSubagentView,
+  TASK_TOOL_NAME,
+  type SubagentLiveState,
+} from "./subagent";
 import { indexToolResults, resolveToolCalls, textOf, type ToolCallView } from "./tool-results";
 
 /**
@@ -182,14 +187,38 @@ export interface BuildGroupsInput {
   /** 这一轮还在流。只作用于**最后一轮**（最后一个人类消息之后） */
   streaming?: boolean;
   activeRunId?: string | null;
+  /** ThreadState 里持久化的委派台账；刷新页面后靠它恢复子任务卡片 */
+  delegations?: readonly DelegationEntry[];
+  /** 当前页面收到的 task_* custom 事件，按 tool_call_id 索引 */
+  subagentEvents?: Readonly<Record<string, SubagentLiveState>>;
 }
 
 export function buildMessageGroups({
   messages,
   streaming = false,
   activeRunId = null,
+  delegations = [],
+  subagentEvents = {},
 }: BuildGroupsInput): MessageGroup[] {
   const results = indexToolResults(messages);
+  const delegationById = new Map<string, DelegationEntry>();
+  for (const entry of delegations) {
+    if (entry && typeof entry.id === "string" && entry.id) {
+      delegationById.set(entry.id, entry);
+    }
+  }
+  const withSubagents = (calls: readonly ToolCallView[]): ToolCallView[] =>
+    calls.map((call) =>
+      call.name === TASK_TOOL_NAME
+        ? {
+            ...call,
+            subagent: buildSubagentView(call, {
+              delegation: delegationById.get(call.id),
+              live: subagentEvents[call.id],
+            }),
+          }
+        : call,
+    );
   const groups: MessageGroup[] = [];
 
   // 按人类消息切轮；人类消息之前的孤儿步骤归入"首轮"
@@ -236,7 +265,7 @@ export function buildMessageGroups({
       if (message.type === "tool") continue; // 结果已经回填进 toolCall
       if (!isRenderable(message)) continue;
 
-      const calls = resolveToolCalls(message, results);
+      const calls = withSubagents(resolveToolCalls(message, results));
       const step: StepView = {
         id: `step-${message.id}`,
         message,

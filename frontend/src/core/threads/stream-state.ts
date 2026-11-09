@@ -1,4 +1,5 @@
 import type {
+  DelegationEntry,
   SandboxState,
   ThreadState,
   TodoItem,
@@ -124,6 +125,58 @@ export function mergeViewedImages(
 /** 累加去重：`promoted` 和 `artifacts` 同一套语义 */
 export const mergePromoted = mergeArtifacts;
 
+const DELEGATION_TERMINAL_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "timed_out",
+  "polling_timed_out",
+]);
+
+const DELEGATION_LEDGER_MAX_ENTRIES = 50;
+
+/**
+ * 委派台账 reducer，语义必须与后端 merge_delegations 一致：
+ * 按 id 合并、首次出现顺序、终态不能被迟到的 in_progress 覆盖。
+ *
+ * 不能用 mergeArtifacts：它只收字符串，会把对象条目全部丢掉——那样实时状态里
+ * 永远看不到 task 的台账，子任务卡片只能等刷新页面才出现结果。
+ */
+export function mergeDelegations(
+  existing: readonly DelegationEntry[] | undefined,
+  incoming: unknown,
+): DelegationEntry[] {
+  if (!Array.isArray(incoming) || incoming.length === 0) {
+    return [...(existing ?? [])];
+  }
+
+  const byId = new Map<string, DelegationEntry>();
+  const order: string[] = [];
+  for (const raw of [...(existing ?? []), ...incoming]) {
+    if (!isPlainObject(raw)) continue;
+    const id = typeof raw.id === "string" ? raw.id : "";
+    if (!id) continue;
+    const entry = { ...raw, id } as DelegationEntry;
+    const status = typeof entry.status === "string" ? entry.status : "";
+    const previous = byId.get(id);
+    if (
+      previous &&
+      DELEGATION_TERMINAL_STATUSES.has(String(previous.status ?? "")) &&
+      !DELEGATION_TERMINAL_STATUSES.has(status)
+    ) {
+      continue;
+    }
+    if (!previous) order.push(id);
+    else {
+      if (!entry.created_at && previous.created_at) entry.created_at = previous.created_at;
+      if (!entry.run_id && previous.run_id) entry.run_id = previous.run_id;
+    }
+    byId.set(id, entry);
+  }
+
+  return order.map((id) => byId.get(id)!).slice(-DELEGATION_LEDGER_MAX_ENTRIES);
+}
+
 function isNonEmptyUpdate(value: unknown): boolean {
   if (value === undefined) return false;
   if (value === null) return true;
@@ -183,7 +236,7 @@ export function foldUpdateFrame(state: ThreadState, chunk: unknown): ThreadState
           next.viewed_images = mergeViewedImages(next.viewed_images, value);
           break;
         case "delegations":
-          next.delegations = mergeArtifacts(next.delegations as never, value) as never;
+          next.delegations = mergeDelegations(next.delegations, value);
           break;
         case "skill_context":
           next.skill_context = mergeArtifacts(next.skill_context as never, value) as never;

@@ -185,9 +185,53 @@ def test_messages_page_is_ascending_and_older_pages_use_the_cursor() -> None:
         "/api/threads/thread-1/messages",
         params={"limit": 2, "before_seq": body["next_cursor"]},
     )
-    assert body["next_cursor"] == "3"
-    assert [row["content"] for row in older.json()["data"]] == ["one", "two"]
+    # 往回翻的游标必须是本页最旧的一条，否则下一页会把当前页再取一遍。
+    assert body["next_cursor"] == "2"
+    assert [row["content"] for row in older.json()["data"]] == ["one"]
     assert older.json()["has_more"] is False
+
+
+def test_older_message_pages_do_not_overlap_and_keep_the_requested_size() -> None:
+    services = _services()
+    client = _client(services)
+    assert client.post("/api/threads", json={"thread_id": "thread-1"}).status_code == 201
+    import asyncio
+
+    asyncio.run(
+        services.events.put_batch(
+            [
+                {
+                    "thread_id": "thread-1",
+                    "run_id": "run-1",
+                    "user_id": "default",
+                    "event_type": "human",
+                    "category": "message",
+                    "content": str(seq),
+                    "metadata": {},
+                }
+                for seq in range(1, 26)
+            ]
+        )
+    )
+
+    first = client.get("/api/threads/thread-1/messages", params={"limit": 10}).json()
+    assert [row["seq"] for row in first["data"]] == list(range(16, 26))
+    assert first["next_cursor"] == "16"
+
+    second = client.get(
+        "/api/threads/thread-1/messages",
+        params={"limit": 10, "before_seq": first["next_cursor"]},
+    ).json()
+    assert [row["seq"] for row in second["data"]] == list(range(6, 16))
+    assert second["next_cursor"] == "6"
+
+    third = client.get(
+        "/api/threads/thread-1/messages",
+        params={"limit": 10, "before_seq": second["next_cursor"]},
+    ).json()
+    assert [row["seq"] for row in third["data"]] == list(range(1, 6))
+    assert third["has_more"] is False
+    assert third["next_cursor"] is None
 
 
 def test_run_list_pages_and_rejects_unknown_status() -> None:

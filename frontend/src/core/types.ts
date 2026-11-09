@@ -80,6 +80,17 @@ export interface ViewedImageData {
 }
 
 export interface DelegationEntry {
+  /** 关联键：task 工具的 tool_call_id */
+  id: string;
+  description?: string;
+  subagent_type?: string;
+  /** 内部状态 in_progress 或终态 completed/failed/cancelled/timed_out/polling_timed_out */
+  status?: string;
+  created_at?: string;
+  run_id?: string;
+  result_brief?: string;
+  result_sha256?: string;
+  stop_reason?: string;
   [key: string]: unknown;
 }
 

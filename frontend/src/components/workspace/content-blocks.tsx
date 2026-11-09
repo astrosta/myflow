@@ -6,6 +6,7 @@ import type { ContentBlockView } from "@/core/messages/group";
 import { cn } from "@/lib/utils";
 
 import { Markdown } from "./markdown";
+import { SubagentCard } from "./subagent-card";
 import { ThinkingBlock } from "./thinking-block";
 import { ToolCallRow } from "./tool-call-row";
 
@@ -63,9 +64,13 @@ export function ContentBlocks({
         return (
           // 工具行和思考行同一形制（一行 + 点开看细节）：行距按行算，不再按卡片算
           <div className="flex flex-col gap-1.5" key={block.id}>
-            {block.calls.map((call) => (
-              <ToolCallRow call={call} key={call.id} />
-            ))}
+            {block.calls.map((call) =>
+              call.subagent ? (
+                <SubagentCard key={call.id} view={call.subagent} />
+              ) : (
+                <ToolCallRow call={call} key={call.id} />
+              ),
+            )}
           </div>
         );
       })}

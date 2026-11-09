@@ -139,7 +139,14 @@ async def list_messages(
     )
     page, has_more = trim_message_page(rows, limit=params.limit, after_seq=params.after_seq)
     wired = [message_to_wire(row) for row in page]
-    next_cursor = str(wired[-1].seq) if has_more and wired else None
+    # 往回翻（默认/latest 与 before_seq）时游标是本页最旧一条，下一页用
+    # before_seq 排他地取更旧内容；只有 after_seq 正向补洞才用最新一条。
+    if not has_more or not wired:
+        next_cursor = None
+    elif params.after_seq is not None:
+        next_cursor = str(wired[-1].seq)
+    else:
+        next_cursor = str(wired[0].seq)
     return Page(data=wired, has_more=has_more, next_cursor=next_cursor)
 
 

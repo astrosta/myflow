@@ -8,7 +8,11 @@ import { toChatMessages } from "../api/adapt";
 import { getApiClient } from "../api/client";
 import { WILDCARD_THREAD, registerRecoveryContext } from "../api/fetch-with-gap";
 import type { StreamRecoveryEvent } from "../api/gap";
-import { DEFAULT_PAGE_SIZE, fetchMessagePage } from "../api/messages-feed";
+import {
+  DEFAULT_PAGE_SIZE,
+  OLDER_PAGE_SIZE,
+  fetchMessagePage,
+} from "../api/messages-feed";
 import { sanitizeChatStreamModes } from "../api/stream-mode";
 import { createThread, getThreadState } from "../api/threads";
 import { uploadFiles } from "../api/uploads";
@@ -24,6 +28,7 @@ import {
 } from "../messages/history";
 import { messageKey } from "../messages/identity";
 import { mergeMessages, type TurnBaseline } from "../messages/order";
+import { applySubagentEvent, type SubagentLiveState } from "../messages/subagent";
 import type { RunContext } from "../models/selection";
 import type { ChatMessage, ThreadState } from "../types";
 import type { ChatController } from "./chat-controller";
@@ -146,6 +151,13 @@ export function useChat({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [interruptBusy, setInterruptBusy] = useState(false);
   /**
+   * task_* custom 事件按 tool_call_id 汇总。它只用于运行中的卡片进度；
+   * 刷新页面后由 ThreadState.delegations + 历史 ToolMessage 重建。
+   */
+  const [subagentEvents, setSubagentEvents] = useState<
+    Record<string, SubagentLiveState>
+  >({});
+  /**
    * The SDK manager only extracts __interrupt__ from values frames. The chat
    * stream deliberately omits values (to avoid resending the whole transcript),
    * so capture the interrupt from the updates frame directly.
@@ -255,6 +267,15 @@ export function useChat({
       if (!isRelevantUpdateFrame(data)) return;
       mutate((prev) => foldUpdateFrame(prev as ThreadState, data) as never);
     },
+    /**
+     * task 工具在根命名空间的 custom 事件。SDK 只要看到 onCustomEvent 就会自动
+     * 把 custom 加进 streamMode，所以这里不需要再改 submit 的模式列表。
+     */
+    onCustomEvent: (data, { namespace }) => {
+      // 子代理自己的帧带 namespace；卡片只认 lead 根命名空间上的 task_* 事件。
+      if (namespace && namespace.length > 0) return;
+      setSubagentEvents((prev) => applySubagentEvent(prev, data));
+    },
     onFinish: () => {
       setTurnBaseline(null);
       /**
@@ -317,6 +338,8 @@ export function useChat({
         // 上层要清掉乐观状态、失效历史缓存、给用户看一个恢复提示
         setOptimistic([]);
         setTurnBaseline(null);
+        // 重连后 live 进度不再可信；卡片改由重新拉取的台账/历史消息重建。
+        setSubagentEvents({});
         // 同样用前缀：恢复回调也可能被旧闭包调用
         queryClient.invalidateQueries({ queryKey: ["messages"] });
       },
@@ -352,14 +375,26 @@ export function useChat({
     [history, streamMessages, optimisticState, floorSeq, turnBaseline],
   );
 
+  const state = useMemo(() => {
+    const values = (stream.values ?? {}) as ThreadState;
+    return {
+      ...values,
+      artifacts: values.artifacts ?? [],
+      todos: values.todos ?? null,
+    } satisfies ThreadState;
+  }, [stream.values]);
+
   const groups = useMemo(
     () =>
       buildMessageGroups({
         messages,
         // 流式期间纯内容 AI 消息留在"处理中"分组（§6.1）
         streaming: Boolean(stream.isLoading),
+        // task 调用要从台账（刷新后）和 custom 事件（运行中）补成子任务卡片
+        delegations: state.delegations,
+        subagentEvents,
       }),
-    [messages, stream.isLoading],
+    [messages, stream.isLoading, state.delegations, subagentEvents],
   );
 
   const loadOlder = useCallback(async () => {
@@ -369,7 +404,10 @@ export function useChat({
     if (cursor === null || loadingOlder) return;
     setLoadingOlder(true);
     try {
-      const page = await fetchMessagePage(effectiveThreadId, { beforeSeq: cursor });
+      const page = await fetchMessagePage(effectiveThreadId, {
+        beforeSeq: cursor,
+        limit: OLDER_PAGE_SIZE,
+      });
       setOlderPages((prev) => [...prev, page]);
     } finally {
       setLoadingOlder(false);
@@ -379,6 +417,8 @@ export function useChat({
   const submit = useCallback(
     async (text: string, files?: readonly File[]) => {
       if (!text.trim()) return;
+      // 新的一轮从干净的 live 卡片开始；旧卡片已经能由消息/台账重建。
+      setSubagentEvents({});
 
       // 先传文件再起 run：M6 的 UploadsMiddleware 在 `before_agent` 里
       // 读取本轮 human message 的 additional_kwargs.files 并注入清单。
@@ -511,15 +551,6 @@ export function useChat({
   }, [stream, queryClient, effectiveThreadId]);
 
   const dismissRecovery = useCallback(() => setRecovery(null), []);
-
-  const state = useMemo(() => {
-    const values = (stream.values ?? {}) as ThreadState;
-    return {
-      ...values,
-      artifacts: values.artifacts ?? [],
-      todos: values.todos ?? null,
-    } satisfies ThreadState;
-  }, [stream.values]);
 
   return {
     threadId: effectiveThreadId,

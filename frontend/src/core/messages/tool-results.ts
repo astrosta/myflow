@@ -1,4 +1,5 @@
 import type { ChatMessage, ToolCall } from "../types";
+import type { SubagentView } from "./subagent";
 
 /** 工具结果按 `tool_call_id` 回填（M5 §2 的 core/messages 职责之一） */
 export function indexToolResults(
@@ -26,6 +27,8 @@ export interface ToolCallView {
   status: ToolCallStatus;
   result?: ChatMessage;
   resultText: string;
+  /** task 工具专用：由台账/实时事件/工具结果合成，普通工具没有这个字段 */
+  subagent?: SubagentView;
 }
 
 export function resolveToolCalls(

@@ -76,6 +76,48 @@ describe("合并 + 空字典清空：viewed_images", () => {
   });
 });
 
+describe("委派台账：按 id 合并，终态不会被 in_progress 复活", () => {
+  it("对象条目不会被当成非字符串丢掉", () => {
+    const next = foldUpdateFrame(createEmptyThreadState(), {
+      tools: {
+        delegations: [
+          {
+            id: "call-1",
+            description: "调研竞品",
+            subagent_type: "researcher",
+            status: "in_progress",
+            created_at: "2026-11-09T00:00:00Z",
+          },
+        ],
+      },
+    });
+
+    expect(next.delegations).toHaveLength(1);
+    expect(next.delegations?.[0]).toMatchObject({ id: "call-1", status: "in_progress" });
+  });
+
+  it("同一 id 的终态覆盖进行中；迟到的进行中不会把终态复活", () => {
+    let state = foldUpdateFrame(createEmptyThreadState(), {
+      delegations: [{ id: "call-1", status: "in_progress", created_at: "t0" }],
+    });
+    state = foldUpdateFrame(state, {
+      delegations: [{ id: "call-1", status: "completed", result_brief: "结论" }],
+    });
+    state = foldUpdateFrame(state, {
+      delegations: [{ id: "call-1", status: "in_progress" }],
+    });
+
+    expect(state.delegations).toEqual([
+      {
+        id: "call-1",
+        status: "completed",
+        result_brief: "结论",
+        created_at: "t0",
+      },
+    ]);
+  });
+});
+
 describe("无关的帧在调用 SDK 的状态改写器之前就被拒掉", () => {
   it("帧里一个 ThreadState 字段都没有 → 不相关", () => {
     expect(isRelevantUpdateFrame({ some_node: { unrelated_field: 1 } })).toBe(false);
