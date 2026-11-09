@@ -141,15 +141,28 @@ uv run --project evals myflow-evals build \
 `build` logs in every fixed account and reads, as that account: `GET /api/mcp-servers`
 plus a direct MCP `tools/list` per server for the real `inputSchema`; `GET /api/skills`
 (private Skills only); `GET /api/knowledge/bases` -> `/documents` -> first chunk per
-document; and the account's own failed/low-scored Langfuse traces when the
-Langfuse variables are set. It then synthesizes one deterministic draft per
-source and, unless `--dry-run` is given, upserts every draft into the dataset
-through Langfuse.
+document; and, only with `--include-traces`, the account's own failed/low-scored
+Langfuse traces. It then synthesizes one deterministic draft per source and,
+unless `--dry-run` is given, upserts every draft into the dataset through Langfuse.
+
+A trace replay declares no expectations (`expected_output` is `{}`), so no metric
+can score it and any `run` over it fails on an `unscored` item. `build` therefore
+excludes trace drafts by default and pages no traces at all; pass
+`--include-traces` to build an exploration dataset. A regression dataset
+(`agent-eval/regression/v1`) must be built without the flag, so it contains only
+scorable samples.
 
 `--dry-run` still logs in and still reads the accounts' data -- sources are
 account-scoped, so there is no way to report real counts without them -- but it
 writes nothing to Langfuse and needs no Langfuse credentials. It is not a
 "no network" mode.
+
+Item ids are namespaced per dataset: Langfuse item ids are unique across a
+project, so `LangfuseDatasetWriter` writes `<8-hex digest of dataset name>-<draft
+id>`. The same account can build `agent-eval/regression/v1` and
+`agent-eval/explore` from the same sources without collision, and rebuilding one
+dataset name reproduces its ids (a rebuild never deletes stale items -- a new
+frozen version needs a new dataset name).
 
 ### `run`
 
@@ -165,7 +178,7 @@ uv run --project evals myflow-evals run \
 | --- | --- |
 | `--mode {ci,full}` | Default `ci`. `ci` executes the fixed stratified 30-item subset; `full` executes every item. |
 | `--run-name NAME` | Per-run identity. Defaults to `<mode>-<UTC timestamp>`. The experiment label itself is always `agent-eval:<dataset>`. |
-| `--max-concurrency N` | Default `2`. Parallel agent runs; keep it small for the Gateway and the subagent runtime. |
+| `--max-concurrency N` | Default `2`. Parallel agent runs; keep it small for the Gateway and the subagent runtime. The item task runs off the SDK event loop (`asyncio.to_thread`), so this really overlaps runs instead of serialising them. |
 | `--limit N` | Cap the selected items after mode selection. |
 
 A real `run` requires the three Langfuse variables plus `AGENT_API` and
@@ -192,6 +205,12 @@ What can fail a run:
   `timeout`, `interrupted`);
 - a completed item that produced no evaluation at all (`unscored`);
 - any `citation_valid` score of 0.0, even if the average passes;
+- any `forbidden_violation` score of 1.0, even if the average passes;
+- a sample that needed a retrieval subagent and never reached it, loaded a Skill it
+  never retrieved, or answered a KB question without KB retrieval evidence
+  (`invalid_routing`), even when the routing average stays above its gate;
+- a run in which no item produced a thresholded score at all
+  (`no scorable samples`);
 - a thresholded metric whose average misses its gate.
 
 ### `ingest`
@@ -259,6 +278,7 @@ verdict:
 dataset: agent-eval/regression/v1
 run: ci-20261109 (mode ci)
 items: 30 of 30 returned
+scorable items: 30
 retrieval_recall@5: 0.980 min 0.95 samples=30 PASS
 tool_hit: 0.933 min 0.90 samples=30 PASS
 args_accuracy: n/a min 0.85 samples=0 insufficient scored samples (LLM metrics need 20)
@@ -288,19 +308,32 @@ Metric catalogue (`THRESHOLDS` as merged):
 | `kb_routing` | R0 routing | A `task` call with `subagent_type="knowledge-researcher"` vs `expect_kb` | `>= 0.95` |
 | `kb_recall@5` | R1 KB retrieval | `retrieval.kb` -> `items[].document_id`, first 5 | `>= 0.85` |
 | `citation_valid` | R3 citations | `additional_kwargs.knowledge_citations` pairs vs chunks this run retrieved | `>= 0.95`; any 0.0 fails the whole run |
+| `forbidden_violation` | S1 safety | Business tool calls vs `forbidden_tools`; 1.0 means a violation | `<= 0.0`; any 1.0 fails the whole run |
 
-Recorded without a numeric gate: `retrieval_mrr`, `skill_mrr`, `kb_mrr`,
-`skill_extra` (lower is better), `forbidden_violation` (1.0 means a forbidden
-tool was called; the merged runner records the score but does not fail the run on
-it, unlike `citation_valid`), and `no_tool_ok` (only items whose
+`citation_valid` returns `None` when any `retrieval.kb` row of the run was
+truncated: the budget hid chunks, so a citation that looks forged may simply be
+out of view. Recorded without a numeric gate: `retrieval_mrr`, `skill_mrr`,
+`kb_mrr`, `skill_extra` (lower is better), and `no_tool_ok` (only items whose
 `metadata.category` is `no_tool` are scored).
 
 An item that finishes with no evaluations at all is a `failed item` with status
 `unscored`, not an absent item: the design counts an unscored sample as a failed
 experiment. This matters for trace-replay drafts, whose `expected_output` is `{}`:
 they are intentionally inapplicable to every metric, so a dataset containing
-them cannot ride in a regression run. Put trace replays in the explore set, or
-give them real expectations before running them as a regression.
+them cannot ride in a regression run. `build` keeps them out unless
+`--include-traces` is passed; put trace replays in the explore set, or give them
+real expectations before running them as a regression.
+
+An item that declares `expect_skill`/`expect_kb` but answers without that
+subagent -- or that loads a Skill it never retrieved, or answers a KB question
+with no KB retrieval evidence -- is a `failed item` with status `invalid_routing`.
+Routing has its own score, but one direct fallback among 30 samples still
+averages above the 0.95 gate, so the runner fails the sample instead.
+
+`scorable items: N` counts the items that produced at least one thresholded
+metric score. With `N = 0` the run fails with
+`no scorable samples: no item produced a thresholded metric score`, even when
+every item completed: an empty gate list is not a clean result.
 
 An incomplete experiment is reported before any gate summary:
 ```text
@@ -311,6 +344,23 @@ there: a `missing` item was planned but never returned, an `unexpected` item was
 not planned, and a `failed` item names its status (`exception`, `unscored`, or a
 non-success run status). Do not rerun only the surviving items to get a green
 result -- the next full run must show every planned item returned.
+
+### Experiment metadata
+
+Every experiment carries these string values on the run, so two experiments are
+comparable without guessing what changed:
+
+| Key | Value |
+| --- | --- |
+| `mode` | `ci` or `full` |
+| `max_concurrency` | The concurrency the run used |
+| `dataset` | The dataset name |
+| `package_version` | The installed `myflow-evals` version (`0.1.0` fallback) |
+| `git_sha` | `GIT_SHA`/`GITHUB_SHA` when present, else `unknown` |
+| `salt_fingerprint` | First 8 hex of `sha256(USER_ID_SALT)`; never the salt |
+
+The experiment label itself is stable (`agent-eval:<dataset>`), so `ci-<sha>` and
+`nightly-<date>` runs land in the same experiment and stay comparable.
 
 ## Package layout
 
@@ -335,7 +385,8 @@ result -- the next full run must show every planned item returned.
 - `GET /api/skills`, keeping `scope == "private"` and dropping builtin/public
   Skills and any Skill without `skill_id`/`name`;
 - `GET /api/knowledge/bases` -> `/documents` -> first chunk per document;
-- the account's own failed or low-scored Langfuse traces (see below).
+- the account's own failed or low-scored Langfuse traces, only when the caller
+  asks for them (`include_traces=True`, i.e. `--include-traces`); see below.
 
 Only `streamable_http` MCP servers are supported. A disabled server
 (`enabled: false` -- the agent cannot route to its tools), an `sse` server, a
@@ -348,7 +399,10 @@ Gateway failure that makes the account data unusable still raises.
 `build_account_items(session, sources, limit=...)` is pure: no I/O, no clock, no
 randomness. It emits one draft per source with a deterministic id
 (`stable_item_id(kind, source_id, ordinal, hashed_user_id)`), so rebuilding is
-idempotent and re-running against the same account never duplicates items.
+idempotent and re-running against the same account never duplicates items. A tool
+whose call name the Agent could not call back -- a dotted upstream name, or one
+beyond the provider length bound -- is skipped with a warning and produces no
+draft, because a sample built from it could never pass.
 
 ### Draft shapes
 
@@ -405,7 +459,7 @@ Notes on the shapes:
 The build uses templates over real data; there is no LLM call or optional extra
 in this path, so a build costs nothing and is reproducible byte for byte for the
 same account data. Categories produced today are `single_tool`, `skill_single`,
-`kb_single_hop`, and `trace_replay`.
+`kb_single_hop`, and -- only with `--include-traces` -- `trace_replay`.
 
 The remaining categories from the design table -- `multi_tool`, `similar_tools`
 (hard negatives), `missing_params`, `similar_skills`, `skill_with_tools`,
@@ -421,8 +475,10 @@ Skills, knowledge documents, and traces are capped separately. It bounds work,
 not truth: only the first `limit` documents get their chunk fetched, but every
 kind is still counted in full (traces are paged to completion under a bounded
 page guard, so even the trace count is real), so the "M sources" in a report is
-the number of sources that account actually has, never the capped sample. The
-returned `BuildReport` records both counts and renders lines such as:
+the number of sources that account actually has, never the capped sample. Without
+`--include-traces` the trace kind is not read at all and the report says
+`trace: 0 drafts from 0 sources`. The returned `BuildReport` records both counts
+and renders lines such as:
 
 ```text
 dataset: myflow-eval
@@ -469,3 +525,13 @@ dataset. `myflow-evals build` is the only command that writes dataset items;
 - The retrieval metrics compare names/ids over the first five results; adding or
   removing source documents invalidates `expected_doc_ids`. Re-chunking alone does
   not, because only document ids are compared.
+- `retrieval.*` events carry only what the model saw: the query, the final
+  cards/chunks, channels, warnings, and the `truncated` flag. They do not carry
+  `task_query`, `domain_keywords`, or a tool `description`, so a metric that needs
+  those must read them elsewhere; the ledger contract stays as merged.
+- A dataset version is immutable once frozen: rebuilding the same name upserts
+  items but never deletes the ones whose sources disappeared. Freeze a new
+  version under a new dataset name (for example `agent-eval/regression/v2`).
+- `trace_replay` items are unscorable by construction, so `build` excludes them
+  unless `--include-traces` is passed and a dataset that contains them cannot
+  pass a run.

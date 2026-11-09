@@ -448,6 +448,43 @@ def test_kb_results_without_any_usable_row_are_not_an_empty_success() -> None:
     assert _normalize("knowledge_search", payload) is None
 
 
+def test_tool_results_without_any_usable_card_are_not_an_empty_success() -> None:
+    event = retrieval_event_for_tool(
+        tool_name="tool_search",
+        content=json.dumps(
+            {
+                "tools": [None, 5, {"call_name": ""}, {"call_name": None}],
+                "retrieval": {
+                    "index": "milvus",
+                    "channels": ["keyword"],
+                    "candidates": 4,
+                    "reranked": False,
+                    "warnings": [],
+                },
+            }
+        ),
+    )
+    assert event is None
+
+
+def test_skill_results_without_any_usable_row_are_not_an_empty_success() -> None:
+    event = retrieval_event_for_tool(
+        tool_name="search_skills",
+        content=json.dumps(
+            {
+                "skills": [None, {"name": "no-id"}, {"skill_id": ""}],
+                "retrieval": {
+                    "channels": ["keyword"],
+                    "candidates": 3,
+                    "reranked": False,
+                    "warnings": [],
+                },
+            }
+        ),
+    )
+    assert event is None
+
+
 def test_real_kb_empty_answer_is_an_event() -> None:
     payload = {
         "query": "升级到 3.2 需要做哪些准备",

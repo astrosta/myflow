@@ -126,8 +126,13 @@ def _tool_content(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     retrieval = _retrieval_marker(payload)
     if retrieval is None or _retrieval_unavailable(retrieval):
         return None
+    cards = [card for card in map(_tool_card, raw) if card is not None]
+    if raw and not cards:
+        # The tool claimed cards but none of them is usable: that is a malformed
+        # payload, not a successful empty retrieval.
+        return None
     return {
-        "tools": [card for card in map(_tool_card, raw) if card is not None],
+        "tools": cards,
         "channels": _strings(retrieval.get("channels")),
         "warnings": _strings(retrieval.get("warnings")),
         "truncated": _truncated(payload, retrieval),
@@ -160,8 +165,13 @@ def _skill_content(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     retrieval = _retrieval_marker(payload)
     if retrieval is None or _skill_search_unavailable(retrieval):
         return None
+    skills = [skill for skill in map(_skill, raw) if skill is not None]
+    if raw and not skills:
+        # Same rule as tool_search and knowledge_search: a non-empty result that
+        # yields no usable row is malformed, not an empty success.
+        return None
     return {
-        "skills": [skill for skill in map(_skill, raw) if skill is not None],
+        "skills": skills,
         "channels": _strings(retrieval.get("channels")),
         "warnings": _strings(retrieval.get("warnings")),
         "truncated": _truncated(payload, retrieval),
