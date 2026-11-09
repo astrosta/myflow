@@ -17,6 +17,7 @@ RUN_EVENT_CATEGORIES = frozenset({
     "subagent",
     "context",
     "workspace",
+    "retrieval",
 })
 
 
@@ -52,3 +53,10 @@ MEMORY_CONTEXT_EVENT = RunEventDefinition("context:memory", "context")
 SUBAGENT_START_EVENT = RunEventDefinition("subagent.start", "subagent")
 SUBAGENT_STEP_EVENT = RunEventDefinition("subagent.step", "subagent")
 SUBAGENT_END_EVENT = RunEventDefinition("subagent.end", "subagent")
+
+# 评测（Task 2）：检索结果是评测样本的原始证据，必须结构化落库，而不是从
+# llm.tool.result 或 subagent.step 的截断 JSON 里反推。三条事件各对应一个检索工具，
+# 内容是该工具的最终模型可见结果（tool_search 预算裁剪之后）。
+RETRIEVAL_TOOL_EVENT = RunEventDefinition("retrieval.tool", "retrieval")
+RETRIEVAL_SKILL_EVENT = RunEventDefinition("retrieval.skill", "retrieval")
+RETRIEVAL_KB_EVENT = RunEventDefinition("retrieval.kb", "retrieval")

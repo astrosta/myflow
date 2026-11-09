@@ -10,6 +10,9 @@
     {"event_type": "context:memory", "category": "context"},
     {"event_type": "subagent.start", "category": "subagent"},
     {"event_type": "subagent.step", "category": "subagent"},
-    {"event_type": "subagent.end", "category": "subagent"}
+    {"event_type": "subagent.end", "category": "subagent"},
+    {"event_type": "retrieval.tool", "category": "retrieval"},
+    {"event_type": "retrieval.skill", "category": "retrieval"},
+    {"event_type": "retrieval.kb", "category": "retrieval"}
   ]
 }
