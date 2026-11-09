@@ -9,12 +9,13 @@ ever uploaded to Langfuse.
 
 Two guarantees shape the design:
 
-* **Completeness.** ``run`` remembers the ids of the dataset items it planned
-  and, once ``run_experiment`` returns, fails with :class:`IncompleteExperiment`
-  naming every id that is missing or unexpected. A task exception (which the
-  SDK logs and swallows into a dropped item) therefore fails the run instead of
-  quietly shrinking the average. A run whose status is ``error``, ``timeout``, or
-  ``interrupted`` is recorded as a failed item and fails the same way.
+* **Completeness.** ``run`` plans the selected items, executes exactly those via
+  ``run_experiment(data=...)``, and -- once it returns -- fails with
+  :class:`IncompleteExperiment` naming every id that is missing or unexpected.
+  A task exception (which the SDK logs and swallows into a dropped item), a run
+  whose status is not ``success``, and a completed item that produced no score
+  at all are each recorded as a failed item, so none of them can quietly shrink
+  the average or leave a run passing with no gates.
 * **Loud configuration.** Account selection never falls back: an item whose
   ``metadata.user_id`` is missing, not a Langfuse hashed id, or not logged in
   raises :class:`ExperimentConfigError` before anything is started.
@@ -58,6 +59,8 @@ _CITATION_METRIC = "citation_valid"
 
 _EVIDENCE_PREFIX = "ev-"
 _RUN_STATUS_SUCCESS = "success"
+_UNSCORED_STATUS = "unscored"
+_EXPERIMENT_PREFIX = "agent-eval:"
 _UNCATEGORIZED = "unknown"
 _CATEGORY_KEY = "category"
 _EVAL_ITEM_METADATA_KEY = "eval_item_id"
@@ -421,9 +424,13 @@ class ExperimentRunner:
         task = _ItemTask(
             api=self._api, plans=plans, store=self._store, run_name=run_name
         )
-        outcome = dataset.run_experiment(
-            name=run_name,
+        # The dataset client would run every item it holds, so the selected subset
+        # travels as explicit data: the plain client still derives the experiment
+        # dataset id from the first item, keeping the experiment linked to it.
+        outcome = self._client.run_experiment(
+            name=_experiment_name(dataset_name),
             run_name=run_name,
+            data=list(selected),
             task=task,
             evaluators=[RuleMetricAdapter(self._store)],
             max_concurrency=max_concurrency,
@@ -448,7 +455,7 @@ class ExperimentRunner:
             mode=mode,
             item_count=len(plans),
             result_count=len(item_results),
-            failed_items=task.snapshot,
+            failed_items=_failed_items(task.snapshot, item_results),
             gates=evaluate_gates(scores, mode=mode),
             citation_violations=citation_violations(item_results),
             experiment_url=getattr(outcome, "experiment_url", None),
@@ -555,19 +562,22 @@ def evaluate_gates(
 ) -> tuple[GateResult, ...]:
     """Compare every thresholded metric average with its design threshold.
 
-    Rule metrics are hard gates. LLM metrics need at least
+    Every metric with a threshold gets a row, so a metric no item produced a
+    sample for is reported as ``insufficient`` instead of disappearing: the
+    summary never claims a clean run over a subset that silently stopped
+    scoring a stratum. Rule metrics are hard gates. LLM metrics need at least
     :data:`LLM_MIN_SAMPLES` scored samples before they are treated as a hard
     gate; below that, and in ``ci`` mode whatever the sample count, they are
     reported without failing the run. A metric with no threshold entry is
     recorded in Langfuse but not gated here.
     """
     gates: list[GateResult] = []
-    for metric in sorted(scores):
-        spec = thresholds.get(metric)
-        if spec is None:
-            continue
+    for metric in sorted(thresholds):
+        spec = thresholds[metric]
         values = [
-            value for value in (_numeric(raw) for raw in scores[metric]) if value is not None
+            value
+            for value in (_numeric(raw) for raw in scores.get(metric, ()))
+            if value is not None
         ]
         average = sum(values) / len(values) if values else None
         threshold = float(spec["value"])
@@ -604,6 +614,36 @@ def citation_violations(item_results: Sequence[Any]) -> tuple[str, ...]:
             if _numeric(getattr(evaluation, "value", None)) == 0.0:
                 violations.append(_item_id(result.item))
     return tuple(sorted(violations))
+
+
+def _failed_items(
+    recorded: Sequence[FailedItem], item_results: Sequence[Any]
+) -> tuple[FailedItem, ...]:
+    """Merge recorded failures with completed items that scored nothing.
+
+    The SDK swallows a per-item evaluator exception, so a broken adapter would
+    otherwise leave a run with no gate rows at all and a passing exit code --
+    the same silent shrink the completeness gate exists to prevent. An item that
+    completed without a single score is therefore a failed item: the design
+    counts an unscored sample as a failed experiment, not as an absent one.
+    """
+    failures = {failure.item_id: failure for failure in recorded}
+    for result in item_results:
+        if _evaluations_of(result):
+            continue
+        item_id = _item_id(result.item)
+        failures.setdefault(item_id, FailedItem(item_id, _UNSCORED_STATUS))
+    return tuple(sorted(failures.values(), key=lambda failure: failure.item_id))
+
+
+def _evaluations_of(result: Any) -> list[Any]:
+    evaluations = getattr(result, "evaluations", None)
+    return list(evaluations) if evaluations else []
+
+
+def _experiment_name(dataset_name: str) -> str:
+    """The stable experiment label; the run name carries the per-run identity."""
+    return f"{_EXPERIMENT_PREFIX}{dataset_name}"
 
 
 def _gate_status(

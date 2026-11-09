@@ -23,6 +23,7 @@ from langfuse import Evaluation
 
 from myflow_evals.accounts import AccountCredential, AccountSession
 from myflow_evals.api import AgentApi
+from myflow_evals.evaluators import THRESHOLDS
 from myflow_evals.evidence import RunEvidence
 from myflow_evals.runner import (
     CI_SUBSET_SIZE,
@@ -267,7 +268,7 @@ class FakeExperimentOutput:
 
 
 class FakeDataset:
-    """Runs the task and evaluators over every item, dropping what the SDK drops."""
+    """The dataset surface the runner reads: .items plus the run bookkeeping."""
 
     def __init__(self, items: Sequence[FakeItem], *, drop: Sequence[str] = ()) -> None:
         self.items = list(items)
@@ -277,8 +278,9 @@ class FakeDataset:
         self.errors: list[tuple[str, Exception]] = []
         self._drop = set(drop)
 
-    def run_experiment(
+    def run_items(
         self,
+        data: Sequence[FakeItem],
         *,
         name: str,
         run_name: str | None = None,
@@ -286,7 +288,6 @@ class FakeDataset:
         evaluators: Sequence[Any] = (),
         max_concurrency: int = 50,
         metadata: Mapping[str, Any] | None = None,
-        **kwargs: Any,
     ) -> FakeExperimentOutput:
         self.calls.append(
             {
@@ -298,7 +299,7 @@ class FakeDataset:
             }
         )
         results: list[FakeItemResult] = []
-        for item in self.items:
+        for item in data:
             try:
                 output = task(item=item)
             except Exception as exc:  # the real SDK logs the failure and drops the item
@@ -329,15 +330,67 @@ class FakeDataset:
 
 
 class FakeLangfuse:
-    def __init__(self, dataset: FakeDataset | None = None) -> None:
+    """The SDK surface the runner may use: get_dataset plus run_experiment(data=...).
+
+    run_experiment requires the selected items as data= and refuses anything else,
+    exactly like the real client, whose DatasetClient variant would silently
+    execute every item of the dataset instead. A regression to that call shape
+    therefore fails here instead of quietly running unselected samples.
+    """
+
+    def __init__(
+        self,
+        dataset: FakeDataset | None = None,
+        *,
+        expected_item_ids: Sequence[str] | None = None,
+    ) -> None:
         self.dataset = dataset
+        self.expected_item_ids = (
+            None if expected_item_ids is None else list(expected_item_ids)
+        )
         self.requested: list[str] = []
+        self.data_ids: list[str] = []
 
     def get_dataset(self, name: str, **kwargs: Any) -> FakeDataset:
         self.requested.append(name)
         if self.dataset is None:
             raise AssertionError(f"no fake dataset configured for {name!r}")
         return self.dataset
+
+    def run_experiment(
+        self,
+        *,
+        name: str,
+        run_name: str | None = None,
+        data: Sequence[FakeItem],
+        task: Any,
+        evaluators: Sequence[Any] = (),
+        max_concurrency: int = 50,
+        metadata: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> FakeExperimentOutput:
+        received = [item.id for item in data]
+        expected = (
+            self.expected_item_ids
+            if self.expected_item_ids is not None
+            else [item.id for item in (self.dataset.items if self.dataset else [])]
+        )
+        if received != expected:
+            raise AssertionError(
+                "run_experiment must execute exactly the selected items via data=; "
+                f"got {received!r}, expected {expected!r}"
+            )
+        self.data_ids = received
+        assert self.dataset is not None
+        return self.dataset.run_items(
+            data,
+            name=name,
+            run_name=run_name,
+            task=task,
+            evaluators=evaluators,
+            max_concurrency=max_concurrency,
+            metadata=metadata,
+        )
 
 
 def _item(
@@ -361,9 +414,14 @@ def _runner(
     *,
     store: EvidenceStore | None = None,
     sessions: Mapping[str, AccountSession] | None = None,
+    expected_item_ids: Sequence[str] | None = None,
+    langfuse: FakeLangfuse | None = None,
 ) -> ExperimentRunner:
+    client = langfuse if langfuse is not None else FakeLangfuse(
+        dataset, expected_item_ids=expected_item_ids
+    )
     return ExperimentRunner(
-        FakeLangfuse(dataset),
+        client,
         sessions=sessions or {HASHED_USER_ID: _session(gateway.transport())},
         api=AgentApi,
         store=store,
@@ -543,7 +601,12 @@ def test_run_gives_every_item_its_own_thread_and_run() -> None:
 @pytest.mark.parametrize("status", ["error", "timeout", "interrupted"])
 def test_run_marks_a_failed_run_status_as_a_failed_item(status: str) -> None:
     gateway = FakeGateway(status_by_item={"item-2": status})
-    dataset = FakeDataset([_item("item-1"), _item("item-2")])
+    dataset = FakeDataset(
+        [
+            _item("item-1", expected_output={"expect_kb": False}),
+            _item("item-2", expected_output={"expect_kb": False}),
+        ]
+    )
     runner = _runner(gateway, dataset)
 
     result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
@@ -651,12 +714,18 @@ def test_run_fails_on_a_citation_violation() -> None:
     gateway = FakeGateway(
         citations_by_item={"item-1": [forged]}, chunks_by_item={"item-1": [CHUNK]}
     )
-    dataset = FakeDataset([_item("item-1"), _item("item-2")])
+    dataset = FakeDataset(
+        [
+            _item("item-1", expected_output={"expect_kb": False}),
+            _item("item-2", expected_output={"expect_kb": False}),
+        ]
+    )
     runner = _runner(gateway, dataset)
 
     result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
 
     assert result.citation_violations == ("item-1",)
+    assert result.failed_items == ()
     assert result.passed is False
     assert "citation violation" in result.render()
 
@@ -664,21 +733,21 @@ def test_run_fails_on_a_citation_violation() -> None:
 def test_evaluate_gates_gates_rule_metrics_hard() -> None:
     gates = evaluate_gates({"tool_hit": [1.0, 0.0]}, mode="ci")
 
-    assert gates == (
-        GateResult(
-            metric="tool_hit",
-            value=0.5,
-            threshold=0.90,
-            comparison="min",
-            kind="rule",
-            samples=2,
-            status="fail",
-        ),
+    by_metric = {gate.metric: gate for gate in gates}
+    assert by_metric["tool_hit"] == GateResult(
+        metric="tool_hit",
+        value=0.5,
+        threshold=0.90,
+        comparison="min",
+        kind="rule",
+        samples=2,
+        status="fail",
     )
-    rendered = gates[0].render()
+    rendered = by_metric["tool_hit"].render()
     assert "tool_hit" in rendered
     assert "0.500" in rendered
     assert "FAIL" in rendered
+    assert {gate.status for gate in gates if gate.metric != "tool_hit"} == {"insufficient"}
 
 
 LLM_THRESHOLDS = {"answer_quality": {"value": 0.85, "comparison": "min", "kind": "llm"}}
@@ -706,7 +775,7 @@ def test_evaluate_gates_reports_insufficient_below_the_minimum_llm_samples() -> 
     assert "insufficient" in gates[0].render()
 
 
-def test_aggregate_scores_drops_none_and_gates_skip_unthresholded_metrics() -> None:
+def test_aggregate_scores_drops_none_and_gates_cover_every_thresholded_metric() -> None:
     results = [
         FakeItemResult(
             item=_item("item-1"),
@@ -720,11 +789,136 @@ def test_aggregate_scores_drops_none_and_gates_skip_unthresholded_metrics() -> N
     ]
 
     scores = aggregate_scores(results)
+    gates = evaluate_gates(scores, mode="ci")
 
     assert scores == {"tool_hit": [1.0], "skill_extra": [3.0]}
-    assert [gate.metric for gate in evaluate_gates(scores, mode="ci")] == ["tool_hit"]
-    assert evaluate_gates({"unknown_metric": [0.0]}, mode="ci") == ()
+    by_metric = {gate.metric: gate for gate in gates}
+    assert sorted(by_metric) == sorted(THRESHOLDS)
+    assert "skill_extra" not in by_metric
+    assert by_metric["tool_hit"] == GateResult(
+        metric="tool_hit",
+        value=1.0,
+        threshold=0.90,
+        comparison="min",
+        kind="rule",
+        samples=1,
+        status="pass",
+    )
+    unscored = by_metric["kb_recall@5"]
+    assert (unscored.value, unscored.samples, unscored.status) == (None, 0, "insufficient")
+    assert evaluate_gates({"unknown_metric": [0.0]}, mode="ci") == evaluate_gates({}, mode="ci")
 
+
+def test_run_executes_only_the_items_it_selected() -> None:
+    items = _dataset_items(40, ["single_tool", "kb_single_hop", "skill_single"])
+    dataset = FakeDataset(items)
+    expected = [item.id for item in ci_subset(items)]
+    langfuse = FakeLangfuse(dataset, expected_item_ids=expected)
+    runner = _runner(FakeGateway(), dataset, langfuse=langfuse)
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    assert langfuse.data_ids == expected
+    assert len(langfuse.data_ids) == CI_SUBSET_SIZE
+    assert set(langfuse.data_ids) != {item.id for item in items}
+    assert (result.item_count, result.result_count) == (CI_SUBSET_SIZE, CI_SUBSET_SIZE)
+
+
+def test_run_honours_max_items_in_full_mode() -> None:
+    items = _dataset_items(5, ["single_tool"])
+    dataset = FakeDataset(items)
+    langfuse = FakeLangfuse(dataset, expected_item_ids=["item-000", "item-001"])
+    runner = _runner(FakeGateway(), dataset, langfuse=langfuse)
+
+    runner.run("agent-eval/regression/v1", RUN_NAME, mode="full", max_items=2)
+
+    assert langfuse.data_ids == ["item-000", "item-001"]
+
+
+def test_run_names_the_experiment_stably_and_keeps_the_run_name() -> None:
+    dataset = FakeDataset([_item("item-1", expected_output={"expect_kb": False})])
+    runner = _runner(FakeGateway(), dataset)
+
+    runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    call = dataset.calls[0]
+    assert call["name"] == "agent-eval:agent-eval/regression/v1"
+    assert call["run_name"] == RUN_NAME
+    assert call["max_concurrency"] == 2
+
+
+def test_run_passes_concurrency_and_mode_metadata_to_the_sdk() -> None:
+    dataset = FakeDataset([_item("item-1", expected_output={"expect_kb": False})])
+    runner = _runner(FakeGateway(), dataset)
+
+    runner.run("agent-eval/regression/v1", RUN_NAME, mode="full", max_concurrency=3)
+
+    call = dataset.calls[0]
+    assert call["max_concurrency"] == 3
+    assert call["metadata"] == {"mode": "full"}
+    assert all(isinstance(value, str) for value in call["metadata"].values())
+
+
+def test_run_fails_when_every_item_is_unscored() -> None:
+    dataset = FakeDataset([_item("item-1"), _item("item-2")])
+    runner = _runner(FakeGateway(), dataset)
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    assert [(failure.item_id, failure.status) for failure in result.failed_items] == [
+        ("item-1", "unscored"),
+        ("item-2", "unscored"),
+    ]
+    assert result.passed is False
+    assert "item-1=unscored" in result.render()
+    assert "result: FAIL" in result.render()
+    assert {gate.status for gate in result.gates} == {"insufficient"}
+
+
+def test_gate_rows_report_insufficient_for_metrics_without_samples() -> None:
+    dataset = FakeDataset(
+        [
+            _item("item-1", expected_output={"expect_kb": False}),
+            _item("item-2", expected_output={"expect_kb": False}),
+        ]
+    )
+    runner = _runner(FakeGateway(), dataset)
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    by_metric = {gate.metric: gate for gate in result.gates}
+    assert set(by_metric) == set(THRESHOLDS)
+    assert (by_metric["kb_routing"].status, by_metric["kb_routing"].samples) == ("pass", 2)
+    assert (by_metric["tool_hit"].status, by_metric["tool_hit"].samples) == (
+        "insufficient",
+        0,
+    )
+    assert result.failed_items == ()
+    assert result.passed is True
+
+
+def test_rule_metric_adapter_passes_item_metadata_to_no_tool_ok() -> None:
+    store = EvidenceStore()
+    evidence_id = store.put("item-1", _evidence())
+    adapter = RuleMetricAdapter(store)
+
+    as_no_tool = adapter(
+        input={},
+        output={"evidence_id": evidence_id},
+        expected_output={},
+        metadata={"category": "no_tool"},
+    )
+    as_tool_sample = adapter(
+        input={},
+        output={"evidence_id": evidence_id},
+        expected_output={},
+        metadata={"category": "single_tool"},
+    )
+
+    assert {evaluation.name: evaluation.value for evaluation in as_no_tool} == {
+        "no_tool_ok": 1.0,
+    }
+    assert as_tool_sample == []
 
 def test_rule_metric_adapter_scores_every_metric_from_stored_evidence() -> None:
     store = EvidenceStore()

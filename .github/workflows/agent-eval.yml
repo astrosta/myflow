@@ -12,6 +12,8 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    # A hung Gateway must not hold the runner for the six-hour default.
+    timeout-minutes: 45
     env:
       AGENT_API: ${{ secrets.AGENT_API }}
       AGENT_USERS: ${{ secrets.AGENT_USERS }}

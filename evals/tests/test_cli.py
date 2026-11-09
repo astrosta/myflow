@@ -82,12 +82,19 @@ class FakeDataset:
         *,
         name: str,
         run_name: str | None = None,
+        data: list[FakeItem],
         task: Any,
         evaluators: list[Any] | None = None,
         max_concurrency: int = 50,
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> FakeExperimentResult:
+        received = [item.id for item in data]
+        if received != [item.id for item in self.items]:
+            raise AssertionError(
+                "run_experiment must execute exactly the selected items via data=; "
+                f"got {received!r}"
+            )
         self.calls.append(
             {
                 "name": name,
@@ -102,7 +109,7 @@ class FakeDataset:
                 output={"answer": "a", "trace_id": "t", "status": "success", "evidence_id": "ev-x"},
                 evaluations=list(self.evaluations.get(item.id, ())),
             )
-            for item in self.items
+            for item in data
             if item.id not in self.missing
         ]
         return FakeExperimentResult(item_results=results)
@@ -118,6 +125,28 @@ class FakeLangfuse:
     def get_dataset(self, name: str, **kwargs: Any) -> FakeDataset:
         self.dataset_reads.append(name)
         return self.dataset
+
+    def run_experiment(
+        self,
+        *,
+        name: str,
+        run_name: str | None = None,
+        data: list[FakeItem],
+        task: Any,
+        evaluators: list[Any] | None = None,
+        max_concurrency: int = 50,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> FakeExperimentResult:
+        return self.dataset.run_experiment(
+            name=name,
+            run_name=run_name,
+            data=data,
+            task=task,
+            evaluators=evaluators,
+            max_concurrency=max_concurrency,
+            metadata=metadata,
+        )
 
     def create_dataset(self, *, name: str, **kwargs: Any) -> None:
         self.created_datasets.append(name)
@@ -172,6 +201,7 @@ class Recorder:
 
     accounts_paths: list[Any] = field(default_factory=list)
     logins: list[dict[str, Any]] = field(default_factory=list)
+    sessions: list[AccountSession] = field(default_factory=list)
     langfuse_calls: list[str] = field(default_factory=list)
     source_calls: list[dict[str, Any]] = field(default_factory=list)
     trace_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -196,7 +226,9 @@ def _services(
         accounts: list[AccountCredential], *, base_url: str, salt: str
     ) -> dict[str, AccountSession]:
         recorder.logins.append({"base_url": base_url, "salt": salt, "count": len(accounts)})
-        return dict(sessions or {HASHED_USER_ID: _session()})
+        logged_in = dict(sessions or {HASHED_USER_ID: _session()})
+        recorder.sessions.extend(logged_in.values())
+        return logged_in
 
     def fake_langfuse_client(environ: dict[str, str]) -> FakeLangfuse:
         recorder.langfuse_calls.append("client")
@@ -549,6 +581,43 @@ def test_build_merges_every_logged_in_account(capsys: pytest.CaptureFixture[str]
         HASHED_USER_ID,
     ]
 
+
+def test_run_closes_every_logged_in_session(capsys: pytest.CaptureFixture[str]) -> None:
+    recorder = Recorder()
+    services, _ = _services(recorder, dataset=_passing_dataset())
+
+    assert main(_run_args(), services=services, environ=dict(ENVIRON)) == 0
+    assert main(_run_args(), services=services, environ=dict(ENVIRON)) == 0
+
+    assert len(recorder.sessions) == 2
+    assert all(session.client.is_closed for session in recorder.sessions)
+
+
+def test_build_and_ingest_close_their_sessions(capsys: pytest.CaptureFixture[str]) -> None:
+    recorder = Recorder()
+    sources = BuildSources(tools=[_tool("search", "mcp__db__search")], source_totals={"tool": 1})
+    services, _ = _services(recorder, sources=sources, traces=[TraceSource("trace-1", "why?")])
+
+    assert main(["build", "--dataset", DATASET], services=services, environ=dict(ENVIRON)) == 0
+    assert main(["ingest", "--dataset", DATASET], services=services, environ=dict(ENVIRON)) == 0
+
+    assert len(recorder.sessions) == 2
+    assert all(session.client.is_closed for session in recorder.sessions)
+
+
+def test_run_passes_max_concurrency_to_the_runner(capsys: pytest.CaptureFixture[str]) -> None:
+    dataset = FakeDataset(
+        [_item("item-1")],
+        evaluations={"item-1": [Evaluation(name="tool_hit", value=1.0)]},
+    )
+    services, _ = _services(Recorder(), dataset=dataset)
+
+    exit_code = main(
+        _run_args("--max-concurrency", "3"), services=services, environ=dict(ENVIRON)
+    )
+
+    assert exit_code == 0
+    assert dataset.calls[0]["max_concurrency"] == 3
 
 def test_main_returns_zero_for_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--help"]) == 0

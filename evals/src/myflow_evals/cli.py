@@ -273,6 +273,16 @@ def _login(
     return sessions
 
 
+def _close_sessions(sessions: Mapping[str, AccountSession]) -> None:
+    """Close every logged-in client; cleanup must never mask the real outcome."""
+    for session in sessions.values():
+        try:
+            session.client.close()
+        except Exception:
+            # A failing close cannot change what the command already decided.
+            continue
+
+
 def _cmd_run(
     args: argparse.Namespace, environ: Mapping[str, str], services: CliServices
 ) -> int:
@@ -283,16 +293,19 @@ def _cmd_run(
     if args.dry_run:
         return _plan_run(args, environ, services, run_name)
     sessions = _login(environ, services, args.accounts_file)
-    runner = ExperimentRunner(
-        services.langfuse_client(environ), sessions=sessions, api=services.api
-    )
-    result = runner.run(
-        args.dataset,
-        run_name,
-        mode=args.mode,
-        max_items=args.limit,
-        max_concurrency=args.max_concurrency,
-    )
+    try:
+        runner = ExperimentRunner(
+            services.langfuse_client(environ), sessions=sessions, api=services.api
+        )
+        result = runner.run(
+            args.dataset,
+            run_name,
+            mode=args.mode,
+            max_items=args.limit,
+            max_concurrency=args.max_concurrency,
+        )
+    finally:
+        _close_sessions(sessions)
     print(result.render())
     return EXIT_OK if result.passed else EXIT_GATE_FAILED
 
@@ -326,23 +339,26 @@ def _cmd_build(
     args: argparse.Namespace, environ: Mapping[str, str], services: CliServices
 ) -> int:
     sessions = _login(environ, services, args.accounts_file)
-    drafts: list[DatasetItemDraft] = []
-    per_account: list[BuildSources] = []
-    for hashed_user_id in sorted(sessions):
-        session = sessions[hashed_user_id]
-        sources = services.load_sources(session, limit=args.limit, environ=environ)
-        per_account.append(sources)
-        drafts.extend(build_account_items(session, sources, limit=args.limit))
-    merged = _merge_sources(per_account)
-    report = build_report(
-        args.dataset, merged, drafts, limit=args.limit, dry_run=args.dry_run
-    )
-    writer = (
-        None
-        if args.dry_run
-        else LangfuseDatasetWriter(services.langfuse_client(environ))
-    )
-    written = write_drafts(args.dataset, drafts, writer, dry_run=args.dry_run)
+    try:
+        drafts: list[DatasetItemDraft] = []
+        per_account: list[BuildSources] = []
+        for hashed_user_id in sorted(sessions):
+            session = sessions[hashed_user_id]
+            sources = services.load_sources(session, limit=args.limit, environ=environ)
+            per_account.append(sources)
+            drafts.extend(build_account_items(session, sources, limit=args.limit))
+        merged = _merge_sources(per_account)
+        report = build_report(
+            args.dataset, merged, drafts, limit=args.limit, dry_run=args.dry_run
+        )
+        writer = (
+            None
+            if args.dry_run
+            else LangfuseDatasetWriter(services.langfuse_client(environ))
+        )
+        written = write_drafts(args.dataset, drafts, writer, dry_run=args.dry_run)
+    finally:
+        _close_sessions(sessions)
     print(report.render())
     if not args.dry_run:
         print(f"written: {written} item(s) to {args.dataset}")
@@ -374,16 +390,22 @@ def _cmd_ingest(
     _require(environ, _LANGFUSE_PUBLIC_KEY_ENV)
     _require(environ, _LANGFUSE_SECRET_KEY_ENV)
     sessions = _login(environ, services, args.accounts_file)
-    drafts = 0
+    try:
+        lines = [
+            f"{_trace_category(trace)}: {trace.trace_id} -> {_preview(trace.query)}"
+            for hashed_user_id in sorted(sessions)
+            for trace in services.fetch_traces(
+                sessions[hashed_user_id].hashed_user_id,
+                limit=args.limit,
+                environ=environ,
+            )
+        ]
+    finally:
+        _close_sessions(sessions)
     print(f"dataset: {args.dataset}")
-    for hashed_user_id in sorted(sessions):
-        traces = services.fetch_traces(
-            sessions[hashed_user_id].hashed_user_id, limit=args.limit, environ=environ
-        )
-        for trace in traces:
-            drafts += 1
-            print(f"{_trace_category(trace)}: {trace.trace_id} -> {_preview(trace.query)}")
-    print(f"ingest: {drafts} draft(s) for {args.dataset}; nothing was written")
+    for line in lines:
+        print(line)
+    print(f"ingest: {len(lines)} draft(s) for {args.dataset}; nothing was written")
     return EXIT_OK
 
 
