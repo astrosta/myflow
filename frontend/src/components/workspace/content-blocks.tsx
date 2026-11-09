@@ -1,5 +1,7 @@
 "use client";
 
+import type { KnowledgeCitation } from "@/core/messages/citations";
+import { withCitationLinks } from "@/core/messages/citations";
 import type { ContentBlockView } from "@/core/messages/group";
 import { cn } from "@/lib/utils";
 
@@ -20,10 +22,17 @@ import { ToolCallRow } from "./tool-call-row";
 export interface ContentBlocksProps {
   blocks: readonly ContentBlockView[];
   streaming?: boolean;
+  /** 终态回答才传：流式期间传 undefined，标记原样保留，避免链接闪烁。 */
+  citations?: readonly KnowledgeCitation[];
   className?: string;
 }
 
-export function ContentBlocks({ blocks, streaming = false, className }: ContentBlocksProps) {
+export function ContentBlocks({
+  blocks,
+  streaming = false,
+  citations,
+  className,
+}: ContentBlocksProps) {
   return (
     <div className={cn("flex flex-col gap-3", className)}>
       {blocks.map((block, index) => {
@@ -43,7 +52,11 @@ export function ContentBlocks({ blocks, streaming = false, className }: ContentB
           return (
             <Markdown
               key={block.id}
-              text={block.text}
+              text={
+                citations === undefined
+                  ? block.text
+                  : withCitationLinks(block.text, citations)
+              }
             />
           );
         }

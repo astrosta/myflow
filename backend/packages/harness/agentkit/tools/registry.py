@@ -20,7 +20,7 @@ from agentkit.sandbox.tools import (
     str_replace,
     write_file,
 )
-from agentkit.tools.builtin.load_skills import load_skills
+from agentkit.tools.builtin.load_skill import load_skill
 from agentkit.tools.builtin.search_skills import search_skills
 from agentkit.tools.builtin.tool_execute import tool_execute
 from agentkit.tools.builtin.tool_search import tool_search
@@ -44,7 +44,7 @@ _HOST_BASH_DISABLED = (
 _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
     # 技能发现只属于 skill-finder；正文加载是框架工具，任何策略下都可用。
     ("skills", search_skills),
-    ("skills", load_skills),
+    ("skills", load_skill),
     ("sandbox", read_file),
     ("sandbox", write_file),
     ("sandbox", str_replace),

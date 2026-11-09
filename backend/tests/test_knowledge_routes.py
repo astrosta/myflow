@@ -216,6 +216,9 @@ def test_search_forwards_type_and_base_id() -> None:
     assert body["results"][0]["knowledge_base_type"] == "technical"
     assert body["results"][0]["rrf_score"] == 0.0328
     assert body["results"][0]["rerank_score"] == 0.9
+    assert body["results"][0]["citation_id"].startswith("k")
+    assert body["citations"][0]["citation_id"] == body["results"][0]["citation_id"]
+    assert body["citations"][0]["filename"] == "manual.md"
     assert body["keyword_query"] == "E1024 安装"
     assert body["retrieval_mode"] == "hybrid"
     assert body["reranked"] is True

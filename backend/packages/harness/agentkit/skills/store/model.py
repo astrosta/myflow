@@ -56,7 +56,7 @@ class SkillRow(Base):
     enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=text("true")
     )
-    #: `load_skills` 成功加载次数；Redis ZSET 的持久化来源，内置技能不入库。
+    #: `load_skill` 成功加载次数；Redis ZSET 的持久化来源，内置技能不入库。
     load_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )

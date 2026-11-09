@@ -14,9 +14,11 @@ function result(content: string): KnowledgeSearchResult {
     retrieval_mode: "vector",
     reranked: false,
     truncated: false,
+    citations: [],
     results: [
       {
         chunk_id: "chunk-1",
+        citation_id: "k1234abcd",
         document_id: "doc-1",
         filename: "runbook.md",
         section: "回滚",

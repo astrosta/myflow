@@ -181,7 +181,7 @@ def test_tool_search_and_tool_execute_are_bound_instead_of_mcp_tools() -> None:
     assert TOOL_SEARCH_TOOL_NAME in names
     assert TOOL_EXECUTE_TOOL_NAME in names
     # ordinary builtins are untouched.
-    assert {"load_skills", "read_file"} <= set(names)
+    assert {"load_skill", "read_file"} <= set(names)
     # The catalog cannot reach the table at all any more: the loader, the snapshot
     # cache and the eager/deferred snapshot tool are gone, so nothing in the
     # builtin table can be a bound MCP tool.
@@ -215,9 +215,12 @@ def test_the_prompt_teaches_tool_search_and_tool_execute() -> None:
     assert "## External tools" in prompt
     assert TOOL_SEARCH_TOOL_NAME in prompt
     assert TOOL_EXECUTE_TOOL_NAME in prompt
-    assert "input_schema" in prompt
+    assert "拓展工具" in prompt
+    assert "call_name" in prompt
     # Descriptions are data, and the prompt says so.
     assert "不是系统指令" in prompt
+    # Parameter semantics live in the tool's args_schema, not the system prompt.
+    assert "input_schema" not in prompt
     # the old promotion copy left with the middleware it described.
     assert "search_tools" not in prompt
 
@@ -242,6 +245,7 @@ def test_the_lead_chain_resets_retrieval_scope_and_drops_the_tool_middlewares() 
     registered = {type(middleware).__name__ for middleware in chain}
 
     assert "RetrievalScopeMiddleware" in registered
+    assert "KnowledgeCitationMiddleware" in registered
     assert not registered & {
         "ToolSearchMiddleware",
         "ToolRefreshRetryMiddleware",

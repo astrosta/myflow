@@ -66,6 +66,7 @@ class FakeDispatcher:
         result: str | None = "the answer",
         error: str | None = None,
         stop_reason: str | None = None,
+        citations: tuple[dict, ...] = (),
         steps: tuple[dict, ...] = (),
         late_steps: tuple[dict, ...] = (),
         usage: tuple[dict, ...] = (),
@@ -77,6 +78,7 @@ class FakeDispatcher:
         self._result = result
         self._error = error
         self._stop_reason = stop_reason
+        self._citations = citations
         self._steps = steps
         self._late_steps = late_steps
         self._usage = usage
@@ -115,7 +117,11 @@ class FakeDispatcher:
     def _finish(self, dispatch: Any) -> None:
         assert self._terminal is not None
         dispatch.holder.try_set_terminal(
-            self._terminal, result=self._result, error=self._error, stop_reason=self._stop_reason
+            self._terminal,
+            result=self._result,
+            error=self._error,
+            stop_reason=self._stop_reason,
+            citations=list(self._citations),
         )
 
 

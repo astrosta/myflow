@@ -119,7 +119,7 @@ def test_visible_for_applies_the_allowlist_and_db_switch(snapshot: SkillSnapshot
     assert [s.skill_id for s in switched.visible_for("u1", available_skills=None)] == ["s2"]
 
 
-def test_private_skill_rows_include_their_container_path(tmp_path: Path) -> None:
+def test_private_skill_rows_include_name_description_and_id(tmp_path: Path) -> None:
     private = tuple(_private(f"s{i}", f"skill-{i}").skill for i in range(9))
     switched = SkillSnapshot(epoch="e4", private_by_owner={"u1": private})
     section = build_skills_section(
@@ -130,8 +130,11 @@ def test_private_skill_rows_include_their_container_path(tmp_path: Path) -> None
     )
 
     for index in range(9):
-        assert f"- skill-{index} [private]" in section
-        assert f"path=/mnt/skills/private/skill-{index}/SKILL.md" in section
+        assert (
+            f"- skill-{index} | skill-{index} description | s{index}"
+            in section
+        )
+    assert "/mnt/skills" not in section
 
 
 def test_the_snapshot_is_immutable(snapshot: SkillSnapshot) -> None:
@@ -268,7 +271,7 @@ def test_legacy_filesystem_registry_is_unchanged_without_a_snapshot(tmp_path: Pa
     assert registry.find("legacy") is not None
 
 
-def test_prompt_renders_only_the_private_root(
+def test_prompt_renders_the_snapshot_without_paths(
     snapshot: SkillSnapshot, tmp_path: Path
 ) -> None:
     clear_skill_prompt_cache()
@@ -279,11 +282,9 @@ def test_prompt_renders_only_the_private_root(
 
     text = build_skills_section(config=config, registry=registry)
 
-    assert "/mnt/skills/private/" in text
-    assert "/mnt/skills/private/<name>/SKILL.md" in text
-    assert "/mnt/skills/public/" not in text
-    assert "- alpha [private]:" in text
-    assert "- beta [private]:" in text
+    assert "/mnt/skills" not in text
+    assert "- alpha | alpha description | s1" in text
+    assert "- beta | beta description | s2" in text
     assert str(tmp_path) not in text
 
 
@@ -292,7 +293,7 @@ def test_a_snapshot_registry_can_be_built_without_the_optional_config(
 ) -> None:
     registry = SkillRegistry(snapshot=snapshot, user_id="u1")
     text = build_skills_section(config=skills_config(tmp_path), registry=registry)
-    assert "/mnt/skills/private/" in text
+    assert "- alpha | alpha description | s1" in text
 
 
 def test_prompt_cache_key_includes_owner_version_scope_and_description() -> None:
@@ -309,13 +310,13 @@ def test_prompt_cache_key_includes_owner_version_scope_and_description() -> None
     assert len(keys) == len(variants)
 
 
-def test_render_skill_index_marks_private_scope() -> None:
+def test_render_skill_index_marks_the_private_id() -> None:
     skills = [_private("s1", "alpha").skill]
     from agentkit.skills.prompt import render_skill_index
 
     rendered = render_skill_index(skills, max_description_chars=120)
-    assert "- alpha [private]:" in rendered
-    assert "[public]" not in rendered
+    assert "- alpha | alpha description | s1" in rendered
+    assert "[private]" not in rendered
 
 
 @pytest.mark.asyncio

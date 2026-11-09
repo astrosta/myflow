@@ -1,8 +1,8 @@
 """search_skills —— 按任务意图检索技能元数据（skill-finder 专属）。
 
 它只返回 `skill_id / name / description`；正文由 lead 再调用系统内置的
-`load_skills` 加载。这样 skill-finder 不把整段 SOP 搬回 lead，也不会在检索阶段
-增加技能使用次数。
+`load_skill(name, id)` 加载。这样 skill-finder 不把整段 SOP 搬回 lead，也不会
+在检索阶段增加技能使用次数。
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ MAX_DOMAIN_KEYWORDS = 8
 
 EMPTY_RESULT_MESSAGE = (
     "没有检索到匹配的技能（当前部署可能一个技能都没启用，或技能树为空）。",
-    "不要用本工具重复尝试相似的说法；需要正文时让 lead 用 load_skills。",
+    "不要用本工具重复尝试相似的说法；需要正文时让 lead 用 load_skill(name, id)。",
 )
 UNAVAILABLE_MESSAGE = (
     "技能检索暂不可用（技能目录或 Milvus 检索索引未就绪）。",
@@ -151,7 +151,7 @@ def _metadata_payload(skills: list[dict], retrieval: dict) -> str:
         {
             "skills": skills,
             "retrieval": retrieval,
-            "message": ("只返回元数据；需要正文时请调用 load_skills(skill_id)。",),
+            "message": ("只返回元数据；需要正文时请调用 load_skill(name, id)。",),
         },
         ensure_ascii=False,
     )

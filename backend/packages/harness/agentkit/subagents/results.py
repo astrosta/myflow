@@ -64,7 +64,9 @@ EXTERNAL_STATUS_BY_RESULT_STATUS: dict[SubagentStatus, str] = {
 }
 
 #: ``try_set_terminal`` 允许携带的载荷。写错键就是编程错误，当场抛。
-_TERMINAL_PAYLOAD_FIELDS = frozenset({"result", "error", "stop_reason", "admission_failure"})
+_TERMINAL_PAYLOAD_FIELDS = frozenset(
+    {"result", "error", "stop_reason", "admission_failure", "citations"}
+)
 
 
 @dataclass
@@ -76,6 +78,9 @@ class SubagentResult:
     status: SubagentStatus
     external_task_id: str | None = None
     result: str | None = None
+    #: 子代理最终回答里实际引用、且确实来自本次 knowledge_search 的来源清单。
+    #: task 工具把它带给 lead，lead 的最终消息再按标记过滤一次。
+    citations: list[dict] = field(default_factory=list)
     error: str | None = None
     stop_reason: str | None = None
     started_at: datetime | None = None

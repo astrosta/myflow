@@ -1,8 +1,10 @@
 "use client";
 
+import { readKnowledgeCitations } from "@/core/messages/citations";
 import type { AnswerGroup } from "@/core/messages/group";
 import { cn, formatTimestamp } from "@/lib/utils";
 
+import { CitationSources } from "./citation-sources";
 import { ContentBlocks } from "./content-blocks";
 
 /**
@@ -26,6 +28,7 @@ export interface AnswerBubbleProps {
 
 export function AnswerBubble({ group, streaming = false, className }: AnswerBubbleProps) {
   const time = formatTimestamp(group.message.created_at);
+  const citations = readKnowledgeCitations(group.message);
 
   return (
     <article
@@ -36,7 +39,8 @@ export function AnswerBubble({ group, streaming = false, className }: AnswerBubb
       {time ? (
         <p className="mb-1 text-[11px] leading-4 text-neutral-400">{time}</p>
       ) : null}
-      <ContentBlocks blocks={group.blocks} streaming={streaming} />
+      <ContentBlocks blocks={group.blocks} citations={citations} streaming={streaming} />
+      <CitationSources citations={citations} />
     </article>
   );
 }

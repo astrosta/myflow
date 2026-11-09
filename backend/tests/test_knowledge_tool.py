@@ -69,6 +69,10 @@ def test_tool_passes_runtime_user_and_type_to_service() -> None:
     payload = json.loads(asyncio.run(call()))
     assert payload["results"][0]["knowledge_base_type"] == "technical"
     assert payload["results"][0]["page"] == 2
+    assert payload["results"][0]["citation_id"].startswith("k")
+    assert payload["sources"][0]["citation_id"] == payload["results"][0]["citation_id"]
+    assert payload["sources"][0]["filename"] == "manual.md"
+    assert payload["sources"][0]["quote"] == "安装步骤"
     assert payload["truncated"] is False
     assert service.calls[0]["user_id"] == "u1"
     assert service.calls[0]["knowledge_base_type"] == "technical"

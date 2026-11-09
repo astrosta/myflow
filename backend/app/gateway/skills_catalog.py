@@ -531,7 +531,7 @@ _runtime: SkillRuntime | None = None
 def configure_skill_runtime(runtime: SkillRuntime | None) -> None:
     """Install (or clear) the process-wide catalog runtime.
 
-    The load_skills / search_skills tools read agentkit.skills.search's own
+    The load_skill / search_skills tools read agentkit.skills.search's own
     registry; pointing both at the same service is the only way the tools and
     the routes can agree on which catalog is authoritative.  The prompt builder
     separately reads the same runtime's usage cache.

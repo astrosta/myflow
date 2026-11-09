@@ -67,8 +67,8 @@ def test_order_is_stable_regardless_of_scan_order(tmp_path):
     assert lines[0] == SKILL_INDEX_HEADER
     assert lines[-1] == SKILL_INDEX_FOOTER
     # (category, name) 稳定排序：custom < public
-    # 每行形如 `- <name> [<category>]: <描述>`，排序按 (category, name)：custom < public
-    assert [line[2:].split(" [")[0] for line in lines[1:-1]] == ["beta", "alpha", "zeta"]
+    # 每行形如 `- <name> | <描述> | <id>`，排序仍按 (category, name)。
+    assert [line[2:].split(" | ", 1)[0] for line in lines[1:-1]] == ["beta", "alpha", "zeta"]
 
 
 def test_adding_a_skill_only_adds_its_own_line(tmp_path):
@@ -80,7 +80,7 @@ def test_adding_a_skill_only_adds_its_own_line(tmp_path):
     after = _block(_index(tmp_path))
 
     assert after[: len(before) - 1] == before[:-1]  # 只有 footer 之后多了新行
-    assert after[-2].startswith("- zzz [")
+    assert after[-2].startswith("- zzz | ")
 
 
 def test_description_is_truncated_to_the_configured_cap(tmp_path):
@@ -94,30 +94,28 @@ def test_description_is_truncated_to_the_configured_cap(tmp_path):
     assert len(line) < 120
 
 
-def test_the_root_is_stated_once_instead_of_per_skill_paths(tmp_path):
-    """根目录 + 两条约定（目录名即技能名、SOP 固定 SKILL.md）够推路径，行里不再重复 dir=。"""
+def test_the_index_does_not_describe_sources_or_paths(tmp_path):
+    """模型只需要 name / description / id；路径由 load_skill 在服务端解析。"""
     write_skill(tmp_path, "public", "pdf-processing")
 
     section = _index(tmp_path, container_path="/mnt/skills")
     line = _block(section)[1]
 
-    assert "技能根目录 `/mnt/skills`" in section
-    assert "目录名就是技能名" in section
-    assert "SKILL.md" in section
-    assert line == "- pdf-processing [public]: Does a thing"
+    assert line == "- pdf-processing | Does a thing | -"
+    assert "技能根目录" not in section
     assert "dir=" not in line
+    assert "/mnt/skills" not in section
     # 根目录是**容器**路径，宿主路径一个字都不该出现
     assert str(tmp_path) not in section
 
 
-def test_a_dir_name_that_differs_from_the_name_falls_back_to_an_explicit_path(tmp_path):
-    """目录名和 name 对不上时，按约定推出来的路径是错的：那种技能单独给 dir=。"""
+def test_a_dir_name_that_differs_from_the_name_is_still_a_name_only_row(tmp_path):
     write_skill(tmp_path, "public", "weird-name", dir_name="other-dir")
 
     line = _block(_index(tmp_path))[1]
 
-    assert line.startswith("- weird-name:")
-    assert "dir=/mnt/skills/public/other-dir" in line
+    assert line == "- weird-name | Does a thing | -"
+    assert "dir=" not in line
 
 
 def test_required_secrets_are_marked(tmp_path):
@@ -160,16 +158,16 @@ def test_a_registry_failure_renders_an_empty_index(tmp_path, monkeypatch):
 
 def test_the_render_cache_is_cleared_on_reload(tmp_path):
     write_skill(tmp_path, "public", "one")
-    assert "- one [" in _index(tmp_path)
+    assert "- one | " in _index(tmp_path)
 
     write_skill(tmp_path, "public", "two")
-    assert "- two [" in _index(tmp_path)  # 每次现算，不缓目录
+    assert "- two | " in _index(tmp_path)  # 每次现算，不缓目录
 
     clear_skill_prompt_cache()
-    assert "- two [" in _index(tmp_path)
+    assert "- two | " in _index(tmp_path)
 
 
-def test_a_catalog_snapshot_uses_the_private_root(tmp_path):
+def test_a_catalog_snapshot_uses_the_uniform_row(tmp_path):
     snapshot = SkillSnapshot(
         epoch="e1",
         private_by_owner={
@@ -184,9 +182,8 @@ def test_a_catalog_snapshot_uses_the_private_root(tmp_path):
         registry=SkillRegistry(config=config, snapshot=snapshot, user_id="u1"),
     )
 
-    assert "/mnt/skills/private/" in section
-    assert "/mnt/skills/public/" not in section
-    assert "- private-one [private]:" in section
+    assert "- private-one | Does a thing | private-one" in section
+    assert "/mnt/skills" not in section
 
 
 def _catalog_skill(name: str, scope: SkillScope, owner: str) -> Skill:
@@ -239,7 +236,7 @@ def test_git_source_renders_the_snapshot_instead_of_scanning_disk(tmp_path):
         owner_less = build_skills_section(config=config)
         bob = build_skills_section(config=config, user_id="bob")
 
-    assert "- alice-private [private]:" in alice
+    assert "- alice-private | Does a thing | alice-private" in alice
     assert "legacy-on-disk" not in alice
     assert "alice-private" not in owner_less
     assert "alice-private" not in bob
@@ -264,7 +261,7 @@ def test_filesystem_source_still_scans_the_disk(tmp_path):
     with _Published(snapshot):
         section = build_skills_section(config=config, user_id="alice")
 
-    assert "- on-disk [" in section
+    assert "- on-disk | " in section
 
 
 # --- built-in overlay (always-on, never a preference) -------------------------
@@ -375,52 +372,20 @@ def test_a_catalog_failure_keeps_the_builtin_rows(tmp_path, monkeypatch):
     assert registry.visible(include_builtin=False) == []
 
 
-def test_builtin_prompt_index_marks_builtin_and_names_its_root(tmp_path):
+def test_builtin_prompt_index_uses_the_constant_id(tmp_path):
     write_skill(tmp_path, "builtin", "demo", description="Demo skill")
     config = skills_config(tmp_path, builtin={"path": str(tmp_path / "skills" / "builtin")})
     section = build_skills_section(config=config)
-    assert "- demo [builtin]: Demo skill" in section
-    assert "内置技能在" in section
-    assert "/mnt/skills/builtin/<name>/SKILL.md" in section
-    assert "同名时内置技能优先于 custom 和 public；custom 仍覆盖 public" in section
+    assert "- demo | Demo skill | builtin" in section
+    assert "/mnt/skills" not in section
     assert "SECRET-BODY" not in section
 
 
-def test_filesystem_convention_is_unchanged_without_builtins(tmp_path):
-    write_skill(tmp_path, "public", "public-one")
-    config = skills_config(tmp_path)
-    section = build_skills_section(config=config)
-    assert "category 是 public 或 custom" in section
-    assert "private" not in section
-
-
-def test_git_convention_with_builtin_names_private_and_builtin_roots(tmp_path):
-    write_skill(tmp_path, "builtin", "demo")
+def test_the_same_uniform_format_is_used_for_private_and_builtin(tmp_path):
+    write_skill(tmp_path, "builtin", "demo", description="Demo skill")
     config = skills_config(
         tmp_path,
         source="git",
-        builtin={"path": str(tmp_path / "skills" / "builtin")},
-    )
-    registry = SkillRegistry(
-        config=config,
-        builtin_skills=load_builtin_skills(config),
-        snapshot=SkillSnapshot("e"),
-    )
-    section = build_skills_section(config=config, registry=registry)
-    assert "private" in section
-    assert "builtin" in section
-    assert "/mnt/skills/private/<name>/SKILL.md" in section
-    assert "/mnt/skills/builtin/<name>/SKILL.md" in section
-    assert "/mnt/skills/public/" not in section
-    assert "同名时内置技能优先" in section
-
-
-def test_filesystem_snapshot_with_builtin_keeps_catalog_text_and_adds_builtin(
-    tmp_path,
-):
-    write_skill(tmp_path, "builtin", "demo")
-    config = skills_config(
-        tmp_path,
         builtin={"path": str(tmp_path / "skills" / "builtin")},
     )
     snapshot = SkillSnapshot(
@@ -439,7 +404,7 @@ def test_filesystem_snapshot_with_builtin_keeps_catalog_text_and_adds_builtin(
 
     section = build_skills_section(config=config, registry=registry)
 
-    assert "/mnt/skills/private/<name>/SKILL.md" in section
-    assert "/mnt/skills/builtin/<name>/SKILL.md" in section
-    assert "- private-one [private]:" in section
-    assert "- demo [builtin]:" in section
+    assert "- private-one | Does a thing | private-one" in section
+    assert "- demo | Demo skill | builtin" in section
+    assert "技能根目录" not in section
+    assert "/mnt/skills" not in section

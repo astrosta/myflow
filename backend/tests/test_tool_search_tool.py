@@ -273,8 +273,11 @@ def test_the_service_accepts_the_documented_constructor_order() -> None:
     assert service.max_cards == 5
 
 
-def test_the_tool_description_speaks_about_mcp_tools() -> None:
-    assert "MCP" in (tool_search.description or "")
+def test_the_tool_description_speaks_about_extended_tools() -> None:
+    description = tool_search.description or ""
+
+    assert "extended tools" in description
+    assert "MCP" not in description
 
 
 class FailingRetirementSync:

@@ -30,7 +30,7 @@ ALL_TOOLS = [
         "write_file",
         "bash",
         "task",
-        "load_skills",
+        "load_skill",
         "search_skills",
         "tool_search",
         "tool_execute",

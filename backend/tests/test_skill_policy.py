@@ -88,7 +88,7 @@ ALL_TOOLS = _tools(
     "bash",
     "ls",
     "task",
-    "load_skills",
+    "load_skill",
     "search_skills",
     "tool_search",
     "tool_execute",
@@ -110,7 +110,7 @@ def test_slash_dominates_and_reading_another_skill_cannot_widen_it(tmp_path):
 
     visible = _run(middleware, ALL_TOOLS, _state(wide), _context(slash=slash))
 
-    assert visible == ["read_file", "load_skills", "tool_search", "tool_execute"]
+    assert visible == ["read_file", "load_skill", "tool_search", "tool_execute"]
 
 
 def test_autonomous_skills_union_and_undeclared_ones_contribute_nothing(tmp_path):
@@ -124,7 +124,7 @@ def test_autonomous_skills_union_and_undeclared_ones_contribute_nothing(tmp_path
     assert set(visible) == {
         "read_file",
         "bash",
-        "load_skills",
+        "load_skill",
         "tool_search",
         "tool_execute",
     }
@@ -137,7 +137,7 @@ def test_an_empty_declaration_does_not_dissolve_another_limit(tmp_path):
 
     visible = _run(middleware, ALL_TOOLS, _state(empty, reader), _context())
 
-    assert set(visible) == {"read_file", "load_skills", "tool_search", "tool_execute"}
+    assert set(visible) == {"read_file", "load_skill", "tool_search", "tool_execute"}
 
 
 def test_an_empty_declaration_alone_leaves_only_framework_tools(tmp_path):
@@ -151,7 +151,7 @@ def test_an_empty_declaration_alone_leaves_only_framework_tools(tmp_path):
 
 def test_the_framework_set_is_exactly_the_discovery_and_skill_tools():
     assert ALWAYS_AVAILABLE_BUILTIN_TOOL_NAMES == frozenset(
-        {"read_file", "load_skills", "tool_search", "tool_execute"}
+        {"read_file", "load_skill", "tool_search", "tool_execute"}
     )
 
 
@@ -163,7 +163,7 @@ def test_search_skills_is_not_a_framework_tool(tmp_path):
     visible = _run(middleware, ALL_TOOLS, _state(reader), _context())
 
     assert "search_skills" not in visible
-    assert "load_skills" in visible
+    assert "load_skill" in visible
 
 
 def test_task_is_not_exempt_but_framework_tools_always_are(tmp_path):

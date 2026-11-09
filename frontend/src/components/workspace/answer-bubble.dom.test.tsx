@@ -28,6 +28,35 @@ function group(createdAt: string | null = null): AnswerGroup {
   };
 }
 
+const CITATION = {
+  citation_id: "k1234abcd",
+  chunk_id: "doc-1:3",
+  document_id: "doc-1",
+  knowledge_base_id: "base-1",
+  knowledge_base_name: "产品文档",
+  knowledge_base_type: "technical",
+  filename: "manual.md",
+  section: "安装",
+  page: 7,
+  chunk_index: 3,
+  quote: "升级前先备份配置。",
+};
+
+function citedGroup(): AnswerGroup {
+  const answer = group();
+  return {
+    ...answer,
+    message: {
+      ...answer.message,
+      content: "升级前先备份 [k1234abcd]。",
+      additional_kwargs: { knowledge_citations: [CITATION] },
+    },
+    blocks: [
+      { kind: "text", id: "m-1-text-0", text: "升级前先备份 [k1234abcd]。" },
+    ],
+  };
+}
+
 describe("助手气泡", () => {
   it("不显示“助手”两个字", () => {
     const view = render(<AnswerBubble group={group()} />);
@@ -53,5 +82,23 @@ describe("助手气泡", () => {
 
     const untimed = render(<AnswerBubble group={group()} />);
     expect(untimed.queryByText(/\d{2}:\d{2}/)).toBeNull();
+  });
+
+  it("把引用标记渲染成可点击编号，并在正文下列出来源", () => {
+    const view = render(<AnswerBubble group={citedGroup()} />);
+
+    const inline = view.getByRole("link", { name: "[1]" });
+    expect(inline.getAttribute("href")).toBe(
+      "/workspace/knowledge/base-1/documents/doc-1#chunk-3",
+    );
+    expect(view.getByText("来源")).toBeTruthy();
+    expect(view.getByText(/manual\.md/)).toBeTruthy();
+    expect(view.getByText(/安装/)).toBeTruthy();
+    expect(view.queryByText(/k1234abcd/)).toBeNull();
+  });
+
+  it("没有结构化来源时不渲染来源区", () => {
+    const view = render(<AnswerBubble group={group()} />);
+    expect(view.queryByText("来源")).toBeNull();
   });
 });

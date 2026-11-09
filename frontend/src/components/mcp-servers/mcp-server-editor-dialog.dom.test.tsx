@@ -149,6 +149,16 @@ describe("新建 MCP 服务", () => {
     expect(mockedGet).not.toHaveBeenCalled();
   });
 
+  it("描述框写明这是可选的 MCP 服务描述", () => {
+    const view = renderEditor();
+    const dialog = view.getByRole("dialog", { name: "新建 MCP 服务" });
+
+    const description = within(dialog).getByLabelText("MCP 服务描述（可选）") as HTMLTextAreaElement;
+    expect(description.placeholder).toContain("可选");
+    expect(description.placeholder).toContain("MCP 服务");
+    expect(description.required).toBe(false);
+  });
+
   it("填完必填项就能创建，transport/headers/verify_tls/enabled 都带上", async () => {
     const view = renderEditor();
     const dialog = view.getByRole("dialog", { name: "新建 MCP 服务" });

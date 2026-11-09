@@ -120,6 +120,9 @@ function SearchHitItem({ hit }: { hit: KnowledgeSearchHit }) {
         <span className="font-medium text-neutral-800">{hit.filename}</span>
         {hit.section ? <span>{hit.section}</span> : null}
         {hit.page > 0 ? <span>第 {hit.page} 页</span> : null}
+        {hit.citation_id ? (
+          <span className="font-mono text-[10px] text-neutral-400">{hit.citation_id}</span>
+        ) : null}
         <span className="ml-auto tabular-nums">相关度 {hit.score.toFixed(3)}</span>
       </div>
       <Markdown className="knowledge-search-md mt-2" text={hit.content} />

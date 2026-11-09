@@ -1,7 +1,8 @@
 """系统提示词的技能索引：私有技能超过 prompt_top_k 时只列最常用的那几个。
 
 选择规则（设计 §12）：
-- 私有技能数 <= prompt_top_k：全列，不读 Redis；
+- prompt_top_k=0：私有技能不列，且不读 Redis；
+- 私有技能数 <= prompt_top_k（N>0）：全列，不读 Redis；
 - 超了：先按 Redis ZSET 的 top-K，缺的用 PostgreSQL 的 load_count 兜底，再按名字稳定排序；
 - 内置技能永远在索引里，且不占配额。
 """
@@ -104,6 +105,33 @@ def test_a_short_list_needs_no_usage_data(tmp_path, monkeypatch) -> None:
     )
 
     assert _listed(section) == ["a", "b", "c"]
+
+
+def test_zero_lists_only_non_private_skills_and_skips_usage(tmp_path, monkeypatch) -> None:
+    def forbidden(_user_id):
+        raise AssertionError("prompt_top_k=0 时不该读使用次数")
+
+    monkeypatch.setattr("agentkit.skills.prompt.top_skill_ids", forbidden)
+    builtin = _skill(
+        "demo",
+        skill_id="ignored-builtin-id",
+        scope=SkillScope.BUILTIN,
+        category=SkillCategory.BUILTIN,
+    )
+    section = build_skills_section(
+        config=skills_config(tmp_path, usage={"prompt_top_k": 0}),
+        registry=FakeRegistry([builtin, _skill("a"), _skill("b")]),
+        user_id="u1",
+    )
+
+    assert _listed(section) == ["demo"]
+    assert "私有技能不列在本索引里" in section
+
+
+def test_zero_is_a_valid_prompt_top_k(tmp_path) -> None:
+    config = skills_config(tmp_path, usage={"prompt_top_k": 0})
+
+    assert config.usage.prompt_top_k == 0
 
 
 def test_over_the_limit_lists_the_redis_top_k_first(tmp_path, monkeypatch) -> None:

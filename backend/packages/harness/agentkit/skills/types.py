@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from agentkit.skills.domain import SkillScope
 
 SKILL_FILE_NAME = "SKILL.md"
+#: 模型看到的 builtin 技能 id。builtin 没有数据库身份，所有内置技能共用这个常量；
+#: load_skill 必须用 name 定位具体是哪一个。
+BUILTIN_SKILL_ID = "builtin"
 
 
 class SkillCategory(StrEnum):
@@ -43,7 +46,7 @@ class Skill:
     category: SkillCategory
     allowed_tools: tuple[str, ...] | None = None  # None = 未声明；() = 声明了空列表
     enabled: bool = True  # 私有技能的用户开关；内置/filesystem 旧路径保持兼容
-    load_count: int = 0  # `load_skills` 成功加载次数（数据库快照；内置不计数）
+    load_count: int = 0  # `load_skill` 成功加载次数（数据库快照；内置不计数）
     required_secrets: tuple[SecretRequirement, ...] = ()
     secrets_autonomous: bool = True
     argument_hint: str | None = None

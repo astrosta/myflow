@@ -407,8 +407,9 @@ def test_container_file_uses_the_configured_private_root(
         config=config, user_id="alice", snapshot=runtime.catalog.snapshot
     )
     prompt = build_skills_section(config=config, registry=registry)
-    assert "/opt/skills/private" in prompt
-    assert "/opt/skills/public" not in prompt
+    assert "- alice-tools | " in prompt
+    assert "| s-alice" in prompt
+    assert "/opt/skills" not in prompt
 
     provider = LocalSandboxProvider(cache_dir=tmp_path / "cache")
     sandbox = provider.get(provider.acquire("thread-a", user_id="alice"))

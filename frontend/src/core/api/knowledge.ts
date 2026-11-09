@@ -118,8 +118,23 @@ export interface KnowledgeChunksPage {
   next_offset: number | null;
 }
 
+export interface KnowledgeSearchCitation {
+  citation_id: string;
+  chunk_id: string;
+  document_id: string;
+  knowledge_base_id: string;
+  knowledge_base_name: string;
+  knowledge_base_type: KnowledgeBaseType;
+  filename: string;
+  section: string;
+  page: number;
+  chunk_index: number;
+  quote: string;
+}
+
 export interface KnowledgeSearchHit {
   chunk_id: string;
+  citation_id: string;
   document_id: string;
   filename: string;
   section: string;
@@ -143,6 +158,7 @@ export interface KnowledgeSearchResult {
   retrieval_mode: KnowledgeRetrievalMode;
   reranked: boolean;
   results: KnowledgeSearchHit[];
+  citations: KnowledgeSearchCitation[];
   truncated: boolean;
 }
 

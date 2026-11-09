@@ -377,12 +377,12 @@ function McpServerEditorForm({ initial, onClose, onSaved, serverId }: McpServerE
       </div>
 
       <label className="block space-y-1.5">
-        <span className="text-xs font-medium text-neutral-700">描述</span>
+        <span className="text-xs font-medium text-neutral-700">MCP 服务描述（可选）</span>
         <textarea
           className={TEXTAREA_CLASS}
           disabled={busy}
           onChange={(event) => set("description", event.target.value)}
-          placeholder="这个服务器提供什么工具、什么场景该用它"
+          placeholder="可选：这个 MCP 服务提供什么工具、什么场景该用它"
           rows={2}
           value={form.description}
         />

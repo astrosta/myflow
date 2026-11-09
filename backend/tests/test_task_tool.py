@@ -171,6 +171,27 @@ def test_the_happy_path_emits_start_step_and_terminal_events() -> None:
     assert message.additional_kwargs["subagent_result_brief"] == "the answer"
 
 
+def test_cited_sources_are_carried_on_the_task_result() -> None:
+    citation = {
+        "citation_id": "k1234abcd",
+        "chunk_id": "d1:0",
+        "document_id": "d1",
+        "knowledge_base_id": "b1",
+        "knowledge_base_name": "产品文档",
+        "knowledge_base_type": "technical",
+        "filename": "manual.md",
+        "section": "安装",
+        "page": 2,
+        "chunk_index": 0,
+        "quote": "安装步骤",
+    }
+    dispatcher = FakeDispatcher(citations=(citation,))
+
+    command = _run(_tool(dispatcher), _runtime())
+
+    assert _tool_message(command).additional_kwargs["knowledge_citations"] == [citation]
+
+
 def test_the_command_writes_one_ledger_entry_next_to_the_tool_message() -> None:
     dispatcher = FakeDispatcher()
     command = _run(_tool(dispatcher), _runtime(), prompt="line one\nline two")

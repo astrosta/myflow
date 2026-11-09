@@ -104,11 +104,17 @@ def test_retrieval_subagents_spell_out_when_to_use_and_when_not() -> None:
     assert "experiences" in memory_prompt
     assert "cases" in memory_prompt
 
+    knowledge_prompt = KNOWLEDGE_RESEARCHER_SUBAGENT.system_prompt or ""
+    assert "citation_id" in knowledge_prompt
+    assert "[k" in knowledge_prompt
+    assert "不要编造" in knowledge_prompt
+
     skill_description = skill_finder.DESCRIPTION
-    assert "skill_id" in skill_description
+    assert "name" in skill_description
+    assert "id" in skill_description
     assert "不交回正文" in skill_description
-    assert "load_skills" not in skill_description
-    assert "load_skills" not in skill_finder.SYSTEM_PROMPT
+    assert "load_skill" not in skill_description
+    assert "load_skill" not in skill_finder.SYSTEM_PROMPT
     assert "看技能索引" not in skill_finder.SYSTEM_PROMPT
 
 
@@ -184,7 +190,7 @@ def _assemble(monkeypatch, *, subagent_enabled: bool, allowed: list[str] | None 
     delegated: dict = {}
     memory_tool = SimpleNamespace(name="memory_search")
     skills_tool = SimpleNamespace(name="search_skills")
-    loader_tool = SimpleNamespace(name="load_skills")
+    loader_tool = SimpleNamespace(name="load_skill")
 
     monkeypatch.setattr(
         "agentkit.agents.leader_agent.agent.create_chat_model",
@@ -245,8 +251,8 @@ def test_delegation_moves_retrieval_tools_off_the_lead(monkeypatch) -> None:
     assert "knowledge_search" not in names
     assert "memory_search" not in names
     assert "search_skills" not in names
-    # load_skills 是系统内置工具：不参与认领，委派与直连都在 lead 上。
-    assert "load_skills" in names
+    # load_skill 是系统内置工具：不参与认领，委派与直连都在 lead 上。
+    assert "load_skill" in names
     assert "task" in names
     delegated = [tool.name for tool in captured["task_kwargs"]["delegated_tools"]]
     assert delegated == ["memory_search", "knowledge_search", "search_skills"]
@@ -262,7 +268,7 @@ def test_a_whitelist_without_retrieval_subagents_keeps_retrieval_on_the_lead(mon
     assert "memory_search" in names
     # search_skills 只属于 skill-finder：没有它就彻底不给 lead，也不留兜底。
     assert "search_skills" not in names
-    assert "load_skills" in names
+    assert "load_skill" in names
     assert captured["task_kwargs"]["delegated_tools"] == []
 
 
@@ -273,7 +279,7 @@ def test_only_claimed_retrieval_tools_leave_the_lead(monkeypatch) -> None:
     assert "knowledge_search" not in names
     assert "memory_search" in names
     assert "search_skills" not in names
-    assert "load_skills" in names
+    assert "load_skill" in names
     delegated = [tool.name for tool in captured["task_kwargs"]["delegated_tools"]]
     assert delegated == ["knowledge_search"]
 
@@ -287,7 +293,7 @@ def test_no_available_subagent_means_no_task_tool(monkeypatch) -> None:
     assert "knowledge_search" in names
     assert "memory_search" in names
     assert "search_skills" not in names
-    assert "load_skills" in names
+    assert "load_skill" in names
 
 
 def test_delegation_hard_reject_falls_back_to_direct_tools(monkeypatch) -> None:
@@ -298,7 +304,7 @@ def test_delegation_hard_reject_falls_back_to_direct_tools(monkeypatch) -> None:
     assert "knowledge_search" in names
     assert "memory_search" in names
     assert "search_skills" not in names
-    assert "load_skills" in names
+    assert "load_skill" in names
 
 
 def test_delegation_disabled_keeps_direct_tools(monkeypatch) -> None:
@@ -308,7 +314,7 @@ def test_delegation_disabled_keeps_direct_tools(monkeypatch) -> None:
     assert "task" not in names
     assert "knowledge_search" in names
     assert "search_skills" not in names
-    assert "load_skills" in names
+    assert "load_skill" in names
 
 
 def test_prompt_lists_subagents_only_when_delegation_is_active() -> None:

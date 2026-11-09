@@ -46,7 +46,14 @@ function normalizeDisplayMath(text: string): string {
 
 const COMPONENTS: Components = {
   a({ node, ...props }) {
-    return <a {...props} rel="noreferrer noopener" target="_blank" />;
+    const internal = typeof props.href === "string" && props.href.startsWith("/");
+    return (
+      <a
+        {...props}
+        rel={internal ? undefined : "noreferrer noopener"}
+        target={internal ? undefined : "_blank"}
+      />
+    );
   },
   table({ node, ...props }) {
     // 宽表格自己滚，不要把整页撑出横向滚动条

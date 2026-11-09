@@ -21,6 +21,7 @@ from agentkit.agents.middlewares.dangling_tool_call_middleware import DanglingTo
 from agentkit.agents.middlewares.durable_context_middleware import DurableContextMiddleware
 from agentkit.agents.middlewares.dynamic_context_middleware import DynamicContextMiddleware
 from agentkit.agents.middlewares.input_sanitization_middleware import InputSanitizationMiddleware
+from agentkit.agents.middlewares.knowledge_citation_middleware import KnowledgeCitationMiddleware
 from agentkit.agents.middlewares.llm_error_handling_middleware import LLMErrorHandlingMiddleware
 from agentkit.agents.middlewares.pii_middleware import PIIMiddleware, PIIOutputMiddleware
 from agentkit.agents.middlewares.retrieval_scope_middleware import (
@@ -200,6 +201,9 @@ def build_middlewares(
             logger.warning(
                 "memory.openviking.enabled=true but the OpenViking runtime is not initialized"
             )
+    # 引用校验注册在脱敏之前：after_model 反序，所以它看到的是已经脱敏的正文；
+    # 数字/文件名的 handle 化不会影响 citation_id 标记。
+    chain.append(KnowledgeCitationMiddleware())
     # 输出侧脱敏最后注册：after_model 反序，因此它在 Memory/Title 之前跑，模型
     # 写回的 AI 文本和 tool_calls 参数先变成 handle，Memory 再看到脱敏/去 handle 视图。
     chain.append(PIIOutputMiddleware(app_config=resolved))

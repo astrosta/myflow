@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from agentkit.knowledge.citations import citations_for_hits
 from agentkit.knowledge.errors import (
     InvalidKnowledgeRequest,
     KnowledgeBaseNotFound,
@@ -29,6 +30,7 @@ from backend.app.gateway.models.response import (
     KnowledgeBaseResponse,
     KnowledgeChunkResponse,
     KnowledgeChunksResponse,
+    KnowledgeCitationResponse,
     KnowledgeDeletedResponse,
     KnowledgeDocumentListResponse,
     KnowledgeDocumentResponse,
@@ -285,14 +287,18 @@ async def search(
         base_ids=[base_id] if base_id else None,
         top_k=top_k,
     )
+    sources = citations_for_hits(outcome.hits)
+    citation_ids = {item["chunk_id"]: item["citation_id"] for item in sources}
     return KnowledgeSearchResponse(
         query=outcome.query,
         keyword_query=outcome.keyword_query,
         retrieval_mode=outcome.retrieval_mode,
         reranked=outcome.reranked,
+        citations=[KnowledgeCitationResponse(**item) for item in sources],
         results=[
             KnowledgeSearchHitResponse(
                 chunk_id=hit.chunk_id,
+                citation_id=citation_ids.get(hit.chunk_id, ""),
                 document_id=hit.document_id,
                 filename=hit.filename,
                 section=hit.section,

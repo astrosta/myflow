@@ -46,6 +46,7 @@ from agentkit.agents.leader_agent.runtime_keys import CHECKPOINT_COORDINATE_KEYS
 from agentkit.agents.middlewares.assembly import build_subagent_runtime_middlewares
 from agentkit.agents.thread_state import ThreadState
 from agentkit.config import AppConfig
+from agentkit.knowledge.citations import collect_known_citations, resolve_citations
 from agentkit.models import create_chat_model
 from agentkit.observability import attach_callback_handler, start_subagent_trace
 from agentkit.sandbox.lease import release_sandbox_lease, subagent_lease_owner_id
@@ -597,6 +598,7 @@ class SubagentExecutor:
         """把执行推向终态。护栏命中**不改状态**，只额外带一个 ``stop_reason``（§13.1）。"""
         holder = dispatch.holder
         result = extract_final_result(run.last_state)
+        citations = extract_citations(run.last_state, result)
         reason = stop_reason or self._consume_stop_reason(dispatch, run)
 
         error: str | None = None
@@ -610,7 +612,9 @@ class SubagentExecutor:
             status = SubagentStatus.FAILED
         if status is SubagentStatus.FAILED and error is None:
             error = "子代理在轮次预算内没有产出结论"
-        holder.try_set_terminal(status, result=result, error=error, stop_reason=reason)
+        holder.try_set_terminal(
+            status, result=result, error=error, stop_reason=reason, citations=citations
+        )
 
     @staticmethod
     def _consume_stop_reason(dispatch: SubagentDispatch, run: _RunState) -> str | None:
@@ -663,6 +667,25 @@ def extract_final_result(state: Mapping[str, Any] | None) -> str | None:
         if text.strip():
             return text
     return None
+
+
+def extract_citations(
+    state: Mapping[str, Any] | None, result_text: str | None
+) -> list[dict[str, Any]]:
+    """Resolve citation markers in the final answer against this subagent's tool results.
+
+    Only sources that were actually retrieved in this run and actually named by a
+    marker in the final answer survive. A marker invented by the model resolves
+    to nothing rather than becoming a fake source in the lead's context.
+    """
+
+    if not result_text:
+        return []
+    messages = state.get("messages") if isinstance(state, Mapping) else None
+    if not isinstance(messages, list):
+        return []
+    known = collect_known_citations(messages)
+    return resolve_citations(result_text, known)
 
 
 def _has_error_fallback(state: Mapping[str, Any] | None) -> bool:

@@ -4,7 +4,7 @@
 deferred_discovery 被刻意删掉了——两套渲染等于两套提示词契约与两套测试。
 
 `search` 是**按需加载的第二条路径**：技能多到一个都读不完时，模型用
-`search_skills` 按任务意图检索元数据，`load_skills` 再按 skill_id 加载正文。
+`search_skills` 按任务意图检索元数据，`load_skill` 再按 name/id 加载正文。
 向量召回与 BM25 召回都在 Milvus 服务端完成，融合使用 Milvus 的 RRFRanker；
 应用进程只负责 query embedding、可见性确认和可选精排，不实现检索算法。
 """
@@ -94,7 +94,7 @@ class SkillSearchConfig(BaseModel):
 
     enabled: bool = Field(
         default=True,
-        description="关掉后 skill-finder / search_skills 不可用；load_skills 仍按 skill_id 加载正文。",
+        description="关掉后 skill-finder / search_skills 不可用；load_skill 仍按 name/id 加载正文。",
     )
     candidate_k: int = Field(
         default=DEFAULT_SEARCH_CANDIDATE_K,
@@ -348,9 +348,12 @@ class SkillUsageConfig(BaseModel):
     )
     prompt_top_k: int = Field(
         default=10,
-        ge=1,
+        ge=0,
         le=100,
-        description="私有技能超过这个数量时，system prompt 只加载最常用的前 N 个。",
+        description=(
+            "私有技能超过这个数量时，system prompt 只列最常用的前 N 个；"
+            "0 = 不把私有技能列进提示词，但使用次数照常记录。"
+        ),
     )
     refresh_seconds: float = Field(
         default=30.0,

@@ -116,6 +116,13 @@ export function feedMessageToChatMessage(row: FeedMessage): ChatMessage | null {
   if (isRecord(row.content) && Array.isArray(row.content.tool_calls)) {
     message.tool_calls = row.content.tool_calls as ChatMessage["tool_calls"];
   }
+  // 引用、思考等展示元数据随 LangChain 消息一起持久化；历史副本不能丢。
+  if (inner && isRecord(inner.additional_kwargs)) {
+    message.additional_kwargs = inner.additional_kwargs;
+  }
+  if (inner && isRecord(inner.response_metadata)) {
+    message.response_metadata = inner.response_metadata;
+  }
   return message;
 }
 

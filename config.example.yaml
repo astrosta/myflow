@@ -408,7 +408,7 @@ subagent_runtime:
 # ------------------------------------------------------------
 # 技能：用户私有技能写入 Git/PostgreSQL，内置技能随进程发布；沙箱根目录是 container_path。
 # 模型看到的是系统提示词尾部的 <available_skills> 索引（每技能一行，描述截断）；
-# 正文一律按需：要么 read_file 读 SKILL.md，要么 search_and_load_skills 按意图检索加载。
+# 正文一律按需：模型用 load_skill(name, id) 加载；内置技能 id 固定为 builtin。
 # 没有"全量注入"模式开关（M7 §3.5）。
 # 个人开关写 PostgreSQL 的 skills.enabled；技能保存后是草稿，必须安全扫描通过并点击生效才进入运行时与向量索引。
 # ------------------------------------------------------------
@@ -462,7 +462,7 @@ skills:
     enabled: true
     redis_url: $REDIS_URL           # 留空则退回 PostgreSQL load_count
     key_prefix: myflow:skills:usage # key = <prefix>:<user_id>
-    prompt_top_k: 10                # 私有技能超过 N 个时，system prompt 只列前 N 个
+    prompt_top_k: 10                # 私有技能超过 N 个时只列前 N 个；0 = 不列私有技能
     refresh_seconds: 30             # 多 worker 的 top-K 缓存刷新间隔；0 = 关闭
   # 可重建缓存的保留策略；数据库元数据与扫描历史永久保留。
   retention:
@@ -471,14 +471,14 @@ skills:
 
 
   path: skills                  # 相对项目根
-  container_path: /mnt/skills   # startup-only：编译进提示词索引与沙箱 mount
+  container_path: /mnt/skills   # startup-only：沙箱里按它 mount；load_skill 返回的 path 用它
   index_description_max_chars: 120
 
-  # 检索加载（search_and_load_skills）：技能多到一个都读不完时，模型按任务意图
-  # 检索并一次加载最相关的几个技能正文。dense 向量、BM25 稀疏检索与 RRF 融合
+  # 检索加载（search_skills + load_skill）：技能多到一个都读不完时，模型按任务意图
+  # 检索并加载最相关的几个技能正文。dense 向量、BM25 稀疏检索与 RRF 融合
   # 都在 Milvus 服务端完成；启用 search 时必须能连上 Milvus。
   search:
-    enabled: false                 # 关掉后这个工具不注册，技能只能靠索引 + read_file
+    enabled: false                 # 关掉后 search_skills 不注册，技能只能靠索引 + load_skill
     candidate_k: 20               # 召回交给精排的候选数
     top_k: 3                      # 最终加载几个技能的正文
     rrf_k: 60                     # Milvus RRFRanker 的 k（服务端融合）

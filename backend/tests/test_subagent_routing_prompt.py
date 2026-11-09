@@ -214,12 +214,12 @@ def test_the_lead_section_says_what_to_do_with_results() -> None:
 def test_the_lead_section_points_at_the_skills_index_when_skill_finder_is_listed() -> None:
     prompt = _section(SubagentPolicy(allowed=None, max_concurrent=3))
     assert "技能见下方索引" in prompt
-    assert "load_skills" in prompt
+    assert "load_skill" in prompt
     assert "私有知识库" not in prompt
 
     bash_only = _section(SubagentPolicy(allowed=["bash"], max_concurrent=3))
     assert "技能见下方索引" not in bash_only
-    assert "load_skills" not in bash_only
+    assert "load_skill" not in bash_only
 
 
 def test_the_role_sets_the_reply_language() -> None:

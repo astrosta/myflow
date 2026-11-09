@@ -396,8 +396,23 @@ class KnowledgeUploadResponse(BaseModel):
     count: int
 
 
+class KnowledgeCitationResponse(BaseModel):
+    citation_id: str
+    chunk_id: str
+    document_id: str
+    knowledge_base_id: str = ""
+    knowledge_base_name: str = ""
+    knowledge_base_type: str = ""
+    filename: str = ""
+    section: str = ""
+    page: int = 0
+    chunk_index: int = 0
+    quote: str = ""
+
+
 class KnowledgeSearchHitResponse(BaseModel):
     chunk_id: str
+    citation_id: str = ""
     document_id: str
     filename: str
     section: str
@@ -419,6 +434,7 @@ class KnowledgeSearchResponse(BaseModel):
     retrieval_mode: str = "vector"
     reranked: bool = False
     results: list[KnowledgeSearchHitResponse]
+    citations: list[KnowledgeCitationResponse] = Field(default_factory=list)
     truncated: bool = False
 
 

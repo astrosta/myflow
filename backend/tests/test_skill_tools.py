@@ -1,4 +1,4 @@
-"""Split skill tools: search_skills returns metadata; load_skills returns bodies."""
+"""Skill tools: search_skills returns metadata; load_skill requires name and row id."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from langchain.tools import ToolRuntime
 
 from agentkit.config import AppConfig, set_app_config
 from agentkit.config.skills_config import SkillsConfig
+from agentkit.skills.catalog import SkillSnapshot, get_skill_snapshot, set_skill_snapshot
 from agentkit.skills.domain import SkillScope
 from agentkit.skills.search import (
     SkillSearchHit,
@@ -18,8 +19,8 @@ from agentkit.skills.search import (
     configure_skill_runtime,
     reset_skill_runtime,
 )
-from agentkit.skills.types import Skill, SkillCategory
-from agentkit.tools.builtin.load_skills import NOT_FOUND_MESSAGE, load_skills
+from agentkit.skills.types import BUILTIN_SKILL_ID, Skill, SkillCategory
+from agentkit.tools.builtin.load_skill import NOT_FOUND_MESSAGE, load_skill
 from agentkit.tools.builtin.search_skills import UNAVAILABLE_MESSAGE, search_skills
 from agentkit.tools.registry import get_available_tools
 from fakes.skill_tree import skills_config, write_skill
@@ -38,6 +39,7 @@ def _restore_config():
         app_config_module._app_config_signature,
         app_config_module._app_config_is_custom,
     )
+    saved_snapshot = get_skill_snapshot()
     yield
     (
         app_config_module._app_config,
@@ -45,6 +47,7 @@ def _restore_config():
         app_config_module._app_config_signature,
         app_config_module._app_config_is_custom,
     ) = saved
+    set_skill_snapshot(saved_snapshot)
     reset_skill_runtime()
 
 
@@ -120,6 +123,13 @@ def _outcome() -> SkillSearchOutcome:
     return SkillSearchOutcome(hits=(_hit(),), candidates=1, warnings=())
 
 
+def _private_snapshot(skill: Skill | None = None) -> SkillSnapshot:
+    return SkillSnapshot(
+        epoch="test",
+        private_by_owner={"u1": (skill or _skill(),)},
+    )
+
+
 def test_search_skills_returns_only_metadata(tmp_path) -> None:
     _install(skills_config(tmp_path))
     service = FakeSearchService(_outcome())
@@ -147,14 +157,18 @@ def test_search_skills_returns_only_metadata(tmp_path) -> None:
     assert service.load_calls == []
 
 
-def test_load_skills_returns_the_full_catalog_body(tmp_path) -> None:
-    _install(skills_config(tmp_path))
+def test_load_skill_returns_a_private_body_by_name(tmp_path) -> None:
+    _install(skills_config(tmp_path, source="git"))
+    set_skill_snapshot(_private_snapshot())
     service = FakeSearchService(_outcome(), loaded=_hit())
     configure_skill_runtime(service)
 
-    payload = _invoke(load_skills, {"skill_id": "skill-1", "runtime": _runtime()})
+    payload = _invoke(
+        load_skill,
+        {"name": SKILL, "id": "skill-1", "runtime": _runtime()},
+    )
 
-    assert payload["skill"]["skill_id"] == "skill-1"
+    assert payload["skill"]["id"] == "skill-1"
     assert payload["skill"]["name"] == SKILL
     assert payload["skill"]["path"] == str(_skill().container_file)
     assert payload["skill"]["body"] == BODY
@@ -162,30 +176,122 @@ def test_load_skills_returns_the_full_catalog_body(tmp_path) -> None:
     assert service.search_calls == []
 
 
-def test_load_skills_does_not_return_a_disabled_or_unknown_skill(tmp_path) -> None:
-    _install(skills_config(tmp_path))
+def test_load_skill_requires_an_id_from_the_row(tmp_path) -> None:
+    _install(skills_config(tmp_path, source="git"))
+    set_skill_snapshot(_private_snapshot())
+    configure_skill_runtime(FakeSearchService(_outcome(), loaded=_hit()))
+
+    with pytest.raises(Exception):
+        _invoke(load_skill, {"name": SKILL, "runtime": _runtime()})
+
+
+def test_prompt_top_k_zero_does_not_disable_loading_or_usage(tmp_path) -> None:
+    _install(
+        skills_config(
+            tmp_path,
+            source="git",
+            usage={"prompt_top_k": 0},
+        )
+    )
+    set_skill_snapshot(_private_snapshot())
+    service = FakeSearchService(_outcome(), loaded=_hit())
+    configure_skill_runtime(service)
+
+    payload = _invoke(
+        load_skill,
+        {"name": SKILL, "id": "skill-1", "runtime": _runtime()},
+    )
+
+    assert payload["skill"]["body"] == BODY
+    assert service.load_calls == [{"user_id": "u1", "skill_id": "skill-1"}]
+
+
+def test_load_skill_does_not_return_a_disabled_or_unknown_skill(tmp_path) -> None:
+    _install(skills_config(tmp_path, source="git"))
+    set_skill_snapshot(_private_snapshot(_skill(enabled=False)))
+    service = FakeSearchService(_outcome(), loaded=_hit())
+    configure_skill_runtime(service)
+
+    disabled = _invoke(
+        load_skill,
+        {"name": SKILL, "id": "skill-1", "runtime": _runtime()},
+    )
+    unknown = _invoke(
+        load_skill,
+        {"name": "missing", "id": "missing", "runtime": _runtime()},
+    )
+
+    assert disabled["skill"] is None
+    assert disabled["message"] == list(NOT_FOUND_MESSAGE)
+    assert unknown["skill"] is None
+    assert service.load_calls == []
+
+
+def test_load_skill_returns_not_found_when_the_service_cannot_confirm_it(tmp_path) -> None:
+    _install(skills_config(tmp_path, source="git"))
+    set_skill_snapshot(_private_snapshot())
     service = FakeSearchService(_outcome(), loaded=None)
     configure_skill_runtime(service)
 
-    payload = _invoke(load_skills, {"skill_id": "missing", "runtime": _runtime()})
+    payload = _invoke(
+        load_skill,
+        {"name": SKILL, "id": "skill-1", "runtime": _runtime()},
+    )
 
     assert payload["skill"] is None
     assert payload["message"] == list(NOT_FOUND_MESSAGE)
 
 
-def test_load_skills_is_available_when_search_is_disabled(tmp_path) -> None:
+def test_load_skill_loads_a_builtin_by_name_without_counting_usage(tmp_path) -> None:
+    write_skill(tmp_path, "builtin", "pdf", description="PDF tools", body=BODY)
+    _install(
+        skills_config(
+            tmp_path,
+            builtin={"path": str(tmp_path / "skills" / "builtin")},
+        )
+    )
+    service = FakeSearchService(_outcome(), loaded=_hit())
+    configure_skill_runtime(service)
+
+    payload = _invoke(
+        load_skill,
+        {"name": "pdf", "id": BUILTIN_SKILL_ID, "runtime": _runtime()},
+    )
+
+    assert payload["skill"]["id"] == BUILTIN_SKILL_ID
+    assert payload["skill"]["scope"] == "builtin"
+    assert payload["skill"]["path"] == "/mnt/skills/builtin/pdf/SKILL.md"
+    assert payload["skill"]["body"].startswith("# 排查")
+    assert service.load_calls == []
+
+
+def test_load_skill_uses_the_configured_container_path(tmp_path) -> None:
+    write_skill(tmp_path, "builtin", "pdf", description="PDF tools", body=BODY)
+    _install(
+        skills_config(
+            tmp_path,
+            container_path="/opt/skills",
+            builtin={"path": str(tmp_path / "skills" / "builtin")},
+        )
+    )
+
+    payload = _invoke(load_skill, {"name": "pdf", "id": "builtin", "runtime": _runtime()})
+
+    assert payload["skill"]["path"] == "/opt/skills/builtin/pdf/SKILL.md"
+
+
+def test_load_skill_is_available_when_search_is_disabled(tmp_path) -> None:
     config = _install(skills_config(tmp_path, search={"enabled": False}))
 
     names = {tool.name for tool in get_available_tools(app_config=config)}
 
-    assert "load_skills" in names
+    assert "load_skill" in names
     assert "search_skills" not in names
 
 
 def test_filesystem_search_fails_closed_without_a_milvus_runtime(tmp_path) -> None:
-    skills = skills_config(tmp_path)
     write_skill(tmp_path, "public", SKILL, description="多租户排查", body=BODY)
-    _install(skills)
+    _install(skills_config(tmp_path))
     reset_skill_runtime()
 
     searched = _invoke(
@@ -199,7 +305,10 @@ def test_filesystem_search_fails_closed_without_a_milvus_runtime(tmp_path) -> No
     assert searched["skills"] == []
     assert searched["message"] == list(UNAVAILABLE_MESSAGE)
 
-    # load_skills is by id and still works without the search index.
-    loaded = _invoke(load_skills, {"skill_id": SKILL, "runtime": _runtime()})
-    assert loaded["skill"]["skill_id"] == SKILL
+    # load_skill still works with the row's placeholder id without the search index.
+    loaded = _invoke(
+        load_skill,
+        {"name": SKILL, "id": "-", "runtime": _runtime()},
+    )
+    assert loaded["skill"]["name"] == SKILL
     assert loaded["skill"]["body"].startswith("# 排查")
