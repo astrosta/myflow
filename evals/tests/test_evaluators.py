@@ -47,6 +47,7 @@ def _evidence(**overrides: Any) -> RunEvidence:
         "retrieved_skills": [],
         "loaded_skills": [],
         "kb_called": False,
+        "kb_truncated": False,
         "retrieved_chunks": [],
         "citations": [],
         "trace_id": None,

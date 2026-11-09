@@ -50,6 +50,8 @@ class RunEvidence:
     retrieved_skills: list[str]
     loaded_skills: list[str]
     kb_called: bool
+    #: A truncated retrieval hides chunks, so nothing about citations is provable.
+    kb_truncated: bool
     retrieved_chunks: list[dict[str, Any]]
     citations: list[dict[str, Any]]
     trace_id: str | None
@@ -94,8 +96,9 @@ def collect_evidence(
         kb_called=any(
             event.get("event_type") == _RETRIEVAL_KB_EVENT for event in event_rows
         ),
+        kb_truncated=_kb_truncated(event_rows),
         retrieved_chunks=_retrieved_chunks(event_rows),
-        citations=_citations(_last_ai(messages, event_rows)),
+        citations=_citations(_citation_row(ai_rows)),
         trace_id=trace_id,
     )
 
@@ -363,17 +366,38 @@ def _retrieved_chunks(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any
     return chunks
 
 
-def _last_ai(
-    messages: Sequence[Mapping[str, Any]], events: Sequence[Mapping[str, Any]]
+def _kb_truncated(events: Sequence[Mapping[str, Any]]) -> bool:
+    """True when any knowledge retrieval of this run was cut off by the budget."""
+    for event in events:
+        if event.get("event_type") != _RETRIEVAL_KB_EVENT:
+            continue
+        content = event.get("content")
+        if isinstance(content, Mapping) and content.get("truncated") is True:
+            return True
+    return False
+
+
+def _citation_row(
+    ai_rows: Sequence[Mapping[str, Any]],
 ) -> Mapping[str, Any] | None:
-    """Citations belong to the last AI row even when it produced no answer text."""
-    message_rows = _message_rows(messages, _AI_MESSAGE_TYPE)
-    if message_rows:
-        return message_rows[-1]
-    event_ai_rows = _event_contents(events, _AI_RESPONSE_EVENT)
-    if event_ai_rows:
-        return event_ai_rows[-1]
-    return None
+    """Citations belong to the last merged AI row, whichever source it came from.
+
+    A textless checkpoint row is still the final message, but the citations can
+    live on the ledger copy, so fall back to the last row that carries some.
+    """
+    if not ai_rows:
+        return None
+    for row in reversed(ai_rows):
+        if _has_citations(row):
+            return row
+    return ai_rows[-1]
+
+
+def _has_citations(row: Mapping[str, Any]) -> bool:
+    additional_kwargs = row.get("additional_kwargs")
+    if not isinstance(additional_kwargs, Mapping):
+        return False
+    return isinstance(additional_kwargs.get(_CITATIONS_KEY), list)
 
 
 def _final_ai(

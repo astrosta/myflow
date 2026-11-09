@@ -8,9 +8,10 @@ through exit code 1 instead of an exception.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ import httpx
 import pytest
 from langfuse import Evaluation
 
-from myflow_evals.accounts import AccountCredential, AccountSession
+from myflow_evals.accounts import AccountCredential, AccountSession, load_accounts
 from myflow_evals.build_dataset import (
     BuildSources,
     DatasetItemDraft,
@@ -206,6 +207,7 @@ class Recorder:
     """Every fake seam the CLI touches, with what it was asked to do."""
 
     accounts_paths: list[Any] = field(default_factory=list)
+    account_environs: list[dict[str, Any]] = field(default_factory=list)
     logins: list[dict[str, Any]] = field(default_factory=list)
     sessions: list[AccountSession] = field(default_factory=list)
     langfuse_calls: list[str] = field(default_factory=list)
@@ -224,14 +226,24 @@ def _services(
 ) -> tuple[CliServices, FakeLangfuse]:
     langfuse = FakeLangfuse(dataset)
 
-    def fake_load_accounts(path: Any = None) -> list[AccountCredential]:
+    def fake_load_accounts(
+        path: Any = None, *, environ: Any = None
+    ) -> list[AccountCredential]:
         recorder.accounts_paths.append(path)
+        recorder.account_environs.append(dict(environ or {}))
         return [AccountCredential(label="analyst_a", username="alice", password=PASSWORD)]
 
     def fake_login_all(
         accounts: list[AccountCredential], *, base_url: str, salt: str
     ) -> dict[str, AccountSession]:
-        recorder.logins.append({"base_url": base_url, "salt": salt, "count": len(accounts)})
+        recorder.logins.append(
+            {
+                "base_url": base_url,
+                "salt": salt,
+                "count": len(accounts),
+                "labels": [account.label for account in accounts],
+            }
+        )
         logged_in = dict(sessions or {HASHED_USER_ID: _session()})
         recorder.sessions.extend(logged_in.values())
         return logged_in
@@ -694,6 +706,85 @@ def test_build_include_traces_keeps_trace_drafts(capsys: pytest.CaptureFixture[s
     assert recorder.source_calls[0]["include_traces"] is True
     kinds = [item["metadata"]["source_kind"] for item in langfuse.created_items]
     assert sorted(kinds) == ["tool", "trace"]
+
+
+def _env_file(tmp_path: Path, extra: dict[str, str] | None = None) -> Path:
+    settings = dict(ENVIRON)
+    settings.update(extra or {})
+    path = tmp_path / "eval.env"
+    path.write_text(
+        "\n".join(f"{key}={value}" for key, value in settings.items()) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_env_file_can_supply_the_fixed_accounts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env_file = _env_file(
+        tmp_path,
+        {
+            "AGENT_USERS": json.dumps(
+                {"from_env": {"username": "alice", "password": PASSWORD}}
+            )
+        },
+    )
+    recorder = Recorder()
+    services, _ = _services(recorder, dataset=_passing_dataset())
+    services = replace(services, load_accounts=load_accounts)
+
+    exit_code = main(_run_args("--env-file", str(env_file)), services=services, environ={})
+
+    output = _capture(capsys)
+    assert exit_code == 0
+    assert recorder.logins[0]["labels"] == ["from_env"]
+    assert PASSWORD not in output
+
+
+def test_accounts_file_wins_over_the_env_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env_file = _env_file(
+        tmp_path,
+        {"AGENT_USERS": json.dumps({"from_env": {"username": "alice", "password": PASSWORD}})},
+    )
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(
+        json.dumps({"from_file": {"username": "bob", "password": "bob-password"}}),
+        encoding="utf-8",
+    )
+    recorder = Recorder()
+    services, _ = _services(recorder, dataset=_passing_dataset())
+    services = replace(services, load_accounts=load_accounts)
+
+    exit_code = main(
+        _run_args("--env-file", str(env_file), "--accounts-file", str(accounts_file)),
+        services=services,
+        environ={},
+    )
+
+    output = _capture(capsys)
+    assert exit_code == 0
+    assert recorder.logins[0]["labels"] == ["from_file"]
+    assert "bob-password" not in output
+
+
+def test_run_forwards_the_salt_fingerprint_to_the_experiment(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset = FakeDataset(
+        [_item("item-1")],
+        evaluations={"item-1": [Evaluation(name="tool_hit", value=1.0)]},
+    )
+    services, _ = _services(Recorder(), dataset=dataset)
+
+    assert main(_run_args(), services=services, environ=dict(ENVIRON)) == 0
+
+    metadata = dataset.calls[0]["metadata"]
+    assert metadata["salt_fingerprint"] == hashlib.sha256(b"salt-fixture").hexdigest()[:8]
+    assert metadata["dataset"] == DATASET
+    assert "salt-fixture" not in json.dumps(metadata)
 
 
 def test_writer_namespaces_item_ids_per_dataset() -> None:

@@ -347,7 +347,13 @@ def citation_valid(
     evidence: RunEvidence,
     metadata: Mapping[str, Any] | None = None,
 ) -> Evaluation | None:
-    """R3: every citation names a (citation_id, chunk_id) pair this run retrieved."""
+    """R3: every citation names a (citation_id, chunk_id) pair this run retrieved.
+
+    A truncated retrieval returns ``None``: the run never saw the chunks the
+    budget dropped, so a citation that looks forged may simply be out of view.
+    """
+    if evidence.kb_truncated:
+        return None
     citations = [
         citation for citation in evidence.citations if isinstance(citation, Mapping)
     ]

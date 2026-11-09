@@ -93,7 +93,7 @@ class CliServices:
     argument; tests substitute every seam and assert what the CLI asked for.
     """
 
-    load_accounts: Callable[[Path | None], Sequence[AccountCredential]] = load_accounts
+    load_accounts: Callable[..., Sequence[AccountCredential]] = load_accounts
     login_all: Callable[..., dict[str, AccountSession]] = login_all
     langfuse_client: Callable[[Mapping[str, str]], Any] = _langfuse_client
     load_sources: Callable[..., BuildSources] = load_build_sources
@@ -276,7 +276,7 @@ def _login(
     """Log in every fixed account, keyed by Langfuse hashed user id."""
     base_url = _require(environ, _GATEWAY_ENV)
     salt = _require(environ, _SALT_ENV)
-    accounts = services.load_accounts(accounts_file)
+    accounts = services.load_accounts(accounts_file, environ=environ)
     if not accounts:
         raise CliError("no fixed accounts were configured to log in")
     sessions = services.login_all(accounts, base_url=base_url, salt=salt)
@@ -304,10 +304,15 @@ def _cmd_run(
     run_name = args.run_name or _default_run_name(args.mode)
     if args.dry_run:
         return _plan_run(args, environ, services, run_name)
+    salt = _require(environ, _SALT_ENV)
     sessions = _login(environ, services, args.accounts_file)
     try:
         runner = ExperimentRunner(
-            services.langfuse_client(environ), sessions=sessions, api=services.api
+            services.langfuse_client(environ),
+            sessions=sessions,
+            api=services.api,
+            salt=salt,
+            environment=environ,
         )
         result = runner.run(
             args.dataset,

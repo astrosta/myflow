@@ -24,6 +24,7 @@ def _evidence(**overrides: Any) -> RunEvidence:
         "retrieved_skills": [],
         "loaded_skills": [],
         "kb_called": False,
+        "kb_truncated": False,
         "retrieved_chunks": [],
         "citations": [],
         "trace_id": None,
@@ -62,6 +63,32 @@ def test_citation_valid_passes_when_every_citation_was_retrieved() -> None:
     assert score.name == "citation_valid"
     assert score.value == 1.0
     assert "1 citation" in score.comment
+
+
+def test_truncated_retrieval_is_unscorable() -> None:
+    chunk = _chunk("doc-1")
+    evidence = _evidence(
+        kb_called=True,
+        kb_truncated=True,
+        retrieved_chunks=[chunk],
+        citations=[_citation(chunk)],
+    )
+
+    assert citation_valid(expected_output={"expect_kb": True}, evidence=evidence) is None
+
+
+def test_an_untruncated_retrieval_still_scores() -> None:
+    chunk = _chunk("doc-1")
+    evidence = _evidence(
+        kb_called=True,
+        retrieved_chunks=[chunk],
+        citations=[_citation(chunk)],
+    )
+
+    score = citation_valid(expected_output={"expect_kb": True}, evidence=evidence)
+
+    assert score is not None
+    assert score.value == 1.0
 
 
 def test_citation_valid_fails_a_forged_citation_id() -> None:

@@ -70,6 +70,53 @@ def _event(
     }
 
 
+def test_kb_truncation_is_carried_into_the_evidence() -> None:
+    events = [
+        _event(
+            "retrieval.kb",
+            {"query": "q", "items": [CHUNK_ONE], "truncated": True},
+        ),
+    ]
+
+    evidence = collect_evidence([], events, run_id=RUN_ID)
+
+    assert evidence.kb_truncated is True
+    assert [chunk["chunk_id"] for chunk in evidence.retrieved_chunks] == ["doc-1:0"]
+
+
+def test_an_untruncated_kb_event_is_not_flagged() -> None:
+    events = [_event("retrieval.kb", {"query": "q", "items": [CHUNK_ONE], "truncated": False})]
+
+    assert collect_evidence([], events, run_id=RUN_ID).kb_truncated is False
+
+
+def test_citations_come_from_the_merged_ai_rows_not_only_the_checkpoint() -> None:
+    messages = [
+        {"type": "human", "content": "what is the refund policy?"},
+        _ai(content="Refunds take five business days.", message_id="ai-answer"),
+        _ai(content="", message_id="ai-textless"),
+    ]
+    events = [
+        _event(
+            "llm.ai.response",
+            _ai(content="", citations=[CITATION], message_id="ai-cited"),
+        ),
+    ]
+
+    evidence = collect_evidence(messages, events, run_id=RUN_ID)
+
+    assert evidence.answer == "Refunds take five business days."
+    assert evidence.citations == [CITATION]
+
+
+def test_evidence_without_any_citation_row_has_no_citations() -> None:
+    messages = [
+        {"type": "human", "content": "hello"},
+        _ai(content="hi", message_id="ai-answer"),
+    ]
+
+    assert collect_evidence(messages, [], run_id=RUN_ID).citations == []
+
 def _ai(
     *,
     content: Any = "",

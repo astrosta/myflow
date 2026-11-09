@@ -2,17 +2,22 @@
 
 Both dependencies are faked in memory. An httpx.MockTransport stands in for the
 Gateway behind a real httpx.Client, so thread/run/event traffic is exercised
-exactly as the client builds it. A tiny fake object stands in for Langfuse and
-exposes only the surface runner.py uses (get_dataset -> object with .items,
-run_experiment -> object with .item_results / .experiment_url), which is the same
-surface the real SDK offers. No network, no sleeps, and no credential is ever
+exactly as the client builds it. A fake object stands in for Langfuse and exposes
+only the surface runner.py uses: get_dataset -> object with .items, and
+run_experiment(data=...) -> object with .item_results / .experiment_url, driven by
+an asyncio semaphore exactly like the SDK. No network, and no credential is ever
 needed: the password below only proves that it never travels.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import importlib.metadata
+import inspect
 import json
+import re
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -87,6 +92,7 @@ def _evidence(**overrides: Any) -> RunEvidence:
         "retrieved_skills": [],
         "loaded_skills": [],
         "kb_called": False,
+        "kb_truncated": False,
         "retrieved_chunks": [],
         "citations": [],
         "trace_id": None,
@@ -149,6 +155,35 @@ def _messages(
     return rows
 
 
+class ConcurrencyProbe:
+    """Measures how many item runs are inside the Gateway at the same time.""
+
+    enter() blocks until the expected number of threads arrived (or the bounded
+    timeout expires), so the concurrent case is deterministic and the serial case
+    costs one short wait instead of hanging.
+    """
+
+    def __init__(self, expected: int = 2, timeout: float = 0.5) -> None:
+        self.expected = expected
+        self.timeout = timeout
+        self.peak = 0
+        self._active = 0
+        self._lock = threading.Lock()
+        self._reached = threading.Event()
+
+    def enter(self) -> None:
+        with self._lock:
+            self._active += 1
+            self.peak = max(self.peak, self._active)
+            if self._active >= self.expected:
+                self._reached.set()
+        self._reached.wait(self.timeout)
+
+    def leave(self) -> None:
+        with self._lock:
+            self._active -= 1
+
+
 class FakeGateway:
     """A Gateway that serves one thread, run, ledger, and checkpoint per item."""
 
@@ -161,8 +196,10 @@ class FakeGateway:
         chunks_by_item: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
         status_by_item: Mapping[str, str] | None = None,
         fail_runs_for: Sequence[str] = (),
+        probe: "ConcurrencyProbe | None" = None,
     ) -> None:
         self.requests: list[httpx.Request] = []
+        self.probe = probe
         self._tools = dict(tools_by_item or {})
         self._subagents = dict(subagents_by_item or {})
         self._citations = dict(citations_by_item or {})
@@ -177,6 +214,15 @@ class FakeGateway:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if self.probe is not None:
+            self.probe.enter()
+            try:
+                return self._respond(request)
+            finally:
+                self.probe.leave()
+        return self._respond(request)
+
+    def _respond(self, request: httpx.Request) -> httpx.Response:
         parts = [part for part in request.url.path.split("/") if part]
         try:
             rest = parts[parts.index("threads") + 1 :]
@@ -272,61 +318,11 @@ class FakeDataset:
 
     def __init__(self, items: Sequence[FakeItem], *, drop: Sequence[str] = ()) -> None:
         self.items = list(items)
+        self.drop = set(drop)
         self.calls: list[dict[str, Any]] = []
         self.outputs: dict[str, Any] = {}
         self.evaluations: dict[str, list[Evaluation]] = {}
         self.errors: list[tuple[str, Exception]] = []
-        self._drop = set(drop)
-
-    def run_items(
-        self,
-        data: Sequence[FakeItem],
-        *,
-        name: str,
-        run_name: str | None = None,
-        task: Any,
-        evaluators: Sequence[Any] = (),
-        max_concurrency: int = 50,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> FakeExperimentOutput:
-        self.calls.append(
-            {
-                "name": name,
-                "run_name": run_name,
-                "max_concurrency": max_concurrency,
-                "metadata": dict(metadata or {}),
-                "evaluator_names": [getattr(ev, "__name__", "?") for ev in evaluators],
-            }
-        )
-        results: list[FakeItemResult] = []
-        for item in data:
-            try:
-                output = task(item=item)
-            except Exception as exc:  # the real SDK logs the failure and drops the item
-                self.errors.append((item.id, exc))
-                continue
-            evaluations: list[Evaluation] = []
-            for evaluator in evaluators:
-                found = evaluator(
-                    input=item.input,
-                    output=output,
-                    expected_output=item.expected_output,
-                    metadata=item.metadata,
-                )
-                evaluations.extend(found or [])
-            self.outputs[item.id] = output
-            self.evaluations[item.id] = evaluations
-            if item.id in self._drop:
-                continue
-            results.append(
-                FakeItemResult(
-                    item=item,
-                    output=output,
-                    evaluations=evaluations,
-                    trace_id=output.get("trace_id"),
-                )
-            )
-        return FakeExperimentOutput(item_results=results, name=name, run_name=run_name or "")
 
 
 class FakeLangfuse:
@@ -381,15 +377,77 @@ class FakeLangfuse:
                 f"got {received!r}, expected {expected!r}"
             )
         self.data_ids = received
-        assert self.dataset is not None
-        return self.dataset.run_items(
-            data,
+        return asyncio.run(
+            self._execute(
+                data,
+                name=name,
+                run_name=run_name,
+                task=task,
+                evaluators=evaluators,
+                max_concurrency=max_concurrency,
+                metadata=metadata,
+            )
+        )
+
+    async def _execute(
+        self,
+        data: Sequence[FakeItem],
+        *,
+        name: str,
+        run_name: str | None,
+        task: Any,
+        evaluators: Sequence[Any],
+        max_concurrency: int,
+        metadata: Mapping[str, Any] | None,
+    ) -> FakeExperimentOutput:
+        """Run the items with an asyncio semaphore, exactly like the real SDK."""
+        dataset = self.dataset
+        assert dataset is not None
+        dataset.calls.append(
+            {
+                "name": name,
+                "run_name": run_name,
+                "max_concurrency": max_concurrency,
+                "metadata": dict(metadata or {}),
+                "evaluator_names": [getattr(ev, "__name__", "?") for ev in evaluators],
+            }
+        )
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def run_one(item: FakeItem) -> FakeItemResult | None:
+            async with semaphore:
+                try:
+                    output = task(item=item)
+                    if inspect.isawaitable(output):
+                        output = await output
+                except Exception as exc:  # the real SDK logs it and drops the item
+                    dataset.errors.append((item.id, exc))
+                    return None
+                evaluations: list[Evaluation] = []
+                for evaluator in evaluators:
+                    found = evaluator(
+                        input=item.input,
+                        output=output,
+                        expected_output=item.expected_output,
+                        metadata=item.metadata,
+                    )
+                    evaluations.extend(found or [])
+                dataset.outputs[item.id] = output
+                dataset.evaluations[item.id] = evaluations
+                if item.id in dataset.drop:
+                    return None
+                return FakeItemResult(
+                    item=item,
+                    output=output,
+                    evaluations=evaluations,
+                    trace_id=output.get("trace_id"),
+                )
+
+        results = await asyncio.gather(*(run_one(item) for item in data))
+        return FakeExperimentOutput(
+            item_results=[result for result in results if result is not None],
             name=name,
-            run_name=run_name,
-            task=task,
-            evaluators=evaluators,
-            max_concurrency=max_concurrency,
-            metadata=metadata,
+            run_name=run_name or "",
         )
 
 
@@ -416,6 +474,8 @@ def _runner(
     sessions: Mapping[str, AccountSession] | None = None,
     expected_item_ids: Sequence[str] | None = None,
     langfuse: FakeLangfuse | None = None,
+    salt: str | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> ExperimentRunner:
     client = langfuse if langfuse is not None else FakeLangfuse(
         dataset, expected_item_ids=expected_item_ids
@@ -425,6 +485,8 @@ def _runner(
         sessions=sessions or {HASHED_USER_ID: _session(gateway.transport())},
         api=AgentApi,
         store=store,
+        salt=salt,
+        environment=environment,
     )
 
 
@@ -885,16 +947,160 @@ def test_run_names_the_experiment_stably_and_keeps_the_run_name() -> None:
     assert call["max_concurrency"] == 2
 
 
-def test_run_passes_concurrency_and_mode_metadata_to_the_sdk() -> None:
+def test_run_passes_concurrency_and_full_experiment_metadata_to_the_sdk() -> None:
     dataset = FakeDataset([_item("item-1", expected_output={"expect_kb": False})])
-    runner = _runner(FakeGateway(), dataset)
+    runner = _runner(
+        FakeGateway(), dataset, salt="salt-fixture", environment={"GIT_SHA": "abc1234"}
+    )
 
     runner.run("agent-eval/regression/v1", RUN_NAME, mode="full", max_concurrency=3)
 
     call = dataset.calls[0]
+    metadata = call["metadata"]
     assert call["max_concurrency"] == 3
-    assert call["metadata"] == {"mode": "full"}
-    assert all(isinstance(value, str) for value in call["metadata"].values())
+    assert set(metadata) == {
+        "mode",
+        "max_concurrency",
+        "dataset",
+        "package_version",
+        "git_sha",
+        "salt_fingerprint",
+    }
+    assert all(isinstance(value, str) for value in metadata.values())
+    assert metadata["mode"] == "full"
+    assert metadata["max_concurrency"] == "3"
+    assert metadata["dataset"] == "agent-eval/regression/v1"
+    assert metadata["git_sha"] == "abc1234"
+    assert metadata["package_version"] in _installed_versions()
+    assert metadata["salt_fingerprint"] == hashlib.sha256(b"salt-fixture").hexdigest()[:8]
+    assert "salt-fixture" not in json.dumps(metadata)
+
+
+def test_experiment_metadata_falls_back_without_a_git_sha() -> None:
+    dataset = FakeDataset([_item("item-1", expected_output={"expect_kb": False})])
+    runner = _runner(FakeGateway(), dataset, environment={})
+
+    runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    metadata = dataset.calls[0]["metadata"]
+    assert metadata["git_sha"] == "unknown"
+    assert metadata["salt_fingerprint"] == "unknown"
+    assert re.fullmatch(r"\d+\.\d+[0-9A-Za-z.+-]*", metadata["package_version"])
+
+
+def _installed_versions() -> set[str]:
+    try:
+        return {importlib.metadata.version("myflow-evals"), "0.1.0"}
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover - installed in the venv
+        return {"0.1.0"}
+
+
+def test_two_items_overlap_when_max_concurrency_is_two() -> None:
+    probe = ConcurrencyProbe(expected=2)
+    dataset = FakeDataset(
+        [
+            _item("item-1", expected_output={"expect_kb": False}),
+            _item("item-2", expected_output={"expect_kb": False}),
+        ]
+    )
+    runner = _runner(FakeGateway(probe=probe), dataset)
+
+    result = runner.run(
+        "agent-eval/regression/v1", RUN_NAME, mode="ci", max_concurrency=2
+    )
+
+    assert probe.peak == 2
+    assert result.result_count == 2
+
+
+def test_one_worker_serialises_item_runs() -> None:
+    probe = ConcurrencyProbe(expected=2, timeout=0.25)
+    dataset = FakeDataset(
+        [
+            _item("item-1", expected_output={"expect_kb": False}),
+            _item("item-2", expected_output={"expect_kb": False}),
+        ]
+    )
+    runner = _runner(FakeGateway(probe=probe), dataset)
+
+    result = runner.run(
+        "agent-eval/regression/v1", RUN_NAME, mode="ci", max_concurrency=1
+    )
+
+    assert probe.peak == 1
+    assert result.result_count == 2
+
+
+def test_run_fails_when_no_item_produced_a_thresholded_score() -> None:
+    dataset = FakeDataset(
+        [_item("item-1", category="no_tool"), _item("item-2", category="no_tool")]
+    )
+    runner = _runner(FakeGateway(), dataset)
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    assert result.scorable_items == 0
+    assert result.passed is False
+    assert "no scorable samples" in result.render()
+
+
+def test_run_passes_when_at_least_one_item_produced_a_thresholded_score() -> None:
+    dataset = FakeDataset([_item("item-1", expected_output={"expect_kb": False})])
+    runner = _runner(FakeGateway(), dataset)
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    assert result.scorable_items == 1
+    assert result.passed is True
+
+
+def _kb_items(count: int) -> list[FakeItem]:
+    return [
+        _item(
+            f"item-{index:02d}",
+            category="kb_single_hop",
+            expected_output={"expect_kb": True, "expected_doc_ids": ["doc-1"]},
+        )
+        for index in range(count)
+    ]
+
+
+def _kb_gateway(*, fallback: str | None) -> FakeGateway:
+    item_ids = [f"item-{index:02d}" for index in range(30)]
+    return FakeGateway(
+        subagents_by_item={
+            item_id: ["knowledge-researcher"]
+            for item_id in item_ids
+            if item_id != fallback
+        },
+        citations_by_item={item_id: [CITATION] for item_id in item_ids},
+        chunks_by_item={item_id: [CHUNK] for item_id in item_ids},
+    )
+
+
+def test_run_fails_when_one_sample_falls_back_instead_of_delegating() -> None:
+    runner = _runner(_kb_gateway(fallback="item-07"), FakeDataset(_kb_items(30)))
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    assert [(failure.item_id, failure.status) for failure in result.failed_items] == [
+        ("item-07", "invalid_routing"),
+    ]
+    assert result.passed is False
+    assert "item-07=invalid_routing" in result.render()
+    # The routing average alone would have passed: 29/30 is still above 0.95.
+    by_metric = {gate.metric: gate for gate in result.gates}
+    assert by_metric["kb_routing"].value == pytest.approx(29 / 30)
+    assert by_metric["kb_routing"].status == "pass"
+
+
+def test_run_passes_when_every_sample_delegates() -> None:
+    runner = _runner(_kb_gateway(fallback=None), FakeDataset(_kb_items(30)))
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    assert result.failed_items == ()
+    assert result.passed is True
 
 
 def test_run_fails_when_every_item_is_unscored() -> None:

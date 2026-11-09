@@ -485,6 +485,62 @@ def test_load_build_sources_reads_the_fixed_accounts_real_data(base_url: str) ->
     assert all(request.headers["x-csrf-token"] == CSRF_TOKEN for request in gateway.requests)
 
 
+UNSAFE_TOOL_SCHEMA = {"type": "object", "required": [], "properties": {}}
+UNCALLABLE_TOOLS = [
+    {
+        "name": "search.projects",
+        "description": "a dotted tool name no provider accepts",
+        "inputSchema": UNSAFE_TOOL_SCHEMA,
+    },
+    {
+        "name": "t" * 200,
+        "description": "a tool name beyond the call-name bound",
+        "inputSchema": UNSAFE_TOOL_SCHEMA,
+    },
+    {
+        "name": "get_project",
+        "description": "a callable tool",
+        "inputSchema": UNSAFE_TOOL_SCHEMA,
+    },
+]
+
+
+def test_load_build_sources_skips_tools_the_agent_cannot_call() -> None:
+    sources = load_build_sources(
+        _session(_FakeGateway(servers=[STREAMABLE_SERVER])),
+        environ={},
+        mcp_client=_Mcp(UNCALLABLE_TOOLS).client,
+    )
+
+    drafts = build_account_items(_offline_session(), sources)
+
+    assert [tool.call_name for tool in sources.tools] == ["mcp__project_db__get_project"]
+    tool_drafts = [
+        draft for draft in drafts if draft.metadata["source_kind"] == "tool"
+    ]
+    assert [draft.metadata["source_id"] for draft in tool_drafts] == [
+        "mcp__project_db__get_project"
+    ]
+    warnings = " ".join(sources.warnings)
+    assert "search.projects" in warnings
+    assert "cannot call" in warnings
+
+
+def test_build_account_items_never_emits_an_uncallable_tool() -> None:
+    sources = BuildSources(
+        tools=[
+            McpTool(
+                call_name="mcp__db__bad.tool",
+                name="bad.tool",
+                description="dotted",
+                input_schema=UNSAFE_TOOL_SCHEMA,
+            )
+        ]
+    )
+
+    assert build_account_items(_offline_session(), sources) == []
+
+
 def test_load_build_sources_skips_servers_it_cannot_call() -> None:
     gateway = _FakeGateway(servers=[STREAMABLE_SERVER, SSE_SERVER, NO_URL_SERVER])
     mcp = _Mcp(PROJECT_TOOLS)

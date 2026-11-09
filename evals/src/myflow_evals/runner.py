@@ -13,9 +13,11 @@ Two guarantees shape the design:
   ``run_experiment(data=...)``, and -- once it returns -- fails with
   :class:`IncompleteExperiment` naming every id that is missing or unexpected.
   A task exception (which the SDK logs and swallows into a dropped item), a run
-  whose status is not ``success``, and a completed item that produced no score
-  at all are each recorded as a failed item, so none of them can quietly shrink
-  the average or leave a run passing with no gates.
+  whose status is not ``success``, a completed item that produced no score at
+  all, and a sample that answered a retrieval question without delegating are
+  each recorded as a failed item, so none of them can quietly shrink the average
+  or leave a run passing with no gates. A run with no thresholded score at all
+  fails as ``no scorable samples``.
 * **Loud configuration.** Account selection never falls back: an item whose
   ``metadata.user_id`` is missing, not a Langfuse hashed id, or not logged in
   raises :class:`ExperimentConfigError` before anything is started.
@@ -26,7 +28,10 @@ returned :class:`ExperimentResult` and owns the process status.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import importlib.metadata
+import os
 import re
 import threading
 import uuid
@@ -57,6 +62,17 @@ LLM_MIN_SAMPLES = 20
 #: Rule metrics that fail a run on a single bad sample.
 _CITATION_METRIC = "citation_valid"
 _FORBIDDEN_METRIC = "forbidden_violation"
+
+#: A sample that required a retrieval subagent and never got one is invalid, not
+#: merely low-scoring: one direct fallback must fail the run.
+_INVALID_ROUTING_STATUS = "invalid_routing"
+_SKILL_SUBAGENT = "skill-finder"
+_KB_SUBAGENT = "knowledge-researcher"
+
+_UNKNOWN_VALUE = "unknown"
+_PACKAGE_NAME = "myflow-evals"
+_PACKAGE_VERSION_FALLBACK = "0.1.0"
+_GIT_SHA_ENV_NAMES = ("GIT_SHA", "GITHUB_SHA")
 
 _EVIDENCE_PREFIX = "ev-"
 _RUN_STATUS_SUCCESS = "success"
@@ -207,6 +223,7 @@ class ExperimentResult:
     mode: str
     item_count: int
     result_count: int
+    scorable_items: int
     failed_items: tuple[FailedItem, ...] = ()
     gates: tuple[GateResult, ...] = ()
     citation_violations: tuple[str, ...] = ()
@@ -223,6 +240,8 @@ class ExperimentResult:
         """
         if self.failed_items or self.citation_violations or self.forbidden_violations:
             return False
+        if self.scorable_items == 0:
+            return False
         return all(gate.status != "fail" for gate in self.gates)
 
     def render(self) -> str:
@@ -231,7 +250,12 @@ class ExperimentResult:
             f"dataset: {self.dataset_name}",
             f"run: {self.run_name} (mode {self.mode})",
             f"items: {self.result_count} of {self.item_count} returned",
+            f"scorable items: {self.scorable_items}",
         ]
+        if self.scorable_items == 0:
+            lines.append(
+                "no scorable samples: no item produced a thresholded metric score"
+            )
         lines.extend(gate.render() for gate in self.gates)
         if self.failed_items:
             lines.append(
@@ -328,8 +352,13 @@ class _ItemTask:
         self._lock = threading.Lock()
         self.failures: list[FailedItem] = []
 
-    def __call__(self, *, item: Any, **kwargs: Any) -> dict[str, Any]:
-        """Run one dataset item and return its compact output."""
+    async def __call__(self, *, item: Any, **kwargs: Any) -> dict[str, Any]:
+        """Run one dataset item off the event loop and return its compact output.
+
+        The Gateway pipeline is synchronous, so it runs in a worker thread: the
+        SDK awaits this coroutine and its semaphore then actually overlaps item
+        runs instead of serialising them on one thread.
+        """
         item_id = _item_id(item)
         plan = self._plans.get(item_id)
         if plan is None:
@@ -337,7 +366,7 @@ class _ItemTask:
                 f"dataset item {item_id} was not part of the planned run"
             )
         try:
-            return self._run_item(plan)
+            return await asyncio.to_thread(self._run_item, plan)
         except Exception as exc:
             self._record(FailedItem(item_id, "exception", _failure_reason(exc)))
             raise
@@ -393,11 +422,16 @@ class ExperimentRunner:
         sessions: Mapping[str, AccountSession],
         api: Any = AgentApi,
         store: EvidenceStore | None = None,
+        salt: str | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self._client = client
         self._sessions = dict(sessions)
         self._api = api
         self._store = store if store is not None else EvidenceStore()
+        # Only a fingerprint of the salt ever leaves this process.
+        self._salt = salt
+        self._environment = environment
 
     def run(
         self,
@@ -444,7 +478,13 @@ class ExperimentRunner:
             task=task,
             evaluators=[RuleMetricAdapter(self._store)],
             max_concurrency=max_concurrency,
-            metadata={"mode": mode},
+            metadata=_experiment_metadata(
+                mode=mode,
+                dataset_name=dataset_name,
+                max_concurrency=max_concurrency,
+                salt=self._salt,
+                environment=self._environment,
+            ),
         )
 
         item_results = list(getattr(outcome, "item_results", ()) or ())
@@ -465,7 +505,8 @@ class ExperimentRunner:
             mode=mode,
             item_count=len(plans),
             result_count=len(item_results),
-            failed_items=_failed_items(task.snapshot, item_results),
+            scorable_items=_scorable_items(item_results),
+            failed_items=_failed_items(task.snapshot, item_results, store=self._store),
             gates=evaluate_gates(scores, mode=mode),
             citation_violations=citation_violations(item_results),
             forbidden_violations=forbidden_violations(item_results),
@@ -643,23 +684,143 @@ def _violating_items(
 
 
 def _failed_items(
-    recorded: Sequence[FailedItem], item_results: Sequence[Any]
+    recorded: Sequence[FailedItem],
+    item_results: Sequence[Any],
+    *,
+    store: EvidenceStore,
 ) -> tuple[FailedItem, ...]:
-    """Merge recorded failures with completed items that scored nothing.
+    """Merge recorded failures with the per-sample checks the evaluators cannot own.
 
     The SDK swallows a per-item evaluator exception, so a broken adapter would
     otherwise leave a run with no gate rows at all and a passing exit code --
     the same silent shrink the completeness gate exists to prevent. An item that
-    completed without a single score is therefore a failed item: the design
-    counts an unscored sample as a failed experiment, not as an absent one.
+    completed without a single score is therefore a failed item, and a sample that
+    should have delegated to a retrieval subagent but answered directly is invalid
+    routing, which no average may absorb.
     """
     failures = {failure.item_id: failure for failure in recorded}
     for result in item_results:
-        if _evaluations_of(result):
-            continue
-        item_id = _item_id(result.item)
-        failures.setdefault(item_id, FailedItem(item_id, _UNSCORED_STATUS))
+        if not _evaluations_of(result):
+            item_id = _item_id(result.item)
+            failures.setdefault(item_id, FailedItem(item_id, _UNSCORED_STATUS))
+    for item_id in _invalid_routing_items(item_results, store):
+        failures.setdefault(item_id, FailedItem(item_id, _INVALID_ROUTING_STATUS))
     return tuple(sorted(failures.values(), key=lambda failure: failure.item_id))
+
+
+def _scorable_items(item_results: Sequence[Any]) -> int:
+    """How many items produced at least one score that a threshold covers.
+
+    Zero means the run measured nothing it can gate. That must fail loudly: an
+    empty gate list is not a clean result.
+    """
+    scorable = 0
+    for result in item_results:
+        names = {getattr(evaluation, "name", None) for evaluation in _evaluations_of(result)}
+        if names & set(THRESHOLDS):
+            scorable += 1
+    return scorable
+
+
+def _invalid_routing_items(
+    item_results: Sequence[Any], store: EvidenceStore
+) -> tuple[str, ...]:
+    invalid: list[str] = []
+    for result in item_results:
+        evidence = store.get(_evidence_id_of(result.output))
+        if evidence is None:
+            continue
+        if _routing_is_invalid(_expected_output_of(result.item), evidence):
+            invalid.append(_item_id(result.item))
+    return tuple(sorted(invalid))
+
+
+def _routing_is_invalid(expected: Any, evidence: RunEvidence) -> bool:
+    """A retrieval question answered without the retrieval path is invalid, not low.
+
+    Routing already has a score, but one direct fallback among 30 samples still
+    averages above its threshold. The design treats that sample as broken, so the
+    runner fails it here instead of letting an average hide it.
+    """
+    if not isinstance(expected, Mapping):
+        return False
+    if _declared_true(expected, "expect_skill"):
+        if not _routed(evidence, _SKILL_SUBAGENT):
+            return True
+        retrieved = set(evidence.retrieved_skills)
+        if any(name not in retrieved for name in evidence.loaded_skills):
+            return True
+    if _declared_true(expected, "expect_kb"):
+        if not _routed(evidence, _KB_SUBAGENT):
+            return True
+        if not (evidence.kb_called or evidence.retrieved_chunks):
+            return True
+    return False
+
+
+def _routed(evidence: RunEvidence, subagent_type: str) -> bool:
+    return any(
+        entry.get("subagent_type") == subagent_type
+        for entry in evidence.subagent_calls
+        if isinstance(entry, Mapping)
+    )
+
+
+def _declared_true(expected: Mapping[str, Any], key: str) -> bool:
+    return expected.get(key) is True
+
+
+def _evidence_id_of(output: Any) -> str:
+    evidence_id = output.get("evidence_id") if isinstance(output, Mapping) else None
+    return evidence_id if isinstance(evidence_id, str) else ""
+
+
+def _expected_output_of(item: Any) -> Any:
+    if isinstance(item, Mapping):
+        return item.get("expected_output")
+    return getattr(item, "expected_output", None)
+
+
+def _experiment_metadata(
+    *,
+    mode: str,
+    dataset_name: str,
+    max_concurrency: int,
+    salt: str | None,
+    environment: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Describe the run so two experiments are comparable; never the salt itself."""
+    return {
+        "mode": mode,
+        "max_concurrency": str(max_concurrency),
+        "dataset": dataset_name,
+        "package_version": _package_version(),
+        "git_sha": _git_sha(environment),
+        "salt_fingerprint": _salt_fingerprint(salt),
+    }
+
+
+def _package_version() -> str:
+    try:
+        return importlib.metadata.version(_PACKAGE_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return _PACKAGE_VERSION_FALLBACK
+
+
+def _git_sha(environment: Mapping[str, str] | None) -> str:
+    env = os.environ if environment is None else environment
+    for name in _GIT_SHA_ENV_NAMES:
+        value = (env.get(name) or "").strip()
+        if value:
+            return value
+    return _UNKNOWN_VALUE
+
+
+def _salt_fingerprint(salt: str | None) -> str:
+    """8 hex of sha256(salt): enough to compare runs, useless as a salt."""
+    if not salt:
+        return _UNKNOWN_VALUE
+    return hashlib.sha256(salt.encode("utf-8")).hexdigest()[:8]
 
 
 def _evaluations_of(result: Any) -> list[Any]:

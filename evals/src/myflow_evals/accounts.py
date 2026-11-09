@@ -45,7 +45,9 @@ class AccountSession:
     hashed_user_id: str
 
 
-def load_accounts(path: Path | None) -> list[AccountCredential]:
+def load_accounts(
+    path: Path | None, *, environ: Mapping[str, str] | None = None
+) -> list[AccountCredential]:
     """Load fixed accounts from a secret JSON file or AGENT_USERS.
 
     The accepted shape is a mapping from label to an object with non-empty
@@ -53,11 +55,13 @@ def load_accounts(path: Path | None) -> list[AccountCredential]:
 
         {"analyst_a": {"username": "alice", "password": "..."}}
 
-    AGENT_USERS uses the same JSON mapping. Error messages identify the source
-    and labels but never echo passwords.
+    AGENT_USERS uses the same JSON mapping. ``environ`` defaults to ``os.environ``
+    so the CLI can hand over the environment it merged from secret files. Error
+    messages identify the source and labels but never echo passwords.
     """
+    env = os.environ if environ is None else environ
     if path is None:
-        raw = os.environ.get("AGENT_USERS")
+        raw = env.get("AGENT_USERS")
         if not raw or not raw.strip():
             raise RuntimeError(
                 "AGENT_USERS is not set; provide fixed-account credentials there "

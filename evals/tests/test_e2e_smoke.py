@@ -23,6 +23,8 @@ Two failure paths are part of the smoke path:
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -140,6 +142,8 @@ class FakeDataset:
         results: list[FakeItemResult] = []
         for item in data:
             output = task(item=item)
+            if inspect.isawaitable(output):
+                output = asyncio.run(output)
             evaluations: list[Evaluation] = []
             for evaluator in evaluators:
                 evaluations.extend(
@@ -474,7 +478,9 @@ def _gateway(items: Sequence[FakeItem], *, retrieval_for: Sequence[str] = ()) ->
 def _services(gateway: FakeGateway, langfuse: FakeLangfuse) -> tuple[CliServices, AccountSession]:
     session = _session(gateway.transport())
 
-    def fake_load_accounts(path: Any = None) -> list[AccountCredential]:
+    def fake_load_accounts(
+        path: Any = None, *, environ: Any = None
+    ) -> list[AccountCredential]:
         return [_credential()]
 
     def fake_login_all(

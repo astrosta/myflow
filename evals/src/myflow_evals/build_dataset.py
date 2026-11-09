@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -64,6 +65,20 @@ _PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
 _SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
 
 _DEFAULT_TIMEOUT_SECONDS = 60.0
+
+#: Mirrors agentkit.mcp.store.tool_repository.is_safe_call_name (copied, never
+#: imported: this package must not depend on agentkit). The backend refuses to
+#: publish a call name the model cannot call back, so a sample built from it
+#: could never pass.
+_CALL_NAME_PREFIX = "mcp__"
+_CALL_NAME_SEPARATOR = "__"
+_MAX_CALL_NAME_CHARS = 128
+_MAX_SERVER_NAME_CHARS = 128
+_MAX_TOOL_NAME_CHARS = 128
+_SAFE_CALL_NAME = re.compile(
+    rf"^{_CALL_NAME_PREFIX}[A-Za-z0-9_-]{{1,{_MAX_SERVER_NAME_CHARS}}}"
+    rf"{_CALL_NAME_SEPARATOR}[A-Za-z0-9][A-Za-z0-9_-]{{0,{_MAX_TOOL_NAME_CHARS - 1}}}$"
+)
 
 
 @dataclass(frozen=True)
@@ -180,6 +195,10 @@ def load_build_sources(
 ) -> BuildSources:
     """Fetch this account's real tools, private Skills, knowledge documents, and traces.
 
+    A tool whose call name the Agent could not call back (a dot, or a name beyond
+    the provider bound) is skipped with a warning: a sample built from it could
+    never pass.
+
     limit bounds the work a capped build does: only the first limit documents get
     their chunk fetched, and the returned source lists are capped per kind. Trace
     reading still pages the whole (page-guarded) trace set, and source_totals
@@ -288,6 +307,21 @@ def fetch_account_traces(
     return kept
 
 
+def is_safe_call_name(name: str) -> bool:
+    """False for a call name the Agent would refuse to publish (mirror rule).
+
+    The whole name must be mcp__<server slug>__<tool>, bounded to a length every
+    provider accepts, with a tool part limited to [A-Za-z0-9_-]: MCP also allows
+    a dot, but no provider accepts one in a function name.
+    """
+    text = str(name or "")
+    return (
+        bool(text)
+        and len(text) <= _MAX_CALL_NAME_CHARS
+        and bool(_SAFE_CALL_NAME.fullmatch(text))
+    )
+
+
 def build_account_items(
     session: AccountSession,
     sources: BuildSources,
@@ -306,6 +340,8 @@ def build_account_items(
 
     drafts: list[DatasetItemDraft] = []
     for tool in _capped(sources.tools, limit):
+        if not is_safe_call_name(tool.call_name):
+            continue  # the Agent cannot call it, so a sample would be unpassable
         drafts.append(_tool_draft(tool, user_hash))
     for skill in _capped(sources.skills, limit):
         drafts.append(_skill_draft(skill, user_hash))
@@ -388,10 +424,19 @@ def _account_tools(
         if server is None:
             continue
         try:
-            tools.extend(client.list_tools(server))
+            listed = client.list_tools(server)
         except RuntimeError as exc:
             # One broken server must cost exactly its own tools, never the build.
             warnings.append(f"skipped MCP server {server.name!r}: tools/list failed ({exc})")
+            continue
+        for tool in listed:
+            if is_safe_call_name(tool.call_name):
+                tools.append(tool)
+                continue
+            warnings.append(
+                f"skipped tool {tool.name!r} of server {server.name!r}: "
+                f"the Agent cannot call {tool.call_name!r}"
+            )
     return tools
 
 
