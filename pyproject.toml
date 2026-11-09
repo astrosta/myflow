@@ -22,5 +22,11 @@ members = [
     "evals",
 ]
 
+# 默认走清华 PyPI 镜像，使 uv.lock 里的制品 URL 也落在国内源上。
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
 [tool.uv.sources]
 agentkit = { workspace = true }
