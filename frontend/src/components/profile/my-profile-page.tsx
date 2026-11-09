@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
+import { UserIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   clearProfile,
@@ -175,9 +176,18 @@ export function MyProfilePage() {
   }
   if (loadError) {
     return (
-      <p className="p-6 text-sm text-red-700" role="alert">
-        {readableError(loadError)}
-      </p>
+      <div className="mx-auto w-full max-w-3xl px-5 py-6 sm:px-8">
+        <div className="flex items-center gap-2">
+          <UserIcon className="text-neutral-500" size={18} />
+          <h1 className="text-xl font-semibold tracking-tight text-neutral-900">我的画像</h1>
+        </div>
+        <p
+          className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700"
+          role="alert"
+        >
+          {readableError(loadError)}
+        </p>
+      </div>
     );
   }
 
@@ -193,7 +203,10 @@ export function MyProfilePage() {
     <div className="h-full overflow-y-auto bg-white">
       <div className="mx-auto w-full max-w-3xl px-5 py-6 sm:px-8">
         <header className="border-b border-neutral-200 pb-5">
-          <h1 className="text-xl font-semibold tracking-tight text-neutral-900">我的画像</h1>
+          <div className="flex items-center gap-2">
+            <UserIcon className="text-neutral-500" size={18} />
+            <h1 className="text-xl font-semibold tracking-tight text-neutral-900">我的画像</h1>
+          </div>
           <p className="mt-1 text-xs leading-relaxed text-neutral-500">
             全部字段都在这里，直接填写即可；字段下方列出的常见写法只是提示。填好后点“保存修改”，
             也可以在对话里明确告诉我，我再更新这些字段。

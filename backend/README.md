@@ -325,7 +325,7 @@ MCP 工具由 **MyFlow 自己管理**：每个用户把自己的 MCP server 加�
 `tools/list` 与 `tools/call`。没有外部网关、没有管理 API 订阅器，也没有 admin/agent token。
 权威目录在 `mcp_servers` / `mcp_tools` 两张表；Milvus 里的 collection 只是可重建的检索投影。
 
-- 页面：`/workspace/mcp-servers`（侧栏「MCP 服务」）。旧入口 `/workspace/tools` 重定向过去。
+- 页面：`/workspace/mcp-servers`（侧栏「工具管理」）。旧入口 `/workspace/tools` 重定向过去。
 - 唯一的管理 API 是 `/api/mcp-servers`；旧的 `/api/tools` 已删除。
 - 旧的 `contextforge_tools` 表由迁移 `0020` 删除；**旧数据故意丢弃**，新目录由每个
   server 的 `tools/list` 重建，不做历史迁移。

@@ -26,9 +26,9 @@ import { cn } from "@/lib/utils";
 import { McpServerEditorDialog } from "./mcp-server-editor-dialog";
 
 /**
- * 「MCP 服务」：用户自己的 MCP 服务器与其工具的只读投影。
+ * 「工具管理」：用户自己的 MCP 服务器与其工具的只读投影。
  *
- * 与旧的「工具管理」相比，这一页**没有任何工具写操作**：工具是服务器 tools/list
+ * 与旧网关的「工具管理」相比，这一页**没有任何工具写操作**：工具是服务器 tools/list
  * 的结果，归属、schema、调用名都由服务端决定，前端只负责展示（call_name、参数、
  * 是否可调用/启用）。服务器本身才有写操作：新建/编辑/启停/刷新/删除/重建索引。
  *
@@ -176,7 +176,7 @@ export function McpServerManagementPage() {
           <div>
             <div className="flex items-center gap-2">
               <WrenchIcon className="text-neutral-500" size={18} />
-              <h1 className="text-xl font-semibold tracking-tight text-neutral-900">MCP 服务</h1>
+              <h1 className="text-xl font-semibold tracking-tight text-neutral-900">工具管理</h1>
             </div>
             <p className="mt-1 text-xs leading-relaxed text-neutral-500">
               每个服务是一台你自己的 MCP 服务器：填地址和凭据后由网关连接、拉取工具，并同步到检索索引。工具由服务器决定，这里只读展示。

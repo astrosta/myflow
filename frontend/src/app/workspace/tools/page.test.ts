@@ -20,7 +20,7 @@ describe("/workspace/tools 旧入口", () => {
     expect(redirectSpy).toHaveBeenCalledWith("/workspace/mcp-servers");
   });
 
-  it("标题跟新页面一致，叫「MCP 服务」", () => {
-    expect(metadata.title).toBe("MCP 服务");
+  it("标题跟新页面一致，叫「工具管理」", () => {
+    expect(metadata.title).toBe("工具管理");
   });
 });

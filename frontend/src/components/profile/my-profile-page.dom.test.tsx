@@ -163,6 +163,9 @@ describe("我的画像：全字段表单", () => {
 
     const name = await screen.findByLabelText("称呼");
     expect(name).toBeTruthy();
+    // 页面标题旁有和侧栏入口一致的画像图标
+    const heading = screen.getByRole("heading", { name: "我的画像" });
+    expect(heading.parentElement?.querySelector("svg")).toBeTruthy();
     expect((name as HTMLInputElement).value).toBe("");
     for (const label of [
       "地区",

@@ -71,7 +71,7 @@ export function ToolIcon(props: IconProps) {
   );
 }
 
-/** MCP 服务。扳手轮廓——侧栏「MCP 服务」入口 */
+/** 工具管理。扳手轮廓——侧栏「工具管理」入口 */
 export function WrenchIcon(props: IconProps) {
   return (
     <Icon {...props}>

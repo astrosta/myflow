@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
+import { MemoryIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Markdown } from "@/components/workspace/markdown";
 import {
@@ -101,7 +102,10 @@ export function MemoryLibraryPage() {
   if (typesQuery.error) {
     return (
       <div className="mx-auto w-full max-w-3xl px-5 py-10 sm:px-8">
-        <h1 className="text-xl font-semibold tracking-tight text-neutral-900">记忆管理</h1>
+        <div className="flex items-center gap-2">
+          <MemoryIcon className="text-neutral-500" size={18} />
+          <h1 className="text-xl font-semibold tracking-tight text-neutral-900">记忆管理</h1>
+        </div>
         <p
           className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-relaxed text-amber-900"
           role="alert"
@@ -126,7 +130,10 @@ export function MemoryLibraryPage() {
     <div className="h-full overflow-y-auto bg-white">
       <div className="mx-auto w-full max-w-5xl px-5 py-6 sm:px-8">
         <header className="border-b border-neutral-200 pb-5">
-          <h1 className="text-xl font-semibold tracking-tight text-neutral-900">记忆管理</h1>
+          <div className="flex items-center gap-2">
+            <MemoryIcon className="text-neutral-500" size={18} />
+            <h1 className="text-xl font-semibold tracking-tight text-neutral-900">记忆管理</h1>
+          </div>
           <p className="mt-1 text-xs leading-relaxed text-neutral-500">
             按类型查看助手自动抽取的长期记忆；左侧目录选择一条记忆，右侧查看、编辑或删除内容。
           </p>

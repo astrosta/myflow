@@ -20,9 +20,9 @@ import {
 import { McpServerManagementPage } from "./mcp-server-management-page";
 
 /**
- * 「MCP 服务」页：列表 + 状态 + 只读工具区 + 启停/刷新/删除/重建索引。
+ * 「工具管理」页：列表 + 状态 + 只读工具区 + 启停/刷新/删除/重建索引。
  *
- * 这页曾经是旧网关的「工具管理」：新页面里**不允许**再出现任何工具写操作
+ * 旧网关也有一个「工具管理」页，但新页面里**不允许**再出现任何工具写操作
  * （新建/编辑/删除/认领），工具只是服务器的只读投影——这也是下面单独钉一条的原因。
  */
 
@@ -155,7 +155,7 @@ describe("MCP 服务列表", () => {
   it("列出服务状态、可达性与工具数量，并画出汇总状态", async () => {
     const view = renderPage();
 
-    expect(await view.findByRole("heading", { name: "MCP 服务" })).toBeTruthy();
+    expect(await view.findByRole("heading", { name: "工具管理" })).toBeTruthy();
     const card = await view.findByRole("article", { name: "anysearch" });
     expect(within(card).getByText("AnySearch")).toBeTruthy();
     expect(within(card).getByText("实时搜索")).toBeTruthy();

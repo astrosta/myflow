@@ -8,7 +8,7 @@ import { Sidebar } from "./sidebar";
 
 /**
  * 侧栏版面：品牌行 → 新对话 → 功能导航 → **最近对话**（历史会话挂在它下面）。
- * 功能导航顺序：我的画像 → 记忆管理 → 技能中心 → MCP 服务 → 知识库。
+ * 功能导航顺序：我的画像 → 记忆管理 → 技能中心 → 工具管理 → 知识库。
  *
  * `next/link` 在 vitest 里没有路由上下文，这里替换成一个普通 `<a>`：
  * 这条测试要断言的是**结构和文案**，不是 Next 的路由行为。
@@ -85,7 +85,7 @@ describe("侧栏的最近对话栏", () => {
     expect(view.getByText(/还没有会话/)).toBeTruthy();
   });
 
-  it("功能导航按我的画像、记忆管理、技能中心、MCP 服务、知识库排列", () => {
+  it("功能导航按我的画像、记忆管理、技能中心、工具管理、知识库排列", () => {
     const view = render(<Sidebar threads={[]} />);
     const nav = view.getByRole("navigation", { name: "功能导航" });
     const links = Array.from(nav.querySelectorAll("a"));
@@ -94,7 +94,7 @@ describe("侧栏的最近对话栏", () => {
       "我的画像",
       "记忆管理",
       "技能中心",
-      "MCP 服务",
+      "工具管理",
       "知识库",
     ]);
     expect(links.map((link) => link.getAttribute("href"))).toEqual([
@@ -106,22 +106,33 @@ describe("侧栏的最近对话栏", () => {
     ]);
   });
 
-  it("技能入口叫「技能中心」，按当前路由高亮", () => {
+  it("技能入口叫「技能中心」，按当前路由高亮，并使用页面标题同款书本图标", () => {
     const view = render(<Sidebar skillsActive threads={[]} />);
 
     const skills = view.getByRole("link", { name: /技能中心/ });
     expect(skills.getAttribute("href")).toBe("/workspace/skills");
     expect(skills.getAttribute("aria-current")).toBe("page");
+    // 技能页标题用的是 BookOpenIcon（书脊 M12 7v14），侧栏必须与页面保持一致
+    expect(skills.querySelector('svg path[d="M12 7v14"]')).toBeTruthy();
   });
 
-  it("MCP 入口叫「MCP 服务」，指向 /workspace/mcp-servers 并按当前路由高亮", () => {
+  it("功能导航每一项都有图标", () => {
+    const view = render(<Sidebar threads={[]} />);
+    const nav = view.getByRole("navigation", { name: "功能导航" });
+
+    for (const link of Array.from(nav.querySelectorAll("a"))) {
+      expect(link.querySelector("svg[aria-hidden='true']")).toBeTruthy();
+    }
+  });
+
+  it("工具管理入口指向 /workspace/mcp-servers 并按当前路由高亮", () => {
     const view = render(<Sidebar mcpServersActive threads={[]} />);
 
-    const link = view.getByRole("link", { name: /MCP 服务/ });
+    const link = view.getByRole("link", { name: /工具管理/ });
     expect(link.getAttribute("href")).toBe("/workspace/mcp-servers");
     expect(link.getAttribute("aria-current")).toBe("page");
-    // 旧入口不能再以任何形式留着
-    expect(view.queryByRole("link", { name: /工具管理/ })).toBeNull();
+    // 文案改了，但旧路由 /workspace/tools 不再作为入口出现
+    expect(view.queryByRole("link", { name: /MCP 服务/ })).toBeNull();
     expect(view.container.querySelector('a[href="/workspace/tools"]')).toBeNull();
   });
 

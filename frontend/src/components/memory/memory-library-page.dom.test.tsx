@@ -104,6 +104,9 @@ describe("记忆管理页", () => {
 
     // 后端会把可管理的七类中文标签都放进筛选栏；skills 不在其中
     expect(await screen.findByRole("button", { name: "偏好" })).toBeTruthy();
+    // 页面标题旁有和侧栏入口一致的记忆图标
+    const heading = screen.getByRole("heading", { name: "记忆管理" });
+    expect(heading.parentElement?.querySelector("svg")).toBeTruthy();
     for (const label of ["实体", "事件", "案例", "轨迹", "经验", "工具"]) {
       expect(screen.getByRole("button", { name: label })).toBeTruthy();
     }
