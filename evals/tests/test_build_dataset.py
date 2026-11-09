@@ -497,6 +497,71 @@ def test_load_build_sources_skips_servers_it_cannot_call() -> None:
     assert any("no_url_db" in warning and "url" in warning for warning in sources.warnings)
 
 
+def test_load_build_sources_skips_a_disabled_server() -> None:
+    gateway = _FakeGateway(servers=[dict(STREAMABLE_SERVER, enabled=False)])
+    mcp = _Mcp(PROJECT_TOOLS)
+
+    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+
+    assert sources.tools == []
+    assert mcp.requests == []
+    assert len(sources.warnings) == 1
+    assert "project_db" in sources.warnings[0]
+    assert "disabled" in sources.warnings[0]
+
+
+def test_a_failing_server_costs_only_its_own_tools() -> None:
+    broken_url = "https://mcp.test/broken"
+    gateway = _FakeGateway(
+        servers=[
+            STREAMABLE_SERVER,
+            dict(STREAMABLE_SERVER, id="srv-2", name="broken_db", url=broken_url),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == broken_url:
+            return httpx.Response(503, text="upstream down")
+        body = json.loads(request.content)
+        if body["method"] == "initialize":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
+        if body["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        return httpx.Response(
+            200, json={"jsonrpc": "2.0", "id": body["id"], "result": {"tools": PROJECT_TOOLS}}
+        )
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=McpClient(transport=httpx.MockTransport(handler)),
+    )
+
+    assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
+    assert len(sources.warnings) == 1
+    assert "broken_db" in sources.warnings[0]
+    assert "HTTP 503" in sources.warnings[0]
+
+
+def test_langfuse_failures_cost_only_the_traces() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="langfuse down")
+
+    sources = load_build_sources(
+        _session(_FakeGateway(servers=[STREAMABLE_SERVER])),
+        environ=LANGFUSE_ENVIRON,
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        trace_transport=httpx.MockTransport(handler),
+    )
+
+    drafts = build_account_items(_offline_session(), sources)
+
+    assert sources.traces == []
+    assert any("Langfuse" in warning for warning in sources.warnings)
+    assert "trace" not in {draft.metadata["source_kind"] for draft in drafts}
+    assert len(drafts) == 6
+
+
 def test_load_build_sources_takes_mcp_auth_and_a_url_override_from_the_secret_map() -> None:
     secret_value = "fixture-header-value"
     override_url = "https://mcp.test/projects?token=query-secret"
@@ -527,6 +592,25 @@ def test_load_build_sources_caps_each_kind_at_the_limit() -> None:
     assert [tool.name for tool in sources.tools] == ["search_projects"]
     assert [skill.name for skill in sources.skills] == ["daily-finance-brief"]
     assert [document.document_id for document in sources.knowledge] == ["doc-1"]
+    chunk_requests = [
+        request for request in gateway.requests if request.url.path.endswith("/chunks")
+    ]
+    assert len(chunk_requests) == 1
+
+
+def test_the_report_shows_true_source_counts_when_the_limit_caps_the_build() -> None:
+    gateway = _FakeGateway(servers=[STREAMABLE_SERVER])
+    session = _session(gateway)
+    tools = [*PROJECT_TOOLS, {"name": "list_sectors", "description": "", "inputSchema": {}}]
+
+    sources = load_build_sources(session, limit=1, environ={}, mcp_client=_Mcp(tools).client)
+    drafts = build_account_items(session, sources, limit=1)
+    report = build_report("myflow-eval", sources, drafts, limit=1, dry_run=True)
+
+    assert len(sources.tools) == 1
+    assert report.source_counts == {"tool": 3, "skill": 2, "knowledge": 2, "trace": 0}
+    assert report.draft_counts == {"tool": 1, "skill": 1, "knowledge": 1, "trace": 0}
+    assert "tool: 1 drafts from 3 sources" in report.render()
 
 
 def test_load_build_sources_warns_about_documents_without_a_readable_chunk() -> None:
@@ -844,3 +928,60 @@ def test_fetch_account_traces_stops_at_the_limit() -> None:
 
     assert [trace.trace_id for trace in traces] == ["trace-error"]
     assert len(requests) == 1
+
+
+def test_fetch_account_traces_warns_instead_of_raising_on_a_langfuse_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="langfuse down")
+
+    warnings: list[str] = []
+
+    traces = fetch_account_traces(
+        HASHED_USER_ID,
+        environ=LANGFUSE_ENVIRON,
+        transport=httpx.MockTransport(handler),
+        warnings=warnings,
+    )
+
+    assert traces == []
+    assert len(warnings) == 1
+    assert "HTTP 500" in warnings[0]
+
+
+def test_a_trace_replay_asks_the_last_human_turn() -> None:
+    rows = [
+        {
+            "id": "trace-chat",
+            "userId": HASHED_USER_ID,
+            "input": {
+                "messages": [
+                    {"type": "human", "content": "Why did the refund fail?"},
+                    {"type": "ai", "content": "Because the card had expired."},
+                ]
+            },
+            "metadata": {},
+            "level": "ERROR",
+        },
+        {
+            "id": "trace-roleless",
+            "userId": HASHED_USER_ID,
+            "input": [{"content": "first question"}, {"content": "second question"}],
+            "metadata": {},
+            "level": "ERROR",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": rows, "meta": {"page": 1, "limit": 100, "totalItems": 2, "totalPages": 1}},
+        )
+
+    traces = fetch_account_traces(
+        HASHED_USER_ID, environ=LANGFUSE_ENVIRON, transport=httpx.MockTransport(handler)
+    )
+
+    assert [trace.query for trace in traces] == [
+        "Why did the refund fail?",
+        "second question",
+    ]

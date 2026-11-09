@@ -30,7 +30,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
@@ -55,6 +55,7 @@ _TRACE_REPLAY_CATEGORY = "trace_replay"
 _TRACE_ERROR_LEVEL = "ERROR"
 _TRACE_LOW_SCORE = 0.5
 _TRACE_PAGE_SIZE = 100
+_HUMAN_TURN_TYPES = frozenset({"human", "user"})
 #: Guard against a Langfuse deployment that reports an absurd page count.
 _TRACE_MAX_PAGES = 20
 _TRACES_PATH = "/api/public/traces"
@@ -98,13 +99,18 @@ class TraceSource:
 
 @dataclass(frozen=True)
 class BuildSources:
-    """Everything one build may sample from, already fetched and filtered."""
+    """Everything one build may sample from, already fetched and filtered.
+
+    source_totals records how many sources each kind really has, so a report can
+    distinguish "2 drafts from 37 sources" when a limit caps the draft set.
+    """
 
     tools: Sequence[McpTool] = ()
     skills: Sequence[SkillSource] = ()
     knowledge: Sequence[KnowledgeSource] = ()
     traces: Sequence[TraceSource] = ()
     warnings: Sequence[str] = ()
+    source_totals: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -169,13 +175,20 @@ def load_build_sources(
     server_secrets: Mapping[str, McpServerSecret] | None = None,
     environ: Mapping[str, str] | None = None,
     mcp_client: McpClient | None = None,
+    trace_transport: httpx.BaseTransport | None = None,
 ) -> BuildSources:
     """Fetch this account's real tools, private Skills, knowledge documents, and traces.
 
-    limit caps each kind at fetch time so a capped build does not page through
-    data it will discard. Transport and protocol failures raise; anything the
-    account cannot use (an unsupported transport, a server without a url, a
-    document without a readable chunk) is skipped with a warning on the result.
+    limit bounds the work a capped build does: Langfuse paging stops at the limit
+    and only the first limit documents get their chunk fetched. The sources come
+    back capped per kind, but source_totals always records how many sources each
+    kind really has.
+
+    A Gateway failure that makes the account data unusable raises. Everything
+    this account cannot use -- an unsupported transport, a disabled or unreachable
+    server, a document without a readable chunk, an unavailable Langfuse -- is
+    skipped with a warning on the result, so one broken source never costs more
+    than its own items.
     """
     _validate_limit(limit)
     env = os.environ if environ is None else environ
@@ -186,16 +199,29 @@ def load_build_sources(
     )
     client = mcp_client if mcp_client is not None else McpClient()
     warnings: list[str] = []
-    tools = _account_tools(session, secrets=secrets, client=client, limit=limit, warnings=warnings)
-    skills = _account_skills(session, limit=limit)
-    knowledge = _account_knowledge(session, limit=limit, warnings=warnings)
-    traces = fetch_account_traces(session.hashed_user_id, limit=limit, environ=env)
+    tools = _account_tools(session, secrets=secrets, client=client, warnings=warnings)
+    skills = _account_skills(session)
+    knowledge, knowledge_total = _account_knowledge(
+        session, limit=limit, warnings=warnings
+    )
+    traces = fetch_account_traces(
+        session.hashed_user_id,
+        environ=env,
+        transport=trace_transport,
+        warnings=warnings,
+    )
     return BuildSources(
-        tools=tools,
-        skills=skills,
+        tools=_capped(tools, limit),
+        skills=_capped(skills, limit),
         knowledge=knowledge,
-        traces=traces,
+        traces=_capped(traces, limit),
         warnings=tuple(warnings),
+        source_totals={
+            _KIND_TOOL: len(tools),
+            _KIND_SKILL: len(skills),
+            _KIND_KNOWLEDGE: knowledge_total,
+            _KIND_TRACE: len(traces),
+        },
     )
 
 
@@ -205,6 +231,7 @@ def fetch_account_traces(
     limit: int | None = None,
     environ: Mapping[str, str] | None = None,
     transport: httpx.BaseTransport | None = None,
+    warnings: list[str] | None = None,
 ) -> list[TraceSource]:
     """Read this account's failed or low-scored traces from Langfuse over HTTP.
 
@@ -212,6 +239,9 @@ def fetch_account_traces(
     LANGFUSE_SECRET_KEY this returns [] and makes no request. Only a trace that
     failed (level == ERROR) or carries a score below 0.5 is kept, and it must
     still have question text to replay.
+
+    Langfuse being unavailable must not fail a build: the traces kept so far are
+    returned and one secret-free warning is appended to the warnings list.
     """
     _validate_limit(limit)
     env = os.environ if environ is None else environ
@@ -230,7 +260,12 @@ def fetch_account_traces(
     ) as client:
         page = 1
         while page <= _TRACE_MAX_PAGES:
-            rows, total_pages = _trace_page(client, user_hash, page)
+            try:
+                rows, total_pages = _trace_page(client, user_hash, page)
+            except RuntimeError as exc:
+                if warnings is not None:
+                    warnings.append(f"stopped reading Langfuse traces after page {page}: {exc}")
+                return kept
             for row in rows:
                 trace = _trace_source(row)
                 if trace is None:
@@ -280,12 +315,16 @@ def build_report(
     limit: int | None = None,
     dry_run: bool = False,
 ) -> BuildReport:
-    """Count what a build saw and produced, per source kind."""
+    """Count what a build saw and produced, per source kind.
+
+    source_counts is the real number of sources each kind has (source_totals),
+    never the capped sample, so a limit can never pass for a full build.
+    """
     source_counts = {
-        _KIND_TOOL: len(sources.tools),
-        _KIND_SKILL: len(sources.skills),
-        _KIND_KNOWLEDGE: len(sources.knowledge),
-        _KIND_TRACE: len(sources.traces),
+        _KIND_TOOL: sources.source_totals.get(_KIND_TOOL, len(sources.tools)),
+        _KIND_SKILL: sources.source_totals.get(_KIND_SKILL, len(sources.skills)),
+        _KIND_KNOWLEDGE: sources.source_totals.get(_KIND_KNOWLEDGE, len(sources.knowledge)),
+        _KIND_TRACE: sources.source_totals.get(_KIND_TRACE, len(sources.traces)),
     }
     draft_counts = {kind: 0 for kind in _KIND_ORDER}
     for draft in drafts:
@@ -328,7 +367,6 @@ def _account_tools(
     *,
     secrets: Mapping[str, McpServerSecret],
     client: McpClient,
-    limit: int | None,
     warnings: list[str],
 ) -> list[McpTool]:
     body = _get_object(session, "/mcp-servers")
@@ -340,9 +378,11 @@ def _account_tools(
         server = _mcp_server(summary, secrets, warnings)
         if server is None:
             continue
-        tools.extend(client.list_tools(server))
-        if limit is not None and len(tools) >= limit:
-            return tools[:limit]
+        try:
+            tools.extend(client.list_tools(server))
+        except RuntimeError as exc:
+            # One broken server must cost exactly its own tools, never the build.
+            warnings.append(f"skipped MCP server {server.name!r}: tools/list failed ({exc})")
     return tools
 
 
@@ -362,6 +402,9 @@ def _mcp_server(
     if name is None:
         warnings.append(f"skipped MCP server {server_id!r}: it has no name to build tool names from")
         return None
+    if summary.get("enabled") is False:
+        warnings.append(f"skipped MCP server {name!r}: it is disabled for this account")
+        return None
 
     secret = secrets.get(name) or secrets.get(server_id) or McpServerSecret()
     transport = secret.transport or summary.get("transport")
@@ -380,7 +423,7 @@ def _mcp_server(
     return McpServer(id=server_id, url=url, headers=dict(secret.headers), name=name)
 
 
-def _account_skills(session: AccountSession, *, limit: int | None) -> list[SkillSource]:
+def _account_skills(session: AccountSession) -> list[SkillSource]:
     body = _get_object(session, "/skills")
     rows = body.get("skills")
     if not isinstance(rows, list):
@@ -388,11 +431,8 @@ def _account_skills(session: AccountSession, *, limit: int | None) -> list[Skill
     skills: list[SkillSource] = []
     for row in rows:
         skill = _private_skill(row)
-        if skill is None:
-            continue
-        skills.append(skill)
-        if limit is not None and len(skills) >= limit:
-            break
+        if skill is not None:
+            skills.append(skill)
     return skills
 
 
@@ -419,30 +459,38 @@ def _private_skill(row: object) -> SkillSource | None:
 
 def _account_knowledge(
     session: AccountSession, *, limit: int | None, warnings: list[str]
-) -> list[KnowledgeSource]:
+) -> tuple[list[KnowledgeSource], int]:
+    """Return the sampled documents and how many documents the account really has."""
+    documents = _knowledge_documents(session)
+    sources: list[KnowledgeSource] = []
+    for base_id, document in documents:
+        if limit is not None and len(sources) >= limit:
+            break
+        source = _knowledge_source(session, base_id, document, warnings)
+        if source is not None:
+            sources.append(source)
+    return sources, len(documents)
+
+
+def _knowledge_documents(session: AccountSession) -> list[tuple[str, object]]:
+    """List every document of every base without fetching a single chunk."""
     body = _get_object(session, "/knowledge/bases")
     bases = body.get("bases")
     if not isinstance(bases, list):
         raise RuntimeError("GET /knowledge/bases returned no bases list")
-    sources: list[KnowledgeSource] = []
+    documents: list[tuple[str, object]] = []
     for base in bases:
         if not isinstance(base, Mapping):
             continue
-        base_id = base.get("id")
-        if not isinstance(base_id, str) or not base_id:
+        base_id = _text(base.get("id"))
+        if base_id is None:
             continue
         documents_body = _get_object(session, f"/knowledge/bases/{base_id}/documents")
-        documents = documents_body.get("documents")
-        if not isinstance(documents, list):
+        rows = documents_body.get("documents")
+        if not isinstance(rows, list):
             raise RuntimeError(f"GET /knowledge/bases/{base_id}/documents returned no documents list")
-        for document in documents:
-            source = _knowledge_source(session, base_id, document, warnings)
-            if source is None:
-                continue
-            sources.append(source)
-            if limit is not None and len(sources) >= limit:
-                return sources
-    return sources
+        documents.extend((base_id, row) for row in rows if isinstance(row, Mapping))
+    return documents
 
 
 def _knowledge_source(
@@ -506,7 +554,7 @@ def _trace_page(
             _TRACES_PATH,
             params={"userId": user_hash, "page": page, "limit": _TRACE_PAGE_SIZE},
         )
-    except httpx.HTTPError as exc:
+    except Exception as exc:
         raise RuntimeError(f"Langfuse traces are unreachable ({type(exc).__name__})") from None
     if response.status_code >= 400:
         raise RuntimeError(f"Langfuse traces request failed with HTTP {response.status_code}")
@@ -569,17 +617,39 @@ def _trace_query(value: object) -> str | None:
                 return inner.strip()
         messages = value.get("messages")
         if isinstance(messages, Sequence) and not isinstance(messages, (str, bytes)):
-            for message in reversed(messages):
-                text = _message_text(message)
-                if text:
-                    return text
+            return _question_from(messages)
         return None
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        for message in reversed(value):
+        return _question_from(value)
+    return None
+
+
+def _question_from(messages: Sequence[Any]) -> str | None:
+    """Prefer the last human turn; fall back to the last message that has text.
+
+    A conversation trace ends with the agent's answer, so taking the last message
+    would replay the answer as the question.
+    """
+    for message in reversed(messages):
+        if _is_human_turn(message):
             text = _message_text(message)
             if text:
                 return text
+    for message in reversed(messages):
+        text = _message_text(message)
+        if text:
+            return text
     return None
+
+
+def _is_human_turn(message: object) -> bool:
+    if not isinstance(message, Mapping):
+        return False
+    for key in ("type", "role"):
+        turn = message.get(key)
+        if isinstance(turn, str) and turn.lower() in _HUMAN_TURN_TYPES:
+            return True
+    return False
 
 
 def _message_text(message: object) -> str | None:

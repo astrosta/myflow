@@ -35,9 +35,13 @@ later tasks; nothing here prints, and no module writes to a dataset by itself.
 - `GET /api/knowledge/bases` -> `/documents` -> first chunk per document;
 - the account's own failed or low-scored Langfuse traces (see below).
 
-Only `streamable_http` MCP servers are supported. An `sse` server, a server
-without a usable url, and a document without a readable chunk are skipped and
-reported as warnings on `BuildSources.warnings` -- never silently dropped.
+Only `streamable_http` MCP servers are supported. A disabled server
+(`enabled: false` -- the agent cannot route to its tools), an `sse` server, a
+server without a usable url, a server whose `tools/list` fails, a document
+without a readable chunk, and an unavailable Langfuse are all skipped and
+reported as warnings on `BuildSources.warnings` -- never silently dropped, and a
+broken source costs exactly its own items instead of failing the build. A
+Gateway failure that makes the account data unusable still raises.
 
 `build_account_items(session, sources, limit=...)` is pure: no I/O, no clock, no
 randomness. It emits one draft per source with a deterministic id
@@ -109,9 +113,12 @@ and the template queries are placeholders, not realistic user phrasing.
 ### Limits, reports, and dry runs
 
 `--limit` (the `limit` argument) caps drafts per source kind: tools, private
-Skills, knowledge documents, and traces are capped separately. The returned
-`BuildReport` records both how many sources were seen and how many drafts were
-produced per kind and renders lines such as:
+Skills, knowledge documents, and traces are capped separately. It bounds work,
+not truth: only the first `limit` documents get their chunk fetched, but every
+kind is still counted in full (Langfuse is paged up to a bounded page guard so
+that even the trace count is real), so the "M sources" in a report is the number
+of sources that account actually has, never the capped sample. The returned
+`BuildReport` records both counts and renders lines such as:
 
 ```
 dataset: myflow-eval
@@ -122,7 +129,7 @@ skill: 2 drafts from 11 sources
 knowledge: 2 drafts from 120 sources
 trace: 2 drafts from 4 sources
 total: 8 drafts
-warning: skipped MCP server 'legacy_db': sse transport is not supported
+warning: skipped MCP server 'legacy_db': sse transport is not supported (only streamable_http is implemented)
 ```
 
 Writes go through `DatasetWriter.upsert_items(dataset_name, items)`.
@@ -137,7 +144,7 @@ the `myflow-evals build` subcommand arrive in a later task.
 | `AGENT_USERS` | JSON map of label -> `{"username": ..., "password": ...}` for the fixed accounts. A secret file with the same shape may be passed instead. |
 | `MCP_SERVER_HEADERS` | JSON map of server name (or id) -> that server's auth headers, for MCP servers that need auth. |
 | `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | Langfuse HTTP API for trace replay. Without all three, no traces are read and no request is made. |
-| `USER_ID_SALT` (or the CLI's salt argument) | Salt for the Langfuse hashed user id; it must match the Agent tracing configuration. |
+| `USER_ID_SALT` | Salt for the Langfuse hashed user id; it must match the Agent tracing configuration. Nothing in this package reads it yet -- today the salt is the `salt` argument of `login_account`/`login_all`; the `myflow-evals` CLI will read it from this variable once the runner lands. |
 
 `MCP_SERVER_HEADERS` example (values are placeholders, never commit real ones):
 
@@ -157,5 +164,5 @@ listed transport is wrong.
 
 The Gateway returns masked MCP header values, so the API can never be used to
 call a server; the secret map is the only usable source, and header values, the
-server URL query string, and Langfuse keys are excluded from dataclass reprs and
-from every error message.
+server URL query string, the `url`/`transport` overrides, and Langfuse keys are
+excluded from dataclass reprs and from every error message.

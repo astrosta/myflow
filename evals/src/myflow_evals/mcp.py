@@ -29,6 +29,7 @@ _JSONRPC_VERSION = "2.0"
 _CLIENT_INFO = {"name": "myflow-evals", "version": "0.1.0"}
 _ACCEPT = "application/json, text/event-stream"
 _SESSION_HEADER = "Mcp-Session-Id"
+_PROTOCOL_VERSION_HEADER = "MCP-Protocol-Version"
 _HEADERS_ENV = "MCP_SERVER_HEADERS"
 _RESERVED_SECRET_KEYS = frozenset({"url", "transport"})
 _DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -43,7 +44,7 @@ class McpServer:
     """
 
     id: str
-    url: str
+    url: str = field(repr=False)
     headers: dict[str, str] = field(repr=False)
     name: str = ""
 
@@ -62,12 +63,13 @@ class McpTool:
 class McpServerSecret:
     """Per-server auth headers plus optional url/transport overrides.
 
-    Header values are secrets: they are excluded from repr and never logged.
+    Header values are secrets, and so is a url override (its query string can
+    carry a token): none of them may appear in a repr or a log.
     """
 
     headers: dict[str, str] = field(default_factory=dict, repr=False)
-    url: str | None = None
-    transport: str | None = None
+    url: str | None = field(default=None, repr=False)
+    transport: str | None = field(default=None, repr=False)
 
 
 def load_server_secrets(environ: Mapping[str, str] | None = None) -> dict[str, McpServerSecret]:
@@ -160,11 +162,14 @@ class McpClient:
         if not server.url:
             raise RuntimeError(f"MCP server {server.id!r} has no url to call")
         with httpx.Client(timeout=self._timeout, transport=self._transport) as client:
-            session_id = self._initialize(client, server)
-            self._notify_initialized(client, server, session_id)
-            return self._tools(client, server, session_id)
+            session_id, protocol_version = self._initialize(client, server)
+            self._notify_initialized(client, server, session_id, protocol_version)
+            return self._tools(client, server, session_id, protocol_version)
 
-    def _initialize(self, client: httpx.Client, server: McpServer) -> str | None:
+    def _initialize(
+        self, client: httpx.Client, server: McpServer
+    ) -> tuple[str | None, str | None]:
+        """Handshake once and return (Mcp-Session-Id, negotiated protocolVersion)."""
         request_id = 1
         response = self._post(
             client,
@@ -180,23 +185,37 @@ class McpClient:
                 },
             },
             session_id=None,
+            protocol_version=None,
         )
-        self._result(response, server, request_id, "initialize")
-        return response.headers.get(_SESSION_HEADER) or None
+        result = self._result(response, server, request_id, "initialize")
+        negotiated = result.get("protocolVersion")
+        return (
+            response.headers.get(_SESSION_HEADER) or None,
+            negotiated if isinstance(negotiated, str) and negotiated else None,
+        )
 
     def _notify_initialized(
-        self, client: httpx.Client, server: McpServer, session_id: str | None
+        self,
+        client: httpx.Client,
+        server: McpServer,
+        session_id: str | None,
+        protocol_version: str | None,
     ) -> None:
         response = self._post(
             client,
             server,
             {"jsonrpc": _JSONRPC_VERSION, "method": "notifications/initialized"},
             session_id=session_id,
+            protocol_version=protocol_version,
         )
         self._check_status(response, server, "notifications/initialized")
 
     def _tools(
-        self, client: httpx.Client, server: McpServer, session_id: str | None
+        self,
+        client: httpx.Client,
+        server: McpServer,
+        session_id: str | None,
+        protocol_version: str | None,
     ) -> list[McpTool]:
         tools: list[McpTool] = []
         cursors: set[str] = set()
@@ -213,6 +232,7 @@ class McpClient:
                     "params": {"cursor": cursor} if cursor else {},
                 },
                 session_id=session_id,
+                protocol_version=protocol_version,
             )
             result = self._result(response, server, request_id, "tools/list")
             published = result.get("tools")
@@ -237,16 +257,20 @@ class McpClient:
         body: Mapping[str, Any],
         *,
         session_id: str | None,
+        protocol_version: str | None,
     ) -> httpx.Response:
         headers = {"accept": _ACCEPT}
         if server.headers:
             headers.update(server.headers)
         if session_id:
             headers[_SESSION_HEADER] = session_id
+        if protocol_version:
+            headers[_PROTOCOL_VERSION_HEADER] = protocol_version
         try:
             return client.post(server.url, json=dict(body), headers=headers)
-        except httpx.HTTPError as exc:
-            # The URL may carry a token in its query string; report the type only.
+        except Exception as exc:
+            # The URL may carry a token in its query string, and a malformed one
+            # (UnsupportedProtocol/InvalidURL) would echo it: report the type only.
             raise RuntimeError(
                 f"MCP server {server.id!r} is unreachable ({type(exc).__name__})"
             ) from None
