@@ -91,6 +91,10 @@ class SubagentResult:
     #: §14.1 捕获的步骤载荷（``{"message_index": ..., "message": {...}}``）。
     #: 捕获在隔离循环写，父循环的 ``task`` 轮询读——所以走同一把锁。
     steps: list[dict] = field(default_factory=list, repr=False)
+    #: 归一化后的检索证据（``{"event_type": ..., "content": {...}}``）。**不截断**：
+    #: 它来自原始 ToolMessage，而不是 ``build_subagent_step`` 的 8192 字符投影。
+    #: 和 ``steps`` 一样跨隔离循环 / 父循环，走同一把锁。
+    retrievals: list[dict] = field(default_factory=list, repr=False)
     _state_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     #: §7.5：用量上报只能有一次——task 工具正常收尾和隔离循环的兜底交付会撞车。
     _usage_reported: bool = field(default=False, init=False, repr=False)
@@ -153,6 +157,18 @@ class SubagentResult:
         """从 ``reported`` 之后还没报出去的步骤（父循环轮询，§9.1 第 8 步）。"""
         with self._state_lock:
             return [dict(step) for step in self.steps[max(reported, 0) :]]
+
+    def append_retrievals(self, events: Sequence[Mapping]) -> None:
+        """§14.1 每捕获一批检索证据就调一次（隔离循环）。"""
+        if not events:
+            return
+        with self._state_lock:
+            self.retrievals.extend(dict(event) for event in events)
+
+    def pending_retrievals(self, reported: int) -> list[dict]:
+        """从 ``reported`` 之后还没报出去的检索证据（父循环轮询）。"""
+        with self._state_lock:
+            return [dict(event) for event in self.retrievals[max(reported, 0) :]]
 
 
 # ---------------------------------------------------------------- 进程内注册表

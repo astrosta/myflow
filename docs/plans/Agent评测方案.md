@@ -36,6 +36,17 @@
 - LLM 评测只用于无法用规则判断的维度：回答是否忠于资料、是否切题、是否满足判定规则。
 - 评测集只在 Langfuse 维护一份。
 
+**实现状态（2026-11）**
+
+本文档仍是评测方案的设计依据；实现进度单独记录如下，不改变本文的方案决策、阈值、样本形态和阶段时间线。
+
+- 实现计划：[2026-11-09-agent-evaluation.md](../superpowers/plans/2026-11-09-agent-evaluation.md)
+- 评测包说明：[evals/README.md](../../evals/README.md)
+
+已实现：只读 run-event 账本与结构化 `retrieval.tool` / `retrieval.skill` / `retrieval.kb` 事件；固定账号登录和 Langfuse hashed user_id（`HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`）；确定性评测集构建（`single_tool`、`skill_single`、`kb_single_hop`、`trace_replay`）；规则 evaluator（T1/T2/T3、K0-K2、R0/R1/R3 的规则部分、S1 的规则部分）；`myflow-evals build|run|ingest`、实验完整性门禁和 CI/nightly 工作流。
+
+尚未实现：K3 `skill_adherence`、R4 `refusal_ok`、Faithfulness、`answer_correctness`、`answer_quality`、AnswerRelevancy、ContextualPrecision/Recall/Relevancy 等 LLM 评判与 DeepEval RAG 指标；LLM 合成样本；人工 Golden 集。`ingest` 目前只打印候选 trace，不写入探索集；规则指标之外的阈值仍待后续阶段补齐。
+
 **3. 评测分层与指标**
 
 工具链和知识库链路分开评测，最终回答统一评测。阈值为初始建议值，首轮基线跑完后按实际分布调整。

@@ -10,6 +10,7 @@ by the methods below. Do not re-derive that mapping anywhere else.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -29,8 +30,13 @@ from agentkit.runtime.events.catalog import (
     RUN_START_EVENT,
     RunEventDefinition,
 )
+from agentkit.runtime.events.retrieval import (
+    RETRIEVAL_TOOL_EVENTS,
+    TOOL_SEARCH_TOOL_NAME,
+    retrieval_event_for_tool,
+)
 from agentkit.persistence.events.base import RunEventStore
-from agentkit.persistence.events.codec import limit_trace
+from agentkit.persistence.events.codec import dumps, limit_trace
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,8 @@ class RunJournal(AsyncCallbackHandler):
         self._pending_llm: _PendingLLM | None = None
         # 消息身份去重：同一条消息会在不同回调里被重复交出（回放、对账）
         self._message_identities: set[str] = set()
+        # 检索证据的去重身份：on_tool_end 的回放与 _reconcile_messages 会交出同一次工具调用
+        self._retrieval_identities: set[str] = set()
         self._tool_names: dict[str, str] = {}
         self._llm_started: dict[str, float] = {}
         self._llm_index: dict[str, int] = {}
@@ -260,17 +268,17 @@ class RunJournal(AsyncCallbackHandler):
     ) -> None:
         if not isinstance(output, ToolMessage):
             return
-        if not self._mark_message(output):
-            return  # 已写过 → False（按 tool_call_id 去重）
-        tool_call_id = str(getattr(output, "tool_call_id", "") or "")
-        await self._put(
-            LLM_TOOL_RESULT,
-            content=output.model_dump(),
-            metadata={
-                "tool_name": getattr(output, "name", None) or self._tool_names.get(tool_call_id),
-                "status": getattr(output, "status", None),
-            },
-        )
+        if self._mark_message(output):
+            await self._put(
+                LLM_TOOL_RESULT,
+                content=output.model_dump(),
+                metadata={
+                    "tool_name": self._tool_name_for(output),
+                    "status": getattr(output, "status", None),
+                },
+            )
+        # 回放也走派生证据：llm.tool.result 由消息身份去重，retrieval 由自己的身份去重。
+        await self._emit_retrieval(output)
 
     async def on_tool_error(
         self,
@@ -401,14 +409,45 @@ class RunJournal(AsyncCallbackHandler):
         for message in _messages_of(outputs):
             if isinstance(message, AIMessage) and not _message_id(message):
                 continue  # 没有 id 就不补，避免与 on_llm_end 双写（§5.7）
+            if isinstance(message, ToolMessage):
+                if self._mark_message(message):
+                    await self._put(LLM_TOOL_RESULT, content=message.model_dump())
+                # 对账可能交出同一工具调用的新实例：工具结果被消息身份挡住，
+                # 派生证据仍必须经过自己的身份去重，而不是依赖消息身份的副作用。
+                await self._emit_retrieval(message)
+                continue
             if not self._mark_message(message):
                 continue
-            if isinstance(message, ToolMessage):
-                await self._put(LLM_TOOL_RESULT, content=message.model_dump())
-            elif isinstance(message, HumanMessage):
+            if isinstance(message, HumanMessage):
                 await self._put(LLM_HUMAN_INPUT, content=message.model_dump())
             elif isinstance(message, AIMessage):
                 await self._put(LLM_AI_RESPONSE, content=message.model_dump())
+
+    async def _emit_retrieval(self, message: ToolMessage) -> None:
+        """tool_search 的结果在 llm.tool.result 之后再补一行 retrieval.tool。
+
+        只写 tool_search：另两个检索工具（skill / kb）目前不由父循环产出。
+        归一化器返回 None（坏 JSON、检索不可用）时什么都不写——证据只能来自真正
+        发生过的检索，"没检索"不能被记成"检索到 0 条"。
+
+        去重按 tool_call_id（没有 ID 时按内容摘要）：同一次工具调用会在 on_tool_end
+        的回放和对账里被交出多份，派生证据只该有一行。
+        """
+        tool_name = self._tool_name_for(message)
+        if tool_name != TOOL_SEARCH_TOOL_NAME:
+            return
+        identity = _retrieval_identity(message)
+        if identity in self._retrieval_identities:
+            return
+        event = retrieval_event_for_tool(tool_name=tool_name, content=message.content)
+        if event is None:
+            return
+        self._retrieval_identities.add(identity)
+        await self._put(
+            RETRIEVAL_TOOL_EVENTS[tool_name],
+            content=event.content,
+            metadata={"tool_name": tool_name},
+        )
 
     # ---- 归因与去重 ----
 
@@ -419,6 +458,11 @@ class RunJournal(AsyncCallbackHandler):
             if isinstance(tag, str) and tag.startswith(MIDDLEWARE_TAG_PREFIX):
                 return tag
         return LEAD_CALLER
+
+    def _tool_name_for(self, message: ToolMessage) -> str | None:
+        """工具名：消息自己带的优先，否则用 on_tool_start 记下的映射。"""
+        tool_call_id = str(getattr(message, "tool_call_id", "") or "")
+        return getattr(message, "name", None) or self._tool_names.get(tool_call_id)
 
     def _mark_message(self, message: BaseMessage) -> bool:
         """True 表示这条消息还是第一次见到，可以写。"""
@@ -465,6 +509,14 @@ def _message_identity(message: BaseMessage) -> str | None:
     if message_id:
         return f"message:{message_id}"
     return None
+
+
+def _retrieval_identity(message: ToolMessage) -> str:
+    """检索证据的身份：优先 tool_call_id，没有 ID 时退回内容摘要。"""
+    tool_call_id = getattr(message, "tool_call_id", None)
+    if isinstance(tool_call_id, str) and tool_call_id:
+        return f"tool:{tool_call_id}"
+    return "content:" + hashlib.sha256(dumps(message.content).encode("utf-8")).hexdigest()
 
 
 def _flatten_messages(messages: Any) -> list[BaseMessage]:

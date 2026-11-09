@@ -36,7 +36,7 @@ from agentkit.mcp.store.tool_repository import (
 )
 from agentkit.persistence.schema import Base
 from agentkit.runtime.user_context import reset_current_user, set_current_user
-from agentkit.tools.builtin.tool_search import TOOL_NAME, tool_search
+from agentkit.tools.builtin.tool_search import TOOL_NAME, _fit_result_budget, tool_search
 from agentkit.tools.search.service import (
     CATALOG_UNAVAILABLE,
     MAX_RESULT_CHARS,
@@ -395,6 +395,7 @@ async def test_tool_search_returns_db_schemas_and_server_aware_cards(
     assert card["score"] > 0
     assert payload["retrieval"]["index"] == "milvus"
     assert payload["retrieval"]["channels"] == ["embedding", "keyword"]
+    assert payload["truncated"] is False
     assert "tool_execute" in payload["message"]
 
 
@@ -571,7 +572,51 @@ async def test_tool_search_keeps_its_payload_inside_the_result_budget(
     assert update["retrieved_tool_names"] == [
         tool["call_name"] for tool in payload["tools"]
     ]
+    assert payload["truncated"] is True
     assert "budget" in payload["message"]
+
+
+def _budget_cards(count: int = 3) -> list[dict[str, Any]]:
+    return [
+        {"call_name": f"mcp__anysearch__tool_{position}", "description": "x" * 100}
+        for position in range(count)
+    ]
+
+
+def _budget_retrieval(count: int = 3) -> dict[str, Any]:
+    return {
+        "index": "milvus",
+        "channels": ["vector"],
+        "candidates": count,
+        "reranked": True,
+        "warnings": [],
+    }
+
+
+def test_budget_fit_without_drops_is_not_truncated() -> None:
+    cards = _budget_cards()
+
+    payload, tools = _fit_result_budget(cards, _budget_retrieval(), 10_000)
+
+    assert tools == cards
+    assert payload["truncated"] is False
+    assert "dropped" not in payload["message"]
+
+
+def test_budget_drop_is_flagged_as_truncated() -> None:
+    payload, tools = _fit_result_budget(_budget_cards(), _budget_retrieval(), 600)
+
+    assert len(tools) == 1
+    assert payload["truncated"] is True
+    assert "dropped to stay inside the output budget" in payload["message"]
+
+
+def test_no_card_fitting_the_budget_is_flagged_as_truncated() -> None:
+    payload, tools = _fit_result_budget(_budget_cards(), _budget_retrieval(), 10)
+
+    assert tools == []
+    assert payload["truncated"] is True
+    assert "did not fit the output budget" in payload["message"]
 
 
 @pytest.mark.asyncio

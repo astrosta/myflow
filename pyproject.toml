@@ -19,6 +19,7 @@ myflow = "myflow:main"
 members = [
     "backend",
     "backend/packages/harness",
+    "evals",
 ]
 
 [tool.uv.sources]

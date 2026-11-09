@@ -1,12 +1,14 @@
 """步骤捕获与事件映射（M8 §14，D8）。
 
-**纯函数**：不启动图、不碰 store，所以单元测试不需要 Gateway。三个入口：
+**纯函数**：不启动图、不碰 store，所以单元测试不需要 Gateway。四个入口：
 
 1. ``capture_new_step_messages`` —— 走**新增的尾部**，不是 ``messages[-1]``：一轮里模型调了
    3 个工具时，ToolNode 会在**一个超级步**里追加 3 条 ToolMessage，只看最后一条会丢两条。
-2. ``build_subagent_step`` —— 一步的载荷，**有界**（§14.2）：一次 ``write_file`` 的全文
+2. ``capture_new_retrieval_events`` —— 同一段新增尾部上的**第二条游标**：只认
+   ``search_skills`` / ``knowledge_search``，读原始 ToolMessage（不截断）并归一化。
+3. ``build_subagent_step`` —— 一步的载荷，**有界**（§14.2）：一次 ``write_file`` 的全文
    不能变成无界的一行事件。
-3. ``subagent_run_event`` —— custom 帧 → ``SubagentEventRow``（§14.3）；不合规的块返回 None。
+4. ``subagent_run_event`` —— custom 帧 → ``SubagentEventRow``（§14.3）；不合规的块返回 None。
 
 只捕获 ``AIMessage`` / ``ToolMessage``；去重有 id 按 id、没 id 按整 dict。
 
@@ -24,9 +26,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from agentkit.runtime.events.catalog import (
+    RETRIEVAL_KB_EVENT,
+    RETRIEVAL_SKILL_EVENT,
+    RETRIEVAL_TOOL_EVENT,
     SUBAGENT_END_EVENT,
     SUBAGENT_START_EVENT,
     SUBAGENT_STEP_EVENT,
+    RunEventDefinition,
+)
+from agentkit.runtime.events.retrieval import (
+    KNOWLEDGE_SEARCH_TOOL_NAME,
+    SEARCH_SKILLS_TOOL_NAME,
+    retrieval_event_for_tool,
 )
 from agentkit.utils.messages import message_content_to_text
 
@@ -44,6 +55,31 @@ _DEFINITION_BY_CUSTOM_TYPE = {
     "task_failed": SUBAGENT_END_EVENT,
     "task_cancelled": SUBAGENT_END_EVENT,
     "task_timed_out": SUBAGENT_END_EVENT,
+}
+
+#: 子代理检索证据的 custom 帧。它和 ``task_running`` 并列，但**不**走步骤的 8192 字符投影：
+#: 载荷来自原始 ToolMessage 的完整正文。
+TASK_RETRIEVAL_CUSTOM_TYPE = "task_retrieval"
+
+#: 只有这两种工具结果会变成检索证据；``tool_search`` 在 lead 侧由 Task 3 负责。
+SUBAGENT_RETRIEVAL_TOOL_NAMES = frozenset({
+    SEARCH_SKILLS_TOOL_NAME,
+    KNOWLEDGE_SEARCH_TOOL_NAME,
+})
+
+#: 子代理这里只可能产出 skill / kb；``retrieval.tool`` 是 lead 的 ``tool_search``。
+#: 映射仍然留全：词表里三种检索事件都能落库，只是今天没有 emitter 产出 tool 帧。
+_RETRIEVAL_DEFINITION_BY_EVENT_TYPE: dict[str, RunEventDefinition] = {
+    RETRIEVAL_SKILL_EVENT.event_type: RETRIEVAL_SKILL_EVENT,
+    RETRIEVAL_KB_EVENT.event_type: RETRIEVAL_KB_EVENT,
+    RETRIEVAL_TOOL_EVENT.event_type: RETRIEVAL_TOOL_EVENT,
+}
+
+#: 归一化之后的载荷必须自证形状：这个键在，而且是 list。空 ``{}`` 不是"检索到零条"。
+_RETRIEVAL_PAYLOAD_KEY_BY_EVENT_TYPE: dict[str, str] = {
+    RETRIEVAL_KB_EVENT.event_type: "items",
+    RETRIEVAL_SKILL_EVENT.event_type: "skills",
+    RETRIEVAL_TOOL_EVENT.event_type: "tools",
 }
 
 
@@ -99,6 +135,44 @@ def capture_new_step_messages(
     if messages:
         capture_step_message(messages[-1], captured, seen_ids, index=total - 1)
     return max(processed_count, total)
+
+
+def capture_new_retrieval_events(
+    messages: Sequence[Any], processed_count: int
+) -> tuple[list[dict[str, Any]], int]:
+    """把新增尾部里的检索工具结果归一化，返回 `(events, 新游标)`。
+
+    走的是和 `capture_new_step_messages` **同一条新增尾部**，但读的是原始
+    `ToolMessage.content`——不是 8192 字符的步骤投影。只有 `search_skills` /
+    `knowledge_search` 参与，且 `retrieval_event_for_tool` 返回 `None`
+    （不可用 / 畸形 / 非检索消息）时**什么都不发**："没检索到"不等于"检索失败"。
+
+    游标只随**增长**推进。等长时没有新尾部，不再重扫最后一条：检索证据是追加型的，
+    重扫会在每个 values 帧上把同一次检索重复记一遍。压缩收缩把游标重置到新的长度；
+    保留下来的尾巴是已经捕获过的证据，不重放。
+    """
+    total = len(messages)
+    processed_count = max(processed_count, 0)
+    if total <= processed_count:
+        return [], min(total, processed_count)
+
+    events: list[dict[str, Any]] = []
+    for index in range(processed_count, total):
+        message = messages[index]
+        if getattr(message, "type", None) != "tool":
+            continue
+        tool_name = getattr(message, "name", None)
+        if tool_name not in SUBAGENT_RETRIEVAL_TOOL_NAMES:
+            continue
+        normalized = retrieval_event_for_tool(
+            tool_name=tool_name, content=getattr(message, "content", "")
+        )
+        if normalized is None:
+            continue
+        events.append(
+            {"event_type": normalized.event_type, "content": normalized.content}
+        )
+    return events, total
 
 
 def capture_step_message(
@@ -182,6 +256,8 @@ def subagent_run_event(chunk: object) -> SubagentEventRow | None:
     """
     if not isinstance(chunk, Mapping):
         return None
+    if chunk.get("type") == TASK_RETRIEVAL_CUSTOM_TYPE:
+        return _task_retrieval_row(chunk)
     definition = _DEFINITION_BY_CUSTOM_TYPE.get(chunk.get("type"))
     if definition is None:
         return None
@@ -209,6 +285,54 @@ def subagent_run_event(chunk: object) -> SubagentEventRow | None:
         content=content,
         metadata=metadata,
     )
+
+
+def _task_retrieval_row(chunk: Mapping[str, Any]) -> SubagentEventRow | None:
+    """`task_retrieval` → `retrieval.skill` / `retrieval.kb` / `retrieval.tool`，正文原样保留。
+
+    `retrieval` 里带的是归一化后的 `{"event_type": ..., "content": ...}`。这里校验形状、
+    种类和**载荷**：malformed 帧返回 `None`，和 `task_running` 一样丢弃而不是抛。
+    `event_type` 先过 `isinstance(str)` 再当 dict key——list/dict 当 key 会抛
+    `TypeError`，而坏帧恰恰是最该被安静丢掉的那种输入。
+    """
+    task_id = chunk.get("task_id")
+    if not isinstance(task_id, str) or not task_id.strip():
+        return None
+    retrieval = chunk.get("retrieval")
+    if not isinstance(retrieval, Mapping):
+        return None
+    event_type = retrieval.get("event_type")
+    if not isinstance(event_type, str):
+        return None
+    definition = _RETRIEVAL_DEFINITION_BY_EVENT_TYPE.get(event_type)
+    content = retrieval.get("content")
+    if definition is None or not isinstance(content, Mapping):
+        return None
+    if not _retrieval_content_is_usable(definition.event_type, content):
+        return None
+    return SubagentEventRow(
+        event_type=definition.event_type,
+        category=definition.category,
+        content=dict(content),
+        metadata={"task_id": task_id},
+    )
+
+
+def _retrieval_content_is_usable(event_type: str, content: Mapping[str, Any]) -> bool:
+    """归一化后的载荷必须自证形状，否则不构造行。
+
+    `content={}` 曾被当成合法行落库——那等于把"坏帧"记成"检索到零条"，正是
+    `retrieval_event_for_tool` 一直在拒的那种谎。判据只有两条：种类对应的载荷键存在
+    且是 list；KB 还要有一个非空 `query`（没有 query 的 KB 结果没法评测）。
+    `items: []` / `skills: []` / `tools: []` 仍然合法——"搜过但零命中"是证据。
+    """
+    payload_key = _RETRIEVAL_PAYLOAD_KEY_BY_EVENT_TYPE.get(event_type)
+    if payload_key is None or not isinstance(content.get(payload_key), list):
+        return False
+    if event_type == RETRIEVAL_KB_EVENT.event_type:
+        query = content.get("query")
+        return isinstance(query, str) and bool(query.strip())
+    return True
 
 
 def _step_content(chunk: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -240,10 +364,13 @@ def _present(chunk: Mapping[str, Any], keys: Sequence[str]) -> dict[str, Any]:
 
 __all__ = [
     "CAPTURABLE_MESSAGE_TYPES",
+    "SUBAGENT_RETRIEVAL_TOOL_NAMES",
     "SUBAGENT_STEP_MAX_CHARS",
     "SubagentEventRow",
+    "TASK_RETRIEVAL_CUSTOM_TYPE",
     "build_subagent_step",
     "build_subagent_tool_call",
+    "capture_new_retrieval_events",
     "capture_new_step_messages",
     "capture_step_message",
     "step_identity",
