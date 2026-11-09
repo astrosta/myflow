@@ -12,6 +12,7 @@ import json
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from langchain_core.messages import ToolMessage
 
 from agentkit.persistence.events import MemoryRunEventStore
@@ -52,11 +53,14 @@ def _card(call_name: str, score: float) -> dict[str, Any]:
     }
 
 
-def _tool_search_result(*call_names: str, index: str = "milvus") -> str:
+def _tool_search_result(
+    *call_names: str, index: str = "milvus", truncated: bool = False
+) -> str:
     """一次成功检索的模型可见结果（tool_search 用 json.dumps 交出）。"""
     return json.dumps(
         {
             "tools": [_card(name, 0.9 - offset / 10) for offset, name in enumerate(call_names)],
+            "truncated": truncated,
             "retrieval": {
                 "index": index,
                 "channels": ["vector"],
@@ -210,6 +214,121 @@ def test_a_successful_search_that_found_nothing_is_still_recorded() -> None:
         assert _kinds(rows) == [LLM_TOOL_RESULT.event_type, RETRIEVAL_TOOL_EVENT.event_type]
         # 检索发生了但没有命中——这是证据，不能和"检索不可用"混为一谈
         assert rows[1]["content"]["tools"] == []
+
+    asyncio.run(scenario())
+
+
+def test_retrieval_name_falls_back_to_the_tool_call_id_mapping() -> None:
+    async def scenario() -> None:
+        store, journal = _journal()
+        await journal.on_tool_start(
+            {"name": TOOL_SEARCH},
+            "",
+            run_id=uuid4(),
+            metadata={"tool_call_id": "c9"},
+        )
+        message = ToolMessage(
+            content=_tool_search_result("mcp__files__read_file"),
+            tool_call_id="c9",
+            status="success",
+        )
+
+        await journal.on_tool_end(message, run_id=uuid4())
+        await journal.flush()
+
+        rows = await store.list_events("thread-1", "run-1")
+        assert _kinds(rows) == [LLM_TOOL_RESULT.event_type, RETRIEVAL_TOOL_EVENT.event_type]
+        assert rows[0]["metadata"]["tool_name"] == TOOL_SEARCH
+        assert rows[1]["metadata"] == {"tool_name": TOOL_SEARCH}
+
+    asyncio.run(scenario())
+
+
+def test_cross_path_replay_of_a_fresh_message_does_not_duplicate_retrieval() -> None:
+    async def scenario() -> None:
+        store, journal = _journal()
+        message = _tool_message(_tool_search_result("mcp__files__read_file"))
+
+        await journal.on_tool_end(message, run_id=uuid4())
+        # 对账交出的是一份新实例：消息身份拦不住它，只有 retrieval 身份能拦
+        await journal.on_chain_end(
+            {"messages": [_tool_message(message.content)]}, run_id=uuid4()
+        )
+
+        rows = await store.list_events("thread-1", "run-1")
+        assert _kinds(rows) == [
+            LLM_TOOL_RESULT.event_type,
+            RETRIEVAL_TOOL_EVENT.event_type,
+            "run.end",
+        ]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tool_name", ["search_skills", "knowledge_search"])
+def test_skill_and_knowledge_tool_messages_write_no_retrieval_tool_row(
+    tool_name: str,
+) -> None:
+    async def scenario() -> None:
+        store, journal = _journal()
+
+        await journal.on_tool_end(
+            _tool_message(_tool_search_result("mcp__files__read_file"), name=tool_name),
+            run_id=uuid4(),
+        )
+        await journal.flush()
+
+        rows = await store.list_events("thread-1", "run-1")
+        assert _kinds(rows) == [LLM_TOOL_RESULT.event_type]
+
+    asyncio.run(scenario())
+
+
+def test_malformed_tool_search_json_keeps_the_tool_result_but_writes_no_evidence() -> None:
+    async def scenario() -> None:
+        store, journal = _journal()
+
+        await journal.on_tool_end(_tool_message("{not json"), run_id=uuid4())
+        await journal.flush()
+
+        rows = await store.list_events("thread-1", "run-1")
+        assert _kinds(rows) == [LLM_TOOL_RESULT.event_type]
+
+    asyncio.run(scenario())
+
+
+def test_a_none_payload_does_not_poison_the_retrieval_identity() -> None:
+    async def scenario() -> None:
+        store, journal = _journal()
+        tool_call_id = "c-none-first"
+
+        await journal._emit_retrieval(_tool_message("not json", tool_call_id=tool_call_id))
+        await journal._emit_retrieval(
+            _tool_message(
+                _tool_search_result("mcp__files__read_file"), tool_call_id=tool_call_id
+            )
+        )
+        await journal.flush()
+
+        rows = await store.list_events("thread-1", "run-1")
+        assert _kinds(rows) == [RETRIEVAL_TOOL_EVENT.event_type]
+
+    asyncio.run(scenario())
+
+
+def test_a_budget_truncated_result_is_recorded_as_truncated() -> None:
+    async def scenario() -> None:
+        store, journal = _journal()
+
+        await journal.on_tool_end(
+            _tool_message(_tool_search_result("mcp__files__read_file", truncated=True)),
+            run_id=uuid4(),
+        )
+        await journal.flush()
+
+        rows = await store.list_events("thread-1", "run-1")
+        assert _kinds(rows) == [LLM_TOOL_RESULT.event_type, RETRIEVAL_TOOL_EVENT.event_type]
+        assert rows[1]["content"]["truncated"] is True
 
     asyncio.run(scenario())
 

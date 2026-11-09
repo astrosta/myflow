@@ -150,6 +150,7 @@ async def tool_search(
         payload["message"],
         write_names=True,
         max_names=max_cards,
+        truncated=bool(payload["truncated"]),
     )
 
 
@@ -182,11 +183,20 @@ def _fit_result_budget(
     total = len(cards)
     tools = list(cards)
     while tools:
-        payload = _payload(tools, retrieval, _message(True, total - len(tools)))
+        dropped = total - len(tools)
+        payload = _payload(
+            tools,
+            retrieval,
+            _message(True, dropped),
+            truncated=dropped > 0,
+        )
         if len(_serialize(payload)) <= max_chars:
             return payload, tools
         tools = tools[:-1]
-    return _payload([], retrieval, _message(False, total)), []
+    return (
+        _payload([], retrieval, _message(False, total), truncated=total > 0),
+        [],
+    )
 
 
 def _card(hit: Any) -> dict[str, Any]:
@@ -221,6 +231,7 @@ def _reply(
     *,
     write_names: bool,
     max_names: int = MAX_RETRIEVED_TOOLS,
+    truncated: bool = False,
 ) -> Command:
     """The tool message, plus retrieved_tool_names only when a search answered.
 
@@ -232,7 +243,7 @@ def _reply(
     the empty one: an empty result has to clear the previous set, or
     tool_execute would keep accepting stale call names.
     """
-    payload = _payload(tools, retrieval, message)
+    payload = _payload(tools, retrieval, message, truncated=truncated)
     update: dict[str, Any] = {
         "messages": [
             ToolMessage(
@@ -252,8 +263,15 @@ def _payload(
     tools: list[dict[str, Any]],
     retrieval: dict[str, Any],
     message: str,
+    *,
+    truncated: bool = False,
 ) -> dict[str, Any]:
-    return {"tools": tools, "retrieval": retrieval, "message": message}
+    return {
+        "tools": tools,
+        "retrieval": retrieval,
+        "truncated": truncated,
+        "message": message,
+    }
 
 
 def _message(has_tools: bool, dropped: int) -> str:

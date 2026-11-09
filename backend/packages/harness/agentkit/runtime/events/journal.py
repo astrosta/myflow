@@ -25,13 +25,13 @@ from agentkit.runtime.events.catalog import (
     LLM_ERROR_EVENT,
     LLM_HUMAN_INPUT,
     LLM_TOOL_RESULT,
-    RETRIEVAL_TOOL_EVENT,
     RUN_END_EVENT,
     RUN_ERROR_EVENT,
     RUN_START_EVENT,
     RunEventDefinition,
 )
 from agentkit.runtime.events.retrieval import (
+    RETRIEVAL_TOOL_EVENTS,
     TOOL_SEARCH_TOOL_NAME,
     retrieval_event_for_tool,
 )
@@ -268,17 +268,16 @@ class RunJournal(AsyncCallbackHandler):
     ) -> None:
         if not isinstance(output, ToolMessage):
             return
-        if not self._mark_message(output):
-            return  # 已写过 → False（按 tool_call_id 去重）
-        tool_call_id = str(getattr(output, "tool_call_id", "") or "")
-        await self._put(
-            LLM_TOOL_RESULT,
-            content=output.model_dump(),
-            metadata={
-                "tool_name": getattr(output, "name", None) or self._tool_names.get(tool_call_id),
-                "status": getattr(output, "status", None),
-            },
-        )
+        if self._mark_message(output):
+            await self._put(
+                LLM_TOOL_RESULT,
+                content=output.model_dump(),
+                metadata={
+                    "tool_name": self._tool_name_for(output),
+                    "status": getattr(output, "status", None),
+                },
+            )
+        # 回放也走派生证据：llm.tool.result 由消息身份去重，retrieval 由自己的身份去重。
         await self._emit_retrieval(output)
 
     async def on_tool_error(
@@ -410,12 +409,16 @@ class RunJournal(AsyncCallbackHandler):
         for message in _messages_of(outputs):
             if isinstance(message, AIMessage) and not _message_id(message):
                 continue  # 没有 id 就不补，避免与 on_llm_end 双写（§5.7）
+            if isinstance(message, ToolMessage):
+                if self._mark_message(message):
+                    await self._put(LLM_TOOL_RESULT, content=message.model_dump())
+                # 对账可能交出同一工具调用的新实例：工具结果被消息身份挡住，
+                # 派生证据仍必须经过自己的身份去重，而不是依赖消息身份的副作用。
+                await self._emit_retrieval(message)
+                continue
             if not self._mark_message(message):
                 continue
-            if isinstance(message, ToolMessage):
-                await self._put(LLM_TOOL_RESULT, content=message.model_dump())
-                await self._emit_retrieval(message)
-            elif isinstance(message, HumanMessage):
+            if isinstance(message, HumanMessage):
                 await self._put(LLM_HUMAN_INPUT, content=message.model_dump())
             elif isinstance(message, AIMessage):
                 await self._put(LLM_AI_RESPONSE, content=message.model_dump())
@@ -430,19 +433,20 @@ class RunJournal(AsyncCallbackHandler):
         去重按 tool_call_id（没有 ID 时按内容摘要）：同一次工具调用会在 on_tool_end
         的回放和对账里被交出多份，派生证据只该有一行。
         """
-        if getattr(message, "name", None) != TOOL_SEARCH_TOOL_NAME:
+        tool_name = self._tool_name_for(message)
+        if tool_name != TOOL_SEARCH_TOOL_NAME:
             return
         identity = _retrieval_identity(message)
         if identity in self._retrieval_identities:
             return
-        event = retrieval_event_for_tool(tool_name=TOOL_SEARCH_TOOL_NAME, content=message.content)
+        event = retrieval_event_for_tool(tool_name=tool_name, content=message.content)
         if event is None:
             return
         self._retrieval_identities.add(identity)
         await self._put(
-            RETRIEVAL_TOOL_EVENT,
+            RETRIEVAL_TOOL_EVENTS[tool_name],
             content=event.content,
-            metadata={"tool_name": TOOL_SEARCH_TOOL_NAME},
+            metadata={"tool_name": tool_name},
         )
 
     # ---- 归因与去重 ----
@@ -454,6 +458,11 @@ class RunJournal(AsyncCallbackHandler):
             if isinstance(tag, str) and tag.startswith(MIDDLEWARE_TAG_PREFIX):
                 return tag
         return LEAD_CALLER
+
+    def _tool_name_for(self, message: ToolMessage) -> str | None:
+        """工具名：消息自己带的优先，否则用 on_tool_start 记下的映射。"""
+        tool_call_id = str(getattr(message, "tool_call_id", "") or "")
+        return getattr(message, "name", None) or self._tool_names.get(tool_call_id)
 
     def _mark_message(self, message: BaseMessage) -> bool:
         """True 表示这条消息还是第一次见到，可以写。"""
