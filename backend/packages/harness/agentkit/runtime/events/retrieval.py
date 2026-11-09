@@ -11,9 +11,15 @@ The normalizer is deliberately naive about *why* a payload looks wrong.  A tool
 result is untrusted input: malformed JSON, an error payload, a partially
 streamed message, an unknown tool name - all of them return ``None`` instead of
 raising, because a retrieval event is evidence, never a reason to fail a turn.
-Per-entry validation follows the same rule: a card or chunk without its
-identity key (call_name / skill_id / chunk_id+document_id) is dropped rather
-than salvaging a half-row.
+A reply that says retrieval did not run (``tool_search``'s unavailable index or
+``catalog_unavailable`` warning, ``search_skills``'s message-only unavailable or
+blank-query reply) also returns ``None``: "could not retrieve" must never be
+recorded as "retrieved nothing".  A successful tool/skill answer therefore has
+to carry a ``retrieval`` mapping, and a KB answer has to carry its query plus
+chunks with non-empty content.  Per-entry validation drops a card or chunk
+without its identity key or content rather than salvaging a half-row, and a
+non-empty results list that yields no usable row is malformed, not an empty
+success.
 
 Only JSON-safe, final model-visible fields cross this boundary.  Tool schemas,
 descriptions of tools, headers, and credentials never appear in the payload -
@@ -40,6 +46,12 @@ from agentkit.utils.messages import message_content_to_text
 TOOL_SEARCH_TOOL_NAME = "tool_search"
 SEARCH_SKILLS_TOOL_NAME = "search_skills"
 KNOWLEDGE_SEARCH_TOOL_NAME = "knowledge_search"
+
+#: ``tool_search`` reports "retrieval did not run" with this index kind or this
+#: warning; both are failure reports, not empty answers.  Mirrors
+#: ``agentkit.tools.search.service`` without importing the tool package here.
+UNAVAILABLE_RETRIEVAL_INDEX = "unavailable"
+CATALOG_UNAVAILABLE_WARNING = "catalog_unavailable"
 
 #: The one place that says which tool result becomes which event type.
 RETRIEVAL_TOOL_EVENTS: dict[str, RunEventDefinition] = {
@@ -96,7 +108,9 @@ def _tool_content(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     raw = payload.get("tools")
     if not isinstance(raw, list):
         return None
-    retrieval = _mapping(payload.get("retrieval"))
+    retrieval = _retrieval_marker(payload)
+    if retrieval is None or _retrieval_unavailable(retrieval):
+        return None
     return {
         "tools": [card for card in map(_tool_card, raw) if card is not None],
         "channels": _strings(retrieval.get("channels")),
@@ -126,7 +140,11 @@ def _skill_content(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     raw = payload.get("skills")
     if not isinstance(raw, list):
         return None
-    retrieval = _mapping(payload.get("retrieval"))
+    # Disabled, unavailable and blank-query replies are message-only: no
+    # retrieval mapping, so they are not a successful empty search.
+    retrieval = _retrieval_marker(payload)
+    if retrieval is None:
+        return None
     return {
         "skills": [skill for skill in map(_skill, raw) if skill is not None],
         "channels": _strings(retrieval.get("channels")),
@@ -141,11 +159,12 @@ def _skill(item: object) -> dict[str, Any] | None:
     skill_id = _text(item.get("skill_id"))
     if not skill_id:
         return None
-    return {
-        "skill_id": skill_id,
-        "name": _text(item.get("name")),
-        "score": _score(item.get("score")),
-    }
+    skill: dict[str, Any] = {"skill_id": skill_id, "name": _text(item.get("name"))}
+    score = _optional_score(item.get("score"))
+    if score is not None:
+        # search_skills does not rank its hits today; never invent a score.
+        skill["score"] = score
+    return skill
 
 
 def _kb_content(payload: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -154,12 +173,20 @@ def _kb_content(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     raw = payload.get("results")
     if not isinstance(raw, list):
         return None
+    query = _text(payload.get("query"))
+    if not query:
+        return None
+    items = [item for item in map(_kb_item, raw) if item is not None]
+    if raw and not items:
+        # The tool claimed results but none of them is usable: that is a
+        # malformed payload, not a successful empty retrieval.
+        return None
     return {
-        "query": _text(payload.get("query")),
+        "query": query,
         "keyword_query": _optional_text(payload.get("keyword_query")),
         "retrieval_mode": _text(payload.get("retrieval_mode")),
         "reranked": payload.get("reranked") is True,
-        "items": [item for item in map(_kb_item, raw) if item is not None],
+        "items": items,
         "truncated": _truncated(payload, None),
     }
 
@@ -173,6 +200,9 @@ def _kb_item(item: object) -> dict[str, Any] | None:
     chunk_id = _text(item.get("chunk_id"))
     if not document_id or not chunk_id:
         return None
+    content = _raw_text(item.get("content"))
+    if not content.strip():
+        return None
     return {
         "document_id": document_id,
         "chunk_id": chunk_id,
@@ -182,7 +212,7 @@ def _kb_item(item: object) -> dict[str, Any] | None:
         "page": _non_negative_int(item.get("page")),
         "score": _score(item.get("score")),
         "rerank_score": _optional_score(item.get("rerank_score")),
-        "content": _raw_text(item.get("content")),
+        "content": content,
     }
 
 
@@ -193,8 +223,19 @@ _NORMALIZERS = {
 }
 
 
-def _mapping(value: object) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
+def _retrieval_marker(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """A successful skill/tool answer always says how the search ran."""
+
+    retrieval = payload.get("retrieval")
+    return retrieval if isinstance(retrieval, Mapping) else None
+
+
+def _retrieval_unavailable(retrieval: Mapping[str, Any]) -> bool:
+    """tool_search's two machine-readable "did not retrieve" markers."""
+
+    if retrieval.get("index") == UNAVAILABLE_RETRIEVAL_INDEX:
+        return True
+    return CATALOG_UNAVAILABLE_WARNING in _strings(retrieval.get("warnings"))
 
 
 def _text(value: object) -> str:
@@ -248,10 +289,12 @@ def _truncated(payload: Mapping[str, Any], retrieval: Mapping[str, Any] | None) 
 
 
 __all__ = [
+    "CATALOG_UNAVAILABLE_WARNING",
     "KNOWLEDGE_SEARCH_TOOL_NAME",
     "RETRIEVAL_TOOL_EVENTS",
     "RetrievalEvent",
     "SEARCH_SKILLS_TOOL_NAME",
     "TOOL_SEARCH_TOOL_NAME",
+    "UNAVAILABLE_RETRIEVAL_INDEX",
     "retrieval_event_for_tool",
 ]
