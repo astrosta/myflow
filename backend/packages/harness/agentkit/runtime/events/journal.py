@@ -10,6 +10,7 @@ by the methods below. Do not re-derive that mapping anywhere else.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -24,13 +25,18 @@ from agentkit.runtime.events.catalog import (
     LLM_ERROR_EVENT,
     LLM_HUMAN_INPUT,
     LLM_TOOL_RESULT,
+    RETRIEVAL_TOOL_EVENT,
     RUN_END_EVENT,
     RUN_ERROR_EVENT,
     RUN_START_EVENT,
     RunEventDefinition,
 )
+from agentkit.runtime.events.retrieval import (
+    TOOL_SEARCH_TOOL_NAME,
+    retrieval_event_for_tool,
+)
 from agentkit.persistence.events.base import RunEventStore
-from agentkit.persistence.events.codec import limit_trace
+from agentkit.persistence.events.codec import dumps, limit_trace
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,8 @@ class RunJournal(AsyncCallbackHandler):
         self._pending_llm: _PendingLLM | None = None
         # 消息身份去重：同一条消息会在不同回调里被重复交出（回放、对账）
         self._message_identities: set[str] = set()
+        # 检索证据的去重身份：on_tool_end 的回放与 _reconcile_messages 会交出同一次工具调用
+        self._retrieval_identities: set[str] = set()
         self._tool_names: dict[str, str] = {}
         self._llm_started: dict[str, float] = {}
         self._llm_index: dict[str, int] = {}
@@ -271,6 +279,7 @@ class RunJournal(AsyncCallbackHandler):
                 "status": getattr(output, "status", None),
             },
         )
+        await self._emit_retrieval(output)
 
     async def on_tool_error(
         self,
@@ -405,10 +414,36 @@ class RunJournal(AsyncCallbackHandler):
                 continue
             if isinstance(message, ToolMessage):
                 await self._put(LLM_TOOL_RESULT, content=message.model_dump())
+                await self._emit_retrieval(message)
             elif isinstance(message, HumanMessage):
                 await self._put(LLM_HUMAN_INPUT, content=message.model_dump())
             elif isinstance(message, AIMessage):
                 await self._put(LLM_AI_RESPONSE, content=message.model_dump())
+
+    async def _emit_retrieval(self, message: ToolMessage) -> None:
+        """tool_search 的结果在 llm.tool.result 之后再补一行 retrieval.tool。
+
+        只写 tool_search：另两个检索工具（skill / kb）目前不由父循环产出。
+        归一化器返回 None（坏 JSON、检索不可用）时什么都不写——证据只能来自真正
+        发生过的检索，"没检索"不能被记成"检索到 0 条"。
+
+        去重按 tool_call_id（没有 ID 时按内容摘要）：同一次工具调用会在 on_tool_end
+        的回放和对账里被交出多份，派生证据只该有一行。
+        """
+        if getattr(message, "name", None) != TOOL_SEARCH_TOOL_NAME:
+            return
+        identity = _retrieval_identity(message)
+        if identity in self._retrieval_identities:
+            return
+        event = retrieval_event_for_tool(tool_name=TOOL_SEARCH_TOOL_NAME, content=message.content)
+        if event is None:
+            return
+        self._retrieval_identities.add(identity)
+        await self._put(
+            RETRIEVAL_TOOL_EVENT,
+            content=event.content,
+            metadata={"tool_name": TOOL_SEARCH_TOOL_NAME},
+        )
 
     # ---- 归因与去重 ----
 
@@ -465,6 +500,14 @@ def _message_identity(message: BaseMessage) -> str | None:
     if message_id:
         return f"message:{message_id}"
     return None
+
+
+def _retrieval_identity(message: ToolMessage) -> str:
+    """检索证据的身份：优先 tool_call_id，没有 ID 时退回内容摘要。"""
+    tool_call_id = getattr(message, "tool_call_id", None)
+    if isinstance(tool_call_id, str) and tool_call_id:
+        return f"tool:{tool_call_id}"
+    return "content:" + hashlib.sha256(dumps(message.content).encode("utf-8")).hexdigest()
 
 
 def _flatten_messages(messages: Any) -> list[BaseMessage]:
