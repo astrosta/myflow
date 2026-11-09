@@ -3,7 +3,8 @@
 The agent prompt builder is synchronous, so it cannot await Redis.  This service
 keeps a process-local top-K cache hydrated from Redis at startup, after each
 load, and by a periodic refresh.  The cache is only a read model; PostgreSQL is
-the durable count and Redis is the ranking source.
+the durable count and Redis is the ranking source.  ``top_k=0`` (prompt_top_k)
+still records loads but skips ranking-cache hydration.
 """
 
 from __future__ import annotations
@@ -36,8 +37,9 @@ class SkillUsageService:
     ) -> None:
         if not key_prefix.strip():
             raise ValueError("key_prefix must not be blank")
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
+        # 0 = prompt 不需要 top-K（skills.usage.prompt_top_k=0），但仍记录使用次数。
+        if top_k < 0:
+            raise ValueError("top_k must not be negative")
         if refresh_seconds < 0:
             raise ValueError("refresh_seconds must not be negative")
         self._store = store
@@ -76,7 +78,8 @@ class SkillUsageService:
             self._seed_task = asyncio.create_task(
                 self.seed_from_database(), name="skill-usage-seed"
             )
-        if self._refresh_seconds > 0 and (
+        # top_k=0 时没有 prompt 排序可读，不必周期刷缓存。
+        if self._top_k > 0 and self._refresh_seconds > 0 and (
             self._refresh_task is None or self._refresh_task.done()
         ):
             self._refresh_task = asyncio.create_task(
@@ -153,6 +156,10 @@ class SkillUsageService:
         await self._warm(user_id)
 
     async def _warm(self, user_id: str) -> None:
+        if self._top_k <= 0:
+            # Redis zrevrange end=-1 会返回全集；prompt_top_k=0 时直接记空缓存。
+            self._remember(user_id, ())
+            return
         rows = await self._redis.zrevrange(
             self.key(user_id), 0, self._top_k - 1, withscores=True
         )

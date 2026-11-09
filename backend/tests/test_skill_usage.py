@@ -173,9 +173,26 @@ def test_the_service_validates_its_configuration() -> None:
     with pytest.raises(ValueError):
         SkillUsageService(FakeStore(), BrokenRedis(), key_prefix="  ")
     with pytest.raises(ValueError):
-        SkillUsageService(FakeStore(), BrokenRedis(), top_k=0)
+        SkillUsageService(FakeStore(), BrokenRedis(), top_k=-1)
     with pytest.raises(ValueError):
         SkillUsageService(FakeStore(), BrokenRedis(), refresh_seconds=-1)
+
+
+@pytest.mark.asyncio
+async def test_top_k_zero_still_records_loads_but_skips_ranking_cache() -> None:
+    """prompt_top_k=0：私有技能不进提示词，但使用次数仍要写入 Redis/PG。"""
+    redis = FakeRedis()
+    store = FakeStore(rows=[("u1", "skill-a", 3)])
+    service = SkillUsageService(store, redis, top_k=0)
+
+    await service.seed_from_database()
+    await service.record_load("u1", "skill-b")
+
+    assert await redis.zscore(service.key("u1"), "skill-a") == 3
+    assert await redis.zscore(service.key("u1"), "skill-b") == 1
+    assert store.incremented == ["skill-b"]
+    # 0 表示不需要 prompt 排序：缓存热成空元组，绝不能 zrevrange(0, -1) 拉全量。
+    assert service.top_ids("u1") == ()
 
 
 def test_the_default_key_prefix_is_the_documented_one() -> None:
