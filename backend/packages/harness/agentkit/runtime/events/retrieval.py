@@ -15,12 +15,12 @@ A reply that says retrieval did not run (``tool_search``'s unavailable index or
 ``catalog_unavailable`` warning, ``search_skills``'s message-only unavailable or
 blank-query reply) also returns ``None``: "could not retrieve" must never be
 recorded as "retrieved nothing".  A successful tool/skill answer therefore has
-to carry a ``retrieval`` mapping, a skill answer has to name at least one
-recall channel that actually answered, and a KB answer has to carry its query
-plus chunks with non-empty content.  Per-entry validation drops a card or chunk
-without its identity key or content rather than salvaging a half-row, and a
-non-empty results list that yields no usable row is malformed, not an empty
-success.
+to carry a ``retrieval`` mapping; a skill answer must not look like a service
+failure (see :func:`_skill_search_unavailable`); and a KB answer has to carry
+its query plus chunks with non-empty content.  Per-entry validation drops a
+card or chunk without its identity key or content rather than salvaging a
+half-row, and a non-empty results list that yields no usable row is malformed,
+not an empty success.
 
 Only JSON-safe, final model-visible fields cross this boundary.  Tool schemas,
 descriptions of tools, headers, and credentials never appear in the payload -
@@ -53,6 +53,20 @@ KNOWLEDGE_SEARCH_TOOL_NAME = "knowledge_search"
 #: ``agentkit.tools.search.service`` without importing the tool package here.
 UNAVAILABLE_RETRIEVAL_INDEX = "unavailable"
 CATALOG_UNAVAILABLE_WARNING = "catalog_unavailable"
+
+#: ``search_skills`` reports a service failure with one of these warnings and no
+#: recall channel.  Mirrors ``agentkit.skills.search`` without importing the
+#: skill runtime here.
+RETRIEVAL_UNAVAILABLE_WARNING = "retrieval_unavailable"
+VECTOR_UNAVAILABLE_WARNING = "vector_unavailable"
+KEYWORD_UNAVAILABLE_WARNING = "keyword_unavailable"
+SKILL_SEARCH_FAILURE_WARNINGS = frozenset(
+    {
+        RETRIEVAL_UNAVAILABLE_WARNING,
+        VECTOR_UNAVAILABLE_WARNING,
+        KEYWORD_UNAVAILABLE_WARNING,
+    }
+)
 
 #: The one place that says which tool result becomes which event type.
 RETRIEVAL_TOOL_EVENTS: dict[str, RunEventDefinition] = {
@@ -240,17 +254,24 @@ def _retrieval_unavailable(retrieval: Mapping[str, Any]) -> bool:
 
 
 def _skill_search_unavailable(retrieval: Mapping[str, Any]) -> bool:
-    """A real skill search names the recall channel(s) that answered.
+    """Tell a service failure apart from a genuine zero-hit search.
 
-    ``SkillSearchService`` returns empty channels for every service failure
-    (no projection: ``retrieval_unavailable``; Milvus search failed:
-    ``vector_unavailable``/``keyword_unavailable``).  An empty channel list is
-    therefore a failure report, not "searched and found nothing", even when a
-    warning is missing.  A degraded search still names its surviving channel,
-    so it stays a real event.
+    An empty channel list alone is *not* a failure: ``SkillSearchService.search``
+    returns as soon as nothing ranked, before it propagates ``channels``, so a
+    successful search that found nothing also serializes ``channels: []``.
+    The warning is what separates the two: every service failure (no
+    projection: ``retrieval_unavailable``; Milvus search failed:
+    ``vector_unavailable``/``keyword_unavailable``) is reported with one of
+    ``SKILL_SEARCH_FAILURE_WARNINGS``.  An empty-channel answer is therefore
+    rejected only when it carries a failure marker; empty channels with no
+    marker are "searched and found nothing" and stay observable.  A search that
+    named a channel is a real search even when it degraded, so it is never
+    rejected here.
     """
 
-    return not _strings(retrieval.get("channels"))
+    if _strings(retrieval.get("channels")):
+        return False
+    return bool(SKILL_SEARCH_FAILURE_WARNINGS.intersection(_strings(retrieval.get("warnings"))))
 
 
 def _text(value: object) -> str:
@@ -305,11 +326,15 @@ def _truncated(payload: Mapping[str, Any], retrieval: Mapping[str, Any] | None) 
 
 __all__ = [
     "CATALOG_UNAVAILABLE_WARNING",
+    "KEYWORD_UNAVAILABLE_WARNING",
     "KNOWLEDGE_SEARCH_TOOL_NAME",
     "RETRIEVAL_TOOL_EVENTS",
+    "RETRIEVAL_UNAVAILABLE_WARNING",
     "RetrievalEvent",
     "SEARCH_SKILLS_TOOL_NAME",
+    "SKILL_SEARCH_FAILURE_WARNINGS",
     "TOOL_SEARCH_TOOL_NAME",
     "UNAVAILABLE_RETRIEVAL_INDEX",
+    "VECTOR_UNAVAILABLE_WARNING",
     "retrieval_event_for_tool",
 ]

@@ -243,12 +243,66 @@ def test_real_search_skills_failure_payloads_return_none(payload: dict[str, Any]
     assert _normalize("search_skills", payload) is None
 
 
+_SKILL_EMPTY_RESULT_MESSAGE = [
+    "没有检索到匹配的技能（当前部署可能一个技能都没启用，或技能树为空）。",
+    "不要用本工具重复尝试相似的说法；需要正文时让 lead 用 load_skill(name, id)。",
+]
+
+
+def test_real_search_skills_zero_hit_success_is_an_event() -> None:
+    """A successful search that ranked nothing is evidence, not a failure.
+
+    `SkillSearchService.search` returns early once `ranked` is empty, before it
+    propagates `channels`, so the genuine zero-hit success serializes an empty
+    channel list *and* an empty warning list.  That is "searched, found
+    nothing" and must stay observable.
+    """
+
+    payload = {
+        "skills": [],
+        "retrieval": {
+            "channels": [],
+            "candidates": 0,
+            "reranked": False,
+            "warnings": [],
+        },
+        "message": _SKILL_EMPTY_RESULT_MESSAGE,
+    }
+    event = _normalize("search_skills", payload)
+    assert event is not None
+    assert event.content["skills"] == []
+    assert event.content["channels"] == []
+    assert event.content["warnings"] == []
+    assert event.content["truncated"] is False
+
+
+def test_zero_hit_search_with_only_non_failure_warnings_is_an_event() -> None:
+    """Only the three service-failure markers reject an empty-channel answer."""
+
+    payload = {
+        "skills": [],
+        "retrieval": {
+            "channels": [],
+            "candidates": 0,
+            "reranked": False,
+            "warnings": ["rerank_unavailable"],
+        },
+        "message": _SKILL_EMPTY_RESULT_MESSAGE,
+    }
+    event = _normalize("search_skills", payload)
+    assert event is not None
+    assert event.content["skills"] == []
+    assert event.content["warnings"] == ["rerank_unavailable"]
+
+
 @pytest.mark.parametrize(
     "warnings",
     [
         ["retrieval_unavailable"],  # SkillSearchService has no projection
         ["vector_unavailable"],  # Milvus search failed; no channel answered
         ["keyword_unavailable"],
+        ["retrieval_unavailable", "vector_unavailable"],  # a marker among others
+        ["rerank_unavailable", "vector_unavailable"],
     ],
 )
 def test_real_search_skills_service_failures_return_none(
@@ -264,15 +318,14 @@ def test_real_search_skills_service_failures_return_none(
             "reranked": False,
             "warnings": warnings,
         },
-        "message": [
-            "没有检索到匹配的技能（当前部署可能一个技能都没启用，或技能树为空）。",
-            "不要用本工具重复尝试相似的说法；需要正文时让 lead 用 load_skill(name, id)。",
-        ],
+        "message": _SKILL_EMPTY_RESULT_MESSAGE,
     }
     assert _normalize("search_skills", payload) is None
 
 
-def test_real_search_skills_empty_answer_is_an_event() -> None:
+def test_real_search_skills_empty_answer_with_channels_is_an_event() -> None:
+    """The other zero-hit shape: the search ran and named its channels."""
+
     payload = {
         "skills": [],
         "retrieval": {
@@ -281,10 +334,7 @@ def test_real_search_skills_empty_answer_is_an_event() -> None:
             "reranked": False,
             "warnings": [],
         },
-        "message": [
-            "没有检索到匹配的技能（当前部署可能一个技能都没启用，或技能树为空）。",
-            "不要用本工具重复尝试相似的说法；需要正文时让 lead 用 load_skill(name, id)。",
-        ],
+        "message": _SKILL_EMPTY_RESULT_MESSAGE,
     }
     event = _normalize("search_skills", payload)
     assert event is not None
@@ -601,6 +651,19 @@ def test_retrieval_definitions_live_in_the_catalog() -> None:
     assert "retrieval" in RUN_EVENT_CATEGORIES
     assert {RETRIEVAL_TOOL_EVENT.category, RETRIEVAL_SKILL_EVENT.category} == {"retrieval"}
     assert RETRIEVAL_KB_EVENT.category == "retrieval"
+
+
+def test_skill_failure_markers_match_the_skill_search_producer() -> None:
+    from agentkit.runtime.events.retrieval import SKILL_SEARCH_FAILURE_WARNINGS
+    from agentkit.skills.search import (
+        KEYWORD_UNAVAILABLE,
+        RETRIEVAL_UNAVAILABLE,
+        VECTOR_UNAVAILABLE,
+    )
+
+    assert SKILL_SEARCH_FAILURE_WARNINGS == frozenset(
+        {RETRIEVAL_UNAVAILABLE, VECTOR_UNAVAILABLE, KEYWORD_UNAVAILABLE}
+    )
 
 
 def test_unavailable_markers_match_the_tool_search_producer() -> None:
