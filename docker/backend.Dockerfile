@@ -6,7 +6,6 @@
 # 改配置不用重新构建。文件名是 config.yaml，不是 config.yml。
 #
 # 依赖层与源码层分开：改 backend/*.py 不应迫使 openai / pydantic-core 等重新下载。
-# BuildKit cache mount 让即使 lock 变了，重叠的 wheel 也能从 /root/.cache/uv 复用。
 
 FROM python:3.12-slim-bookworm
 
@@ -35,12 +34,10 @@ COPY pyproject.toml uv.lock README.md ./
 COPY backend/pyproject.toml backend/pyproject.toml
 COPY backend/packages/harness/pyproject.toml backend/packages/harness/pyproject.toml
 
-# 根项目没有 extras。网关可选依赖在 backend / agentkit 上。
+# 根项目没有 extras。网关可选依赖都挂在 backend 上（含 openviking → agentkit[openviking]）。
 # --no-install-workspace：只装第三方依赖，不装本地包，这一层可被 Docker 缓存。
-# --inexact 让第二次 sync 只补 OpenViking，不卸掉第一次装上的包。
 # MCP SDK / cryptography / jsonschema 是 agentkit 的核心依赖，不用 extra。
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-workspace --package backend \
+RUN uv sync --frozen --no-dev --no-install-workspace --package backend \
         --extra postgres \
         --extra redis \
         --extra knowledge \
@@ -48,15 +45,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --extra tool_search \
         --extra observability \
         --extra opensandbox \
-    && uv sync --frozen --no-dev --inexact --no-install-workspace --package agentkit \
         --extra openviking
 
 COPY backend backend
 COPY skills skills
 
-# 源码进镜像后再装本地 workspace 包；第三方 wheel 走上面的 cache mount。
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --package backend \
+# 源码进镜像后再装本地 workspace 包；第三方依赖层在上面，通常可命中 Docker 层缓存。
+RUN uv sync --frozen --no-dev --package backend \
         --extra postgres \
         --extra redis \
         --extra knowledge \
@@ -64,7 +59,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --extra tool_search \
         --extra observability \
         --extra opensandbox \
-    && uv sync --frozen --no-dev --inexact --package agentkit \
         --extra openviking \
     && uv pip install --python /app/.venv/bin/python "uvicorn[standard]>=0.32"
 

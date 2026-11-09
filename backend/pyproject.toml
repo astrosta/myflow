@@ -44,6 +44,10 @@ e2b = [
 opensandbox = [
     "agentkit[opensandbox,redis]",
 ]
+# OpenViking 记忆适配器的 HTTP SDK（server 另外部署）。
+openviking = [
+    "agentkit[openviking]",
+]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",

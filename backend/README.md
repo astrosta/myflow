@@ -249,7 +249,8 @@ models:
 ### 持久记忆（M10 / OpenViking）
 
 `memory.openviking.enabled: true` 是长期记忆的唯一开关：自动抽取的偏好/实体/事件等八类记忆
-存 OpenViking，MyFlow 只保留运行所需元数据表。用户画像（profile）是数据库里的身份资料
+存 OpenViking，MyFlow 只保留运行所需元数据表。启用前先装依赖：
+`cd backend && uv sync --extra openviking`（= `agentkit[openviking]`）。用户画像（profile）是数据库里的身份资料
 （`memory_profile_documents`），**不随这个开关关闭**：
 
 | 面 | 说明 |

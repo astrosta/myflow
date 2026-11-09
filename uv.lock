@@ -417,6 +417,9 @@ observability = [
 opensandbox = [
     { name = "agentkit", extra = ["opensandbox", "redis"] },
 ]
+openviking = [
+    { name = "agentkit", extra = ["openviking"] },
+]
 postgres = [
     { name = "agentkit", extra = ["postgres"] },
 ]
@@ -444,6 +447,7 @@ requires-dist = [
     { name = "agentkit", extras = ["knowledge"], marker = "extra == 'knowledge'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["observability"], marker = "extra == 'observability'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["opensandbox", "redis"], marker = "extra == 'opensandbox'", editable = "backend/packages/harness" },
+    { name = "agentkit", extras = ["openviking"], marker = "extra == 'openviking'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["postgres"], marker = "extra == 'postgres'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["redis"], marker = "extra == 'redis'", editable = "backend/packages/harness" },
     { name = "agentkit", extras = ["skills"], marker = "extra == 'skills'", editable = "backend/packages/harness" },
@@ -453,7 +457,7 @@ requires-dist = [
     { name = "pyjwt", specifier = ">=2.8" },
     { name = "python-multipart", specifier = ">=0.0.20" },
 ]
-provides-extras = ["postgres", "knowledge", "tool-search", "observability", "skills", "redis", "e2b", "opensandbox"]
+provides-extras = ["postgres", "knowledge", "tool-search", "observability", "skills", "redis", "e2b", "opensandbox", "openviking"]
 
 [package.metadata.requires-dev]
 dev = [
