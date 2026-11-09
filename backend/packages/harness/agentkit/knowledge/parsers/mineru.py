@@ -66,6 +66,45 @@ def _mime(filename: str) -> str:
     return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
+def _is_pdf(filename: str) -> bool:
+    return Path(filename).suffix.lower() == ".pdf"
+
+
+def _pdf_page_count(path: Path) -> int | None:
+    """Return page count for a PDF, or None when pypdf cannot read it."""
+
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return None
+    try:
+        return len(PdfReader(str(path)).pages)
+    except Exception:  # noqa: BLE001 - encrypted/corrupt PDFs fall through to cloud
+        return None
+
+
+def _split_pdf_bytes(path: Path, *, max_pages: int) -> list[bytes]:
+    """Split a PDF into contiguous page windows of at most ``max_pages`` each."""
+
+    from pypdf import PdfReader, PdfWriter
+
+    if max_pages <= 0:
+        raise ValueError("max_pages must be positive")
+    reader = PdfReader(str(path))
+    total = len(reader.pages)
+    if total <= max_pages:
+        return [path.read_bytes()]
+    parts: list[bytes] = []
+    for start in range(0, total, max_pages):
+        writer = PdfWriter()
+        for page in reader.pages[start : start + max_pages]:
+            writer.add_page(page)
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        parts.append(buffer.getvalue())
+    return parts
+
+
 def _extract_markdown_from_json(payload: Any) -> str | None:
     if isinstance(payload, str):
         return payload if payload.strip() else None
@@ -229,6 +268,41 @@ class MineruCloudParser:
         return self._config.base_url.rstrip("/") + "/" + rendered.lstrip("/")
 
     async def parse(self, path: Path, *, filename: str) -> ParsedDocument:
+        max_pages = int(self._config.max_pages_per_file)
+        if max_pages > 0 and _is_pdf(filename):
+            page_count = await asyncio.to_thread(_pdf_page_count, path)
+            if page_count is not None and page_count > max_pages:
+                parts = await asyncio.to_thread(_split_pdf_bytes, path, max_pages=max_pages)
+                logger.info(
+                    "MinerU cloud: splitting %s (%s pages) into %s parts of <=%s pages",
+                    filename,
+                    page_count,
+                    len(parts),
+                    max_pages,
+                )
+                stem = Path(filename).stem
+                suffix = Path(filename).suffix or ".pdf"
+                markdowns: list[str] = []
+                for index, blob in enumerate(parts, start=1):
+                    part_name = f"{stem}_p{index}{suffix}"
+                    parsed = await self._parse_bytes(blob, filename=part_name)
+                    if parsed.markdown.strip():
+                        markdowns.append(parsed.markdown.strip())
+                if not markdowns:
+                    raise KnowledgeUnavailable("MinerU cloud returned no markdown output")
+                return ParsedDocument(
+                    markdown="\n\n".join(markdowns),
+                    metadata={
+                        "parser": "mineru",
+                        "mode": "cloud",
+                        "split_parts": len(parts),
+                        "page_count": page_count,
+                        "max_pages_per_file": max_pages,
+                    },
+                )
+        return await self._parse_bytes(await asyncio.to_thread(path.read_bytes), filename=filename)
+
+    async def _parse_bytes(self, content: bytes, *, filename: str) -> ParsedDocument:
         http = self._http()
         headers = _auth(self._config.api_key)
         payload = {
@@ -250,9 +324,7 @@ class MineruCloudParser:
             if not file_urls:
                 raise KnowledgeUnavailable("MinerU cloud returned no upload URL")
             upload_url = str(file_urls[0])
-            uploaded = await http.put(
-                upload_url, content=await asyncio.to_thread(path.read_bytes)
-            )
+            uploaded = await http.put(upload_url, content=content)
             if uploaded.status_code >= 400:
                 raise KnowledgeUnavailable(f"MinerU cloud upload failed (HTTP {uploaded.status_code})")
             result = await self._poll(batch_id, headers)
@@ -284,9 +356,15 @@ class MineruCloudParser:
                 if state in {"done", "success", "completed"}:
                     return row
                 if state in {"failed", "error"}:
-                    raise KnowledgeUnavailable(
-                        _with_provider_detail("MinerU cloud parsing failed", row)
-                    )
+                    detail = _with_provider_detail("MinerU cloud parsing failed", row)
+                    lowered = detail.lower()
+                    if "pages exceeds limit" in lowered or "200 pages" in lowered:
+                        detail += (
+                            "; PDF uploads are auto-split locally — convert oversized "
+                            "Office files to PDF under the page limit, or lower "
+                            "parse.cloud.max_pages_per_file"
+                        )
+                    raise KnowledgeUnavailable(detail)
             await asyncio.sleep(self._config.poll_interval_seconds)
         raise KnowledgeUnavailable("MinerU cloud parsing timed out")
 

@@ -35,6 +35,7 @@ postgres = [
 ]
 knowledge = [
     "pymilvus>=2.5",
+    "pypdf>=7.0.0",
 ]
 # tool_search 的检索通道：MCP 工具目录的 Milvus collection（pymilvus 只在这里
 # 懒加载，没装也不影响启动；开关打开时才需要）。MCP SDK、jsonschema、

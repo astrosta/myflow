@@ -165,6 +165,9 @@ class CloudMinerUConfig(BaseModel):
     poll_interval_seconds: float = Field(default=2.0, gt=0, le=60)
     timeout_seconds: float = Field(default=900.0, gt=0)
     max_download_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
+    # mineru.net rejects files over ~200 pages; PDFs above this are split locally.
+    # 0 disables splitting (cloud will fail on oversized PDFs).
+    max_pages_per_file: int = Field(default=200, ge=0, le=2000)
 
     @field_validator("file_urls_path", "extract_results_path")
     @classmethod

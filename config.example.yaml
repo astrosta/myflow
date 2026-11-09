@@ -647,6 +647,8 @@ knowledge_base:
       poll_interval_seconds: 2
       timeout_seconds: 900
       max_download_bytes: 536870912
+      # mineru.net 单文件约 200 页上限；超过时本地拆 PDF 再合并 markdown。0 = 不拆。
+      max_pages_per_file: 200
     max_download_bytes: 536870912
 
   chunking:

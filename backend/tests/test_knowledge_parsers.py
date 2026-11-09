@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from agentkit.knowledge.config import CloudMinerUConfig, LocalMinerUConfig
 from agentkit.knowledge.errors import KnowledgeUnavailable
 from agentkit.knowledge.parsers.mineru import MineruCloudParser, MineruLocalParser
 from agentkit.knowledge.parsers.text import LocalTextParser
+from pypdf import PdfReader, PdfWriter
 
 
 def _zip(files: dict[str, bytes]) -> bytes:
@@ -20,6 +22,14 @@ def _zip(files: dict[str, bytes]) -> bytes:
         for name, payload in files.items():
             archive.writestr(name, payload)
     return buffer.getvalue()
+
+
+def _pdf_with_pages(path: Path, pages: int) -> None:
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=200, height=200)
+    with path.open("wb") as handle:
+        writer.write(handle)
 
 
 @pytest.mark.asyncio
@@ -227,6 +237,75 @@ async def test_cloud_mineru_api_error_includes_provider_message(tmp_path) -> Non
     assert "code A0202" in str(excinfo.value)
     await parser.aclose()
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cloud_mineru_splits_pdfs_over_page_limit(tmp_path) -> None:
+    """mineru.net rejects >200 pages; we split locally and merge markdown."""
+    path = tmp_path / "long.pdf"
+    _pdf_with_pages(path, pages=5)
+    uploads: list[bytes] = []
+    batch = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v4/file-urls/batch":
+            batch["n"] += 1
+            bid = f"b{batch['n']}"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "batch_id": bid,
+                        "file_urls": [f"http://upload.local/{bid}"],
+                    },
+                },
+            )
+        if request.url.host == "upload.local":
+            uploads.append(request.content)
+            return httpx.Response(200)
+        if request.url.path.startswith("/api/v4/extract-results/batch/"):
+            bid = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "extract_result": [
+                            {
+                                "state": "done",
+                                "full_zip_url": f"http://download.local/{bid}.zip",
+                            }
+                        ]
+                    },
+                },
+            )
+        if request.url.host == "download.local":
+            name = request.url.path.strip("/").removesuffix(".zip")
+            return httpx.Response(
+                200,
+                content=_zip({"full.md": f"# part {name}\n\nbody {name}".encode()}),
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    parser = MineruCloudParser(
+        CloudMinerUConfig(
+            base_url="http://cloud.test",
+            api_key="ok",
+            poll_interval_seconds=0.001,
+            max_pages_per_file=2,
+        ),
+        client=client,
+    )
+    parsed = await parser.parse(path, filename="long.pdf")
+    await parser.aclose()
+    await client.aclose()
+
+    assert len(uploads) == 3
+    assert [len(PdfReader(io.BytesIO(blob)).pages) for blob in uploads] == [2, 2, 1]
+    assert "part b1" in parsed.markdown and "part b3" in parsed.markdown
+    assert parsed.metadata.get("split_parts") == 3
 
 
 @pytest.mark.asyncio
