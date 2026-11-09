@@ -730,6 +730,44 @@ def test_run_fails_on_a_citation_violation() -> None:
     assert "citation violation" in result.render()
 
 
+def test_run_fails_on_a_forbidden_call_and_names_the_item() -> None:
+    declared = {
+        "forbidden_tools": ["search_projects"],
+        "expect_kb": False,
+    }
+    items = [_item(f"item-{index}", expected_output=declared) for index in range(1, 4)]
+    gateway = FakeGateway(tools_by_item={"item-1": ["search_projects"]})
+    dataset = FakeDataset(items)
+    runner = _runner(gateway, dataset)
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    assert result.forbidden_violations == ("item-1",)
+    assert result.passed is False
+    assert "forbidden violation: item-1" in result.render()
+    by_metric = {gate.metric: gate for gate in result.gates}
+    forbidden = by_metric["forbidden_violation"]
+    assert (forbidden.samples, forbidden.threshold, forbidden.comparison) == (3, 0.0, "max")
+    assert forbidden.status == "fail"
+
+
+def test_run_reports_forbidden_violation_as_insufficient_when_undeclared() -> None:
+    dataset = FakeDataset(
+        [
+            _item("item-1", expected_output={"expect_kb": False}),
+            _item("item-2", expected_output={"expect_kb": False}),
+        ]
+    )
+    runner = _runner(FakeGateway(), dataset)
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    by_metric = {gate.metric: gate for gate in result.gates}
+    assert (by_metric["forbidden_violation"].samples,
+            by_metric["forbidden_violation"].status) == (0, "insufficient")
+    assert result.forbidden_violations == ()
+    assert result.passed is True
+
 def test_evaluate_gates_gates_rule_metrics_hard() -> None:
     gates = evaluate_gates({"tool_hit": [1.0, 0.0]}, mode="ci")
 

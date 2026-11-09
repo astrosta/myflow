@@ -908,11 +908,16 @@ def test_thresholds_carry_the_design_gates(
 
 
 def test_thresholds_gate_only_rule_metrics() -> None:
-    assert len(THRESHOLDS) == 10
+    assert len(THRESHOLDS) == 11
     assert set(THRESHOLDS) <= set(RULE_EVALUATORS)
-    for name in ("retrieval_mrr", "skill_mrr", "kb_mrr", "skill_extra",
-                 "forbidden_violation", "no_tool_ok"):
+    for name in ("retrieval_mrr", "skill_mrr", "kb_mrr", "skill_extra", "no_tool_ok"):
         assert name not in THRESHOLDS
+    # A forbidden call must never happen, so its gate is the zero upper bound.
+    assert THRESHOLDS["forbidden_violation"] == {
+        "value": 0.0,
+        "comparison": "max",
+        "kind": "rule",
+    }
 
 
 # --- robustness ------------------------------------------------------------

@@ -459,9 +459,10 @@ RULE_EVALUATORS: dict[str, Callable[..., Evaluation | None]] = {
     "no_tool_ok": no_tool_ok,
 }
 
-#: The design's rule gates; ``extra_calls_ratio`` is the only upper bound.
-#: MRR, ``skill_extra``, ``forbidden_violation``, and ``no_tool_ok`` are recorded but
-#: not gated here -- the design states no numeric gate for them.
+#: The design's rule gates; ``extra_calls_ratio`` and ``forbidden_violation`` are the
+#: upper bounds (a violation must never happen, so its gate is 0.0).
+#: MRR, ``skill_extra``, and ``no_tool_ok`` are recorded but not gated here -- the
+#: design states no numeric gate for them.
 THRESHOLDS: dict[str, dict[str, Any]] = {
     "retrieval_recall@5": {"value": 0.95, "comparison": "min", "kind": "rule"},
     "tool_hit": {"value": 0.90, "comparison": "min", "kind": "rule"},
@@ -473,6 +474,7 @@ THRESHOLDS: dict[str, dict[str, Any]] = {
     "kb_routing": {"value": 0.95, "comparison": "min", "kind": "rule"},
     "kb_recall@5": {"value": 0.85, "comparison": "min", "kind": "rule"},
     "citation_valid": {"value": 0.95, "comparison": "min", "kind": "rule"},
+    "forbidden_violation": {"value": 0.0, "comparison": "max", "kind": "rule"},
 }
 
 

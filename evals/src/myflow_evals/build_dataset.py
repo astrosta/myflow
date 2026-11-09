@@ -176,6 +176,7 @@ def load_build_sources(
     environ: Mapping[str, str] | None = None,
     mcp_client: McpClient | None = None,
     trace_transport: httpx.BaseTransport | None = None,
+    include_traces: bool = True,
 ) -> BuildSources:
     """Fetch this account's real tools, private Skills, knowledge documents, and traces.
 
@@ -183,6 +184,10 @@ def load_build_sources(
     their chunk fetched, and the returned source lists are capped per kind. Trace
     reading still pages the whole (page-guarded) trace set, and source_totals
     always records how many sources each kind really has.
+
+    include_traces=False skips Langfuse entirely: a trace replay has no
+    expectations, so a dataset built for scoring must not contain one. The trace
+    count is then a real 0, not a silently skipped kind.
 
     A Gateway failure that makes the account data unusable raises. Everything
     this account cannot use -- an unsupported transport, a disabled or unreachable
@@ -204,11 +209,15 @@ def load_build_sources(
     knowledge, knowledge_total = _account_knowledge(
         session, limit=limit, warnings=warnings
     )
-    traces = fetch_account_traces(
-        session.hashed_user_id,
-        environ=env,
-        transport=trace_transport,
-        warnings=warnings,
+    traces = (
+        fetch_account_traces(
+            session.hashed_user_id,
+            environ=env,
+            transport=trace_transport,
+            warnings=warnings,
+        )
+        if include_traces
+        else []
     )
     return BuildSources(
         tools=_capped(tools, limit),

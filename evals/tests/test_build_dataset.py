@@ -562,6 +562,54 @@ def test_langfuse_failures_cost_only_the_traces() -> None:
     assert len(drafts) == 6
 
 
+def test_load_build_sources_skips_trace_paging_unless_included() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"data": [], "meta": {"totalPages": 1}})
+
+    sources = load_build_sources(
+        _session(_FakeGateway(servers=[STREAMABLE_SERVER])),
+        environ=LANGFUSE_ENVIRON,
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        trace_transport=httpx.MockTransport(handler),
+        include_traces=False,
+    )
+
+    drafts = build_account_items(_offline_session(), sources)
+
+    assert requests == []
+    assert list(sources.traces) == []
+    assert sources.source_totals["trace"] == 0
+    assert "trace" not in {draft.metadata["source_kind"] for draft in drafts}
+
+
+def test_load_build_sources_reads_traces_when_included() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "trace-1", "level": "ERROR", "input": {"query": "why did it fail?"}}
+                ],
+                "meta": {"totalPages": 1},
+            },
+        )
+
+    sources = load_build_sources(
+        _session(_FakeGateway(servers=[STREAMABLE_SERVER])),
+        environ=LANGFUSE_ENVIRON,
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        trace_transport=httpx.MockTransport(handler),
+        include_traces=True,
+    )
+
+    drafts = build_account_items(_offline_session(), sources)
+
+    assert [trace.trace_id for trace in sources.traces] == ["trace-1"]
+    assert "trace" in {draft.metadata["source_kind"] for draft in drafts}
+
 def test_load_build_sources_takes_mcp_auth_and_a_url_override_from_the_secret_map() -> None:
     secret_value = "fixture-header-value"
     override_url = "https://mcp.test/projects?token=query-secret"

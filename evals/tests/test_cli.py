@@ -9,6 +9,7 @@ through exit code 1 instead of an exception.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,13 @@ import pytest
 from langfuse import Evaluation
 
 from myflow_evals.accounts import AccountCredential, AccountSession
-from myflow_evals.build_dataset import BuildSources, TraceSource, stable_item_id
-from myflow_evals.cli import CliServices, main
+from myflow_evals.build_dataset import (
+    BuildSources,
+    DatasetItemDraft,
+    TraceSource,
+    stable_item_id,
+)
+from myflow_evals.cli import CliServices, LangfuseDatasetWriter, dataset_item_prefix, main
 from myflow_evals.mcp import McpTool
 
 BASE_URL = "http://gateway.test/api"
@@ -235,9 +241,19 @@ def _services(
         return langfuse
 
     def fake_load_sources(
-        session: AccountSession, *, limit: Any = None, environ: Any = None
+        session: AccountSession,
+        *,
+        limit: Any = None,
+        environ: Any = None,
+        include_traces: bool = True,
     ) -> BuildSources:
-        recorder.source_calls.append({"limit": limit, "environ": dict(environ or {})})
+        recorder.source_calls.append(
+            {
+                "limit": limit,
+                "environ": dict(environ or {}),
+                "include_traces": include_traces,
+            }
+        )
         if sources_by_session is not None:
             return sources_by_session[session.hashed_user_id]
         return sources if sources is not None else BuildSources()
@@ -445,7 +461,10 @@ def test_build_writes_every_draft_through_the_langfuse_writer(
     assert langfuse.created_datasets == [DATASET]
     assert [item["dataset_name"] for item in langfuse.created_items] == [DATASET]
     created = langfuse.created_items[0]
-    assert created["id"] == stable_item_id("tool", "mcp__db__search", 0, HASHED_USER_ID)
+    assert created["id"] == (
+        f"{dataset_item_prefix(DATASET)}-"
+        + stable_item_id("tool", "mcp__db__search", 0, HASHED_USER_ID)
+    )
     assert created["input"]["query"].startswith("Use the search tool")
     assert created["metadata"]["user_id"] == HASHED_USER_ID
     assert f"written: 1 item(s) to {DATASET}" in output
@@ -572,9 +591,10 @@ def test_build_merges_every_logged_in_account(capsys: pytest.CaptureFixture[str]
     output = _capture(capsys)
     assert exit_code == 0
     assert "tool: 2 drafts from 2 sources" in output
+    prefix = dataset_item_prefix(DATASET)
     assert [item["id"] for item in langfuse.created_items] == [
-        stable_item_id("tool", "mcp__db__load", 0, OTHER_HASHED_USER_ID),
-        stable_item_id("tool", "mcp__db__search", 0, HASHED_USER_ID),
+        f"{prefix}-" + stable_item_id("tool", "mcp__db__load", 0, OTHER_HASHED_USER_ID),
+        f"{prefix}-" + stable_item_id("tool", "mcp__db__search", 0, HASHED_USER_ID),
     ]
     assert [item["metadata"]["user_id"] for item in langfuse.created_items] == [
         OTHER_HASHED_USER_ID,
@@ -618,6 +638,82 @@ def test_run_passes_max_concurrency_to_the_runner(capsys: pytest.CaptureFixture[
 
     assert exit_code == 0
     assert dataset.calls[0]["max_concurrency"] == 3
+
+
+def _draft(item_id: str, *, kind: str = "tool") -> DatasetItemDraft:
+    expected = {} if kind == "trace" else {"expect_kb": False}
+    category = "trace_replay" if kind == "trace" else "single_tool"
+    return DatasetItemDraft(
+        id=item_id,
+        input={"query": f"question for {item_id}"},
+        expected_output=expected,
+        metadata={
+            "user_id": HASHED_USER_ID,
+            "source_kind": kind,
+            "category": category,
+        },
+    )
+
+
+def test_build_skips_trace_drafts_unless_include_traces(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recorder = Recorder()
+    sources = BuildSources(
+        tools=[_tool("search", "mcp__db__search")],
+        traces=[TraceSource("trace-1", "why did it fail?")],
+        source_totals={"tool": 1, "trace": 1},
+    )
+    services, langfuse = _services(recorder, sources=sources)
+
+    exit_code = main(["build", "--dataset", DATASET], services=services, environ=dict(ENVIRON))
+
+    assert exit_code == 0
+    assert recorder.source_calls[0]["include_traces"] is False
+    kinds = [item["metadata"]["source_kind"] for item in langfuse.created_items]
+    assert kinds == ["tool"]
+    assert "trace: 0 drafts" in _capture(capsys)
+
+
+def test_build_include_traces_keeps_trace_drafts(capsys: pytest.CaptureFixture[str]) -> None:
+    recorder = Recorder()
+    sources = BuildSources(
+        tools=[_tool("search", "mcp__db__search")],
+        traces=[TraceSource("trace-1", "why did it fail?")],
+        source_totals={"tool": 1, "trace": 1},
+    )
+    services, langfuse = _services(recorder, sources=sources)
+
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--include-traces"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
+
+    assert exit_code == 0
+    assert recorder.source_calls[0]["include_traces"] is True
+    kinds = [item["metadata"]["source_kind"] for item in langfuse.created_items]
+    assert sorted(kinds) == ["tool", "trace"]
+
+
+def test_writer_namespaces_item_ids_per_dataset() -> None:
+    client = FakeLangfuse()
+    drafts = [_draft("tool-1")]
+
+    LangfuseDatasetWriter(client).upsert_items("agent-eval/regression/v1", drafts)
+    LangfuseDatasetWriter(client).upsert_items("agent-eval/explore", drafts)
+    LangfuseDatasetWriter(client).upsert_items("agent-eval/regression/v1", drafts)
+
+    ids = [item["id"] for item in client.created_items]
+    assert len({ids[0], ids[1]}) == 2
+    assert all(re.fullmatch(r"[0-9a-f]{8}-tool-1", value) for value in ids)
+    assert ids[2] == ids[0]
+    assert [item["dataset_name"] for item in client.created_items] == [
+        "agent-eval/regression/v1",
+        "agent-eval/explore",
+        "agent-eval/regression/v1",
+    ]
+
 
 def test_main_returns_zero_for_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--help"]) == 0

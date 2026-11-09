@@ -14,6 +14,7 @@ password, a header value, a cookie, or a raw user id.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -60,6 +61,8 @@ _LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
 _MCP_HEADERS_ENV = "MCP_SERVER_HEADERS"
 
 _INGEST_QUERY_PREVIEW = 100
+#: Drafts from this source kind carry no expectations and are never scored.
+_TRACE_SOURCE_KIND = "trace"
 
 
 class CliError(RuntimeError):
@@ -101,9 +104,12 @@ class CliServices:
 class LangfuseDatasetWriter:
     """DatasetWriter that upserts drafts into one Langfuse dataset.
 
-    Datasets are keyed by name in Langfuse, so creation is idempotent and items
-    upsert by their deterministic id. Only the builder writes: the runner treats
-    the dataset as frozen input.
+    Datasets are keyed by name in Langfuse, so creation is idempotent. Item ids are
+    globally unique across a project while `stable_item_id` is deliberately
+    dataset-agnostic, so every id is namespaced here with an 8-hex digest of the
+    dataset name: the same account can build a regression and an exploration
+    dataset without collision, and a rebuild of one dataset reproduces its ids.
+    Only the builder writes: the runner treats the dataset as frozen input.
     """
 
     def __init__(self, client: Any) -> None:
@@ -111,14 +117,15 @@ class LangfuseDatasetWriter:
         self._dataset: str | None = None
 
     def upsert_items(self, dataset_name: str, items: Sequence[DatasetItemDraft]) -> None:
-        """Create the dataset once, then upsert every draft as one item."""
+        """Create the dataset once, then upsert every draft as one namespaced item."""
         if self._dataset != dataset_name:
             self._client.create_dataset(name=dataset_name)
             self._dataset = dataset_name
+        prefix = dataset_item_prefix(dataset_name)
         for draft in items:
             self._client.create_dataset_item(
                 dataset_name=dataset_name,
-                id=draft.id,
+                id=f"{prefix}-{draft.id}",
                 input=draft.input,
                 expected_output=draft.expected_output,
                 metadata=draft.metadata,
@@ -184,11 +191,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     shared.add_argument("--env-file", type=Path, default=None, help="KEY=VALUE settings file")
 
-    commands.add_parser(
+    build = commands.add_parser(
         "build",
         parents=[shared],
         help="build dataset drafts from the fixed accounts",
         description="Read each fixed account data and upsert deterministic drafts.",
+    )
+    build.add_argument(
+        "--include-traces",
+        action="store_true",
+        help="also emit trace replays (unscorable: keep them out of a regression dataset)",
     )
     run = commands.add_parser(
         "run",
@@ -344,9 +356,16 @@ def _cmd_build(
         per_account: list[BuildSources] = []
         for hashed_user_id in sorted(sessions):
             session = sessions[hashed_user_id]
-            sources = services.load_sources(session, limit=args.limit, environ=environ)
+            sources = services.load_sources(
+                session,
+                limit=args.limit,
+                environ=environ,
+                include_traces=args.include_traces,
+            )
             per_account.append(sources)
             drafts.extend(build_account_items(session, sources, limit=args.limit))
+        if not args.include_traces:
+            drafts = [draft for draft in drafts if not _is_trace_draft(draft)]
         merged = _merge_sources(per_account)
         report = build_report(
             args.dataset, merged, drafts, limit=args.limit, dry_run=args.dry_run
@@ -363,6 +382,16 @@ def _cmd_build(
     if not args.dry_run:
         print(f"written: {written} item(s) to {args.dataset}")
     return EXIT_OK
+
+
+def dataset_item_prefix(dataset_name: str) -> str:
+    """The per-dataset item-id namespace: first 8 hex of sha256(dataset name)."""
+    return hashlib.sha256(dataset_name.encode("utf-8")).hexdigest()[:8]
+
+
+def _is_trace_draft(draft: DatasetItemDraft) -> bool:
+    """A trace replay declares no expectations, so a scored run cannot use it."""
+    return draft.metadata.get("source_kind") == _TRACE_SOURCE_KIND
 
 
 def _merge_sources(all_sources: Sequence[BuildSources]) -> BuildSources:

@@ -54,8 +54,9 @@ DEFAULT_MAX_CONCURRENCY = 2
 #: Design: an LLM metric needs this many scored samples before it can gate.
 LLM_MIN_SAMPLES = 20
 
-#: The one rule metric that fails a run on a single bad sample.
+#: Rule metrics that fail a run on a single bad sample.
 _CITATION_METRIC = "citation_valid"
+_FORBIDDEN_METRIC = "forbidden_violation"
 
 _EVIDENCE_PREFIX = "ev-"
 _RUN_STATUS_SUCCESS = "success"
@@ -86,6 +87,7 @@ __all__ = [
     "ci_subset",
     "citation_violations",
     "evaluate_gates",
+    "forbidden_violations",
     "select_items",
 ]
 
@@ -208,12 +210,18 @@ class ExperimentResult:
     failed_items: tuple[FailedItem, ...] = ()
     gates: tuple[GateResult, ...] = ()
     citation_violations: tuple[str, ...] = ()
+    forbidden_violations: tuple[str, ...] = ()
     experiment_url: str | None = None
 
     @property
     def passed(self) -> bool:
-        """True only when every item finished, no citation was forged, and no gate failed."""
-        if self.failed_items or self.citation_violations:
+        """True only when every item finished cleanly and no gate failed.
+
+        A citation naming an unretrieved chunk and a forbidden call are both
+        correctness invariants, so one bad sample fails the run even when the
+        average would pass.
+        """
+        if self.failed_items or self.citation_violations or self.forbidden_violations:
             return False
         return all(gate.status != "fail" for gate in self.gates)
 
@@ -236,6 +244,8 @@ class ExperimentResult:
             )
         if self.citation_violations:
             lines.append("citation violation: " + ", ".join(self.citation_violations))
+        if self.forbidden_violations:
+            lines.append("forbidden violation: " + ", ".join(self.forbidden_violations))
         lines.append("result: " + ("PASS" if self.passed else "FAIL"))
         if self.experiment_url:
             lines.append(f"experiment: {self.experiment_url}")
@@ -458,6 +468,7 @@ class ExperimentRunner:
             failed_items=_failed_items(task.snapshot, item_results),
             gates=evaluate_gates(scores, mode=mode),
             citation_violations=citation_violations(item_results),
+            forbidden_violations=forbidden_violations(item_results),
             experiment_url=getattr(outcome, "experiment_url", None),
         )
 
@@ -606,12 +617,27 @@ def citation_violations(item_results: Sequence[Any]) -> tuple[str, ...]:
     One citation that names a chunk the run never retrieved is a correctness
     invariant, not a quality trend, so a single zero fails the experiment.
     """
+    return _violating_items(item_results, _CITATION_METRIC, 0.0)
+
+
+def forbidden_violations(item_results: Sequence[Any]) -> tuple[str, ...]:
+    """Return the ids of items that called a forbidden tool.
+
+    ``forbidden_violation`` scores 1.0 for a violation, so one sample is enough to
+    fail the run; a clean average cannot buy a forbidden call back.
+    """
+    return _violating_items(item_results, _FORBIDDEN_METRIC, 1.0)
+
+
+def _violating_items(
+    item_results: Sequence[Any], metric: str, failing_value: float
+) -> tuple[str, ...]:
     violations: list[str] = []
     for result in item_results:
         for evaluation in getattr(result, "evaluations", ()) or ():
-            if getattr(evaluation, "name", None) != _CITATION_METRIC:
+            if getattr(evaluation, "name", None) != metric:
                 continue
-            if _numeric(getattr(evaluation, "value", None)) == 0.0:
+            if _numeric(getattr(evaluation, "value", None)) == failing_value:
                 violations.append(_item_id(result.item))
     return tuple(sorted(violations))
 

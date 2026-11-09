@@ -60,6 +60,7 @@ from myflow_evals.runner import (
     ci_subset,
     citation_violations,
     evaluate_gates,
+    forbidden_violations,
     select_items,
 )
 
@@ -100,6 +101,7 @@ __all__ = [
     "extra_calls_ratio",
     "fetch_account_traces",
     "forbidden_violation",
+    "forbidden_violations",
     "hashed_langfuse_user_id",
     "kb_mrr",
     "kb_recall_at_5",
