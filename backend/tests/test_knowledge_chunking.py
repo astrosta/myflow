@@ -6,7 +6,7 @@ import pytest
 
 from agentkit.knowledge.chunking import chunk_document
 from agentkit.knowledge.config import KnowledgeBaseConfig
-from agentkit.knowledge.text import clean_text
+from agentkit.knowledge.text import clean_document_text, clean_text
 from agentkit.knowledge.tokenizer import ApproximateTokenCounter
 from agentkit.knowledge.types import KnowledgeBaseType
 
@@ -158,6 +158,41 @@ def test_legal_chunks_split_by_article_and_keep_the_chapter_path() -> None:
     # 不跨条合并
     assert "第二条" not in chunks[0].content
     assert "第一条" not in chunks[1].content
+
+
+def test_legal_plain_chapter_lines_become_section_path_after_toc_clean() -> None:
+    """Statute PDFs often leave 「第一章 …」 as plain text, not ``##`` headings."""
+    raw = (
+        "中华人民共和国网络安全法\n\n"
+        "（2016年11月7日第十二届全国人民代表大会常务委员会第二十四次会议通过）\n\n"
+        "目  录\n"
+        "第一章 总  则\n"
+        "第二章 网络安全支持与促进\n"
+        "第三章 网络运行安全\n"
+        "第四章 网络信息安全\n"
+        "第五章 监测预警与应急处置\n"
+        "第六章 法律责任\n"
+        "第七章 附  则\n\n"
+        "第一章 总  则\n\n"
+        "第一条 为了保障网络安全，维护网络空间主权和国家安全，制定本法。\n\n"
+        "第二条 在中华人民共和国境内建设、运营、维护和使用网络，适用本法。\n\n"
+        "第二章 网络安全支持与促进\n\n"
+        "第十四条 国家鼓励开发网络数据安全保护和利用技术。\n"
+    )
+    text = clean_document_text(raw)
+    chunks = chunk_document(
+        text, KnowledgeBaseType.LEGAL, _config(), token_counter=CharCounter()
+    )
+
+    assert "目  录" not in text
+    assert not any(chunk.content.strip() == "第一章 总  则" for chunk in chunks)
+    first = next(chunk for chunk in chunks if "第一条" in chunk.content)
+    second = next(chunk for chunk in chunks if "第二条" in chunk.content)
+    fourteenth = next(chunk for chunk in chunks if "第十四条" in chunk.content)
+    assert "第一章" in first.section and "第一条" in first.section
+    assert "第一章" in second.section and "第二条" in second.section
+    assert "第二章" in fourteenth.section and "第十四条" in fourteenth.section
+    assert first.section.startswith("中华人民共和国网络安全法")
 
 
 @pytest.mark.parametrize(

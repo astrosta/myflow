@@ -51,6 +51,12 @@ _LEGAL_ARTICLE_RE = re.compile(
     rf"^\s*{_LINE_DECORATION}({_ARTICLE}|\d+\.\d+(?:\.\d+)*)",
     re.IGNORECASE,
 )
+_CN_ORDINAL = r"[一二三四五六七八九十百千万零〇两0-9]+"
+#: Plain statute structure lines (no ``##``), common after PDF/MinerU extraction.
+_LEGAL_STRUCT_LINE_RE = re.compile(
+    rf"^\s*(第\s*{_CN_ORDINAL}\s*(编|章|节)\s+\S.*?)\s*$"
+)
+_LEGAL_STRUCT_LEVEL = {"编": 2, "章": 2, "节": 3}
 _STEP_RE = re.compile(
     r"^\s*(?:步骤\s*[一二三四五六七八九十百0-9]+|(?:Step)\s*\d+|\d+\s*[.、)])\s*",
     re.IGNORECASE,
@@ -65,6 +71,58 @@ class _Section:
     @property
     def title(self) -> str:
         return " / ".join(self.path)
+
+
+def _promote_legal_headings(text: str) -> str:
+    """Turn plain 「第X章/节」 (and the leading statute title) into Markdown headings.
+
+    Legal section paths come from ``_sections``; without ``#`` markers a cleaned
+    statute PDF yields citations like ``第一条`` and leaves ``第一章 总则`` as an
+    orphan body chunk instead of ``《法》 / 第一章 / 第一条``.
+    """
+
+    if not text:
+        return ""
+    output: list[str] = []
+    seen_content = False
+    in_fence = False
+    fence_marker = ""
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith((_FENCE, "~~~")):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence, fence_marker = True, marker
+            elif marker == fence_marker:
+                in_fence, fence_marker = False, ""
+            output.append(line)
+            continue
+        if in_fence:
+            output.append(line)
+            continue
+        if _HEADING_RE.match(line):
+            output.append(line)
+            seen_content = True
+            continue
+        plain = line.strip()
+        struct = _LEGAL_STRUCT_LINE_RE.match(plain) if plain else None
+        if struct:
+            level = _LEGAL_STRUCT_LEVEL.get(struct.group(2), 2)
+            output.append("#" * level + " " + struct.group(1).strip())
+            seen_content = True
+            continue
+        if (
+            plain
+            and not seen_content
+            and _LEGAL_ARTICLE_RE.match(plain) is None
+        ):
+            output.append("# " + plain)
+            seen_content = True
+            continue
+        if plain:
+            seen_content = True
+        output.append(line)
+    return "\n".join(output)
 
 
 def _sections(markdown: str) -> list[_Section]:
@@ -404,7 +462,7 @@ def _legal_clauses(sections: list[_Section], fallback: str) -> list[tuple[str, s
     for section in source:
         title = _section_title(section)
         parts = [part for part in _LEGAL_CLAUSE_RE.split(section.body) if part.strip()]
-        if len(parts) <= 1:
+        if not parts:
             if section.body.strip():
                 output.append((title, section.body.strip()))
             continue
@@ -412,6 +470,7 @@ def _legal_clauses(sections: list[_Section], fallback: str) -> list[tuple[str, s
             body = part.strip()
             # 条款号进 section：引用时“《XX法》第三条”比“第三章某段”有用得多。
             # 拿不到条号时宁可不加标签，也不能把整段正文塞进 section。
+            # 单条成章时同样要挂条号，否则引用只剩「第二章」丢掉「第十四条」。
             output.append((_title_with_clause(title, _clause_label(body)), body))
     return output
 
@@ -456,6 +515,8 @@ def chunk_document(
     counter = token_counter or ApproximateTokenCounter()
     max_tokens = min(type_config.chunk_size_tokens, chunking.max_chunk_tokens)
     overlap = min(type_config.chunk_overlap_tokens, max_tokens - 1)
+    if resolved_type is KnowledgeBaseType.LEGAL:
+        text = _promote_legal_headings(text)
     sections = _sections(text)
     separators = chunking.separators
     chunks: list[KnowledgeChunk] = []
