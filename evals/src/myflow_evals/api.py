@@ -184,6 +184,29 @@ class AgentApi:
                 )
             cursor = advanced
 
+    @staticmethod
+    def thread_state(session: AccountSession, thread_id: str) -> dict[str, Any]:
+        """Read a thread's checkpoint values mapping.
+
+        GET /threads/{thread_id}/state returns a body whose "values" key holds the
+        checkpoint state and needs the threads:read scope the logged-in account
+        already has. Only that mapping is returned. A thread whose checkpoint has
+        not been written yet reports no values at all and is treated as empty, and a
+        missing values.messages is legal too: the caller falls back to the run event
+        ledger for evidence.
+        """
+        response = session.client.get(_data_path(session, f"/threads/{thread_id}/state"))
+        response.raise_for_status()
+        body = _json_object(response, f"thread state for thread {thread_id!r}")
+        values = body.get("values")
+        if values is None:
+            return {}
+        if not isinstance(values, dict):
+            raise RuntimeError(
+                f"thread state for thread {thread_id!r} returned a non-object values field"
+            )
+        return values
+
 
 def _data_path(session: AccountSession, suffix: str) -> str:
     """Data routes live under /api (not /api/v1); match the AGENT_API base spelling."""

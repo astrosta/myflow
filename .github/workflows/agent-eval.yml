@@ -1,0 +1,45 @@
+name: agent-eval
+
+on:
+  pull_request:
+  schedule:
+    # Nightly full run: every metric, LLM metrics as hard gates.
+    - cron: "0 18 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      AGENT_API: ${{ secrets.AGENT_API }}
+      AGENT_USERS: ${{ secrets.AGENT_USERS }}
+      USER_ID_SALT: ${{ secrets.USER_ID_SALT }}
+      LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # PR: fixed stratified 30-item subset, rule metrics are hard gates,
+      # LLM metrics stay soft (under 20 scored samples they never gate).
+      # The dataset is frozen input here: this workflow never runs "build".
+      - name: CI regression subset
+        if: github.event_name == 'pull_request'
+        run: >-
+          uv run --project evals myflow-evals run
+          --mode ci
+          --dataset agent-eval/regression/v1
+          --run-name "ci-${GITHUB_SHA}"
+
+      # Nightly: full dataset, LLM metrics may be hard gates.
+      - name: Nightly full run
+        if: github.event_name == 'schedule'
+        run: >-
+          uv run --project evals myflow-evals run
+          --mode full
+          --dataset agent-eval/regression/v1
+          --run-name "nightly-${GITHUB_SHA}"

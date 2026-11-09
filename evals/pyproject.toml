@@ -9,6 +9,9 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.scripts]
+myflow-evals = "myflow_evals.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9",
