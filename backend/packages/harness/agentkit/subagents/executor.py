@@ -54,7 +54,10 @@ from agentkit.sandbox.security import safe_app_config
 from agentkit.subagents.capacity import AdmissionDenied, SubagentExecutionCapacity
 from agentkit.subagents.registry import filter_tools
 from agentkit.subagents.results import SubagentResult, SubagentStatus, attach_future, cleanup
-from agentkit.subagents.step_events import capture_new_step_messages
+from agentkit.subagents.step_events import (
+    capture_new_retrieval_events,
+    capture_new_step_messages,
+)
 from agentkit.subagents.token_collector import SubagentTokenCollector, attach_token_collector
 from agentkit.utils.messages import message_content_to_text
 
@@ -332,6 +335,8 @@ class _RunState:
     middlewares: list[Any] = field(default_factory=list)
     processed_count: int = 0
     seen_messages: set[str] = field(default_factory=set)
+    #: 检索证据自己的游标：它和步骤共用新增尾部，但读原始 ToolMessage，不截断。
+    retrieval_processed_count: int = 0
 
 
 class SubagentExecutor:
@@ -650,6 +655,14 @@ class SubagentExecutor:
         )
         if captured:
             holder.append_steps(captured)
+
+        # 检索证据走另一条游标：同一段新增尾部，但读**原始** ToolMessage.content。
+        # 步骤投影仍然是 8192 字符（前端卡片）；这里不截断（评测要看完整正文）。
+        retrievals, run.retrieval_processed_count = capture_new_retrieval_events(
+            messages, run.retrieval_processed_count
+        )
+        if retrievals:
+            holder.append_retrievals(retrievals)
 
 
 # ---------------------------------------------------------------- 纯函数

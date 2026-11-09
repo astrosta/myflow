@@ -410,6 +410,7 @@ async def _poll(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + config.timeout_seconds + poll_slack_seconds
     reported = 0
+    retrievals_reported = 0
     while not holder.status.is_terminal:
         if loop.time() >= deadline:
             # §17：父侧停止等待，但**不回收**已经拿到的部分结果。
@@ -419,8 +420,12 @@ async def _poll(
         reported = await _report_new_steps(
             holder, runtime, reported=reported, label=label, model_name=model_name
         )
+        retrievals_reported = await _report_new_retrievals(
+            holder, runtime, reported=retrievals_reported
+        )
     # §3.2 第 6 步在"检查取消"之前：先把最新证据发出去，再终态化。
     await _report_new_steps(holder, runtime, reported=reported, label=label, model_name=model_name)
+    await _report_new_retrievals(holder, runtime, reported=retrievals_reported)
     return _external_status(holder.status, default=SubagentStatus.FAILED)
 
 
@@ -450,6 +455,32 @@ async def _report_new_steps(
             },
         )
     return reported + len(steps)
+
+
+async def _report_new_retrievals(
+    holder: SubagentResult,
+    runtime: Any,
+    *,
+    reported: int,
+) -> int:
+    """把新捕获的检索证据发成 ``task_retrieval`` 帧（与 ``task_running`` 并列）。
+
+    载荷是归一化后的完整结果，不是步骤投影；worker 的 ``_SubagentEventBuffer``
+    再把它记成 ``retrieval.skill`` / ``retrieval.kb``。事件失败不影响结果。
+    """
+    retrievals = holder.pending_retrievals(reported)
+    if not retrievals:
+        return reported
+    for retrieval in retrievals:
+        await _emit(
+            runtime,
+            {
+                "type": "task_retrieval",
+                "task_id": holder.external_task_id,
+                "retrieval": retrieval,
+            },
+        )
+    return reported + len(retrievals)
 
 
 def _result_command(
