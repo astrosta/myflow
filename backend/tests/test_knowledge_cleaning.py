@@ -102,3 +102,90 @@ def test_toc_heading_keeps_chapter_when_body_starts_under_first_chapter() -> Non
     assert "第一条 为保证数据安全" in cleaned
     assert "第二章 管理" in cleaned
     assert "第二条 本规定适用于全体员工" in cleaned
+
+
+def test_strips_markdown_toc_heading_with_plain_chapter_lines() -> None:
+    raw = (
+        "# 中华人民共和国网络安全法\n\n"
+        "# 目  录\n\n"
+        "第一章 总  则\n"
+        "第二章 网络安全支持与促进\n"
+        "第三章 网络运行安全\n"
+        "第四章 网络信息安全\n"
+        "第五章 监测预警与应急处置\n"
+        "第六章 法律责任\n"
+        "第七章 附  则\n\n"
+        "# 第一章 总  则\n\n"
+        "第一条 为了保障网络安全，制定本法。\n"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "# 目  录" not in cleaned
+    assert "第二章 网络安全支持与促进" not in cleaned
+    assert "# 第一章 总  则" in cleaned
+    assert "第一条 为了保障网络安全" in cleaned
+
+
+def test_strips_law_toc_with_plain_chapter_lines_no_page_numbers() -> None:
+    """Chinese statutes list chapters under 目录 without dotted leaders."""
+    raw = (
+        "中华人民共和国网络安全法\n\n"
+        "（2016年11月7日第十二届全国人民代表大会常务委员会第二十四次会议通过）\n\n"
+        "目  录\n"
+        "第一章 总  则\n"
+        "第二章 网络安全支持与促进\n"
+        "第三章 网络运行安全\n"
+        "  第一节 一般规定\n"
+        "  第二节 关键信息基础设施的运行安全\n"
+        "第四章 网络信息安全\n"
+        "第五章 监测预警与应急处置\n"
+        "第六章 法律责任\n"
+        "第七章 附  则\n\n"
+        "第一章 总  则\n\n"
+        "第一条 为了保障网络安全，维护网络空间主权和国家安全，制定本法。\n"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "目  录" not in cleaned and "目录" not in cleaned.replace(" ", "")
+    assert "第二章 网络安全支持与促进" not in cleaned
+    assert "第二节 关键信息基础设施的运行安全" not in cleaned
+    assert "中华人民共和国网络安全法" in cleaned
+    assert "第一章 总" in cleaned
+    assert "第一条 为了保障网络安全" in cleaned
+
+
+def test_strips_compact_inline_law_toc_paragraph() -> None:
+    raw = (
+        "中华人民共和国网络安全法\n\n"
+        "第一章 总则 第二章 网络安全支持与促进 第三章 网络运行安全 "
+        "第一节 一般规定 第二节 关键信息基础设施的运行安全 "
+        "第四章 网络信息安全 第五章 监测预警与应急处置 "
+        "第六章 法律责任 第七章 附则\n\n"
+        "第一章 总 则\n\n"
+        "第一条 为了保障网络安全，制定本法。\n"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "第二章 网络安全支持与促进" not in cleaned
+    assert "第七章 附则" not in cleaned
+    assert "第一章 总" in cleaned
+    assert "第一条 为了保障网络安全" in cleaned
+
+
+def test_keeps_real_chapter_body_sequence_without_toc() -> None:
+    raw = (
+        "第一章 总则\n\n"
+        "第一条 为规范管理，制定本办法。\n\n"
+        "第二章 职责\n\n"
+        "第三条 主管部门负责解释。\n"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "第一章 总则" in cleaned
+    assert "第一条 为规范管理" in cleaned
+    assert "第二章 职责" in cleaned
+    assert "第三条 主管部门负责解释" in cleaned

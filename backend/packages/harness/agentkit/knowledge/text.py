@@ -42,6 +42,9 @@ _NOISE_TITLES = frozenset(
 _TOC_LINE_RE = re.compile(
     r"^(?=\S).{1,120}?(?:\.{2,}|…{2,}|\t|\s{2,})\s*(?:第\s*)?\d{1,5}\s*(?:页)?\s*$"
 )
+_CN_ORDINAL = r"[一二三四五六七八九十百千万零〇两0-9]+"
+_CHAPTER_MARK_RE = re.compile(rf"第\s*{_CN_ORDINAL}\s*[章节篇编]")
+_CHAPTER_ENTRY_RE = re.compile(rf"^\s*第\s*{_CN_ORDINAL}\s*[章节篇编]\s*\S.{{0,100}}\s*$")
 
 
 def _normalise_heading(title: str) -> str:
@@ -59,6 +62,24 @@ def _is_toc_heading(title: str) -> bool:
     return _normalise_heading(title) in _TOC_TITLES
 
 
+def _is_toc_title_line(line: str) -> bool:
+    """Plain-text TOC labels such as ``目  录`` (common in statute PDFs)."""
+    return _normalise_heading(line) in _TOC_TITLES
+
+
+def _is_inline_toc_line(line: str) -> bool:
+    """Single paragraph packing many chapter titles, typical of flattened parsers."""
+    return len(_CHAPTER_MARK_RE.findall(line)) >= 3
+
+
+def _is_toc_entry_line(line: str) -> bool:
+    return bool(
+        _TOC_LINE_RE.match(line)
+        or _CHAPTER_ENTRY_RE.match(line)
+        or _is_inline_toc_line(line)
+    )
+
+
 def _strip_noise_sections(text: str) -> str:
     """Remove known non-content sections, preserving same/higher headings after them.
 
@@ -68,6 +89,9 @@ def _strip_noise_sections(text: str) -> str:
     - a same/higher heading appears, or
     - a nested heading title repeats (TOC entry then body heading), or
     - non-TOC body text appears under the first chapter heading.
+
+    Statute PDFs often emit a plain ``目  录`` line and chapter titles without
+    dotted page leaders; those are also treated as TOC entries while skipping.
     """
     lines = text.split("\n")
     output: list[str] = []
@@ -85,6 +109,15 @@ def _strip_noise_sections(text: str) -> str:
         toc_seen_headings.clear()
         pending_toc_heading = None
 
+    def note_toc_title(title: str) -> bool:
+        """Return True when a repeated TOC title means body is starting."""
+        normalised = _normalise_heading(title)
+        if normalised and normalised in toc_seen_headings:
+            return True
+        if normalised:
+            toc_seen_headings.add(normalised)
+        return False
+
     for line in lines:
         stripped = line.lstrip()
         if stripped.startswith(("\x60\x60\x60", "~~~")):
@@ -97,18 +130,17 @@ def _strip_noise_sections(text: str) -> str:
         if heading:
             level = len(heading.group(1))
             title = heading.group(2).strip()
-            normalised = _normalise_heading(title)
-            if skip_level is not None and level <= skip_level:
+            # skip_level < 0 marks a plain-text 「目录」 block: markdown heading
+            # depth must not terminate it (statute PDFs have no real heading level).
+            if skip_level is not None and skip_level >= 0 and level <= skip_level:
                 end_toc_skip()
             if skip_level is not None:
                 if toc_mode:
-                    if normalised and normalised in toc_seen_headings:
+                    if note_toc_title(title):
                         # Repeated chapter title: the real body is starting.
                         end_toc_skip()
                         output.append(line)
                         continue
-                    if normalised:
-                        toc_seen_headings.add(normalised)
                     pending_toc_heading = line
                 continue
             if _is_noise_heading(title):
@@ -120,11 +152,22 @@ def _strip_noise_sections(text: str) -> str:
             output.append(line)
             continue
         if skip_level is None:
+            if not in_fence and stripped and _is_toc_title_line(stripped):
+                skip_level = -1
+                toc_mode = True
+                toc_seen_headings.clear()
+                pending_toc_heading = None
+                continue
             output.append(line)
             continue
         if not toc_mode:
             continue
-        if not stripped or _TOC_LINE_RE.match(line):
+        if not stripped:
+            continue
+        if _is_toc_entry_line(line):
+            if _CHAPTER_ENTRY_RE.match(line) and note_toc_title(line):
+                end_toc_skip()
+                output.append(line)
             continue
         # Real body text under a chapter heading that was listed in the TOC.
         pending = pending_toc_heading
@@ -158,8 +201,14 @@ def _strip_toc_blocks(text: str) -> str:
                 in_fence, fence_marker = True, marker
             elif marker == fence_marker:
                 in_fence, fence_marker = False, ""
-        if not in_fence and _TOC_LINE_RE.match(line):
+        if not in_fence and _is_inline_toc_line(line):
+            flush()
+            continue
+        if not in_fence and (_TOC_LINE_RE.match(line) or _CHAPTER_ENTRY_RE.match(line)):
             run.append(line)
+            continue
+        if not in_fence and stripped and _is_toc_title_line(stripped):
+            flush()
             continue
         flush()
         output.append(line)
