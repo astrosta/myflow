@@ -10,7 +10,7 @@ import { WILDCARD_THREAD, registerRecoveryContext } from "../api/fetch-with-gap"
 import type { StreamRecoveryEvent } from "../api/gap";
 import { DEFAULT_PAGE_SIZE, fetchMessagePage } from "../api/messages-feed";
 import { sanitizeChatStreamModes } from "../api/stream-mode";
-import { getThreadState } from "../api/threads";
+import { createThread, getThreadState } from "../api/threads";
 import { uploadFiles } from "../api/uploads";
 import { buildMessageGroups } from "../messages/group";
 import {
@@ -34,6 +34,7 @@ import {
   type ChatInterrupt,
 } from "./interrupts";
 import { foldUpdateFrame, isRelevantUpdateFrame } from "./stream-state";
+import { generateThreadId } from "./thread-id";
 import {
   createOptimisticHumanMessage,
   createTurnBaseline,
@@ -62,6 +63,9 @@ export interface UseChatOptions {
    *
    * 这么做而不是"进页面就建一个空 thread"，是因为后者会往侧栏塞一堆
    * 没人用过的空会话——用户只是路过工作区，不该留下垃圾。
+   *
+   * 唯一的例外是**带附件**的新会话：上传端点挂在 thread 下，所以这一轮由前端
+   * 先建 thread（见 `submit`），再把同一个 id 交给 SDK 起 run。
    */
   threadId: string | null;
   assistantId?: string;
@@ -110,6 +114,14 @@ export function useChat({
    * 只在第一个 run 需要——后续 run 的地址已经是它了。
    */
   const navigatedRef = useRef(false);
+
+  /**
+   * 带附件的新会话里，由前端**先建出来**的那个 thread（见 `submit`）。
+   *
+   * 放在 ref 而不是 state：它只在"上传还没成功"这段窗口里有意义，不需要触发
+   * 重渲染；一旦 run 起来了，SDK 的 `onThreadId` 会把它写进 `createdThreadId`。
+   */
+  const preCreatedThreadIdRef = useRef<string | null>(null);
 
   const effectiveThreadId = threadId ?? createdThreadId;
   const hasThread = effectiveThreadId !== null;
@@ -372,13 +384,25 @@ export function useChat({
       // 读取本轮 human message 的 additional_kwargs.files 并注入清单。
       // 这里必须把上传结果随消息一起提交；只传文本会让模型看不到附件。
       //
-      // threadId 为 null 时不允许带附件（UI 也把附件按钮禁掉了）：上传需要一个
-      // 已存在的 thread，而这里若是先建 thread 再 submit，SDK 会**再建一个**，
-      // 于是文件传到了 A、对话跑在 B。
+      // 上传端点挂在 thread 下（`POST /threads/{id}/uploads` 会校验 thread 可见），
+      // 而新会话在 submit 之前根本没有 thread。所以带附件的新会话要**先把 thread
+      // 建出来**，再把同一个 id 交给 `stream.submit(..., { threadId })`：SDK 内部
+      // threadId 为空时走的就是 `client.threads.create({ threadId })`，而后端 create
+      // 对同一 owner 幂等（命中已有行直接返回），于是不会变成两个 thread。
+      //
+      // 只发文本时**不建** thread，仍交给 SDK —— 不往侧栏塞没人用过的空会话。
+      let targetThreadId = effectiveThreadId ?? preCreatedThreadIdRef.current;
       let uploadedFiles: Awaited<ReturnType<typeof uploadFiles>> = [];
       if (files?.length) {
-        if (effectiveThreadId === null) throw new Error("请先发送一条消息，再上传附件");
-        uploadedFiles = await uploadFiles(effectiveThreadId, files);
+        if (targetThreadId === null) {
+          targetThreadId = generateThreadId();
+          await createThread({ threadId: targetThreadId, assistantId });
+          // 先记在 ref 上而不是 state：上传失败时用户再点一次发送要复用这个
+          // thread，否则每失败一次就在侧栏多一个空会话。走 ref 也避免在
+          // 「thread 已建、run 还没起」这段窗口里多一次无谓的重渲染。
+          preCreatedThreadIdRef.current = targetThreadId;
+        }
+        uploadedFiles = await uploadFiles(targetThreadId, files);
         if (uploadedFiles.length !== files.length) {
           throw new Error("上传接口没有返回完整的文件清单，请重试");
         }
@@ -424,6 +448,11 @@ export function useChat({
             /** model_name / reasoning_effort：空对象时网关按默认模型处理 */
             context: runContextValue as never,
             /**
+             * 新会话带附件时 thread 已经建好了（见上面），这里让 SDK **复用**它
+             * 而不是再建一个；已有会话时 SDK 用自己的 threadId，这个字段被忽略。
+             */
+            threadId: targetThreadId ?? undefined,
+            /**
              * 显式写出来，哪怕它和默认值一样。
              *
              * **断开连接就该取消这一轮**（M3 §8.2 的创建端语义）：用户关掉页面
@@ -440,7 +469,7 @@ export function useChat({
         throw error;
       }
     },
-    [stream, streamModes, effectiveThreadId, messages, runContextValue],
+    [stream, streamModes, effectiveThreadId, assistantId, messages, runContextValue],
   );
 
   const respondToInterrupt = useCallback(

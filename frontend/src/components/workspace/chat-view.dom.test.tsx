@@ -87,6 +87,12 @@ describe("空会话：输入框在页面中间", () => {
     expect(view.queryByRole("complementary", { name: "产物" })).toBeNull();
   });
 
+  it("新会话也能添加文件", () => {
+    const view = renderView(makeController({ threadId: null }));
+
+    expect(view.getByRole("button", { name: "添加文件" })).toHaveProperty("disabled", false);
+  });
+
   it("**拉历史时不算空会话** —— 否则每个已有会话首屏都会闪一下 hero", () => {
     const view = renderView(makeController({ threadLoading: true }));
 

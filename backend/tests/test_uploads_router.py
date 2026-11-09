@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -96,6 +97,31 @@ def test_oversize_and_thread_limit(tmp_path, monkeypatch) -> None:
     )
     assert limited.status_code == 409
     assert limited.json()["code"] == "upload_limit_reached"
+
+
+def test_a_new_chat_can_create_its_thread_upload_and_recreate_it(tmp_path, monkeypatch) -> None:
+    """新会话带附件的真实顺序（前端 use-chat.submit）。
+
+    上传端点挂在 thread 下，而 SDK 只在 submit 那一刻才建 thread——晚于上传。
+    所以前端先用自己的 uuid 建 thread，再上传，最后把同一个 id 交给
+    `stream.submit(..., {threadId})`；SDK 内部会**再 create 一次同一个 id**。
+    这一次必须是 201 而不是 409，否则对话会跑到另一个 thread 上。
+    """
+    client = _client(_services(), tmp_path, monkeypatch)
+    thread_id = uuid4().hex  # 前端用的是 crypto.randomUUID()，同为 ^[A-Za-z0-9_-]{1,64}$
+
+    first = client.post("/api/threads", json={"thread_id": thread_id, "assistant_id": "lead_agent"})
+    uploaded = client.post(
+        f"/api/threads/{thread_id}/uploads",
+        files=[("files", ("note.md", b"hi", "text/markdown"))],
+    )
+    again = client.post("/api/threads", json={"thread_id": thread_id, "assistant_id": "lead_agent"})
+
+    assert first.status_code == 201
+    assert uploaded.status_code == 201
+    assert uploaded.json()["files"][0]["virtual_path"] == "/mnt/user-data/uploads/note.md"
+    assert again.status_code == 201
+    assert again.json()["thread_id"] == thread_id
 
 
 def test_duplicate_name_is_renamed_and_list_is_not_a_filename(tmp_path, monkeypatch) -> None:

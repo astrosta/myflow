@@ -146,7 +146,6 @@ export function ChatView({
           ) : null}
 
           <Composer
-            attachmentsDisabled={controller.threadId === null}
             disabled={controller.threadLoading || controller.interrupt !== null}
             modelControl={modelControl}
             onSubmit={submit}

@@ -33,13 +33,6 @@ export interface ComposerProps {
   streaming?: boolean;
   disabled?: boolean;
   /**
-   * 这个会话还没有 thread（/workspace 的新会话入口）。
-   *
-   * 上传需要一个已存在的 thread，而"先建 thread 再提交"会让 SDK 再建一个——
-   * 文件传到 A、对话跑在 B。所以第一条消息之前先不给传附件。
-   */
-  attachmentsDisabled?: boolean;
-  /**
    * "hero"  = 对话还没开始，输入框在页面中间；
    * "docked" = 对话进行中，输入框贴在底部。
    *
@@ -78,7 +71,6 @@ export function Composer({
   onStop,
   streaming = false,
   disabled = false,
-  attachmentsDisabled = false,
   variant = "docked",
   placeholder = "输入消息，Enter 发送，Shift+Enter 换行",
   className,
@@ -188,7 +180,7 @@ export function Composer({
           {/* 工具行：附件在左，发送 / 停止在**框内右下角** */}
           <div className="flex items-center gap-1 px-2 pb-2">
             <FileUpload
-              disabled={disabled || submitting || attachmentsDisabled}
+              disabled={disabled || submitting}
               files={files}
               onChange={setFiles}
             />

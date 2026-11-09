@@ -32,12 +32,14 @@ vi.mock("@/core/api/messages-feed", () => ({
   DEFAULT_PAGE_SIZE: 30,
   fetchMessagePage: () => new Promise(() => {}),
 }));
-vi.mock("@/core/api/threads", () => ({ getThreadState: vi.fn() }));
+vi.mock("@/core/api/threads", () => ({ createThread: vi.fn(), getThreadState: vi.fn() }));
 vi.mock("@/core/api/uploads", () => ({ uploadFiles: vi.fn() }));
 
+import { createThread } from "@/core/api/threads";
 import { uploadFiles } from "@/core/api/uploads";
 import { useChat } from "./use-chat";
 
+const createThreadMock = vi.mocked(createThread);
 const uploadFilesMock = vi.mocked(uploadFiles);
 
 afterEach(cleanup);
@@ -165,6 +167,50 @@ describe("useChat 的附件清单", () => {
     expect(input.messages[0]!.additional_kwargs).toEqual({
       files: [{ filename: "note.md", size: 2 }],
     });
+  });
+
+  /**
+   * 新会话的第一条消息也可能带附件。/workspace 上新会话还没有 thread，而上传
+   * 端点挂在 thread 下（`POST /threads/{id}/uploads` 会校验 thread 可见），
+   * 所以必须先建 thread、再上传、最后让 SDK **复用**这个 thread 起 run。
+   * 否则 SDK 会自己再建一个：文件传到 A、对话跑在 B。
+   */
+  it("新会话带附件时先建 thread，上传和起 run 都用同一个 id", async () => {
+    streamMock.submit.mockClear();
+    uploadFilesMock.mockReset();
+    uploadFilesMock.mockResolvedValue([
+      { path: "/mnt/user-data/uploads/note.md", filename: "note.md", size: 2 } as never,
+    ]);
+    createThreadMock.mockReset();
+    createThreadMock.mockResolvedValue({ thread_id: "server-ignored" } as never);
+
+    const { result } = renderHook(() => useChat({ threadId: null }), { wrapper });
+    const file = new File(["hi"], "note.md", { type: "text/markdown" });
+
+    await act(async () => {
+      await result.current.submit("看这个", [file]);
+    });
+
+    const created = createThreadMock.mock.calls.at(-1)?.[0];
+    expect(created?.assistantId).toBe("lead_agent");
+    expect(created?.threadId).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+    expect(uploadFilesMock).toHaveBeenCalledWith(created?.threadId, [file]);
+    expect(streamMock.submit.mock.calls.at(-1)?.[1]).toMatchObject({
+      threadId: created?.threadId,
+    });
+  });
+
+  it("只发文本的新会话不建 thread（交给 SDK，别往侧栏塞空会话）", async () => {
+    streamMock.submit.mockClear();
+    createThreadMock.mockReset();
+
+    const { result } = renderHook(() => useChat({ threadId: null }), { wrapper });
+    await act(async () => {
+      await result.current.submit("只发文字");
+    });
+
+    expect(createThreadMock).not.toHaveBeenCalled();
+    expect(streamMock.submit).toHaveBeenCalled();
   });
 });
 

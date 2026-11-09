@@ -62,3 +62,43 @@ def test_removes_exact_duplicate_blocks_but_not_short_repeated_lines() -> None:
     assert cleaned.count("这是重复出现的业务说明") == 1
     assert cleaned.count("步骤一") == 2
     assert "第一段正文" in cleaned and "第二段正文" in cleaned
+
+
+def test_toc_heading_does_not_swallow_lower_level_chapter_body() -> None:
+    """MinerU often emits `# 目录` then `## 第一章` for both TOC and body."""
+    raw = (
+        "# XX管理办法\n\n"
+        "# 目录\n\n"
+        "## 第一章 总则\n\n"
+        "## 第二章 职责\n\n"
+        "## 第一章 总则\n\n"
+        "第一条 为规范管理，制定本办法。\n\n"
+        "## 第二章 职责\n\n"
+        "第三条 主管部门负责解释。\n"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "# 目录" not in cleaned
+    assert "第一章 总则" in cleaned
+    assert "第一条 为规范管理" in cleaned
+    assert "第二章 职责" in cleaned
+    assert "第三条 主管部门负责解释" in cleaned
+
+
+def test_toc_heading_keeps_chapter_when_body_starts_under_first_chapter() -> None:
+    raw = (
+        "# 目录\n\n"
+        "## 第一章 总则\n\n"
+        "第一条 为保证数据安全，制定本规定。\n\n"
+        "## 第二章 管理\n\n"
+        "第二条 本规定适用于全体员工。\n"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "# 目录" not in cleaned
+    assert "第一章 总则" in cleaned
+    assert "第一条 为保证数据安全" in cleaned
+    assert "第二章 管理" in cleaned
+    assert "第二条 本规定适用于全体员工" in cleaned

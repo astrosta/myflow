@@ -171,6 +171,65 @@ async def test_cloud_mineru_failure_is_sanitized(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cloud_mineru_parse_failure_includes_provider_error(tmp_path) -> None:
+    path = tmp_path / "scan.pdf"
+    path.write_bytes(b"pdf-bytes")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"batch_id": "b-fail", "file_urls": ["http://upload.local/u"]}},
+            )
+        if request.method == "PUT":
+            return httpx.Response(200)
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "extract_result": [
+                        {
+                            "state": "failed",
+                            "err_msg": "The file format is unsupported or OCR is required",
+                        }
+                    ]
+                },
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    parser = MineruCloudParser(
+        CloudMinerUConfig(base_url="http://cloud.test", api_key="ok", poll_interval_seconds=0.01),
+        client=client,
+    )
+    with pytest.raises(KnowledgeUnavailable, match="OCR is required") as excinfo:
+        await parser.parse(path, filename="scan.pdf")
+    assert "MinerU cloud parsing failed" in str(excinfo.value)
+    await parser.aclose()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cloud_mineru_api_error_includes_provider_message(tmp_path) -> None:
+    path = tmp_path / "x.pdf"
+    path.write_bytes(b"x")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": "A0202", "msg": "insufficient quota"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    parser = MineruCloudParser(
+        CloudMinerUConfig(base_url="http://cloud.test", api_key="ok"), client=client
+    )
+    with pytest.raises(KnowledgeUnavailable, match="insufficient quota") as excinfo:
+        await parser.parse(path, filename="x.pdf")
+    assert "code A0202" in str(excinfo.value)
+    await parser.aclose()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_text_parser_decodes_and_keeps_markdown(tmp_path) -> None:
     path = tmp_path / "notes.md"
     path.write_bytes("﻿# 标题\n\n正文".encode())

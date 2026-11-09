@@ -21,9 +21,45 @@ from agentkit.knowledge.parsers.text import LocalTextParser
 
 logger = logging.getLogger(__name__)
 
+#: Keep provider text short enough for document.error_message / logs; never dump whole payloads.
+_PROVIDER_ERROR_MAX_CHARS = 300
+_PROVIDER_ERROR_KEYS = (
+    "err_msg",
+    "error_msg",
+    "error_message",
+    "fail_reason",
+    "message",
+    "msg",
+    "error",
+)
+
 
 def _auth(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+def _provider_error_text(payload: Any) -> str:
+    """Pull a short, single-line error string out of MinerU JSON bodies/rows."""
+
+    if isinstance(payload, str):
+        text = " ".join(payload.split())
+        return text[:_PROVIDER_ERROR_MAX_CHARS]
+    if not isinstance(payload, dict):
+        return ""
+    for key in _PROVIDER_ERROR_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return _provider_error_text(value)
+        if isinstance(value, dict):
+            nested = _provider_error_text(value)
+            if nested:
+                return nested
+    return ""
+
+
+def _with_provider_detail(prefix: str, payload: Any) -> str:
+    detail = _provider_error_text(payload)
+    return f"{prefix}: {detail}" if detail else prefix
 
 
 def _mime(filename: str) -> str:
@@ -248,7 +284,9 @@ class MineruCloudParser:
                 if state in {"done", "success", "completed"}:
                     return row
                 if state in {"failed", "error"}:
-                    raise KnowledgeUnavailable("MinerU cloud parsing failed")
+                    raise KnowledgeUnavailable(
+                        _with_provider_detail("MinerU cloud parsing failed", row)
+                    )
             await asyncio.sleep(self._config.poll_interval_seconds)
         raise KnowledgeUnavailable("MinerU cloud parsing timed out")
 
@@ -264,10 +302,14 @@ class MineruCloudParser:
             raise KnowledgeUnavailable(f"MinerU cloud {action} returned an invalid body")
         code = payload.get("code")
         if code not in (None, 0, "0", 200):
-            raise KnowledgeUnavailable(f"MinerU cloud {action} failed (code {code})")
+            raise KnowledgeUnavailable(
+                _with_provider_detail(f"MinerU cloud {action} failed (code {code})", payload)
+            )
         data = payload.get("data")
         if not isinstance(data, dict):
-            raise KnowledgeUnavailable(f"MinerU cloud {action} returned no data")
+            raise KnowledgeUnavailable(
+                _with_provider_detail(f"MinerU cloud {action} returned no data", payload)
+            )
         return data
 
     async def aclose(self) -> None:
