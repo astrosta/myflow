@@ -34,6 +34,9 @@ _PENDING_RUN_STATUSES = frozenset({"pending", "running"})
 #: Tests shrink this; production trades latency for one request every second.
 _POLL_INTERVAL_SECONDS = 1.0
 
+#: A run whose worker died must not hang the evaluator forever.
+_DEFAULT_WAIT_TIMEOUT_SECONDS = 900.0
+
 
 @dataclass(frozen=True)
 class RunSnapshot:
@@ -92,12 +95,27 @@ class AgentApi:
         return run_id
 
     @staticmethod
-    def wait_run(session: AccountSession, thread_id: str, run_id: str) -> RunSnapshot:
-        """Poll until the run leaves pending/running and return the terminal snapshot.
+    def wait_run(
+        session: AccountSession,
+        thread_id: str,
+        run_id: str,
+        timeout_seconds: float | None = None,
+    ) -> RunSnapshot:
+        """Poll until the run leaves pending/running or the deadline expires.
 
-        A terminal ``error`` or ``timeout`` is returned, not raised: the caller
-        decides what a failed run means for the sample. HTTP errors still propagate.
+        ``timeout_seconds`` defaults to 900 seconds: ``None`` selects that default
+        and ``float("inf")`` disables the bound. The deadline is measured on the
+        monotonic clock. A terminal ``error``, ``timeout``, or ``interrupted``
+        status is returned, not raised: the caller decides what a failed run means
+        for the sample. When the deadline expires a ``RuntimeError`` names the run,
+        its last observed status, and the elapsed budget. HTTP errors still propagate.
         """
+        budget = (
+            _DEFAULT_WAIT_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        started_at = time.monotonic()
         path = _data_path(session, f"/threads/{thread_id}/runs/{run_id}")
         while True:
             response = session.client.get(path)
@@ -108,6 +126,12 @@ class AgentApi:
                 raise RuntimeError(f"run {run_id!r} did not return a status")
             if status not in _PENDING_RUN_STATUSES:
                 return _run_snapshot(body, status=status, requested_run_id=run_id)
+            elapsed = time.monotonic() - started_at
+            if elapsed >= budget:
+                raise RuntimeError(
+                    f"run {run_id!r} was still {status!r} after {elapsed:.1f}s "
+                    f"(budget {budget:g}s)"
+                )
             time.sleep(_POLL_INTERVAL_SECONDS)
 
     @staticmethod
@@ -148,11 +172,17 @@ class AgentApi:
                     f"events for run {run_id!r} reported has_more without a next_cursor"
                 )
             try:
-                cursor = int(next_cursor)
+                advanced = int(next_cursor)
             except ValueError:
                 raise RuntimeError(
                     f"events for run {run_id!r} returned a non-integer next_cursor"
                 ) from None
+            if cursor is not None and advanced <= cursor:
+                raise RuntimeError(
+                    f"events for run {run_id!r} returned next_cursor {advanced} "
+                    f"that did not advance past {cursor}"
+                )
+            cursor = advanced
 
 
 def _data_path(session: AccountSession, suffix: str) -> str:

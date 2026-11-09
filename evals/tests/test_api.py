@@ -325,3 +325,52 @@ def test_list_events_propagates_404() -> None:
         AgentApi.list_events(session, THREAD_ID, RUN_ID)
 
     assert excinfo.value.response.status_code == 404
+
+
+def test_wait_run_raises_when_the_timeout_budget_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "_POLL_INTERVAL_SECONDS", 0.0)
+    requests: list[httpx.Request] = []
+    statuses = ["running", "success"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, json={"run_id": RUN_ID, "status": statuses.pop(0), "metadata": {}}
+        )
+
+    session = _session(BASE_URLS[0], handler)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        AgentApi.wait_run(session, THREAD_ID, RUN_ID, timeout_seconds=0.0)
+
+    message = str(excinfo.value)
+    assert RUN_ID in message
+    assert "running" in message
+    assert "budget" in message
+    assert len(requests) == 1
+
+
+def test_list_events_rejects_a_cursor_that_does_not_advance() -> None:
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] > 3:
+            raise AssertionError("list_events did not reject a non-advancing cursor")
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"seq": 1, "run_id": RUN_ID, "event_type": "llm.ai.response"}],
+                "next_cursor": "1",
+                "has_more": True,
+            },
+        )
+
+    session = _session(BASE_URLS[0], handler)
+
+    with pytest.raises(RuntimeError, match="advance"):
+        AgentApi.list_events(session, THREAD_ID, RUN_ID)
+
+    assert calls["count"] == 2

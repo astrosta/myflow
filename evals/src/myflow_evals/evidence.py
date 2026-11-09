@@ -60,14 +60,16 @@ def collect_evidence(
     events: Sequence[Mapping[str, Any]],
     *,
     run_id: str,
+    trace_id: str | None = None,
 ) -> RunEvidence:
     """Normalize one run's checkpoint messages and event-ledger rows.
 
     ``messages`` is the checkpoint's message list (``values.messages``) and
     ``events`` comes from ``GET .../runs/{run_id}/events``. Events that name
     another run are ignored so mixed input cannot contaminate one sample.
-    ``trace_id`` is left empty here: it lives on ``RunSnapshot``, not on the
-    message stream or the ledger, and the runner copies it onto this dataclass.
+    ``trace_id`` is the runner's handoff from ``RunSnapshot.trace_id``, which
+    ``wait_run`` parsed from ``metadata["myflow-trace_id"]``; it stays ``None``
+    when no run snapshot was read.
     """
     event_rows = _event_rows(events, run_id)
     ai_rows = _dedupe_messages(
@@ -93,8 +95,8 @@ def collect_evidence(
             event.get("event_type") == _RETRIEVAL_KB_EVENT for event in event_rows
         ),
         retrieved_chunks=_retrieved_chunks(event_rows),
-        citations=_citations(final_ai),
-        trace_id=None,
+        citations=_citations(_last_ai(messages, event_rows)),
+        trace_id=trace_id,
     )
 
 
@@ -359,6 +361,19 @@ def _retrieved_chunks(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any
             if isinstance(item, Mapping):
                 chunks.append(dict(item))
     return chunks
+
+
+def _last_ai(
+    messages: Sequence[Mapping[str, Any]], events: Sequence[Mapping[str, Any]]
+) -> Mapping[str, Any] | None:
+    """Citations belong to the last AI row even when it produced no answer text."""
+    message_rows = _message_rows(messages, _AI_MESSAGE_TYPE)
+    if message_rows:
+        return message_rows[-1]
+    event_ai_rows = _event_contents(events, _AI_RESPONSE_EVENT)
+    if event_ai_rows:
+        return event_ai_rows[-1]
+    return None
 
 
 def _final_ai(

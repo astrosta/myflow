@@ -477,3 +477,22 @@ def test_events_from_another_run_are_ignored() -> None:
     assert evidence.answer == ""
     assert evidence.kb_called is False
     assert evidence.retrieved_chunks == []
+
+
+def test_collect_evidence_carries_the_run_trace_id() -> None:
+    evidence = collect_evidence([], [], run_id=RUN_ID, trace_id="trace-123")
+
+    assert evidence.trace_id == "trace-123"
+
+
+def test_collect_evidence_defaults_the_trace_id_to_none() -> None:
+    assert collect_evidence([], [], run_id=RUN_ID).trace_id is None
+
+
+def test_citations_come_from_the_last_ai_row_without_answer_text() -> None:
+    final = _ai(content="", citations=[CITATION], message_id="ai-final")
+
+    evidence = collect_evidence([final], [], run_id=RUN_ID)
+
+    assert evidence.answer == ""
+    assert evidence.citations == [CITATION]
