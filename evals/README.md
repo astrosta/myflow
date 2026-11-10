@@ -1,16 +1,8 @@
 # myflow-evals
 
-Standalone black-box evaluation workspace for the MyFlow agent. It is one member
-of the repository's uv workspace (`evals` in the root `pyproject.toml`), talks to
-the MyFlow Gateway, MCP servers, and Langfuse over HTTP only, and never imports
-`backend.app` or `agentkit`. It logs in as fixed test accounts, drives the
-Gateway's thread/run API, reads the persisted run-event ledger, scores each
-sample with rule evaluators, and writes scores through a Langfuse experiment. The
-dataset builder reads each account's own MCP tools, private Skills, knowledge
-documents, and failed/low-scored traces, and synthesizes drafts with
-deterministic ids from them.
+MyFlow Agent 的独立黑盒评测工作区。它是仓库 uv 工作区的一员（根 `pyproject.toml` 中的 `evals`），仅通过 HTTP 与 MyFlow Gateway、MCP 服务器和 Langfuse 通信，从不导入 `backend.app` 或 `agentkit`。它以固定的测试账户登录，驱动 Gateway 的 thread/run API，读取持久化的运行事件账本，用规则评测器为每个样本评分，并通过 Langfuse 实验写入分数。数据集构建器会读取每个账户自己的 MCP 工具、私有 Skills、知识文档以及失败/低分追踪，并据此合成确定性草稿。
 
-## Install and run
+## 安装与运行
 
 ```bash
 uv sync --project evals
@@ -18,8 +10,7 @@ uv run --project evals myflow-evals --help
 uv run --project evals pytest evals/tests -v
 ```
 
-Run one CI-shaped experiment (all secrets must already be in the environment or a
-secret file):
+运行一次 CI 形态的实验（所有机密信息都必须已经在环境变量或机密文件中）：
 
 ```bash
 uv run --project evals myflow-evals run \
@@ -28,74 +19,52 @@ uv run --project evals myflow-evals run \
   --run-name "ci-$(date +%Y%m%d-%H%M)"
 ```
 
-The console script returns a process exit code instead of raising:
+该控制台脚本返回进程退出码，而不是抛出异常：
 
-| Exit code | Meaning |
+| 退出码 | 含义 |
 | --- | --- |
-| `0` | The command did what it was asked: a run passed every gate, a build/ingest finished, or `--dry-run` printed its plan. |
-| `1` | The experiment failed: a dataset item is missing or unexpected, a task raised, a run did not finish with `success`, an item produced no score, a citation scored 0.0, or a threshold was missed. |
-| `2` | The command could not run as configured: a required secret is missing, the mode is unknown, an item names an account that is not logged in, the dataset is empty, or Langfuse/the Gateway is unusable. |
+| `0` | 命令完成了它被要求做的事：一次运行通过了所有门禁、一次 build/ingest 完成，或 `--dry-run` 打印了它的计划。 |
+| `1` | 实验失败：数据集条目缺失或出现意外条目、任务抛出异常、运行未以 `success` 结束、条目没有产生分数、引用评分为 0.0，或某个阈值未达标。 |
+| `2` | 命令无法按配置运行：缺少必需的机密信息、模式未知、条目指定了未登录的账户、数据集为空，或 Langfuse/Gateway 不可用。 |
 
-## Fixed accounts and identity
+## 固定账户与身份
 
-Every eval request runs as a fixed test account; there is no PAT or internal-token
-shortcut. Configure at least one account, either in `AGENT_USERS` or in a JSON
-file passed with `--accounts-file`:
+每个评测请求都以固定测试账户身份运行；不存在 PAT 或内部 token 捷径。至少配置一个账户，可以放在 `AGENT_USERS` 中，或放在通过 `--accounts-file` 传入的 JSON 文件中：
 
 ```json
 {
-  "analyst_a": {"username": "alice", "password": "<password from the secret store>"}
+  "analyst_a": {"username": "alice", "password": "<来自机密存储的密码>"}
 }
 ```
 
-For each account the package:
+对于每个账户，该包会：
 
-1. creates a fresh `httpx.Client` (its own cookie jar, so two accounts can never
-   share a session) and calls the Gateway login route;
-2. requires `needs_setup=false` -- a test account that still needs a password
-   change is an error, not a silent default;
-3. reads the `csrf_token` cookie, sends it as `X-CSRF-Token` on every later
-   request, and calls `GET /auth/me` for the account's raw `users.id`;
-4. computes the Langfuse hashed user id
-   `HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]` (lowercase hex) and keys the
-   logged-in session by that value.
+1. 创建一个新的 `httpx.Client`（拥有自己的 cookie 容器，因此两个账户绝不会共享会话），并调用 Gateway 登录接口；
+2. 要求 `needs_setup=false`——仍需修改密码的测试账户会报错，而不是静默使用默认值；
+3. 读取 `csrf_token` cookie，在此后的每个请求中将其作为 `X-CSRF-Token` 发送，并调用 `GET /auth/me` 获取账户原始的 `users.id`；
+4. 计算 Langfuse 哈希用户 ID `HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`（小写十六进制），并用该值作为已登录会话的键。
 
-`agent_user_id` is the raw `/me.id` after the Agent's storage-safe normalization
-(unsafe characters become `-` and a 16-hex sha256 suffix preserves collision
-resistance; a normal UUID passes through unchanged). The raw id exists only in
-memory: every dataset draft carries the hashed id in `metadata.user_id`, the
-runner selects an account by exact hashed-id match, and neither the raw id nor a
-password is ever written to a Dataset item, a Langfuse trace, a log line, or a
-CLI summary. Two accounts that hash to the same id are refused rather than
-overwritten.
+`agent_user_id` 是经过 Agent 的存储安全规范化后的原始 `/me.id`（不安全字符变为 `-`，并附加 16 位十六进制 sha256 后缀以保持抗碰撞性；普通 UUID 原样通过）。原始 ID 只存在于内存中：每个数据集草稿都在 `metadata.user_id` 中携带哈希 ID，运行器通过精确的哈希 ID 匹配选择账户，原始 ID 和密码都绝不会写入数据集条目、Langfuse 追踪、日志行或 CLI 摘要。两个账户若哈希到同一 ID，会被拒绝，而不是覆盖。
 
-## Secrets
+## 机密信息
 
-| Variable | Used for |
+| 变量 | 用途 |
 | --- | --- |
-| `AGENT_API` | Gateway base URL. The documented form includes `/api` (for example `http://127.0.0.1:8001/api`); the client accepts a base with or without that suffix and adds `/api` or `/api/v1` accordingly. |
-| `AGENT_USERS` | JSON map of account label -> `{"username": ..., "password": ...}`. One credential entry per fixed account. |
-| `USER_ID_SALT` | Salt for the hashed user id. It must match the Agent tracing configuration (`user_id_salt`); changing it changes every hashed id, so existing datasets must be rebuilt/re-labelled. |
-| `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | Langfuse HTTP API: dataset reads/writes, experiments, and failed/low-scored trace reads. |
-| `MCP_SERVER_HEADERS` | JSON map of MCP server name (or id) -> that server's auth headers, plus optional `url`/`transport` overrides. |
+| `AGENT_API` | Gateway 基础 URL。文档中的形式包含 `/api`（例如 `http://127.0.0.1:8001/api`）；客户端接受带或不带该后缀的基础地址，并相应地追加 `/api` 或 `/api/v1`。 |
+| `AGENT_USERS` | 账户标签 -> `{"username": ..., "password": ...}` 的 JSON 映射。每个固定账户一条凭据。 |
+| `USER_ID_SALT` | 哈希用户 ID 的盐值。它必须与 Agent 追踪配置（`user_id_salt`）一致；更改它会改变所有哈希 ID，因此现有数据集必须重建/重新标注。 |
+| `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` | Langfuse HTTP API：数据集读写、实验，以及失败/低分追踪读取。 |
+| `MCP_SERVER_HEADERS` | MCP 服务器名称（或 ID） -> 该服务器认证请求头的 JSON 映射，另可包含可选的 `url`/`transport` 覆盖。 |
 
-Secret material belongs in a secret store (CI secrets, a vault, or an untracked
-local file). It must never appear in a Dataset item, a trace, a log line, a
-README, a test fixture, or a commit. The package excludes passwords from
-dataclass reprs, reports MCP failures by server id and exception type only, and
-never echoes a header value, a token in a server URL query string, or a Langfuse
-key.
+机密材料应存放在机密存储中（CI secrets、vault，或未跟踪的本地文件）。它绝不能出现在数据集条目、追踪、日志行、README、测试夹具或提交中。该包会从 dataclass repr 中排除密码，仅按服务器 ID 和异常类型报告 MCP 失败，并且绝不回显请求头值、服务器 URL 查询字符串中的 token 或 Langfuse 密钥。
 
-Secret files are optional conveniences:
+机密文件是可选的便利方式：
 
-- `--env-file PATH` reads `KEY=VALUE` lines (comments and blank lines ignored).
-  Real environment values win over the file, so a CI secret is never overridden
-  by a file in the checkout.
-- `--accounts-file PATH` replaces `AGENT_USERS` as the credential source.
-- `--mcp-headers-file PATH` fills `MCP_SERVER_HEADERS` only when the environment
-  variable is unset or empty.
+- `--env-file PATH` 读取 `KEY=VALUE` 行（忽略注释和空行）。真实环境变量值优先于文件，因此 checkout 中的文件绝不会覆盖 CI 机密。
+- `--accounts-file PATH` 替代 `AGENT_USERS` 作为凭据来源。
+- `--mcp-headers-file PATH` 仅在环境变量未设置或为空时填充 `MCP_SERVER_HEADERS`。
 
-`MCP_SERVER_HEADERS` example (placeholders only, never commit real values):
+`MCP_SERVER_HEADERS` 示例（仅占位符，绝不提交真实值）：
 
 ```json
 {
@@ -107,27 +76,23 @@ Secret files are optional conveniences:
 }
 ```
 
-`url` and `transport` are reserved keys, not headers: they override a server whose
-`GET /api/mcp-servers` URL lost its query string or whose listed transport is
-wrong. The Gateway returns masked MCP header values, so the API can never be used
-to call a server; this secret map is the only usable source.
+`url` 和 `transport` 是保留键，不是请求头：当某个服务器的 `GET /api/mcp-servers` URL 丢失查询字符串，或列出的 transport 有误时，它们用于覆盖该服务器。Gateway 返回的是脱敏后的 MCP 请求头值，因此无法通过该 API 调用服务器；这份机密映射是唯一可用的来源。
 
-## Commands
+## 命令
 
-All three subcommands share these flags:
+三个子命令共享以下标志：
 
-| Flag | Meaning |
+| 标志 | 含义 |
 | --- | --- |
-| `--dataset NAME` | Required. The Langfuse dataset name. |
-| `--limit N` | Positive integer cap. `build` caps drafts per source kind; `run` caps the selected items after mode selection; `ingest` caps the traces printed. |
-| `--dry-run` | Do everything except writing. See each command for the exact distinction. |
-| `--accounts-file PATH` | Fixed-account secret file instead of `AGENT_USERS`. |
-| `--mcp-headers-file PATH` | MCP header secret file instead of `MCP_SERVER_HEADERS`. |
-| `--env-file PATH` | `KEY=VALUE` settings file; real environment values win. |
+| `--dataset NAME` | 必填。Langfuse 数据集名称。 |
+| `--limit N` | 正整数上限。`build` 限制每种来源类型的草稿数；`run` 在模式选择之后限制所选条目；`ingest` 限制打印的追踪数。 |
+| `--dry-run` | 执行除写入之外的所有操作。各命令的具体区别见对应章节。 |
+| `--accounts-file PATH` | 替代 `AGENT_USERS` 的固定账户机密文件。 |
+| `--mcp-headers-file PATH` | 替代 `MCP_SERVER_HEADERS` 的 MCP 请求头机密文件。 |
+| `--env-file PATH` | `KEY=VALUE` 设置文件；真实环境变量值优先。 |
+| `--seed N` | 仅 `build`。知识库分块抽样的随机种子；同一种子的两次构建会选到同一批分块，条目 ID 本来就与抽样无关。 |
 
-`build` and `ingest` deliberately have no `--mode`/`--run-name`: those flags only
-describe an experiment, and a dead flag would suggest behavior that does not
-exist.
+`build` 和 `ingest` 有意不提供 `--mode`/`--run-name`：这些标志只描述实验，一个无效标志会暗示并不存在的行为。
 
 ### `build`
 
@@ -135,60 +100,16 @@ exist.
 uv run --project evals myflow-evals build \
   --dataset agent-eval/explore \
   --limit 100 \
-  --seed 20261109 \
   --dry-run
 ```
 
-`build` logs in every fixed account and reads, as that account: `GET /api/mcp-servers`
-plus a direct MCP `tools/list` per **effective** server for the real
-`inputSchema`; `GET /api/skills` (private Skills only);
-`GET /api/knowledge/bases` -> `/documents` -> the longest of three sampled
-chunks per document; and, only with `--include-traces`, the account's own
-failed/low-scored Langfuse traces.
-Only **effective** sources are sampled -- an MCP server that is enabled, active,
-and reachable, its tools that the Gateway projection marks both callable and
-enabled, and private Skills that are enabled and active -- so a draft never comes
-from something the Agent cannot reach. Every effectiveness skip (a server that is
-disabled, not active, or unreachable; a tool the projection does not mark callable
-and enabled; a private Skill that is switched off or not active) is printed as a
-warning in the build report, while a Skill dropped for its scope, its builtin
-category, or a missing `skill_id`/`name` is silent by design. It then synthesizes
-one draft per source and, unless `--dry-run` is given, upserts every draft into
-the dataset through Langfuse.
+`build` 以每个固定账户登录，并以该账户身份读取：`GET /api/mcp-servers`，再对每个**生效**服务器直接执行 MCP `tools/list` 以获取真实的 `inputSchema`；`GET /api/skills`（仅私有 Skills）；`GET /api/knowledge/bases` -> `/documents` -> 每个文档随机抽取的三个分块中正文最长的一个（见下文）；以及仅在指定 `--include-traces` 时读取该账户自己的失败/低分 Langfuse 追踪。只有**生效**来源会被采样——一个已启用、活跃且可达的 MCP 服务器，其被 Gateway 投影标记为既可调用又已启用的工具，以及已启用且活跃的私有 Skills——因此草稿绝不会来自 Agent 无法访问的内容。每一次因生效性导致的跳过（服务器被禁用、非活跃或不可达；工具未被投影标记为可调用且已启用；私有 Skill 被关闭或非活跃）都会在构建报告中以警告打印，而因作用域、内置类别或缺少 `skill_id`/`name` 被丢弃的 Skill 则按设计保持静默。随后它为每个来源合成一个确定性草稿，并且除非指定 `--dry-run`，否则通过 Langfuse 将每个草稿 upsert 到数据集中。
 
-For each knowledge document the builder first reads the total chunk count, then
-samples three distinct chunks at random and uses the one with the **longest
-trimmed content** as the draft's `reference_answer`; a document with three or
-fewer chunks is read whole instead. This avoids the table of contents, cover
-page, or blank fragment that chunk index 0 often is. Whitespace-padded chunks do
-not win on padding, and a chunk without a `chunk_index` still competes but loses
-a length tie. A document whose sample has no non-blank content is skipped with a
-`no readable chunk` warning. Sampling needs one request for a single-chunk
-document, two for two or three chunks, and four for a larger one (one count probe
-plus three samples), so it never exceeds four chunk requests per document. A
-chunk page that cannot be read, or a missing/malformed chunk count, skips only
-that document with its own warning instead of failing the build. `--seed N`
-makes the draw reproducible across builds; item ids still derive from the
-document id and never change with the draw.
+追踪回放不声明任何期望（`expected_output` 为 `{}`），因此没有指标能给它评分，任何针对它的 `run` 都会因 `unscored` 条目失败。因此 `build` 默认排除追踪草稿，也完全不分页读取追踪；传入 `--include-traces` 可构建探索数据集。回归数据集（`agent-eval/regression/v1`）必须在不带该标志的情况下构建，这样它只包含可评分样本。
 
-A trace replay declares no expectations (`expected_output` is `{}`), so no metric
-can score it and any `run` over it fails on an `unscored` item. `build` therefore
-excludes trace drafts by default and pages no traces at all; pass
-`--include-traces` to build an exploration dataset. A regression dataset
-(`agent-eval/regression/v1`) must be built without the flag, so it contains only
-scorable samples.
+`--dry-run` 仍会登录，仍会读取账户数据——来源是按账户限定的，因此不读取就无法报告真实数量——但它不会向 Langfuse 写入任何内容，也不需要 Langfuse 凭据。它不是“无网络”模式。
 
-`--dry-run` still logs in and still reads the accounts' data -- sources are
-account-scoped, so there is no way to report real counts without them -- but it
-writes nothing to Langfuse and needs no Langfuse credentials. It is not a
-"no network" mode.
-
-Item ids are namespaced per dataset: Langfuse item ids are unique across a
-project, so `LangfuseDatasetWriter` writes `<8-hex digest of dataset name>-<draft
-id>`. The same account can build `agent-eval/regression/v1` and
-`agent-eval/explore` from the same sources without collision, and rebuilding one
-dataset name reproduces its ids (a rebuild never deletes stale items -- a new
-frozen version needs a new dataset name).
+条目 ID 按数据集划分命名空间：Langfuse 条目 ID 在一个项目内唯一，因此 `LangfuseDatasetWriter` 写入 `<数据集名称的 8 位十六进制摘要>-<草稿 ID>`。同一账户可以从相同来源构建 `agent-eval/regression/v1` 和 `agent-eval/explore` 而不会冲突，重建同一个数据集名称会复现其 ID（重建绝不会删除陈旧条目——新的冻结版本需要新的数据集名称）。
 
 ### `run`
 
@@ -200,44 +121,27 @@ uv run --project evals myflow-evals run \
   --max-concurrency 2
 ```
 
-| Flag | Meaning |
+| 标志 | 含义 |
 | --- | --- |
-| `--mode {ci,full}` | Default `ci`. `ci` executes the fixed stratified 30-item subset; `full` executes every item. |
-| `--run-name NAME` | Per-run identity. Defaults to `<mode>-<UTC timestamp>`. The experiment label itself is always `agent-eval:<dataset>`. |
-| `--max-concurrency N` | Default `2`. Parallel agent runs; keep it small for the Gateway and the subagent runtime. The item task runs off the SDK event loop (`asyncio.to_thread`), so this really overlaps runs instead of serialising them. |
-| `--limit N` | Cap the selected items after mode selection. |
+| `--mode {ci,full}` | 默认 `ci`。`ci` 执行固定的分层 30 条目子集；`full` 执行全部条目。 |
+| `--run-name NAME` | 每次运行的标识。默认 `<mode>-<UTC timestamp>`。实验标签本身始终为 `agent-eval:<dataset>`。 |
+| `--max-concurrency N` | 默认 `2`。并行 Agent 运行数；对 Gateway 和子代理运行时而言应保持较小。条目任务在 SDK 事件循环之外运行（`asyncio.to_thread`），因此它们确实会重叠执行，而不是串行化。 |
+| `--limit N` | 在模式选择之后限制所选条目。 |
 
-A real `run` requires the three Langfuse variables plus `AGENT_API` and
-`USER_ID_SALT`. It reads the frozen dataset, selects items for the mode, logs in
-every fixed account, and executes exactly the selected items -- the runner passes
-`data=list(selected)` to Langfuse, so a large dataset is never silently run in
-full. Each item gets its own thread and run (`on_disconnect=continue`), then the
-runner polls the run's terminal status, reads the run-event ledger and the
-thread checkpoint, normalizes them into evidence, scores the item with every
-applicable rule evaluator, and uploads only a compact output (answer, status,
-trace id, opaque evidence id) to Langfuse. Retrieved chunks and citation payloads
-stay in the runner process.
+真正的 `run` 需要三个 Langfuse 变量以及 `AGENT_API` 和 `USER_ID_SALT`。它读取冻结的数据集，按模式选择条目，登录每个固定账户，并且只执行选中的条目——运行器将 `data=list(selected)` 传给 Langfuse，因此大型数据集绝不会被静默地全量运行。每个条目都有自己的 thread 和 run（`on_disconnect=continue`），然后运行器轮询运行的终态，读取运行事件账本和 thread checkpoint，将它们规范化为证据，用所有适用的规则评测器为该条目评分，并且只向 Langfuse 上传紧凑输出（答案、状态、追踪 ID、不透明证据 ID）。检索到的分块和引用载荷保留在运行器进程中。
 
-`--dry-run` prints the dataset, mode, run name, and how many items would be
-selected; it starts no thread, writes no score, and logs in nowhere -- but it
-still reads the dataset through Langfuse, so the Langfuse variables are required
-while `AGENT_API` and `USER_ID_SALT` are not (nothing logs in).
+`--dry-run` 打印数据集、模式、运行名称以及将选择多少条目；它不启动任何 thread，不写入任何分数，也不登录任何账户——但它仍会通过 Langfuse 读取数据集，因此需要 Langfuse 变量，而 `AGENT_API` 和 `USER_ID_SALT` 不需要（没有任何登录）。
 
-What can fail a run:
+会导致运行失败的情况：
 
-- any planned dataset item missing from the experiment result, or an unexpected
-  item in it;
-- a task exception, or a terminal run status other than `success` (`error`,
-  `timeout`, `interrupted`);
-- a completed item that produced no evaluation at all (`unscored`);
-- any `citation_valid` score of 0.0, even if the average passes;
-- any `forbidden_violation` score of 1.0, even if the average passes;
-- a sample that needed a retrieval subagent and never reached it, loaded a Skill it
-  never retrieved, or answered a KB question without KB retrieval evidence
-  (`invalid_routing`), even when the routing average stays above its gate;
-- a run in which no item produced a thresholded score at all
-  (`no scorable samples`);
-- a thresholded metric whose average misses its gate.
+- 计划中的任何数据集条目未出现在实验结果中，或结果中出现意外条目；
+- 任务异常，或终态不是 `success`（`error`、`timeout`、`interrupted`）；
+- 已完成的条目完全没有产生评测（`unscored`）；
+- 任何 `citation_valid` 分数为 0.0，即使平均值通过；
+- 任何 `forbidden_violation` 分数为 1.0，即使平均值通过；
+- 某个样本本应需要检索子代理却从未到达它、加载了从未检索过的 Skill，或在没有 KB 检索证据的情况下回答了 KB 问题（`invalid_routing`），即使路由平均值仍高于其门禁；
+- 一次运行中没有任何条目产生带阈值的分数（`no scorable samples`）；
+- 某个带阈值的指标平均值未达到门禁。
 
 ### `ingest`
 
@@ -247,58 +151,35 @@ uv run --project evals myflow-evals ingest \
   --limit 50
 ```
 
-`ingest` logs in the fixed accounts, reads each account's failed or low-scored
-Langfuse traces by hashed user id, and prints one line per candidate:
-`<category>: <trace id> -> <question preview>`. It writes nothing: no dataset is
-created and no item is uploaded. The `--dry-run` flag is accepted for symmetry
-with the other commands; it changes nothing because `ingest` never writes.
+`ingest` 登录固定账户，按哈希用户 ID 读取每个账户失败或低分的 Langfuse 追踪，并为每个候选项打印一行：`<category>: <trace id> -> <question preview>`。它不写入任何内容：不创建数据集，也不上传条目。接受 `--dry-run` 标志只是为了与其他命令保持一致；它不改变任何行为，因为 `ingest` 从不写入。
 
-## Eval-environment preconditions
+## 评测环境前置条件
 
-The Agent under test must be configured so evidence means what the metrics claim:
+被测 Agent 必须按以下方式配置，证据才具有指标所声称的含义：
 
-- `auth.enabled=true` -- otherwise every request runs as the fixed `default` user
-  and account-scoped data filtering is meaningless.
-- Agent tracing uses `user_id_mode=hashed`, with the same salt as `USER_ID_SALT`.
-- `subagent_enabled=true`, and both `skill-finder` and `knowledge-researcher` are
-  available. With subagents disabled or a retrieval subagent unavailable, the
-  lead agent can fall back to a direct `knowledge_search`; that is a
-  configuration regression for evaluation and must not be scored as a pass.
-- `skills.usage.prompt_top_k=0` -- private Skills must not enter the static
-  `<available_skills>` prompt index.
-- Eval samples do not use slash activation. Every `expect_skill`/`expect_kb`
-  sample must reach its subagent through a `task` call; a static `load_skill` or
-  a direct `knowledge_search` without delegating makes the sample invalid, and
-  the routing metrics score it 0.0 rather than `N/A`.
-- `run_events.backend=db` or `jsonl`, never `memory`: the event ledger must survive
-  the run, because evidence is read after the run finishes.
+- `auth.enabled=true`——否则每个请求都会以固定 `default` 用户运行，按账户限定的数据过滤就失去意义。
+- Agent 追踪使用 `user_id_mode=hashed`，盐值与 `USER_ID_SALT` 相同。
+- `subagent_enabled=true`，且 `skill-finder` 和 `knowledge-researcher` 都可用。如果禁用子代理或某个检索子代理不可用，主 Agent 可以回退到直接 `knowledge_search`；这是评测配置上的退化，绝不能评分为通过。
+- `skills.usage.prompt_top_k=0`——私有 Skills 不得进入静态 `<available_skills>` 提示索引。
+- 评测样本不使用斜杠激活。每个 `expect_skill`/`expect_kb` 样本都必须通过 `task` 调用到达其子代理；静态 `load_skill` 或未经委托的直接 `knowledge_search` 会使样本无效，路由指标会将其评为 0.0 而不是 `N/A`。
+- `run_events.backend=db` 或 `jsonl`，绝不能是 `memory`：事件账本必须在运行结束后仍然存在，因为证据是在运行完成后读取的。
 
-## CI and nightly
+## CI 与夜间任务
 
-`.github/workflows/agent-eval.yml` runs on pull requests and nightly (`0 18 * * *`
-UTC), with a 45-minute job timeout and the Gateway/Langfuse secrets injected from
-GitHub secrets (a run never reads MCP headers). The dataset is frozen input: the
-workflow never runs `build`.
+`.github/workflows/agent-eval.yml` 在拉取请求和夜间（UTC `0 18 * * *`）运行，作业超时为 45 分钟，Gateway/Langfuse 机密信息由 GitHub secrets 注入（运行从不读取 MCP 请求头）。数据集是冻结输入：工作流从不运行 `build`。
 
-| Trigger | Command | What it covers |
+| 触发条件 | 命令 | 覆盖范围 |
 | --- | --- | --- |
-| Pull request | `--mode ci --dataset agent-eval/regression/v1 --run-name ci-${GITHUB_SHA}` | The fixed stratified 30-item subset (round-robin over id-sorted `metadata.category` groups; a smaller dataset contributes every item). Rule metrics are hard gates. LLM metrics never hard-fail in `ci` mode. |
-| Nightly schedule | `--mode full --dataset agent-eval/regression/v1 --run-name nightly-${GITHUB_SHA}` | Every dataset item. Rule metrics are hard gates; LLM metrics may become hard gates once they have at least 20 scored samples. |
+| 拉取请求 | `--mode ci --dataset agent-eval/regression/v1 --run-name ci-${GITHUB_SHA}` | 固定的分层 30 条目子集（在按 ID 排序的 `metadata.category` 分组间轮询；数据集较小时贡献每个条目）。规则指标是硬门禁。LLM 指标在 `ci` 模式下绝不会硬性失败。 |
+| 夜间计划 | `--mode full --dataset agent-eval/regression/v1 --run-name nightly-${GITHUB_SHA}` | 每个数据集条目。规则指标是硬门禁；一旦至少有 20 个已评分样本，LLM 指标可能成为硬门禁。 |
 
-A gated metric with zero scored samples is reported `insufficient` and does not
-fail the run; it also does not count as a pass. Do not read "PASS" as "every
-metric was measured" -- check the `samples=` column.
+零个已评分样本的门禁指标会报告为 `insufficient`，不会使运行失败；它也不计入通过。不要把“PASS”理解为“每个指标都已被测量”——请检查 `samples=` 列。
 
-Today every entry in `THRESHOLDS` is a rule metric (`kind: rule`). The runner
-already implements the LLM-metric policy -- below 20 scored samples an LLM metric
-is `insufficient`, and with at least 20 it can gate hard in `full` mode while it
-stays `soft` outside it -- but no LLM/DeepEval metric is wired into `THRESHOLDS`
-yet.
+目前 `THRESHOLDS` 中的每个条目都是规则指标（`kind: rule`）。运行器已经实现了 LLM 指标策略——已评分样本少于 20 个时，LLM 指标为 `insufficient`；达到至少 20 个时，它在 `full` 模式下可以硬性门禁，而在其他模式下保持 `soft`——但尚未有任何 LLM/DeepEval 指标接入 `THRESHOLDS`。
 
-## Results: gates, scores, and incomplete experiments
+## 结果：门禁、分数与不完整实验
 
-A successful run prints one summary line per thresholded metric, then the
-verdict:
+成功的运行会为每个带阈值的指标打印一行摘要，然后打印判定结果：
 
 ```text
 dataset: agent-eval/regression/v1
@@ -313,153 +194,92 @@ result: PASS
 experiment: https://langfuse.example/project/p/experiments/<id>
 ```
 
-`PASS`/`FAIL` compare the average of the metric's non-`None` samples with the
-threshold (`min`: average must be at least the threshold; `max`: at most).
-`None` means "this sample cannot be scored on this metric" and is not counted as
-zero. `insufficient` means no sample produced a numeric score for that metric
-(or an LLM metric has fewer than 20); the renderer uses one LLM-oriented sentence
-for both cases, so read `samples=0` as "nothing scored this metric".
+`PASS`/`FAIL` 将指标所有非 `None` 样本的平均值与该阈值比较（`min`：平均值必须至少达到阈值；`max`：至多）。`None` 表示“该样本无法在此指标上评分”，不计为零。`insufficient` 表示没有样本为该指标产生数值分数（或某个 LLM 指标少于 20 个样本）；渲染器对两种情况使用同一句面向 LLM 的说明，因此把 `samples=0` 理解为“没有任何内容为该指标评分”。
 
-Metric catalogue (`THRESHOLDS` as merged):
+指标目录（合并后的 `THRESHOLDS`）：
 
-| Score | Layer | Evidence it reads | Gate |
+| 分数 | 层级 | 读取的证据 | 门禁 |
 | --- | --- | --- | --- |
-| `retrieval_recall@5` | T1 tool retrieval | `retrieval.tool` -> `tools[].call_name`, first 5 | `>= 0.95` |
-| `tool_hit` | T2 tool selection | Business tool calls, with `tool_execute` unwrapped and infrastructure tools excluded | `>= 0.90` |
-| `args_accuracy` | T2 arguments | `expected_calls[].check_keys` against the actual call arguments | `>= 0.85` |
-| `extra_calls_ratio` | T3 trajectory | Business tool calls / expected calls | `<= 1.5` |
-| `skill_routing` | K0 routing | A `task` call with `subagent_type="skill-finder"` vs `expect_skill` | `>= 0.95` |
-| `skill_recall@5` | K1 Skill retrieval | `retrieval.skill` -> `skills[].name`, first 5 | `>= 0.95` |
-| `skill_hit` | K2 Skill selection | `load_skill` names: every expected Skill loaded, and only retrieved Skills loaded | `>= 0.90` |
-| `kb_routing` | R0 routing | A `task` call with `subagent_type="knowledge-researcher"` vs `expect_kb` | `>= 0.95` |
-| `kb_recall@5` | R1 KB retrieval | `retrieval.kb` -> `items[].document_id`, first 5 | `>= 0.85` |
-| `citation_valid` | R3 citations | `additional_kwargs.knowledge_citations` pairs vs chunks this run retrieved | `>= 0.95`; any 0.0 fails the whole run |
-| `forbidden_violation` | S1 safety | Business tool calls vs `forbidden_tools`; 1.0 means a violation | `<= 0.0`; any 1.0 fails the whole run |
+| `retrieval_recall@5` | T1 工具检索 | `retrieval.tool` -> `tools[].call_name`，前 5 个 | `>= 0.95` |
+| `tool_hit` | T2 工具选择 | 业务工具调用，`tool_execute` 已解包，排除基础设施工具 | `>= 0.90` |
+| `args_accuracy` | T2 参数 | 用 `expected_calls[].check_keys` 对照实际调用参数 | `>= 0.85` |
+| `extra_calls_ratio` | T3 轨迹 | 业务工具调用 / 期望调用 | `<= 1.5` |
+| `skill_routing` | K0 路由 | 带 `subagent_type="skill-finder"` 的 `task` 调用 vs `expect_skill` | `>= 0.95` |
+| `skill_recall@5` | K1 Skill 检索 | `retrieval.skill` -> `skills[].name`，前 5 个 | `>= 0.95` |
+| `skill_hit` | K2 Skill 选择 | `load_skill` 名称：每个期望的 Skill 都已加载，且只加载已检索的 Skill | `>= 0.90` |
+| `kb_routing` | R0 路由 | 带 `subagent_type="knowledge-researcher"` 的 `task` 调用 vs `expect_kb` | `>= 0.95` |
+| `kb_recall@5` | R1 KB 检索 | `retrieval.kb` -> `items[].document_id`，前 5 个 | `>= 0.85` |
+| `citation_valid` | R3 引用 | 将 `additional_kwargs.knowledge_citations` 与本运行检索到的分块对照 | `>= 0.95`；任何 0.0 都会使整个运行失败 |
+| `forbidden_violation` | S1 安全 | 业务工具调用 vs `forbidden_tools`；1.0 表示违规 | `<= 0.0`；任何 1.0 都会使整个运行失败 |
 
-`citation_valid` returns `None` when any `retrieval.kb` row of the run was
-truncated: the budget hid chunks, so a citation that looks forged may simply be
-out of view. Recorded without a numeric gate: `retrieval_mrr`, `skill_mrr`,
-`kb_mrr`, `skill_extra` (lower is better), and `no_tool_ok` (only items whose
-`metadata.category` is `no_tool` are scored).
+当运行的任何 `retrieval.kb` 行被截断时，`citation_valid` 返回 `None`：预算隐藏了分块，因此看起来伪造的引用可能只是不在可见范围内。仅记录、不设数值门禁的指标有：`retrieval_mrr`、`skill_mrr`、`kb_mrr`、`skill_extra`（越低越好）和 `no_tool_ok`（仅对 `metadata.category` 为 `no_tool` 的条目评分）。
 
-An item that finishes with no evaluations at all is a `failed item` with status
-`unscored`, not an absent item: the design counts an unscored sample as a failed
-experiment. This matters for trace-replay drafts, whose `expected_output` is `{}`:
-they are intentionally inapplicable to every metric, so a dataset containing
-them cannot ride in a regression run. `build` keeps them out unless
-`--include-traces` is passed; put trace replays in the explore set, or give them
-real expectations before running them as a regression.
+一个完成时完全没有评测的条目是 `failed item`，状态为 `unscored`，而不是缺失条目：该设计将未评分样本计为失败实验。这对追踪回放草稿很重要，它们的 `expected_output` 为 `{}`：它们从设计上就不适用于任何指标，因此包含它们的数据集不能进入回归运行。`build` 会排除它们，除非传入 `--include-traces`；请将追踪回放放入探索集，或在将其作为回归运行前赋予真实期望。
 
-An item that declares `expect_skill`/`expect_kb` but answers without that
-subagent -- or that loads a Skill it never retrieved, or answers a KB question
-with no KB retrieval evidence -- is a `failed item` with status `invalid_routing`.
-Routing has its own score, but one direct fallback among 30 samples still
-averages above the 0.95 gate, so the runner fails the sample instead.
+一个声明了 `expect_skill`/`expect_kb` 但未通过该子代理就作答的条目——或加载了从未检索过的 Skill，或在没有 KB 检索证据的情况下回答 KB 问题的条目——是 `failed item`，状态为 `invalid_routing`。路由有单独分数，但 30 个样本中出现一次直接回退，平均值仍会高于 0.95 门禁，因此运行器会将该样本判为失败。
 
-`scorable items: N` counts the items that produced at least one thresholded
-metric score. With `N = 0` the run fails with
-`no scorable samples: no item produced a thresholded metric score`, even when
-every item completed: an empty gate list is not a clean result.
+`scorable items: N` 统计产生至少一个带阈值指标分数的条目。当 `N = 0` 时，即使每个条目都已完成，运行也会以 `no scorable samples: no item produced a thresholded metric score` 失败：空门禁列表不是干净的结果。
 
-An incomplete experiment is reported before any gate summary:
+不完整实验会在任何门禁摘要之前报告：
+
 ```text
 error: experiment did not return every dataset item it planned; missing: kb-1a2b3c4d5e6f7a8b; failed: kb-1a2b3c4d5e6f7a8b=exception (RuntimeError: ...)
 ```
-The CLI prints that line to stderr and exits `1`. Investigate the item ids named
-there: a `missing` item was planned but never returned, an `unexpected` item was
-not planned, and a `failed` item names its status (`exception`, `unscored`, or a
-non-success run status). Do not rerun only the surviving items to get a green
-result -- the next full run must show every planned item returned.
 
-### Experiment metadata
+CLI 将该行打印到 stderr 并以 `1` 退出。调查其中列出的条目 ID：`missing` 条目是已计划但从未返回的，`unexpected` 条目是未计划的，`failed` 条目会列出其状态（`exception`、`unscored` 或非成功的运行状态）。不要只重跑幸存条目来获得绿色结果——下一次完整运行必须显示每个计划条目都已返回。
 
-Every experiment carries these string values on the run, so two experiments are
-comparable without guessing what changed:
+### 实验元数据
 
-| Key | Value |
+每次实验都会在运行上携带这些字符串值，因此两次实验无需猜测改了什么就能比较：
+
+| 键 | 值 |
 | --- | --- |
-| `mode` | `ci` or `full` |
-| `max_concurrency` | The concurrency the run used |
-| `dataset` | The dataset name |
-| `package_version` | The installed `myflow-evals` version (`0.1.0` fallback) |
-| `git_sha` | `GIT_SHA`/`GITHUB_SHA` when present, else `unknown` |
-| `salt_fingerprint` | First 8 hex of `sha256(USER_ID_SALT)`; never the salt |
+| `mode` | `ci` 或 `full` |
+| `max_concurrency` | 运行使用的并发数 |
+| `dataset` | 数据集名称 |
+| `package_version` | 已安装的 `myflow-evals` 版本（回退为 `0.1.0`） |
+| `git_sha` | 存在时使用 `GIT_SHA`/`GITHUB_SHA`，否则为 `unknown` |
+| `salt_fingerprint` | `sha256(USER_ID_SALT)` 的前 8 位十六进制；绝不是盐本身 |
 
-The experiment label itself is stable (`agent-eval:<dataset>`), so `ci-<sha>` and
-`nightly-<date>` runs land in the same experiment and stay comparable.
+实验标签本身是稳定的（`agent-eval:<dataset>`），因此 `ci-<sha>` 和 `nightly-<date>` 运行会落入同一实验并保持可比。
 
-## Package layout
+## 包布局
 
-| Module | Responsibility |
+| 模块 | 职责 |
 | --- | --- |
-| `accounts.py` | Load fixed accounts (`AGENT_USERS` or a secret file), log in once per account, compute the Langfuse hashed user id. |
-| `api.py` | Gateway thread/run/event client (`AgentApi`, `RunSnapshot`). |
-| `evidence.py` | Pure normalization of a finished run into `RunEvidence` (answer, tool calls, subagents, retrieval, citations). |
-| `evaluators.py` | Pure per-sample rule metrics and the `RULE_EVALUATORS`/`THRESHOLDS` registry. |
-| `mcp.py` | Direct MCP `tools/list` client (`McpClient`) plus `MCP_SERVER_HEADERS` secret loading. |
-| `build_dataset.py` | Dataset sources, deterministic draft synthesis (`build_account_items`), optional trace fetch, and the `DatasetWriter` seam. |
-| `runner.py` | Experiment execution, completeness gate, compact evidence handoff, metric gates. |
-| `cli.py` | The `myflow-evals build` / `run` / `ingest` command line and its exit-code contract. |
+| `accounts.py` | 加载固定账户（`AGENT_USERS` 或机密文件），每个账户登录一次，计算 Langfuse 哈希用户 ID。 |
+| `api.py` | Gateway thread/run/event 客户端（`AgentApi`、`RunSnapshot`）。 |
+| `evidence.py` | 以纯函数方式将已完成的运行规范化为 `RunEvidence`（答案、工具调用、子代理、检索、引用）。 |
+| `evaluators.py` | 纯逐样本规则指标，以及 `RULE_EVALUATORS`/`THRESHOLDS` 注册表。 |
+| `mcp.py` | 直接 MCP `tools/list` 客户端（`McpClient`），以及 `MCP_SERVER_HEADERS` 机密加载。 |
+| `build_dataset.py` | 数据来源、确定性草稿合成（`build_account_items`）、可选追踪获取，以及 `DatasetWriter` 抽象接口。 |
+| `runner.py` | 实验执行、完整性门禁、紧凑证据交接、指标门禁。 |
+| `cli.py` | `myflow-evals build` / `run` / `ingest` 命令行及其退出码契约。 |
 
-## Building drafts from the fixed account
+## 从固定账户构建草稿
 
-`load_build_sources(session, limit=...)` reads, as that account:
+`load_build_sources(session, limit=...)` 以该账户身份读取：
 
-- `GET /api/mcp-servers`, then -- for every **effective** server -- a direct MCP
-  `tools/list` for the real `inputSchema` (`GET /api/mcp-servers/{id}/tools`
-  returns summaries without schemas, so it is not a schema source);
-- `GET /api/skills`, keeping `scope == "private"` and dropping builtin/public
-  Skills and any Skill without `skill_id`/`name`;
-- `GET /api/knowledge/bases` -> `/documents` -> sample three chunks per document
-  and keep the longest readable one;
-- the account's own failed or low-scored Langfuse traces, only when the caller
-  asks for them (`include_traces=True`, i.e. `--include-traces`); see below.
+- `GET /api/mcp-servers`，然后——对每个**生效**服务器——直接执行 MCP `tools/list` 获取真实的 `inputSchema`（`GET /api/mcp-servers/{id}/tools` 返回不含 schema 的摘要，因此它不是 schema 来源）；
+- `GET /api/skills`，保留 `scope == "private"`，丢弃 builtin/public Skills 以及任何缺少 `skill_id`/`name` 的 Skill；
+- `GET /api/knowledge/bases` -> `/documents` -> 每个文档的分块抽样（随机三个，取最长，见下条）；
+- 账户自己的失败或低分 Langfuse 追踪，仅在调用方要求时读取（`include_traces=True`，即 `--include-traces`）；见下文。
 
-Only effective sources become samples, mirroring what the Agent can really
-route to:
+只有生效来源会成为样本，与 Agent 实际能路由到的内容保持一致：
 
-- **MCP server**: the summary must say `enabled: true`, `status: "active"`, and
-  `reachable: true` (agentkit's `is_active`). An absent flag is not `true`, so a
-  disabled, still-pending, errored, unreachable, or flag-less server is skipped
-  with a warning naming it and the reason. Locally fixable problems are checked
-  first: an unsupported transport or a missing url is reported even when the
-  server is also not effective, because that is the reason an operator can act on.
-- **MCP tool**: after `tools/list` succeeds, `GET /api/mcp-servers/{id}/tools`
-  supplies the Gateway's projection; a tool is sampled only when its row is both
-  `callable: true` **and** `enabled: true`. Rows are matched by `call_name`,
-  falling back to `name` when a row carries no `call_name`. A listed tool with
-  no projection row is skipped with a warning, and a failed `/tools` call skips
-  that whole server with a warning (effectiveness cannot be established; it
-  never aborts the build).
-- **Skill**: a private Skill must be `enabled: true` and, when the row carries a
-  `status`, `status == "active"`; a switched-off or non-active Skill is skipped
-  with a warning naming it.
+- **MCP 服务器**：摘要必须表明 `enabled: true`、`status: "active"` 和 `reachable: true`（agentkit 的 `is_active`）。缺失标志不能视为 `true`，因此被禁用、仍待处理、出错、不可达或无标志的服务器会被跳过，并给出警告，指出其名称和原因。先检查本地可修复的问题：不支持的 transport 或缺失 url 即使服务器同时未生效也会报告，因为那是运维人员可以采取行动的原因。
+- **MCP 工具**：在 `tools/list` 成功后，`GET /api/mcp-servers/{id}/tools` 提供 Gateway 的投影；只有某一行的 `callable: true` **且** `enabled: true` 时才会采样该工具。行按 `call_name` 匹配，当行没有 `call_name` 时回退到 `name`。已列出但没有投影行的工具会被跳过并给出警告；`/tools` 调用失败会跳过整个服务器并给出警告（无法确认生效性；它绝不会中止构建）。
+- **Skill**：私有 Skill 必须 `enabled: true`，当行带有 `status` 时还必须 `status == "active"`；被关闭或非活跃的 Skill 会被跳过，并给出警告指出其名称。
+- **知识库分块**：不再固定取第 0 个分块，而是在该文档的分块中随机抽取三个不同位置，取正文最长的那个；比较用 `len(content.strip())`，并列时取 `chunk_index` 最小的，空白分块永不入选（即使它的原始字符串最长）。文档只有 1 个分块时复用计数请求，2-3 个分块时整页读取，更多时发 1 次计数请求加 3 次单分块请求，因此每个文档最多 4 次分块请求。抽样用注入的 `random.Random`：`build --seed N` 让抽号可复现，而条目 ID 由文档 ID 推导、与抽号无关。某个文档的分块页读取失败只跳过该文档并给出警告，不会中断构建；`count` 缺失或格式非法时给出“分块计数缺失或非法”的警告，而不是误报成没有可读分块。
 
-Only `streamable_http` MCP servers are supported. Every effectiveness skip and
-every unusable local source -- a non-effective server, an `sse` server, a server
-without a usable url, a server whose `tools/list` or `/tools` call fails, a tool
-the projection does not list or does not mark `callable`/`enabled`, a
-non-effective Skill, a document without a readable chunk or with an unreadable
-chunk page or malformed chunk count, an unavailable
-Langfuse -- is reported as a warning on `BuildSources.warnings` and therefore in
-the build report, and a broken source costs exactly its own items instead of
-failing the build. Rows dropped for a different reason are silent by design: a
-Skill that is public, builtin-category, or missing `skill_id`/`name` was never a
-sample this account could use, so it is not reported. A Gateway failure that
-makes the account data unusable still raises.
+仅支持 `streamable_http` MCP 服务器。每一次生效性跳过和每一个不可用的本地来源——未生效服务器、`sse` 服务器、没有可用 url 的服务器、`tools/list` 或 `/tools` 调用失败的服务器、投影未列出或未标记 `callable`/`enabled` 的工具、未生效 Skill、没有可读分块的文档、不可用的 Langfuse——都会作为警告记录在 `BuildSources.warnings` 上，从而出现在构建报告中；一个损坏来源只损失它自己的条目，而不会使构建失败。因其他原因被丢弃的行按设计保持静默：public、builtin 类别或缺少 `skill_id`/`name` 的 Skill 从来不是该账户可用的样本，因此不会报告。导致账户数据不可用的 Gateway 故障仍会抛出异常。
 
-`build_account_items(session, sources, limit=...)` is pure: no I/O, no clock, no
-randomness. It emits one draft per source with a deterministic id
-(`stable_item_id(kind, source_id, ordinal, hashed_user_id)`), so rebuilding is
-idempotent and re-running against the same account never duplicates items. A tool
-whose call name the Agent could not call back -- a dotted upstream name, or one
-beyond the provider length bound -- is skipped with a warning and produces no
-draft, because a sample built from it could never pass.
+`build_account_items(session, sources, limit=...)` 是纯函数：没有 I/O、没有时钟、没有随机性。它为每个来源生成一个带确定性 ID 的草稿（`stable_item_id(kind, source_id, ordinal, hashed_user_id)`），因此重建是幂等的，对同一账户重复运行绝不会重复条目。如果某个工具调用名是 Agent 无法回调的——带点的上游名称，或超出提供方长度限制——则跳过并给出警告，不产生草稿，因为用它构建的样本永远无法通过。
 
-### Draft shapes
+### 草稿结构
 
 ```json
-// tool
+// 工具
 {"id": "tool-<16 hex>", "input": {"query": "Use the <tool> tool: <description>."},
  "expected_output": {"expected_tools": ["mcp__<server>__<tool>"],
    "expected_calls": [{"tool": "mcp__<server>__<tool>", "args": {}, "check_keys": []}],
@@ -467,70 +287,43 @@ draft, because a sample built from it could never pass.
  "metadata": {"user_id": "<hashed>", "source_id": "mcp__<server>__<tool>", "source_kind": "tool",
    "category": "single_tool", "source": "synthetic_from_tools", "tool_schema_hash": "<16 hex>"}}
 
-// private Skill
+// 私有 Skill
 {"input": {"query": "Use the <skill> skill: <description>."},
  "expected_output": {"expect_skill": true, "expected_skills": ["<skill>"], "skill_rules": "",
    "expect_kb": false, "expected_tools": []},
  "metadata": {"user_id": "<hashed>", "source_id": "<skill_id>", "source_kind": "skill",
    "category": "skill_single", "source": "synthetic_from_skill", "skill_commit": "<sha or null>"}}
 
-// knowledge document
+// 知识库文档
 {"input": {"query": "According to <filename>, what are the key points?"},
  "expected_output": {"expect_kb": true, "expected_doc_ids": ["<document_id>"],
-   "reference_answer": "<longest of three sampled chunks>", "key_points": [], "expect_refusal": false},
+   "reference_answer": "<采样的最长分块正文>", "key_points": [], "expect_refusal": false},
  "metadata": {"user_id": "<hashed>", "source_id": "<document_id>", "source_kind": "knowledge",
    "category": "kb_single_hop", "source": "synthetic_from_docs", "document_id": "...",
    "chunk_id": "<document_id>:<chunk_index>", "knowledge_base_id": "...", "kb_version": "..."}}
 
-// replayed online trace
+// 回放的在线追踪
 {"input": {"query": "<the trace's question>"}, "expected_output": {},
  "metadata": {"user_id": "<hashed>", "source_id": "<trace id>", "source_kind": "trace",
    "source": "online_trace", "trace_id": "<trace id>", "category": "trace_replay"}}
 ```
 
-Notes on the shapes:
+关于这些结构的说明：
 
-- Tool `args` come from the real `inputSchema`: required properties only, first
-  `enum` value when present, else a type placeholder, recursing into a required
-  object one level. `check_keys` is the sorted list of the required properties
-  that were filled. `forbidden_tools` stays empty: safety expectations are not
-  guessed.
-- Knowledge items carry `document_id`/`chunk_id` provenance in metadata but emit
-  `expected_doc_ids` only -- chunk ids are a retriever implementation detail.
-  `kb_version` is `<base_id>:<chunk_count>` because the knowledge APIs expose no
-  version string; it still changes when a document is re-chunked.
-- A trace draft has no expectations at all, so evaluators report it as
-  inapplicable (`None`) instead of scoring it -- which also means it is
-  `unscored` for the completeness gate, so keep replays out of regression runs.
-- `metadata.user_id` is always the Langfuse hashed user id
-  (`HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`). The raw `/me.id`, usernames,
-  and passwords never enter a draft, a log, or a report.
+- 工具的 `args` 来自真实 `inputSchema`：仅必填属性；存在 `enum` 时取第一个值，否则取类型占位符，并递归进入必填对象一层。`check_keys` 是已填充必填属性的排序列表。`forbidden_tools` 保持为空：安全期望不做猜测。
+- 知识条目在元数据中携带 `document_id`/`chunk_id` 来源信息，但只输出 `expected_doc_ids`——chunk ID 是检索器实现细节。`kb_version` 为 `<base_id>:<chunk_count>`，因为知识 API 不暴露版本字符串；当文档重新分块时它仍会变化。
+- 追踪草稿完全没有期望，因此评测器会将其报告为不适用（`None`），而不是评分——这也意味着它对完整性门禁是 `unscored`，所以请将回放排除在回归运行之外。
+- `metadata.user_id` 始终是 Langfuse 哈希用户 ID（`HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`）。原始 `/me.id`、用户名和密码绝不会进入草稿、日志或报告。
 
-### Deterministic synthesis only
+### 仅确定性合成
 
-The build uses templates over real data; there is no LLM call or optional extra
-in this path, so a build costs nothing and is reproducible byte for byte for the
-same account data and the same `--seed`. Categories produced today are `single_tool`, `skill_single`,
-`kb_single_hop`, and -- only with `--include-traces` -- `trace_replay`.
+构建在真实数据上使用模板；此路径没有 LLM 调用或可选附加组件，因此构建不产生费用，并且对相同账户数据可逐字节复现。目前产生的类别有 `single_tool`、`skill_single`、`kb_single_hop`，以及仅在 `--include-traces` 时的 `trace_replay`。
 
-The remaining categories from the design table -- `multi_tool`, `similar_tools`
-(hard negatives), `missing_params`, `similar_skills`, `skill_with_tools`,
-`kb_multi_hop`, `kb_unanswerable`, and rewritten/human-reviewed questions --
-need LLM synthesis or human review and are future work. Until then the built dataset has a narrower category mix than the
-design's target ratios, and the template queries are placeholders, not realistic
-user phrasing.
+设计表中的其余类别——`multi_tool`、`similar_tools`（硬负样本）、`missing_params`、`similar_skills`、`skill_with_tools`、`kb_multi_hop`、`kb_unanswerable`，以及重写/人工审核的问题——需要 LLM 合成或人工审核，属于未来工作。在此之前，构建出的数据集类别组合比设计目标比例更窄，模板问题也只是占位符，而非真实的用户措辞。
 
-### Limits, reports, and dry runs
+### 限制、报告与试运行
 
-`--limit` (the `limit` argument) caps drafts per source kind: tools, private
-Skills, knowledge documents, and traces are capped separately. It bounds work,
-not truth: only the first `limit` documents get their chunk fetched, but every
-kind is still counted in full (traces are paged to completion under a bounded
-page guard, so even the trace count is real), so the "M sources" in a report is
-the number of sources that account actually has, never the capped sample. Without
-`--include-traces` the trace kind is not read at all and the report says
-`trace: 0 drafts from 0 sources`. The returned `BuildReport` records both counts
-and renders lines such as:
+`--limit`（`limit` 参数）限制每种来源类型的草稿数：工具、私有 Skills、知识文档和追踪分别独立设上限。它限制工作量，而不是真实性：只有前 `limit` 个文档会获取分块，但每种类型仍会完整计数（追踪会在有界分页保护下翻页到完成，因此连追踪计数也是真实的），所以报告中的“M sources”是该账户实际拥有的来源数，而不是被上限截断的样本数。没有 `--include-traces` 时，根本不会读取追踪类型，报告会显示 `trace: 0 drafts from 0 sources`。返回的 `BuildReport` 会记录这两个计数并渲染如下行：
 
 ```text
 dataset: myflow-eval
@@ -544,48 +337,19 @@ total: 8 drafts
 warning: skipped MCP server 'legacy_db': sse transport is not supported (only streamable_http is implemented)
 ```
 
-Writes go through `DatasetWriter.upsert_items(dataset_name, items)`, implemented
-by `LangfuseDatasetWriter` in `cli.py`. `write_drafts(..., dry_run=True)` returns 0
-and never calls the writer, so a dry run cannot create or change a Langfuse
-dataset. `myflow-evals build` is the only command that writes dataset items;
-`run` treats the dataset as frozen input, and `ingest` only prints.
+写入通过 `DatasetWriter.upsert_items(dataset_name, items)` 完成，由 `cli.py` 中的 `LangfuseDatasetWriter` 实现。`write_drafts(..., dry_run=True)` 返回 0 且从不调用 writer，因此试运行无法创建或更改 Langfuse 数据集。`myflow-evals build` 是唯一写入数据集条目的命令；`run` 将数据集视为冻结输入，`ingest` 只打印。
 
-## Known limits
+## 已知限制
 
-- Deterministic synthesis covers `single_tool`, `skill_single`, `kb_single_hop`,
-  and `trace_replay` only. `multi_tool`, `similar_tools`, `missing_params`,
-  `similar_skills`, `skill_with_tools`, `kb_multi_hop`, `kb_unanswerable`, and
-  rewritten questions are not generated.
-- K3 `skill_adherence`, R4 `refusal_ok`, Faithfulness, `answer_correctness`,
-  `answer_quality`, AnswerRelevancy, ContextualPrecision/Recall/Relevancy, and
-  every other DeepEval metric are not implemented. Every current `THRESHOLDS`
-  entry is a rule metric.
-- LLM-based dataset synthesis and the optional DeepEval extra are not present;
-  there is no manual Golden set.
-- `ingest` prints candidate failed/low-scored traces but does not write an
-  explore dataset; promoting them into a dataset is still manual.
-- Only `streamable_http` MCP servers contribute tools. Non-effective servers
-  (not enabled, not `active`, or unreachable), `sse` servers, servers without a
-  URL, servers whose `tools/list` or `/tools` call fails, tools the Gateway
-  projection does not mark callable **and** enabled, and private Skills that are
-  switched off or not active are skipped with a warning.
-- Evidence carries the run trace id only because the runner hands
-  `RunSnapshot.trace_id` to `collect_evidence`; a different caller must pass it
-  explicitly or the evidence's `trace_id` is `None`.
-- No user-id, permission, cross-user isolation, or long-term-memory metric is
-  scored; `metadata.user_id` is only an account-selection/provenance key.
-- Builtin Skills and slash activation are excluded from samples. Only
-  `scope=private` Skills are sampled.
-- The retrieval metrics compare names/ids over the first five results; adding or
-  removing source documents invalidates `expected_doc_ids`. Re-chunking alone does
-  not, because only document ids are compared.
-- `retrieval.*` events carry only what the model saw: the query, the final
-  cards/chunks, channels, warnings, and the `truncated` flag. They do not carry
-  `task_query`, `domain_keywords`, or a tool `description`, so a metric that needs
-  those must read them elsewhere; the ledger contract stays as merged.
-- A dataset version is immutable once frozen: rebuilding the same name upserts
-  items but never deletes the ones whose sources disappeared. Freeze a new
-  version under a new dataset name (for example `agent-eval/regression/v2`).
-- `trace_replay` items are unscorable by construction, so `build` excludes them
-  unless `--include-traces` is passed and a dataset that contains them cannot
-  pass a run.
+- 确定性合成仅覆盖 `single_tool`、`skill_single`、`kb_single_hop` 和 `trace_replay`。不会生成 `multi_tool`、`similar_tools`、`missing_params`、`similar_skills`、`skill_with_tools`、`kb_multi_hop`、`kb_unanswerable` 以及重写问题。
+- K3 `skill_adherence`、R4 `refusal_ok`、Faithfulness、`answer_correctness`、`answer_quality`、AnswerRelevancy、ContextualPrecision/Recall/Relevancy 以及所有其他 DeepEval 指标都未实现。当前每个 `THRESHOLDS` 条目都是规则指标。
+- 不存在基于 LLM 的数据集合成和可选 DeepEval 附加组件；也没有人工 Golden set。
+- `ingest` 会打印候选的失败/低分追踪，但不会写入探索数据集；将其提升为数据集仍需手动操作。
+- 只有 `streamable_http` MCP 服务器会贡献工具。未生效服务器（未启用、非 `active` 或不可达）、`sse` 服务器、没有 URL 的服务器、`tools/list` 或 `/tools` 调用失败的服务器、Gateway 投影未标记为可调用**且**已启用的工具，以及被关闭或非活跃的私有 Skills 都会被跳过并给出警告。
+- 证据携带运行追踪 ID，只是因为运行器将 `RunSnapshot.trace_id` 传给 `collect_evidence`；其他调用方必须显式传入，否则证据的 `trace_id` 为 `None`。
+- 不会对用户 ID、权限、跨用户隔离或长期记忆指标评分；`metadata.user_id` 仅作为账户选择/来源键。
+- 内置 Skills 和斜杠激活被排除在样本之外。只采样 `scope=private` 的 Skills。
+- 检索指标只在前五个结果上比较名称/ID；增加或删除来源文档会使 `expected_doc_ids` 失效。仅重新分块不会，因为只比较文档 ID。
+- `retrieval.*` 事件只携带模型看到的内容：查询、最终卡片/分块、通道、警告以及 `truncated` 标志。它们不携带 `task_query`、`domain_keywords` 或工具 `description`，因此需要这些信息的指标必须从别处读取；账本约定保持合并状态。
+- 数据集版本一旦冻结就不可变：重建同名会 upsert 条目，但绝不会删除来源已消失的条目。请在新的数据集名称下冻结新版本（例如 `agent-eval/regression/v2`）。
+- `trace_replay` 条目从设计上不可评分，因此除非传入 `--include-traces`，`build` 会排除它们，而包含它们的数据集无法通过运行。
