@@ -567,6 +567,12 @@ def quality_report(
         if sources is not None
         else None
     )
+    known_tools = (
+        {tool.call_name for tool in sources.tools} if sources is not None else None
+    )
+    known_skills = (
+        {skill.name for skill in sources.skills} if sources is not None else None
+    )
 
     for draft in drafts:
         user_id = draft.metadata.get("user_id")
@@ -599,6 +605,20 @@ def quality_report(
         for name in _expected_tool_names(expected):
             if not is_safe_call_name(name):
                 problems.append(f"unsafe expected tool name: {name}")
+            elif known_tools is not None and name not in known_tools:
+                problems.append(f"expected tool is not in account sources: {name}")
+
+        if known_skills is not None:
+            for name in _string_values(expected.get("expected_skills")):
+                if name not in known_skills:
+                    problems.append(
+                        f"expected Skill is not in account sources: {name}"
+                    )
+
+        if category.startswith("kb_") and not _text(
+            expected.get("reference_answer")
+        ):
+            problems.append(f"KB draft has no reference answer: {draft.id}")
 
         if known_docs is not None and category.startswith("kb_"):
             for document_id in _string_values(expected.get("expected_doc_ids")):

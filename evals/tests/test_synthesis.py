@@ -708,6 +708,29 @@ def test_quality_report_allows_one_query_across_two_accounts() -> None:
     assert report.problems == ()
 
 
+
+
+def test_quality_report_rejects_unsolvable_tool_and_skill_expectations() -> None:
+    sources = _quality_sources()
+    unknown_tool = _draft(
+        "unknown-tool",
+        "a unique question",
+        expected={"expected_tools": ["mcp__db__ghost"]},
+    )
+    unknown_skill = _draft(
+        "unknown-skill",
+        "another unique question",
+        expected={"expected_skills": ["ghost-skill"]},
+        source_id="skill-2",
+        category="skill_single",
+    )
+
+    report = quality_report([unknown_tool, unknown_skill], sources=sources)
+
+    assert report.ok is False
+    assert any("expected tool is not in account sources" in problem for problem in report.problems)
+    assert any("expected Skill is not in account sources" in problem for problem in report.problems)
+
 def test_quality_report_accepts_a_clean_synthesized_set_and_counts_dimensions() -> None:
     result = synthesize_account_items(
         _session(),
