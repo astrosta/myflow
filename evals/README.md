@@ -98,7 +98,7 @@ uv run --project evals myflow-evals build \
 
 `build` 以每个固定账户登录，并以该账户身份读取：`GET /api/mcp-servers`，再对每个**生效**服务器发一次 `GET /api/mcp-servers/{id}/tools?include_schema=true`，一次拿到工具名、`callable`/`enabled` 标记和真实的 `inputSchema`（不再直接开 MCP 会话，也不需要任何服务器凭据）；`GET /api/skills`（仅私有 Skills）；`GET /api/knowledge/bases` -> `/documents` -> 每个文档随机抽取的三个分块，取正文最长的作为主分块并保留最多两个相关分块（见下文）；以及仅在指定 `--include-traces` 时读取该账户自己的失败/低分 Langfuse 追踪。只有**生效**来源会被采样——一个已启用、活跃且可达的 MCP 服务器，其被 Gateway 投影标记为既可调用又已启用的工具，以及已启用且活跃的私有 Skills——因此草稿绝不会来自 Agent 无法访问的内容。每一次因生效性导致的跳过都会在构建报告中以警告打印，而因作用域、内置类别或缺少 `skill_id`/`name` 被丢弃的 Skill 则按设计保持静默。
 
-**默认是扩展构建**：每个工具生成 2 条 `single_tool`，有必填参数时再加 1 条 `missing_params`；工具描述相近时生成 `similar_tools`，同服务器读写工具成对时生成 `multi_tool`，检测到破坏性工具时生成 `injection`；每个私有 Skill 生成 2 条 `skill_single`，描述相近时生成 `similar_skills`，描述点名真实工具时生成 `skill_with_tools`；每个文档生成 1 条 `kb_single_hop`，有相关分块时再加 `kb_multi_hop`，每个账户最多 2 条 `kb_unanswerable`；每个账户再加 3 条 `no_tool` 边界样本。这些草稿先按“账户 + 规范化 query”去重（精确重复和 3-gram Jaccard ≥ 0.9 的近重复），再做结构质检（hashed user_id、query、期望字段、重复 ID/query、工具名安全性、期望工具/Skill 是否属于该账号、KB 文档 ID 与参考答案），最后才写入 Langfuse。`--no-expand` 恢复阶段 1 的“一来源一草稿”行为；`--strict` 在质检发现问题时以退出码 2 终止且不写任何条目；`--llm-synthesis` 用评判模型改写确定性问法并提炼 Skill 规则，失败会回退到确定性文本并记录警告。
+**默认是扩展构建**：每个工具生成 2 条 `single_tool`，有必填参数时再加 1 条 `missing_params`；工具描述相近时生成 `similar_tools`，同服务器读写工具成对时生成 `multi_tool`，检测到破坏性工具时生成 `injection`；每个私有 Skill 生成 2 条 `skill_single`，描述相近时生成 `similar_skills`，描述点名真实工具时生成 `skill_with_tools`；每个文档生成 1 条 `kb_single_hop`，有相关分块时再加 `kb_multi_hop`，每个账户最多 2 条 `kb_unanswerable`；每个账户再加 3 条 `no_tool` 边界样本。这些草稿先按“账户 + 规范化 query”去重（精确重复和 3-gram Jaccard ≥ 0.9 的近重复），再做结构质检（hashed user_id、query、期望字段、重复 ID/query、工具名安全性、期望工具/Skill 是否属于该账号、KB 文档 ID 与参考答案），最后才写入 Langfuse。`--no-expand` 恢复阶段 1 的“一来源一草稿”行为；`--strict` 在质检发现问题时以退出码 2 终止且不写任何条目；`--llm-synthesis` 用评判模型根据来源内容和评测项生成问法并提炼 Skill 规则，失败会回退到规则模板并记录警告。
 
 追踪回放不声明任何期望（`expected_output` 为 `{}`，`review_status=pending`），因此没有指标能给它评分，任何针对它的 `run` 都会因 `unscored` 条目失败。因此 `build` 默认排除追踪草稿，也完全不分页读取追踪；传入 `--include-traces` 可构建探索数据集。回归数据集（`agent-eval/regression/v1`）必须在不带该标志的情况下构建，这样它只包含可评分样本。
 
@@ -280,7 +280,7 @@ CLI 将该行打印到 stderr 并以 `1` 退出。调查其中列出的条目 ID
 | `llm_metrics.py` | 依赖无关的 prompt 评判指标、适用性判断、`LLM_THRESHOLDS`。 |
 | `deepeval_engine.py` | 可选的 DeepEval 指标适配器（RAG 指标、GEval、ToolCorrectness）和引擎选择。 |
 | `build_dataset.py` | 数据来源、阶段 1 的确定性一来源一草稿合成、可选追踪获取，以及 `DatasetWriter` 抽象接口。 |
-| `synthesis.py` | 阶段 2 的类别扩展、去重、质检报告、数据集 fingerprint、可选 LLM 问法改写。 |
+| `synthesis.py` | 阶段 2 的类别扩展、去重、质检报告、数据集 fingerprint、可选 LLM 问法生成。 |
 | `runner.py` | 实验执行、完整性门禁、紧凑证据交接、LLM 确定性抽样、指标门禁。 |
 | `cli.py` | `myflow-evals build` / `run` / `ingest` 命令行及其退出码契约。 |
 
@@ -302,9 +302,11 @@ CLI 将该行打印到 stderr 并以 `1` 退出。调查其中列出的条目 ID
 
 transport 不影响采样，只要求服务器生效。每一次生效性跳过和每一个不可用的本地来源——未生效服务器、`/tools` 调用失败的服务器、未标记 `callable`/`enabled` 或没有可用 `input_schema` 的工具、未生效 Skill、没有可读分块的文档、不可用的 Langfuse——都会作为警告记录在 `BuildSources.warnings` 上，从而出现在构建报告中；一个损坏来源只损失它自己的条目，而不会使构建失败。因其他原因被丢弃的行按设计保持静默：public、builtin 类别或缺少 `skill_id`/`name` 的 Skill 从来不是该账户可用的样本，因此不会报告。导致账户数据不可用的 Gateway 故障仍会抛出异常。
 
-`build_account_items(session, sources, limit=...)` 是阶段 1 的纯函数：没有 I/O、没有时钟、没有随机性，为每个来源生成一个带确定性 ID 的草稿（`stable_item_id(kind, source_id, ordinal, hashed_user_id)`），因此重建是幂等的。`synthesize_account_items(session, sources, plan=..., writer=..., embedder=...)` 是阶段 2 的扩展路径：同样全程确定性，但每个来源按类别扩展成多个草稿，再统一去重、质检和计算 fingerprint。默认 `build` 用扩展路径；`--no-expand` 恢复阶段 1 路径。如果某个工具调用名是 Agent 无法回调的——带点的上游名称，或超出提供方长度限制——两条路径都会跳过并给出警告，不产生草稿，因为用它构建的样本永远无法通过。
+`build_account_items(session, sources, limit=...)` 是阶段 1 的纯函数：没有 I/O、没有时钟、没有随机性，为每个来源生成一个带确定性 ID 的草稿（`stable_item_id(kind, source_id, ordinal, hashed_user_id)`），因此重建是幂等的。`synthesize_account_items(session, sources, plan=..., writer=..., embedder=...)` 是阶段 2 的扩展路径：默认确定性扩展；传入 writer 时，按每个草稿的 source/evaluation_item 生成新 query，再统一去重、质检和计算 fingerprint。默认 `build` 用扩展路径；`--no-expand` 恢复阶段 1 路径。如果某个工具调用名是 Agent 无法回调的——带点的上游名称，或超出提供方长度限制——两条路径都会跳过并给出警告，不产生草稿，因为用它构建的样本永远无法通过。
 
 ### 草稿结构
+
+以下 JSON 只展示字段结构；`--llm-synthesis` 的 query 由模型根据 source/evaluation_item 生成，不一定是示例文本，失败时才回退到规则模板。
 
 ```json
 // 工具：single_tool / similar_tools / multi_tool / missing_params
@@ -369,11 +371,11 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
 - `metadata.user_id` 始终是 Langfuse 哈希用户 ID（`HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`）。原始 `/me.id`、用户名和密码绝不会进入草稿、日志或报告。
 - 所有合成 query 的模板和固定问题使用简体中文；工具名、Skill 名、文档标题/文件名、ID 等专有标识保留原样。LLM 增强构建会把源描述和 `trace_replay` 也翻译成中文；纯确定性路径只保证模板中文，源描述/追踪原文可能保留原语言。语言变化会改变 query/fingerprint，已有数据集请用新名称重建。
 
-### 确定性扩展与可选 LLM 改写
+### 确定性扩展与可选 LLM 生成
 
 默认构建全程确定性：没有 LLM 调用、没有时钟、没有随机数，因此对相同账户数据（相同 `--seed`）可逐字节复现，也不产生模型费用。扩展路径产生的类别有 `single_tool`、`missing_params`、`similar_tools`、`multi_tool`、`injection`、`skill_single`、`similar_skills`、`skill_with_tools`、`kb_single_hop`、`kb_multi_hop`、`kb_unanswerable`、`no_tool`，以及 `--include-traces` 时的 `trace_replay`。设计表中的 `kb_conflict` 和 `hybrid` 仍需要 LLM 合成或人工审核，确定性路径不会生成它们。
 
-`--llm-synthesis` 是可选的增强：它用评判模型把确定性问法改写成更自然的中文用户请求，并从私有 Skill 的描述提炼 `skill_rules`（Gateway 只暴露 Skill 元数据，不暴露 SKILL.md 正文）。任何失败（超时、非 JSON、数量不符）都会原样保留确定性问法/规则并记录一条不含 prompt 内容的警告，绝不会中止构建。改写结果仍要经过同一套去重和质检；所有 query 必须为简体中文，非中文输出会被拒绝并回退，工具名/Skill 名/文档标题/ID 等专有标识保留原样。该模式会为每条草稿（含 `trace_replay`）调用一次改写，并给每个 Skill 草稿再加一次规则提炼，成本随数据集大小增长；先用 `--limit` 小规模试跑。为避免把超长工具/Skill 描述及其中的操作规则带进问题，查询模板和改写上下文只使用描述的前两句（最多 320 字符）；相似度配对和 Skill 规则提炼仍读取完整描述。
+`--llm-synthesis` 是可选的增强：它把每个评测项的 `source`（工具 schema/描述及 target/distractor 角色、Skill 描述、文档正文、trace 原文）和 `evaluation_item`（category、期望参数、`expect_*` 标记）交给评判模型，生成新的中文用户请求，不再让模型改写规则模板；规则模板只在生成失败时作为兜底，且不会进入 prompt。它还会从私有 Skill 的描述提炼 `skill_rules`（Gateway 只暴露 Skill 元数据，不暴露 SKILL.md 正文）。任何失败（超时、非 JSON、非中文、空 query）都会保留规则模板/规则并记录一条不含 prompt 内容的警告，绝不会中止构建。生成结果仍要经过同一套去重和质检；所有 query 必须为简体中文，工具名/Skill 名/文档标题/ID 等专有标识保留原样。该模式会为每条草稿（含 `trace_replay`）调用一次生成，并给每个 Skill 草稿再加一次规则提炼，成本随数据集大小增长；先用 `--limit` 小规模试跑。为避免把超长工具/Skill 描述及其中的操作规则塞进 prompt，source 描述只使用前两句（最多 320 字符），文档正文/相关分块也有长度上限；相似度配对和 Skill 规则提炼仍读取完整描述。
 
 ### 限制、报告与试运行
 
@@ -397,7 +399,7 @@ warning: skipped MCP server 'legacy_db': status=pending is not active
 
 - 确定性扩展覆盖工具、Skill、知识库、边界和安全的主要类别，但 `kb_conflict` 与 `hybrid` 仍需要 LLM 合成或人工审核；确定性路径不会生成它们。
 - LLM 指标需要评判模型配置；不配置时只跑规则指标。DeepEval 是可选 `llm` extra，未安装时 `auto` 引擎回退到内置 prompt 引擎；两者都依赖同一个 OpenAI 兼容接口。
-- `--llm-synthesis` 目前只改写 query 和提炼 skill rules，不生成 `multi_hop`/`conflict`/`hybrid` 的新语义样本；改写质量需要人工抽检。
+- `--llm-synthesis` 目前只根据 source/evaluation_item 生成 query 和提炼 skill rules，不新增 `multi_hop`/`conflict`/`hybrid` 等类别；生成质量需要人工抽检。
 - 近重复检测默认用 3-gram Jaccard；`dedupe_drafts` 接受注入的 `Embedder`，但 CLI 尚未接入 embedding 服务，因此没有向量相似度去重。
 - `ingest --write` 会写入探索集候选，但不会自动提升为回归样本；需要人工审核 `review_status` 后再冻结新数据集版本。
 - 没有人工 Golden set；合成集只作为回归信号，不用于宣称绝对回答质量。

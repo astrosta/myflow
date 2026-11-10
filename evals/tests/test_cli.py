@@ -1020,9 +1020,17 @@ def test_build_llm_synthesis_uses_the_configured_writer(
     seen: list[str] = []
 
     class FakeWriter:
-        def rewrite(self, *, kind: str, queries: list[str], context: str) -> list[str]:
+        def generate(
+            self,
+            *,
+            kind: str,
+            source: dict[str, object],
+            evaluation: dict[str, object],
+            variant: int,
+            fallback: str,
+        ) -> str:
             seen.append(kind)
-            return [f"rewritten {query}" for query in queries]
+            return f"生成的问题 {len(seen)}"
 
         def skill_rules(self, *, name: str, description: str, body: str) -> list[str]:
             return ["a rule"]
@@ -1043,7 +1051,7 @@ def test_build_llm_synthesis_uses_the_configured_writer(
     assert exit_code == 0
     assert "single_tool" in seen
     queries = [item["input"]["query"] for item in langfuse.created_items]
-    assert any(query.startswith("rewritten ") for query in queries)
+    assert any(query.startswith("生成的问题") for query in queries)
     assert "judge-secret-key" not in output
 
 
@@ -1074,7 +1082,7 @@ def test_build_reports_a_llm_writer_fallback_without_failing(
 
     output = _capture(capsys)
     assert exit_code == 0
-    assert "question writer rewrite failed" in output
+    assert "question writer generation failed" in output
     assert langfuse.created_items
 
 

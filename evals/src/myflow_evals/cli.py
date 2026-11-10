@@ -239,7 +239,7 @@ def _build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--llm-synthesis",
         action="store_true",
-        help="rewrite deterministic questions with the configured judge",
+        help="generate questions from sources and evaluation targets with the configured judge",
     )
     run = commands.add_parser(
         "run",
