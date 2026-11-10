@@ -139,11 +139,20 @@ uv run --project evals myflow-evals build \
 ```
 
 `build` logs in every fixed account and reads, as that account: `GET /api/mcp-servers`
-plus a direct MCP `tools/list` per server for the real `inputSchema`; `GET /api/skills`
-(private Skills only); `GET /api/knowledge/bases` -> `/documents` -> first chunk per
-document; and, only with `--include-traces`, the account's own failed/low-scored
-Langfuse traces. It then synthesizes one deterministic draft per source and,
-unless `--dry-run` is given, upserts every draft into the dataset through Langfuse.
+plus a direct MCP `tools/list` per **effective** server for the real
+`inputSchema`; `GET /api/skills` (private Skills only);
+`GET /api/knowledge/bases` -> `/documents` -> first chunk per document; and, only
+with `--include-traces`, the account's own failed/low-scored Langfuse traces.
+Only **effective** sources are sampled -- an MCP server that is enabled, active,
+and reachable, its tools that the Gateway projection marks both callable and
+enabled, and private Skills that are enabled and active -- so a draft never comes
+from something the Agent cannot reach. Every effectiveness skip (a server that is
+disabled, not active, or unreachable; a tool the projection does not mark callable
+and enabled; a private Skill that is switched off or not active) is printed as a
+warning in the build report, while a Skill dropped for its scope, its builtin
+category, or a missing `skill_id`/`name` is silent by design. It then synthesizes
+one deterministic draft per source and, unless `--dry-run` is given, upserts
+every draft into the dataset through Langfuse.
 
 A trace replay declares no expectations (`expected_output` is `{}`), so no metric
 can score it and any `run` over it fails on an `unscored` item. `build` therefore
@@ -379,22 +388,46 @@ The experiment label itself is stable (`agent-eval:<dataset>`), so `ci-<sha>` an
 
 `load_build_sources(session, limit=...)` reads, as that account:
 
-- `GET /api/mcp-servers`, then a direct MCP `tools/list` per server for the real
-  `inputSchema` (`GET /api/mcp-servers/{id}/tools` returns summaries without
-  schemas, so it is not a schema source);
+- `GET /api/mcp-servers`, then -- for every **effective** server -- a direct MCP
+  `tools/list` for the real `inputSchema` (`GET /api/mcp-servers/{id}/tools`
+  returns summaries without schemas, so it is not a schema source);
 - `GET /api/skills`, keeping `scope == "private"` and dropping builtin/public
   Skills and any Skill without `skill_id`/`name`;
 - `GET /api/knowledge/bases` -> `/documents` -> first chunk per document;
 - the account's own failed or low-scored Langfuse traces, only when the caller
   asks for them (`include_traces=True`, i.e. `--include-traces`); see below.
 
-Only `streamable_http` MCP servers are supported. A disabled server
-(`enabled: false` -- the agent cannot route to its tools), an `sse` server, a
-server without a usable url, a server whose `tools/list` fails, a document
-without a readable chunk, and an unavailable Langfuse are all skipped and
-reported as warnings on `BuildSources.warnings` -- never silently dropped, and a
-broken source costs exactly its own items instead of failing the build. A
-Gateway failure that makes the account data unusable still raises.
+Only effective sources become samples, mirroring what the Agent can really
+route to:
+
+- **MCP server**: the summary must say `enabled: true`, `status: "active"`, and
+  `reachable: true` (agentkit's `is_active`). An absent flag is not `true`, so a
+  disabled, still-pending, errored, unreachable, or flag-less server is skipped
+  with a warning naming it and the reason. Locally fixable problems are checked
+  first: an unsupported transport or a missing url is reported even when the
+  server is also not effective, because that is the reason an operator can act on.
+- **MCP tool**: after `tools/list` succeeds, `GET /api/mcp-servers/{id}/tools`
+  supplies the Gateway's projection; a tool is sampled only when its row is both
+  `callable: true` **and** `enabled: true`. Rows are matched by `call_name`,
+  falling back to `name` when a row carries no `call_name`. A listed tool with
+  no projection row is skipped with a warning, and a failed `/tools` call skips
+  that whole server with a warning (effectiveness cannot be established; it
+  never aborts the build).
+- **Skill**: a private Skill must be `enabled: true` and, when the row carries a
+  `status`, `status == "active"`; a switched-off or non-active Skill is skipped
+  with a warning naming it.
+
+Only `streamable_http` MCP servers are supported. Every effectiveness skip and
+every unusable local source -- a non-effective server, an `sse` server, a server
+without a usable url, a server whose `tools/list` or `/tools` call fails, a tool
+the projection does not list or does not mark `callable`/`enabled`, a
+non-effective Skill, a document without a readable chunk, an unavailable
+Langfuse -- is reported as a warning on `BuildSources.warnings` and therefore in
+the build report, and a broken source costs exactly its own items instead of
+failing the build. Rows dropped for a different reason are silent by design: a
+Skill that is public, builtin-category, or missing `skill_id`/`name` was never a
+sample this account could use, so it is not reported. A Gateway failure that
+makes the account data unusable still raises.
 
 `build_account_items(session, sources, limit=...)` is pure: no I/O, no clock, no
 randomness. It emits one draft per source with a deterministic id
@@ -512,9 +545,11 @@ dataset. `myflow-evals build` is the only command that writes dataset items;
   there is no manual Golden set.
 - `ingest` prints candidate failed/low-scored traces but does not write an
   explore dataset; promoting them into a dataset is still manual.
-- Only `streamable_http` MCP servers contribute tools. `sse` servers, disabled
-  servers, servers without a URL, and servers whose `tools/list` fails are skipped
-  with a warning.
+- Only `streamable_http` MCP servers contribute tools. Non-effective servers
+  (not enabled, not `active`, or unreachable), `sse` servers, servers without a
+  URL, servers whose `tools/list` or `/tools` call fails, tools the Gateway
+  projection does not mark callable **and** enabled, and private Skills that are
+  switched off or not active are skipped with a warning.
 - Evidence carries the run trace id only because the runner hands
   `RunSnapshot.trace_id` to `collect_evidence`; a different caller must pass it
   explicitly or the evidence's `trace_id` is `None`.
