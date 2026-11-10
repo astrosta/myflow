@@ -18,6 +18,7 @@ _HTML_TABLE_RE = re.compile(r"<table\b[^>]*>.*?</table\s*>", re.IGNORECASE | re.
 _HTML_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr\s*>", re.IGNORECASE | re.DOTALL)
 _HTML_CELL_RE = re.compile(r"<t([dh])\b([^>]*)>(.*?)</t\1\s*>", re.IGNORECASE | re.DOTALL)
 _COLSPAN_RE = re.compile(r"""\bcolspan\s*=\s*["']?(\d+)""", re.IGNORECASE)
+_ROWSPAN_RE = re.compile(r"""\browspan\s*=\s*["']?(\d+)""", re.IGNORECASE)
 _PAGE_NUMBER_RE = re.compile(r"^\s*(?:[-—–]\s*)?(?:第\s*)?\d{1,5}\s*(?:页)?\s*(?:[-—–])?\s*$")
 
 
@@ -95,30 +96,88 @@ def _table_cell_text(fragment: str) -> str:
     return text.replace("|", "\\|")
 
 
+def _span(attrs: str, pattern: re.Pattern[str]) -> int:
+    match = pattern.search(attrs) if attrs else None
+    if match is None:
+        return 1
+    return min(max(int(match.group(1)), 1), 50)
+
+
 def _html_table_to_markdown(table_html: str) -> str:
     """Convert MinerU's HTML table into a GFM pipe table.
 
-    The first row becomes the header (MinerU uses th there). colspan is
-    expanded into empty cells so every row has the same width; a malformed
-    table falls back to the old behaviour instead of failing ingestion.
+    GFM cannot express merged cells, so the HTML grid is flattened column by
+    column. Honouring rowspan is essential: when a rowspan cell is omitted
+    from later <tr> elements, padding those rows on the right shifts every
+    value one column to the left. Data rowspans are repeated in each covered
+    row so a table split into chunks still carries its category/standard;
+    header rowspans only occupy their anchor cell, leaving the sub-header row's
+    leading placeholders for the frontend to restore.
+
+    The first row becomes the header (MinerU uses th there). A malformed table
+    falls back to the old behaviour instead of failing ingestion.
     """
-    rows: list[list[str]] = []
+    raw_rows: list[list[tuple[str, str, str]]] = []
     for row_match in _HTML_ROW_RE.finditer(table_html):
-        cells: list[str] = []
-        for cell_match in _HTML_CELL_RE.finditer(row_match.group(1)):
-            cells.append(_table_cell_text(cell_match.group(3)))
-            attr = cell_match.group(2)
-            span_match = _COLSPAN_RE.search(attr) if attr else None
-            if span_match:
-                cells.extend([""] * (min(max(int(span_match.group(1)), 1), 50) - 1))
+        cells = [
+            (
+                "th" if match.group(1).lower() == "h" else "td",
+                match.group(2),
+                match.group(3),
+            )
+            for match in _HTML_CELL_RE.finditer(row_match.group(1))
+        ]
         if cells:
-            rows.append(cells)
-    if not rows:
+            raw_rows.append(cells)
+    if not raw_rows:
         return ""
-    width = max(len(row) for row in rows)
+
+    # The first row is the GFM header. Consecutive all-th rows are its second
+    # (or deeper) visual header layer, e.g. 「准入标准 / 储蓄业务」.
+    header_rows: list[bool] = []
+    for index, cells in enumerate(raw_rows):
+        if index == 0:
+            header_rows.append(True)
+        else:
+            header_rows.append(
+                header_rows[-1] and all(tag == "th" for tag, _attrs, _text in cells)
+            )
+
+    grid: list[list[str | None]] = []
+    for row_index, cells in enumerate(raw_rows):
+        while len(grid) <= row_index:
+            grid.append([])
+        column = 0
+        for _tag, attrs, fragment in cells:
+            while column < len(grid[row_index]) and grid[row_index][column] is not None:
+                column += 1
+            rowspan = min(_span(attrs, _ROWSPAN_RE), len(raw_rows) - row_index)
+            colspan = _span(attrs, _COLSPAN_RE)
+            for covered_row in range(row_index, row_index + rowspan):
+                while len(grid) <= covered_row:
+                    grid.append([])
+                while len(grid[covered_row]) < column + colspan:
+                    grid[covered_row].append(None)
+
+            value = _table_cell_text(fragment)
+            grid[row_index][column] = value
+            for covered_column in range(column + 1, column + colspan):
+                grid[row_index][covered_column] = ""
+            for covered_row in range(row_index + 1, row_index + rowspan):
+                # A data cell that spans rows is repeated: the reader (and the
+                # retriever) must not lose the category on continuation rows.
+                grid[covered_row][column] = "" if header_rows[covered_row] else value
+                for covered_column in range(column + 1, column + colspan):
+                    grid[covered_row][covered_column] = ""
+            column += colspan
+
+    width = max((len(row) for row in grid), default=0)
     if width == 0:
         return ""
-    padded = [row + [""] * (width - len(row)) for row in rows]
+    padded = [
+        [cell if cell is not None else "" for cell in row] + [""] * (width - len(row))
+        for row in grid
+    ]
     header = padded[0]
     lines = [
         "| " + " | ".join(header) + " |",

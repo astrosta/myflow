@@ -1,7 +1,8 @@
 /**
- * Backend HTML→GFM conversion expands colspan/rowspan into empty placeholder
- * cells so pipe tables stay rectangular (see knowledge/text.py). GFM cannot
- * express the merges, so the frontend restores them for display only.
+ * Backend HTML→GFM conversion cannot express merged cells. Header colspan /
+ * rowspan slots become empty placeholders; data rowspans are repeated so each
+ * body row stays self-contained (see knowledge/text.py). The frontend restores
+ * the dual-layer header for display only.
  *
  * Dual-layer detection is intentionally conservative: only when the first body
  * row has a leading empty prefix (rowspan candidates) AND the remaining header

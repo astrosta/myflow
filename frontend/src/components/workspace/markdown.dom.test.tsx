@@ -35,6 +35,35 @@ describe("Markdown 表格", () => {
     expect(table.querySelector("tbody")?.querySelectorAll("tr")).toHaveLength(0);
   });
 
+  it("行跨展平后的数据行仍与列一一对应", async () => {
+    render(
+      <Markdown
+        text={
+          "| 类别 | 行员级别 | 考核分值 | 准入标准 |  |  |\n" +
+          "| --- | --- | --- | --- | --- | --- |\n" +
+          "|  |  |  | 储蓄业务 | 个贷业务 | 卡业务 |\n" +
+          "| 客户经理助理 | 5 | 90 | 300万 |  | 500 张 |\n" +
+          "| 客户经理助理 | 4 | 95 | 300万 |  | 500 张 |"
+        }
+      />,
+    );
+
+    const table = await screen.findByRole("table");
+    const tbody = table.querySelector("tbody") as HTMLElement;
+    const rows = within(tbody).getAllByRole("row");
+    expect(rows).toHaveLength(2);
+    expect(
+      rows.map((row) =>
+        within(row)
+          .getAllByRole("cell")
+          .map((cell) => cell.textContent?.trim()),
+      ),
+    ).toEqual([
+      ["客户经理助理", "5", "90", "300万", "", "500 张"],
+      ["客户经理助理", "4", "95", "300万", "", "500 张"],
+    ]);
+  });
+
   it("普通表格保持原样，不把首行数据误当成双层表头", async () => {
     render(
       <Markdown

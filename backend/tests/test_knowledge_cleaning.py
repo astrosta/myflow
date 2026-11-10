@@ -59,6 +59,30 @@ def test_html_table_colspan_keeps_the_grid_rectangular() -> None:
     assert "| 左 | 右 |" in cleaned
 
 
+def test_html_table_rowspan_keeps_columns_aligned_and_repeats_data() -> None:
+    raw = (
+        "<table><thead>"
+        '<tr><th rowspan="2">类别</th><th rowspan="2">行员级别</th>'
+        '<th rowspan="2">考核分值</th><th colspan="3">准入标准</th></tr>'
+        "<tr><th>储蓄业务</th><th>个贷业务</th><th>卡业务</th></tr>"
+        "</thead><tbody>"
+        '<tr><td rowspan="2">客户经理助理</td><td>5</td><td>90</td>'
+        '<td rowspan="2">300万</td><td></td><td rowspan="2">500 张</td></tr>'
+        "<tr><td>4</td><td>95</td></tr>"
+        "</tbody></table>"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "| 类别 | 行员级别 | 考核分值 | 准入标准 |  |  |" in cleaned
+    assert "|  |  |  | 储蓄业务 | 个贷业务 | 卡业务 |" in cleaned
+    assert "| 客户经理助理 | 5 | 90 | 300万 |  | 500 张 |" in cleaned
+    # The rowspan must put 4/95 back under 行员级别/考核分值 instead of
+    # letting right-padding shift them into the 类别/行员级别 columns.
+    assert "| 客户经理助理 | 4 | 95 | 300万 |  | 500 张 |" in cleaned
+    assert "\n| 4 | 95 |" not in cleaned
+
+
 def test_removes_toc_block_only_when_it_has_three_or_more_entries() -> None:
     raw = (
         "正文开头。\n\n"
