@@ -9,9 +9,15 @@ already masked by the service.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+)
 
 McpTransportName = Literal["streamable_http", "sse"]
 
@@ -97,7 +103,14 @@ class McpServerStateRequest(BaseModel):
 
 
 class McpServerToolSummary(BaseModel):
-    """Read-only projection of one mcp_tools row; no schema or secret rides along."""
+    """Read-only projection of one mcp_tools row; a secret never rides along.
+
+    The stored input schema is opt-in (GET /tools?include_schema=true) because the
+    browser list never reads it, while the evaluation dataset builder derives a
+    sample's arguments from exactly that object.  A schema is not a secret -- the
+    agent hands one to the model on every tool call -- so it needs no masking; it
+    is hidden by default only to keep the UI payload small.
+    """
 
     model_config = ConfigDict(extra="ignore", from_attributes=True)
 
@@ -108,6 +121,20 @@ class McpServerToolSummary(BaseModel):
     parameters: list[str] = Field(default_factory=list)
     callable: bool = False
     enabled: bool = True
+    #: mcp_tools.input_schema, verbatim, and only when the caller asked for it.
+    input_schema: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_an_absent_schema(self, handler: Any) -> dict[str, Any]:
+        """Drop the key instead of sending null.
+
+        include_schema=false must return byte-for-byte the pre-opt-in payload, so an
+        unset schema is absent from the JSON rather than present as a null.
+        """
+        data = handler(self)
+        if self.input_schema is None:
+            data.pop("input_schema", None)
+        return data
 
 
 class McpServerToolsResponse(BaseModel):
