@@ -740,7 +740,7 @@ def _similar_tools_draft(
             "expected_calls": [
                 {"tool": target.call_name, "args": args, "check_keys": check_keys}
             ],
-            "forbidden_tools": [distractor.call_name],
+            "forbidden_tools": [],
             "similar_tools": [target.call_name, distractor.call_name],
             "expect_kb": False,
             "expect_skill": False,
@@ -1077,6 +1077,7 @@ def _trace_draft(trace: TraceSource, user_hash: str) -> DatasetItemDraft:
             "source": _SOURCE_TRACE,
             "difficulty": "medium",
             "trace_id": trace.trace_id,
+            "review_status": "pending",
         },
     )
 
@@ -1355,10 +1356,13 @@ def _apply_writer(
             skill = skills.get(skill_id) if skill_id else None
             if skill is not None:
                 try:
+                    # The Gateway exposes Skill metadata, not the SKILL.md body.
+                    # The writer derives rules from the description; a future source
+                    # can pass a real body without changing this seam.
                     rules = writer.skill_rules(
                         name=skill.name,
                         description=skill.description,
-                        body=skill.description,
+                        body="",
                     )
                     if _valid_rules(rules):
                         expected["skill_rules"] = list(rules)

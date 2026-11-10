@@ -142,7 +142,7 @@ def _case(expected: dict[str, Any], **overrides: Any) -> JudgeCase:
     return JudgeCase(
         item_id="item-1",
         query="what is the answer?",
-        answer="The answer is forty-two.",
+        answer=overrides.pop("answer", "The answer is forty-two."),
         expected_output=expected,
         evidence=overrides.pop("evidence", _evidence()),
         metadata={"category": "kb_single_hop", "user_id": HASHED_USER_ID},
@@ -289,6 +289,18 @@ def test_refusal_ok_builds_a_geval_without_a_reference(
     assert type(metric).__name__ == "GEval"
     assert "no relevant information" in " ".join(metric.kwargs["evaluation_steps"])
 
+
+
+
+def test_deepeval_refusal_ok_short_circuits_a_clear_refusal(
+    fake_deepeval: types.ModuleType,
+) -> None:
+    FakeMetric.last = None
+    score = DeepEvalEngine(FakeJudge()).score(
+        "refusal_ok", _case({"expect_refusal": True}, answer="知识库中没有找到相关信息。")
+    )
+    assert score is not None and score.value == 1.0
+    assert FakeMetric.last is None
 
 def test_an_unknown_metric_is_unscorable(fake_deepeval: types.ModuleType) -> None:
     assert DeepEvalEngine(FakeJudge()).score("not_a_metric", _case({"expect_kb": True})) is None

@@ -24,6 +24,7 @@ from myflow_evals.llm_metrics import (
     JudgeCase,
     JudgeScore,
     PromptJudgeEngine,
+    refusal_short_circuit,
 )
 
 _ENGINE_PREFERENCES = ("auto", "prompt", "deepeval")
@@ -80,6 +81,10 @@ class DeepEvalEngine:
         self._model_name = model_name
 
     def score(self, metric: str, case: JudgeCase) -> JudgeScore | None:
+        if metric == "refusal_ok":
+            decided = refusal_short_circuit(case)
+            if decided is not None:
+                return decided
         handler = _METRIC_HANDLERS.get(metric)
         if handler is None:
             return None

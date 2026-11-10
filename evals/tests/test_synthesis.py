@@ -265,7 +265,8 @@ def test_similar_tools_use_the_highest_description_token_overlap() -> None:
     pair = draft.expected_output["similar_tools"]
     assert pair[0] == draft.expected_output["expected_tools"][0]
     assert set(pair) == {SEARCH.call_name, FIND.call_name}
-    assert draft.expected_output["similar_tools"][1] == draft.expected_output["forbidden_tools"][0]
+    assert draft.expected_output["forbidden_tools"] == []
+    assert pair[1] in {SEARCH.call_name, FIND.call_name}
     assert draft.input["query"]
     assert draft.metadata["category"] == "similar_tools"
 
@@ -474,6 +475,7 @@ def test_trace_sources_become_unscored_trace_replay_drafts() -> None:
     assert trace[0].expected_output == {}
     assert trace[0].metadata["source_kind"] == "trace"
     assert trace[0].metadata["source_id"] == TRACE.trace_id
+    assert trace[0].metadata["review_status"] == "pending"
 
 
 def test_generation_is_deterministic_and_ids_are_unique() -> None:

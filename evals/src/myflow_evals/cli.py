@@ -132,6 +132,8 @@ class LangfuseDatasetWriter:
 
     def upsert_items(self, dataset_name: str, items: Sequence[DatasetItemDraft]) -> None:
         """Create the dataset once, then upsert every draft as one namespaced item."""
+        if not items:
+            return
         if self._dataset != dataset_name:
             self._client.create_dataset(name=dataset_name)
             self._dataset = dataset_name
@@ -193,7 +195,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--dataset", required=True, help="Langfuse dataset name")
-    shared.add_argument("--limit", type=int, default=None, help="cap drafts or items")
+    shared.add_argument(
+        "--limit", type=int, default=None, help="cap sources, drafts, or items"
+    )
     shared.add_argument(
         "--dry-run", action="store_true", help="do everything except writing"
     )
@@ -446,6 +450,7 @@ def _cmd_build(
         drafts: list[DatasetItemDraft] = []
         per_account: list[BuildSources] = []
         quality: list[QualityReport] = []
+        extra_warnings: list[str] = []
         dropped = 0
         rng = random.Random(args.seed)
         for hashed_user_id in sorted(sessions):
@@ -469,6 +474,7 @@ def _cmd_build(
                     writer=question_writer,
                 )
                 account_drafts = list(result.drafts)
+                extra_warnings.extend(result.warnings)
                 dropped += result.dropped_duplicates
                 account_quality = quality_report(
                     account_drafts,
@@ -483,7 +489,12 @@ def _cmd_build(
         report = build_report(
             args.dataset, merged, drafts, limit=args.limit, dry_run=args.dry_run
         )
-        merged_quality = _merge_quality(quality, dropped)
+        source_warnings = set(merged.warnings)
+        merged_quality = _merge_quality(
+            quality,
+            dropped,
+            [warning for warning in extra_warnings if warning not in source_warnings],
+        )
         print(report.render())
         print(merged_quality.render())
         print(f"fingerprint: {dataset_fingerprint(drafts)}")
@@ -523,13 +534,17 @@ def _question_writer_for(
     return services.writer_factory(services.judge_client(config))
 
 
-def _merge_quality(reports: Sequence[QualityReport], dropped: int) -> QualityReport:
+def _merge_quality(
+    reports: Sequence[QualityReport],
+    dropped: int,
+    extra_warnings: Sequence[str] = (),
+) -> QualityReport:
     """Fold per-account quality reports; duplicates are judged within one account."""
     category_counts: Counter[str] = Counter()
     source_counts: Counter[str] = Counter()
     difficulty_counts: Counter[str] = Counter()
     problems: list[str] = []
-    warnings: list[str] = []
+    warnings: list[str] = list(extra_warnings)
     total = 0
     for report in reports:
         total += report.total
@@ -612,7 +627,7 @@ def _cmd_ingest(
                     metadata={**draft.metadata, "review_status": "pending"},
                 )
             )
-    if args.write and not args.dry_run:
+    if args.write and not args.dry_run and drafts:
         writer = LangfuseDatasetWriter(services.langfuse_client(environ))
         written = write_drafts(args.dataset, drafts, writer)
         print(f"ingest: {len(drafts)} draft(s) for {args.dataset}; wrote {written}")

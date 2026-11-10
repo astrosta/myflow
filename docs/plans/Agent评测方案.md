@@ -40,12 +40,13 @@
 
 本文档仍是评测方案的设计依据；实现进度单独记录如下，不改变本文的方案决策、阈值、样本形态和阶段时间线。
 
-- 实现计划：[2026-11-09-agent-evaluation.md](../superpowers/plans/2026-11-09-agent-evaluation.md)
+- 阶段 1 实现计划：[2026-11-09-agent-evaluation.md](../superpowers/plans/2026-11-09-agent-evaluation.md)
+- 阶段 2 实现计划：[2026-11-10-agent-evaluation-phase-2.md](../superpowers/plans/2026-11-10-agent-evaluation-phase-2.md)
 - 评测包说明：[evals/README.md](../../evals/README.md)
 
-已实现：只读 run-event 账本与结构化 `retrieval.tool` / `retrieval.skill` / `retrieval.kb` 事件；固定账号登录和 Langfuse hashed user_id（`HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`）；确定性评测集构建（`single_tool`、`skill_single`、`kb_single_hop`、`trace_replay`）；规则 evaluator（T1/T2/T3、K0-K2、R0/R1/R3 的规则部分、S1 的规则部分）；`myflow-evals build|run|ingest`、实验完整性门禁和 CI/nightly 工作流。
+已实现：只读 run-event 账本与结构化 `retrieval.tool` / `retrieval.skill` / `retrieval.kb` 事件；固定账号登录和 Langfuse hashed user_id（`HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`）；阶段 2 的扩展数据集合成（`single_tool`、`missing_params`、`similar_tools`、`multi_tool`、`injection`、`skill_single`、`similar_skills`、`skill_with_tools`、`kb_single_hop`、`kb_multi_hop`、`kb_unanswerable`、`no_tool`、`trace_replay`），带账户内去重、结构质检、分布警告和 dataset fingerprint；`build --strict`、`build --llm-synthesis`、`ingest --write`；规则 evaluator（T1/T2/T3、K0-K2、R0/R1/R3 的规则部分、S1 的规则部分、`clarification_ok`）；可选的 prompt / DeepEval LLM 评判（K3 `skill_adherence`、R4 `refusal_ok`、Faithfulness、`answer_correctness`、`answer_quality`、AnswerRelevancy、ContextualPrecision/Recall/Relevancy、ToolCorrectness）与确定性分层抽样；`myflow-evals build|run|ingest`、实验完整性门禁和 CI/nightly 工作流。
 
-尚未实现：K3 `skill_adherence`、R4 `refusal_ok`、Faithfulness、`answer_correctness`、`answer_quality`、AnswerRelevancy、ContextualPrecision/Recall/Relevancy 等 LLM 评判与 DeepEval RAG 指标；LLM 合成样本；人工 Golden 集。`ingest` 目前只打印候选 trace，不写入探索集；规则指标之外的阈值仍待后续阶段补齐。
+尚未实现：人工 Golden 集；Langfuse 侧 LLM-as-a-Judge 配置；基于 embedding 服务的近重复检测（`dedupe_drafts` 已留 `Embedder` 接口，CLI 尚未接入）；`kb_conflict` 与 `hybrid` 的确定性合成（仍依赖 LLM 合成或人工审核）；`--llm-synthesis` 只改写问法/提炼 Skill 规则，不生成新的多跳或冲突样本。
 
 **3. 评测分层与指标**
 
@@ -288,7 +289,7 @@ skill_rules 用于 K3 遵循度评判，可从 SKILL.md 中的关键步骤和输
 2. `user_id` 不能放在请求体里。`start_run()` 会从 `metadata`、`config.configurable`、`config.context`、`context` 中删除所有客户端身份键，服务端只认认证中间件解析出的身份；请求体里的 `user_id` 不会生效，放错位置还会 422。
 3. `thread_id` 是 URL 路径参数，也是当前项目的会话隔离单位；没有 `session_id` 字段。评测要带的是“测试账号凭据 + thread_id”，不是“user_id + session_id”。
 4. 不建议为评测新增 debug 模式。已有 `subagent.start/step/end` 等 run_event；结构化的 `retrieval.tool/skill/kb` 需要新增，检索结果才能稳定、完整地取到。还需要一个只读的 run events 查询接口，由评测脚本聚合，而不是把评测字段塞进 run 响应。
-5. 现有 API 仍不足以完整覆盖原第 5 节的所有字段：`messages` 只返回 `category=message`，看不到 `subagent.step`；`citation` 已经有 `knowledge_citations`，但检索事件和 run events 接口尚未实现；`skill_commit` 没有按 run 记录。下面的取数矩阵逐项标出。
+5. 现有 API 仍不足以完整覆盖原第 5 节的所有字段：`messages` 只返回 `category=message`，看不到 `subagent.step`；`citation` 已经有 `knowledge_citations`，检索事件和 run events 接口已在阶段 1 实现；`skill_commit` 仍没有按 run 记录。下面的取数矩阵逐项标出。
 
 **5.1 实际调用链**
 
@@ -300,7 +301,7 @@ skill_rules 用于 K3 遵循度评判，可从 SKILL.md 中的关键步骤和输
 | 异步起 run | `POST /api/threads/{thread_id}/runs` | 返回 202 + `run_id`；适合 CI，避免长请求超时或断连取消。 |
 | 读 run | `GET /api/threads/{thread_id}/runs/{run_id}` | 取 `status`、`error`、`metadata`；本次 Langfuse trace id 在 `metadata["myflow-trace-id"]`。 |
 | 读父消息 | `GET /api/threads/{thread_id}/messages` | 只有 `category=message` 的父代理消息；工具调用/结果嵌在消息内容里。 |
-| 读证据 | `GET /api/threads/{thread_id}/runs/{run_id}/events` | **本方案新增，当前代码尚未实现**；这是取得 `subagent.*` 和 `retrieval.*` 的 API 途径。 |
+| 读证据 | `GET /api/threads/{thread_id}/runs/{run_id}/events` | **本方案新增，阶段 1 已实现**；这是取得 `subagent.*` 和 `retrieval.*` 的 API 途径。 |
 | 清理 | `DELETE /api/threads/{thread_id}` | 可选；至少保证每条样本使用独立 thread。 |
 
 **5.2 请求**

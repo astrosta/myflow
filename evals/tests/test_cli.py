@@ -1047,6 +1047,37 @@ def test_build_llm_synthesis_uses_the_configured_writer(
     assert "judge-secret-key" not in output
 
 
+
+
+def test_build_reports_a_llm_writer_fallback_without_failing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from myflow_evals.llm import JudgeError
+
+    class FailingJudge:
+        def complete(self, *, system: str, prompt: str) -> str:
+            raise JudgeError("judge timeout")
+
+    services, langfuse = _services(
+        Recorder(),
+        sources=BuildSources(
+            tools=[_tool("search", "mcp__db__search")], source_totals={"tool": 1}
+        ),
+    )
+    services = replace(services, judge_client=lambda config: FailingJudge())
+
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--llm-synthesis"],
+        services=services,
+        environ=dict(JUDGE_ENVIRON),
+    )
+
+    output = _capture(capsys)
+    assert exit_code == 0
+    assert "question writer rewrite failed" in output
+    assert langfuse.created_items
+
+
 def test_build_llm_synthesis_requires_a_judge(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

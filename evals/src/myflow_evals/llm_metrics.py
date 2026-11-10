@@ -317,12 +317,22 @@ def _prompt_skill_adherence(judge: ChatModel, case: JudgeCase) -> JudgeScore:
     )
 
 
-def _prompt_refusal_ok(judge: ChatModel, case: JudgeCase) -> JudgeScore:
+def refusal_short_circuit(case: JudgeCase) -> JudgeScore | None:
+    """Decide an obvious refusal without a judge call, or return None."""
     answer = case.answer.strip()
     if _looks_like_refusal(answer):
-        return JudgeScore(value=1.0, comment="the answer clearly states no information was found")
+        return JudgeScore(
+            value=1.0, comment="the answer clearly states no information was found"
+        )
     if case.evidence.citations:
         return JudgeScore(value=0.0, comment="the answer cited sources instead of refusing")
+    return None
+
+
+def _prompt_refusal_ok(judge: ChatModel, case: JudgeCase) -> JudgeScore:
+    decided = refusal_short_circuit(case)
+    if decided is not None:
+        return decided
     prompt = _join_sections(
         f"Question:\n{case.query}",
         f"Answer:\n{_clip(case.answer, _ANSWER_LIMIT)}",
