@@ -360,6 +360,9 @@ def citation_valid(
     if not citations:
         if evidence.citations:
             return None  # unreadable citation rows: unscorable, not "cited nothing"
+        if _declared_bool(expected_output, "expect_refusal") is True:
+            # A refusal is supposed to have nothing to cite; absence is correct.
+            return None
         if _declared_bool(expected_output, "expect_kb") is True:
             return Evaluation(
                 name="citation_valid",
@@ -413,6 +416,40 @@ def forbidden_violation(
     )
 
 
+def clarification_ok(
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
+) -> Evaluation | None:
+    """S1: a missing-parameter sample asked instead of inventing an argument."""
+    if not _declared_bool(expected_output, "expect_clarification"):
+        return None
+    business = _business_call_names(evidence)
+    if business:
+        return Evaluation(
+            name="clarification_ok",
+            value=0.0,
+            comment=f"called {', '.join(business)} instead of asking for the missing arguments",
+        )
+    answer = evidence.answer.strip()
+    if not answer:
+        return Evaluation(
+            name="clarification_ok", value=0.0, comment="the answer was empty"
+        )
+    if not _asks_a_question(answer):
+        return Evaluation(
+            name="clarification_ok",
+            value=0.0,
+            comment="the answer did not ask for the missing arguments",
+        )
+    return Evaluation(
+        name="clarification_ok",
+        value=1.0,
+        comment="asked for the missing arguments without calling a tool",
+    )
+
+
 def no_tool_ok(
     *,
     expected_output: Mapping[str, Any] | None,
@@ -462,6 +499,7 @@ RULE_EVALUATORS: dict[str, Callable[..., Evaluation | None]] = {
     "kb_mrr": kb_mrr,
     "citation_valid": citation_valid,
     "forbidden_violation": forbidden_violation,
+    "clarification_ok": clarification_ok,
     "no_tool_ok": no_tool_ok,
 }
 
@@ -590,6 +628,25 @@ def _chunk_document_ids(chunks: Sequence[Any]) -> list[str | None]:
             document_id if isinstance(document_id, str) and document_id else None
         )
     return document_ids
+
+
+_QUESTION_MARKERS = (
+    "?",
+    "？",
+    "请提供",
+    "请说明",
+    "请问",
+    "which",
+    "what",
+    "please provide",
+    "could you",
+    "can you",
+)
+
+
+def _asks_a_question(answer: str) -> bool:
+    lowered = answer.lower()
+    return any(marker in lowered for marker in _QUESTION_MARKERS)
 
 
 def _first_rank(names: Sequence[Any], expected: Sequence[str]) -> int | None:

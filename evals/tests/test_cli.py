@@ -444,7 +444,7 @@ def test_build_dry_run_reports_counts_and_writes_nothing(capsys: pytest.CaptureF
     services, langfuse = _services(recorder, sources=sources)
 
     exit_code = main(
-        ["build", "--dataset", DATASET, "--dry-run"],
+        ["build", "--dataset", DATASET, "--dry-run", "--no-expand"],
         services=services,
         environ=dict(ENVIRON),
     )
@@ -497,7 +497,11 @@ def test_build_writes_every_draft_through_the_langfuse_writer(
     )
     services, langfuse = _services(recorder, sources=sources)
 
-    exit_code = main(["build", "--dataset", DATASET], services=services, environ=dict(ENVIRON))
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--no-expand"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
 
     output = _capture(capsys)
     assert exit_code == 0
@@ -650,7 +654,11 @@ def test_build_merges_every_logged_in_account(capsys: pytest.CaptureFixture[str]
         recorder, sessions=sessions, sources_by_session=sources_by_session
     )
 
-    exit_code = main(["build", "--dataset", DATASET], services=services, environ=dict(ENVIRON))
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--no-expand"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
 
     output = _capture(capsys)
     assert exit_code == 0
@@ -730,7 +738,11 @@ def test_build_skips_trace_drafts_unless_include_traces(
     )
     services, langfuse = _services(recorder, sources=sources)
 
-    exit_code = main(["build", "--dataset", DATASET], services=services, environ=dict(ENVIRON))
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--no-expand"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
 
     assert exit_code == 0
     assert recorder.source_calls[0]["include_traces"] is False
@@ -749,7 +761,7 @@ def test_build_include_traces_keeps_trace_drafts(capsys: pytest.CaptureFixture[s
     services, langfuse = _services(recorder, sources=sources)
 
     exit_code = main(
-        ["build", "--dataset", DATASET, "--include-traces"],
+        ["build", "--dataset", DATASET, "--include-traces", "--no-expand"],
         services=services,
         environ=dict(ENVIRON),
     )
@@ -957,6 +969,142 @@ def test_run_returns_two_when_the_engine_cannot_be_built(
     assert exit_code == 2
     assert "DeepEval is not installed" in output
     assert "judge-secret-key" not in output
+
+
+
+
+def test_build_expands_sources_by_default(capsys: pytest.CaptureFixture[str]) -> None:
+    sources = BuildSources(
+        tools=[_tool("search", "mcp__db__search")], source_totals={"tool": 1}
+    )
+    services, langfuse = _services(Recorder(), sources=sources)
+
+    assert main(["build", "--dataset", DATASET], services=services, environ=dict(ENVIRON)) == 0
+
+    output = _capture(capsys)
+    categories = [item["metadata"]["category"] for item in langfuse.created_items]
+    assert categories.count("single_tool") == 2
+    assert "no_tool" in categories
+    assert "fingerprint:" in output
+    assert "problems: none" in output
+
+
+def test_build_strict_stops_before_writing_a_duplicate_query(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sources = BuildSources(
+        tools=[_tool("same", "mcp__db__a"), _tool("same", "mcp__db__b")],
+        source_totals={"tool": 2},
+    )
+    services, langfuse = _services(Recorder(), sources=sources)
+
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--no-expand", "--strict"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
+
+    output = _capture(capsys)
+    assert exit_code == 2
+    assert "duplicate normalized query" in output
+    assert langfuse.created_items == []
+
+
+def test_build_llm_synthesis_uses_the_configured_writer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sources = BuildSources(
+        tools=[_tool("search", "mcp__db__search")], source_totals={"tool": 1}
+    )
+    services, langfuse = _services(Recorder(), sources=sources)
+    seen: list[str] = []
+
+    class FakeWriter:
+        def rewrite(self, *, kind: str, queries: list[str], context: str) -> list[str]:
+            seen.append(kind)
+            return [f"rewritten {query}" for query in queries]
+
+        def skill_rules(self, *, name: str, description: str, body: str) -> list[str]:
+            return ["a rule"]
+
+    services = replace(
+        services,
+        judge_client=lambda config: "judge",
+        writer_factory=lambda judge: FakeWriter(),
+    )
+
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--llm-synthesis"],
+        services=services,
+        environ=dict(JUDGE_ENVIRON),
+    )
+
+    output = _capture(capsys)
+    assert exit_code == 0
+    assert "single_tool" in seen
+    queries = [item["input"]["query"] for item in langfuse.created_items]
+    assert any(query.startswith("rewritten ") for query in queries)
+    assert "judge-secret-key" not in output
+
+
+def test_build_llm_synthesis_requires_a_judge(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    services, _ = _services(
+        Recorder(),
+        sources=BuildSources(
+            tools=[_tool("search", "mcp__db__search")], source_totals={"tool": 1}
+        ),
+    )
+
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--llm-synthesis"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
+
+    assert exit_code == 2
+    assert "EVAL_JUDGE" in _capture(capsys)
+
+
+def test_ingest_write_upserts_trace_replays_for_review(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    traces = [TraceSource(trace_id="trace-abc", query="what is the refund policy?")]
+    services, langfuse = _services(Recorder(), traces=traces)
+
+    exit_code = main(
+        ["ingest", "--dataset", DATASET, "--write"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
+
+    output = _capture(capsys)
+    assert exit_code == 0
+    assert langfuse.created_datasets == [DATASET]
+    created = langfuse.created_items[0]
+    assert created["metadata"]["review_status"] == "pending"
+    assert created["metadata"]["category"] == "trace_replay"
+    assert created["expected_output"] == {}
+    assert "wrote 1" in output
+
+
+def test_ingest_dry_run_writes_nothing_even_with_write(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    traces = [TraceSource(trace_id="trace-abc", query="what is the refund policy?")]
+    services, langfuse = _services(Recorder(), traces=traces)
+
+    exit_code = main(
+        ["ingest", "--dataset", DATASET, "--write", "--dry-run"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
+
+    output = _capture(capsys)
+    assert exit_code == 0
+    assert langfuse.created_items == []
+    assert "nothing was written" in output
 
 
 def test_writer_namespaces_item_ids_per_dataset() -> None:

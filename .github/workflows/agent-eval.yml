@@ -21,13 +21,17 @@ jobs:
       LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
       LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
       LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      # Optional: without these the run stays rule-only and prints one warning.
+      EVAL_JUDGE_BASE_URL: ${{ secrets.EVAL_JUDGE_BASE_URL }}
+      EVAL_JUDGE_API_KEY: ${{ secrets.EVAL_JUDGE_API_KEY }}
+      EVAL_JUDGE_MODEL: ${{ secrets.EVAL_JUDGE_MODEL }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: astral-sh/setup-uv@v5
 
-      # PR: fixed stratified 30-item subset, rule metrics are hard gates,
-      # LLM metrics stay soft (under 20 scored samples they never gate).
+      # PR: fixed stratified 30-item subset. Rule metrics are hard gates; LLM
+      # metrics run only when judge secrets exist, are sampled, and stay soft.
       # The dataset is frozen input here: this workflow never runs "build".
       - name: CI regression subset
         if: github.event_name == 'pull_request'
@@ -37,11 +41,12 @@ jobs:
           --dataset agent-eval/regression/v1
           --run-name "ci-${GITHUB_SHA}"
 
-      # Nightly: full dataset, LLM metrics may be hard gates.
+      # Nightly: full dataset with the DeepEval extra. Once a metric has at
+      # least 20 scored samples, LLM metrics become hard gates.
       - name: Nightly full run
         if: github.event_name == 'schedule'
         run: >-
-          uv run --project evals myflow-evals run
+          uv run --project evals --extra llm myflow-evals run
           --mode full
           --dataset agent-eval/regression/v1
           --run-name "nightly-${GITHUB_SHA}"

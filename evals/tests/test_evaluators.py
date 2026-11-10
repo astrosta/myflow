@@ -17,6 +17,8 @@ from myflow_evals.evaluators import (
     RULE_EVALUATORS,
     THRESHOLDS,
     args_accuracy,
+    citation_valid,
+    clarification_ok,
     extra_calls_ratio,
     forbidden_violation,
     kb_mrr,
@@ -832,7 +834,7 @@ def test_every_evaluator_accepts_item_metadata() -> None:
     metadata = {"category": "kb_single_hop", "source": "synthetic_from_docs"}
 
     for name, evaluator in RULE_EVALUATORS.items():
-        if name == "no_tool_ok":
+        if name in {"no_tool_ok", "clarification_ok"}:
             continue
         without = evaluator(expected_output=RICH_EXPECTED, evidence=evidence)
         with_metadata = evaluator(
@@ -863,6 +865,7 @@ def test_rule_evaluators_map_the_design_metric_names() -> None:
         "kb_mrr",
         "citation_valid",
         "forbidden_violation",
+        "clarification_ok",
         "no_tool_ok",
     }
 
@@ -875,11 +878,53 @@ def test_every_evaluator_names_itself_after_its_rule() -> None:
             result = evaluator(
                 expected_output={}, evidence=_evidence(), metadata=NO_TOOL_METADATA
             )
+        elif name == "clarification_ok":
+            result = evaluator(
+                expected_output={"expect_clarification": True},
+                evidence=_evidence(answer="Which sector should I use?"),
+            )
         else:
             result = evaluator(expected_output=RICH_EXPECTED, evidence=evidence)
         assert result is not None, name
         assert result.name == name
         assert result.value is not None
+
+
+def test_clarification_ok_requires_a_question_and_no_tool_call() -> None:
+    expected = {"expect_clarification": True}
+
+    asked = clarification_ok(
+        expected_output=expected,
+        evidence=_evidence(answer="Which sector should I use?"),
+        metadata={"category": "missing_params"},
+    )
+    assert asked is not None and asked.value == 1.0
+
+    guessed = clarification_ok(
+        expected_output=expected,
+        evidence=_evidence(
+            answer="Which sector should I use?",
+            business_tool_calls=[_business_call("mcp__db__search")],
+        ),
+        metadata={"category": "missing_params"},
+    )
+    assert guessed is not None and guessed.value == 0.0
+
+    silent = clarification_ok(
+        expected_output=expected,
+        evidence=_evidence(answer="Done."),
+        metadata={"category": "missing_params"},
+    )
+    assert silent is not None and silent.value == 0.0
+
+    assert (
+        clarification_ok(
+            expected_output={"expect_kb": True},
+            evidence=_evidence(answer="Which sector?"),
+            metadata={},
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -911,7 +956,14 @@ def test_thresholds_carry_the_design_gates(
 def test_thresholds_gate_only_rule_metrics() -> None:
     assert len(THRESHOLDS) == 11
     assert set(THRESHOLDS) <= set(RULE_EVALUATORS)
-    for name in ("retrieval_mrr", "skill_mrr", "kb_mrr", "skill_extra", "no_tool_ok"):
+    for name in (
+        "retrieval_mrr",
+        "skill_mrr",
+        "kb_mrr",
+        "skill_extra",
+        "no_tool_ok",
+        "clarification_ok",
+    ):
         assert name not in THRESHOLDS
     # A forbidden call must never happen, so its gate is the zero upper bound.
     assert THRESHOLDS["forbidden_violation"] == {
@@ -919,6 +971,17 @@ def test_thresholds_gate_only_rule_metrics() -> None:
         "comparison": "max",
         "kind": "rule",
     }
+
+
+
+
+def test_citation_valid_abstains_on_a_no_answer_sample() -> None:
+    result = citation_valid(
+        expected_output={"expect_kb": True, "expect_refusal": True},
+        evidence=_evidence(),
+        metadata={"category": "kb_unanswerable"},
+    )
+    assert result is None
 
 
 # --- robustness ------------------------------------------------------------

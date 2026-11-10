@@ -1439,6 +1439,26 @@ def test_a_large_document_never_issues_more_than_four_chunk_requests() -> None:
     assert len(_chunk_requests(gateway)) == 4
 
 
+def test_a_knowledge_source_exposes_up_to_two_related_chunks_and_location() -> None:
+    contents = ["A short first chunk.", "A longer second chunk for the hop.", "The longest third chunk."]
+    gateway = _knowledge_gateway(contents)
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        rng=random.Random(7),
+    )
+
+    document = sources.knowledge[0]
+    assert (document.chunk_id, document.chunk_content) == ("doc-1:1", contents[1])
+    assert document.related_chunks == (
+        ("doc-1:0", contents[0]),
+        ("doc-1:2", contents[2]),
+    )
+    assert (document.section, document.page) == ("section-1", 1)
+    assert len(_chunk_requests(gateway)) == 2
+
+
 def test_build_account_items_emits_one_tool_draft_per_real_tool() -> None:
     sources = _sources(tools=[SEARCH_TOOL, PROJECT_TOOL, THIRD_TOOL])
 

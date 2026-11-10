@@ -18,8 +18,9 @@ import hashlib
 import os
 import random
 import sys
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,14 @@ from myflow_evals.runner import (
     ExperimentRunner,
     IncompleteExperiment,
     select_items,
+)
+from myflow_evals.synthesis import (
+    OpenAIQuestionWriter,
+    QualityReport,
+    SynthesisPlan,
+    dataset_fingerprint,
+    quality_report,
+    synthesize_account_items,
 )
 
 EXIT_OK = 0
@@ -102,6 +111,7 @@ class CliServices:
     fetch_traces: Callable[..., list[TraceSource]] = fetch_account_traces
     judge_client: Callable[[Any], Any] = OpenAICompatibleChat
     build_engine: Callable[..., Any] = build_engine
+    writer_factory: Callable[[Any], Any] = OpenAIQuestionWriter
     api: Any = AgentApi
 
 
@@ -212,6 +222,21 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="seed the knowledge chunk sample for a reproducible build",
     )
+    build.add_argument(
+        "--no-expand",
+        action="store_true",
+        help="emit one legacy draft per source instead of the expanded category mix",
+    )
+    build.add_argument(
+        "--strict",
+        action="store_true",
+        help="fail the build (exit 2) when a quality problem is found",
+    )
+    build.add_argument(
+        "--llm-synthesis",
+        action="store_true",
+        help="rewrite deterministic questions with the configured judge",
+    )
     run = commands.add_parser(
         "run",
         parents=[shared],
@@ -243,11 +268,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="fraction of applicable items scored by LLM metrics (default: 0.2 ci, 1.0 full)",
     )
-    commands.add_parser(
+    ingest = commands.add_parser(
         "ingest",
         parents=[shared],
-        help="print the failed online traces that would join the explore set",
-        description="Read failed or low-scored traces; Task 9 writes nothing.",
+        help="print or write the failed online traces for the explore set",
+        description=(
+            "Read failed or low-scored traces; --write upserts them as trace_replay "
+            "items with review_status=pending."
+        ),
+    )
+    ingest.add_argument(
+        "--write",
+        action="store_true",
+        help="upsert the candidates into the dataset instead of only printing them",
     )
     return parser
 
@@ -409,8 +442,11 @@ def _cmd_build(
 ) -> int:
     sessions = _login(environ, services, args.accounts_file)
     try:
+        question_writer = _question_writer_for(args, environ, services)
         drafts: list[DatasetItemDraft] = []
         per_account: list[BuildSources] = []
+        quality: list[QualityReport] = []
+        dropped = 0
         rng = random.Random(args.seed)
         for hashed_user_id in sorted(sessions):
             session = sessions[hashed_user_id]
@@ -422,13 +458,39 @@ def _cmd_build(
                 rng=rng,
             )
             per_account.append(sources)
-            drafts.extend(build_account_items(session, sources, limit=args.limit))
+            if args.no_expand:
+                account_drafts = build_account_items(session, sources, limit=args.limit)
+                account_quality = quality_report(account_drafts, sources=sources)
+            else:
+                result = synthesize_account_items(
+                    session,
+                    sources,
+                    plan=SynthesisPlan(),
+                    writer=question_writer,
+                )
+                account_drafts = list(result.drafts)
+                dropped += result.dropped_duplicates
+                account_quality = quality_report(
+                    account_drafts,
+                    sources=sources,
+                    dropped_duplicates=result.dropped_duplicates,
+                )
+            drafts.extend(account_drafts)
+            quality.append(account_quality)
         if not args.include_traces:
             drafts = [draft for draft in drafts if not _is_trace_draft(draft)]
         merged = _merge_sources(per_account)
         report = build_report(
             args.dataset, merged, drafts, limit=args.limit, dry_run=args.dry_run
         )
+        merged_quality = _merge_quality(quality, dropped)
+        print(report.render())
+        print(merged_quality.render())
+        print(f"fingerprint: {dataset_fingerprint(drafts)}")
+        if args.strict and not merged_quality.ok:
+            raise CliError(
+                "quality gate failed: " + "; ".join(merged_quality.problems[:5])
+            )
         writer = (
             None
             if args.dry_run
@@ -437,7 +499,6 @@ def _cmd_build(
         written = write_drafts(args.dataset, drafts, writer, dry_run=args.dry_run)
     finally:
         _close_sessions(sessions)
-    print(report.render())
     if not args.dry_run:
         print(f"written: {written} item(s) to {args.dataset}")
     return EXIT_OK
@@ -446,6 +507,46 @@ def _cmd_build(
 def dataset_item_prefix(dataset_name: str) -> str:
     """The per-dataset item-id namespace: first 8 hex of sha256(dataset name)."""
     return hashlib.sha256(dataset_name.encode("utf-8")).hexdigest()[:8]
+
+
+def _question_writer_for(
+    args: argparse.Namespace, environ: Mapping[str, str], services: CliServices
+) -> Any:
+    """Build the optional LLM question writer, or None for deterministic queries."""
+    if not args.llm_synthesis:
+        return None
+    config = judge_config_from_env(environ)
+    if config is None:
+        raise CliError(
+            "--llm-synthesis needs EVAL_JUDGE_BASE_URL, EVAL_JUDGE_MODEL and an API key"
+        )
+    return services.writer_factory(services.judge_client(config))
+
+
+def _merge_quality(reports: Sequence[QualityReport], dropped: int) -> QualityReport:
+    """Fold per-account quality reports; duplicates are judged within one account."""
+    category_counts: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
+    difficulty_counts: Counter[str] = Counter()
+    problems: list[str] = []
+    warnings: list[str] = []
+    total = 0
+    for report in reports:
+        total += report.total
+        category_counts.update(report.category_counts)
+        source_counts.update(report.source_counts)
+        difficulty_counts.update(report.difficulty_counts)
+        problems.extend(report.problems)
+        warnings.extend(report.warnings)
+    return QualityReport(
+        total=total,
+        category_counts=dict(category_counts),
+        source_counts=dict(source_counts),
+        difficulty_counts=dict(difficulty_counts),
+        dropped_duplicates=dropped,
+        problems=tuple(problems),
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
 
 
 def _is_trace_draft(draft: DatasetItemDraft) -> bool:
@@ -478,22 +579,47 @@ def _cmd_ingest(
     _require(environ, _LANGFUSE_PUBLIC_KEY_ENV)
     _require(environ, _LANGFUSE_SECRET_KEY_ENV)
     sessions = _login(environ, services, args.accounts_file)
+    traces_by_account: dict[str, list[TraceSource]] = {}
     try:
-        lines = [
-            f"{_trace_category(trace)}: {trace.trace_id} -> {_preview(trace.query)}"
-            for hashed_user_id in sorted(sessions)
-            for trace in services.fetch_traces(
-                sessions[hashed_user_id].hashed_user_id,
-                limit=args.limit,
-                environ=environ,
+        for hashed_user_id in sorted(sessions):
+            traces_by_account[hashed_user_id] = list(
+                services.fetch_traces(
+                    sessions[hashed_user_id].hashed_user_id,
+                    limit=args.limit,
+                    environ=environ,
+                )
             )
-        ]
     finally:
         _close_sessions(sessions)
+
     print(f"dataset: {args.dataset}")
-    for line in lines:
-        print(line)
-    print(f"ingest: {len(lines)} draft(s) for {args.dataset}; nothing was written")
+    for hashed_user_id in sorted(traces_by_account):
+        for trace in traces_by_account[hashed_user_id]:
+            print(
+                f"{_trace_category(trace)}: {trace.trace_id} -> {_preview(trace.query)}"
+            )
+    drafts: list[DatasetItemDraft] = []
+    for hashed_user_id in sorted(traces_by_account):
+        session = sessions[hashed_user_id]
+        traces = traces_by_account[hashed_user_id]
+        for draft in build_account_items(
+            session,
+            BuildSources(traces=traces, source_totals={"trace": len(traces)}),
+        ):
+            drafts.append(
+                replace(
+                    draft,
+                    metadata={**draft.metadata, "review_status": "pending"},
+                )
+            )
+    if args.write and not args.dry_run:
+        writer = LangfuseDatasetWriter(services.langfuse_client(environ))
+        written = write_drafts(args.dataset, drafts, writer)
+        print(f"ingest: {len(drafts)} draft(s) for {args.dataset}; wrote {written}")
+    else:
+        print(
+            f"ingest: {len(drafts)} draft(s) for {args.dataset}; nothing was written"
+        )
     return EXIT_OK
 
 
