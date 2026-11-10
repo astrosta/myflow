@@ -41,9 +41,6 @@ export default function LandingPage() {
           MyFlow
         </Link>
         <nav aria-label="主导航" className="flex items-center gap-6 text-sm text-neutral-500">
-          <a className="transition-colors hover:text-neutral-900" href="#capabilities">
-            能力
-          </a>
           <Link className="transition-colors hover:text-neutral-900" href="/workspace">
             工作区
           </Link>
@@ -62,30 +59,18 @@ export default function LandingPage() {
           <p className="mt-3 max-w-2xl text-sm leading-relaxed text-neutral-500">
             刷新、断线或中断之后，会话仍能接着走；知识库、技能、MCP 与长期记忆按任务组装，不必换一套工具从头再来。
           </p>
-          <div className="mt-8 flex flex-wrap items-center gap-x-6 gap-y-3">
+          <div className="mt-8">
             <Link
               className="inline-flex h-10 items-center rounded-md bg-neutral-900 px-5 text-sm font-medium text-white transition-colors hover:bg-neutral-700"
               href="/workspace"
             >
               进入工作区
             </Link>
-            <a
-              className="text-sm font-medium text-neutral-600 underline-offset-4 transition-colors hover:text-neutral-900 hover:underline"
-              href="#capabilities"
-            >
-              看看它如何工作
-            </a>
           </div>
         </section>
 
-        <section aria-labelledby="capabilities-title" className="py-14" id="capabilities">
-          <h2
-            className="max-w-3xl text-balance text-2xl font-semibold tracking-tight text-neutral-900"
-            id="capabilities-title"
-          >
-            过程、连接、能力、边界，都在会话里。
-          </h2>
-          <div className="mt-10 grid gap-x-10 gap-y-9 sm:grid-cols-2">
+        <section aria-label="工作区能力" className="py-14">
+          <div className="grid gap-x-10 gap-y-9 sm:grid-cols-2">
             {FEATURES.map((feature) => (
               <article className="border-t border-neutral-200 pt-5" key={feature.title}>
                 <h3 className="text-base font-semibold text-neutral-900">{feature.title}</h3>
