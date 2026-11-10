@@ -691,6 +691,21 @@ def test_load_build_sources_requires_an_explicit_enabled_flag() -> None:
     assert "enabled" in sources.warnings[0]
 
 
+def test_an_sse_server_reports_its_transport_before_a_pending_status() -> None:
+    gateway = _FakeGateway(servers=[dict(SSE_SERVER, status="pending")])
+    mcp = _Mcp(PROJECT_TOOLS)
+
+    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+
+    assert sources.tools == []
+    assert mcp.requests == []
+    assert len(sources.warnings) == 1
+    assert "legacy_db" in sources.warnings[0]
+    assert "sse" in sources.warnings[0]
+    assert "transport" in sources.warnings[0]
+    assert "pending" not in sources.warnings[0]
+
+
 def test_load_build_sources_skips_a_tool_the_gateway_index_marks_uncallable() -> None:
     gateway = _FakeGateway(
         servers=[STREAMABLE_SERVER],
@@ -710,7 +725,7 @@ def test_load_build_sources_skips_a_tool_the_gateway_index_marks_uncallable() ->
     ] == ["mcp__project_db__search_projects"]
     assert len(sources.warnings) == 1
     assert "get_project" in sources.warnings[0]
-    assert "callable" in sources.warnings[0]
+    assert "callable=false" in sources.warnings[0]
 
 
 def test_load_build_sources_skips_a_tool_disabled_in_the_gateway_index() -> None:
@@ -732,7 +747,51 @@ def test_load_build_sources_skips_a_tool_disabled_in_the_gateway_index() -> None
     ] == ["mcp__project_db__search_projects"]
     assert len(sources.warnings) == 1
     assert "get_project" in sources.warnings[0]
-    assert "disabled" in sources.warnings[0]
+    assert "enabled=false" in sources.warnings[0]
+
+
+def test_a_projection_row_without_a_call_name_still_matches_its_tool() -> None:
+    without_call_name = {"name": "get_project", "callable": True, "enabled": True}
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={
+            STREAMABLE_SERVER["id"]: [
+                without_call_name if row["name"] == "get_project" else dict(row)
+                for row in PROJECT_TOOL_INDEX
+            ]
+        },
+    )
+
+    sources = load_build_sources(
+        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
+    )
+
+    assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
+    assert sources.warnings == ()
+
+
+def test_a_projection_row_without_an_enabled_flag_is_skipped() -> None:
+    without_enabled = {
+        key: value for key, value in PROJECT_TOOL_INDEX[1].items() if key != "enabled"
+    }
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={
+            STREAMABLE_SERVER["id"]: [
+                without_enabled if row["name"] == "get_project" else dict(row)
+                for row in PROJECT_TOOL_INDEX
+            ]
+        },
+    )
+
+    sources = load_build_sources(
+        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
+    )
+
+    assert [tool.name for tool in sources.tools] == ["search_projects"]
+    assert len(sources.warnings) == 1
+    assert "get_project" in sources.warnings[0]
+    assert "no enabled flag" in sources.warnings[0]
 
 
 def test_load_build_sources_skips_a_listed_tool_the_gateway_index_never_saw() -> None:
@@ -830,6 +889,11 @@ def test_an_all_effective_account_still_builds_every_source() -> None:
         "knowledge",
         "knowledge",
     ]
+
+    report = build_report("myflow-eval", sources, drafts)
+    assert report.source_counts == {"tool": 2, "skill": 2, "knowledge": 2, "trace": 0}
+    assert "tool: 2 drafts from 2 sources" in report.render()
+    assert "skill: 2 drafts from 2 sources" in report.render()
 
 
 def test_a_failing_server_costs_only_its_own_tools() -> None:

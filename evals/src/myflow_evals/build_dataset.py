@@ -454,16 +454,12 @@ def _account_tools(
                     "the Gateway tool index does not list it"
                 )
                 continue
-            if row.get("callable") is not True:
+            problem = _tool_flag_problem(row, "callable")
+            if problem is None:
+                problem = _tool_flag_problem(row, "enabled")
+            if problem is not None:
                 warnings.append(
-                    f"skipped tool {tool.name!r} of server {server.name!r}: "
-                    "the Gateway tool index does not mark it callable"
-                )
-                continue
-            if row.get("enabled") is not True:
-                warnings.append(
-                    f"skipped tool {tool.name!r} of server {server.name!r}: "
-                    "the Gateway tool index marks it disabled"
+                    f"skipped tool {tool.name!r} of server {server.name!r}: {problem}"
                 )
                 continue
             tools.append(tool)
@@ -486,8 +482,6 @@ def _mcp_server(
     if name is None:
         warnings.append(f"skipped MCP server {server_id!r}: it has no name to build tool names from")
         return None
-    if not _effective_server(summary, name, warnings):
-        return None
 
     secret = secrets.get(name) or secrets.get(server_id) or McpServerSecret()
     transport = secret.transport or summary.get("transport")
@@ -502,6 +496,10 @@ def _mcp_server(
         warnings.append(
             f"skipped MCP server {name!r}: no url to call; set one in MCP_SERVER_HEADERS"
         )
+        return None
+    # A locally fixable problem is reported before effectiveness: an operator
+    # who can correct the transport or url needs that reason, not a status.
+    if not _effective_server(summary, name, warnings):
         return None
     return McpServer(id=server_id, url=url, headers=dict(secret.headers), name=name)
 
@@ -545,6 +543,23 @@ def _effective_server(
             )
         return False
     return True
+
+
+def _tool_flag_problem(row: Mapping[str, Any], flag: str) -> str | None:
+    """Say why one projection flag is not usable, or None when it is True.
+
+    An absent key is not True either, and the warning says which it is: a row
+    that never carried the flag is a different problem from one that switched it
+    off, and an operator acts on them differently.
+    """
+    if flag not in row:
+        return f"the Gateway tool index row has no {flag} flag"
+    value = row[flag]
+    if value is True:
+        return None
+    if value is False:
+        return f"the Gateway tool index row has {flag}=false"
+    return f"the Gateway tool index row has {flag}={value!r}"
 
 
 def _server_tool_index(
