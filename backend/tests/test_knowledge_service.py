@@ -127,6 +127,26 @@ class FakeVectorStore:
         return None
 
 
+class SiblingParentStore(FakeVectorStore):
+    """Two distinct child rows that share one parent, in fusion order."""
+
+    async def hybrid_search(self, **kwargs):
+        self.hybrid_searches.append(kwargs)
+        common = dict(
+            document_id="d1",
+            filename="考核制度.md",
+            section="个人业绩考核标准",
+            knowledge_base_id="b1",
+            knowledge_base_name="安全合规",
+            knowledge_base_type="security",
+            parent_id="d1:p0",
+        )
+        return [
+            SearchHit(chunk_id="d1:1", content="child one", score=0.032, chunk_index=1, **common),
+            SearchHit(chunk_id="d1:0", content="child zero", score=0.031, chunk_index=0, **common),
+        ]
+
+
 class FakeReranker:
     enabled = True
 
@@ -257,6 +277,41 @@ async def test_search_replaces_child_content_with_parent_text(tmp_path) -> None:
     assert outcome.hits[0].content == "父块全文"
     assert outcome.hits[0].parent_id == "d1:p0"
     assert vector.parent_queries == [("d1:p0",)]
+
+
+@pytest.mark.asyncio
+async def test_sibling_child_hits_collapse_to_one_parent_hit(tmp_path) -> None:
+    """Two recalled children of one parent must not render as two identical chunks.
+
+    Parent-child types replace each child body with the parent body. Sibling
+    children therefore become byte-identical results with different chunk ids;
+    the best-ranked child should represent that parent once.
+    """
+    vector = SiblingParentStore()
+    vector.parent_map = {"d1:p0": "父块全文"}
+    service, _store = await _service(tmp_path, vector=vector)
+    await service.create_base(user_id="u1", name="安全合规", knowledge_type="security")
+
+    outcome = await service.search(user_id="u1", query="考核标准是什么")
+
+    assert [hit.chunk_id for hit in outcome.hits] == ["d1:1"]
+    assert outcome.hits[0].content == "父块全文"
+    assert outcome.hits[0].parent_id == "d1:p0"
+    await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sibling_children_stay_separate_when_parent_text_is_missing(tmp_path) -> None:
+    """A failed parent lookup must not collapse distinct child bodies."""
+    vector = SiblingParentStore()
+    service, _store = await _service(tmp_path, vector=vector)
+    await service.create_base(user_id="u1", name="安全合规", knowledge_type="security")
+
+    outcome = await service.search(user_id="u1", query="考核标准是什么")
+
+    assert [hit.chunk_id for hit in outcome.hits] == ["d1:1", "d1:0"]
+    assert [hit.content for hit in outcome.hits] == ["child one", "child zero"]
+    await service.aclose()
 
 
 @pytest.mark.asyncio
@@ -453,6 +508,22 @@ async def test_search_routes_by_type_name_and_truncates_context(tmp_path) -> Non
 
     await service.search(user_id="u1", query="问题", knowledge_base_name="产品文档 B")
     assert vector.hybrid_searches[1]["base_ids"]
+    await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_never_touches_another_users_base(tmp_path) -> None:
+    """Even an explicit base_id from another user's bucket must not reach recall."""
+    vector = FakeVectorStore()
+    service, _ = await _service(tmp_path, vector=vector)
+    base = await service.create_base(user_id="u1", name="安全合规", knowledge_type="security")
+
+    outcome = await service.search(
+        user_id="u2", query="考核标准是什么", base_ids=[base.id]
+    )
+
+    assert outcome.hits == []
+    assert vector.hybrid_searches == []
     await service.aclose()
 
 

@@ -224,6 +224,8 @@ def test_description_names_every_field_and_the_call_gates() -> None:
         "null",
         "自由填写",
         "常见",
+        "扁平字段名",
+        "communication.verbosity",
     ):
         assert phrase in description
     assert "无障碍" not in description

@@ -194,7 +194,7 @@ class ServerUrlPolicy:
         max_servers_per_user: int = 20,
         enabled: bool = True,
     ) -> None:
-        schemes = ("https",) if allowed_schemes is None else allowed_schemes
+        schemes = ("http", "https") if allowed_schemes is None else allowed_schemes
         self.allowed_schemes = tuple(
             str(scheme).strip().lower() for scheme in schemes
         )
@@ -715,7 +715,7 @@ def _coerce_policy(policy: ServerUrlPolicy | Any | None) -> ServerUrlPolicy:
     if policy is None:
         return ServerUrlPolicy()
     return ServerUrlPolicy(
-        getattr(policy, "allowed_schemes", ("https",)),
+        getattr(policy, "allowed_schemes", ("http", "https")),
         allow_private_networks=bool(
             getattr(policy, "allow_private_networks", False)
         ),

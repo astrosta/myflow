@@ -459,6 +459,7 @@ class KnowledgeService:
             candidates=candidates,
         )
         parent_ids = [hit.parent_id for hit in hits if hit.parent_id]
+        expanded_parent_ids: set[str] = set()
         if parent_ids:
             try:
                 parent_texts = await self._vector_store.get_parents(
@@ -474,8 +475,16 @@ class KnowledgeService:
             for hit in hits:
                 if hit.parent_id and hit.parent_id in parent_texts:
                     hit.content = parent_texts[hit.parent_id]
+                    expanded_parent_ids.add(hit.parent_id)
                 elif hit.parent_id:
                     logger.warning("Knowledge parent %s is missing", hit.parent_id)
+        # Sibling children become byte-identical after parent expansion. Collapse
+        # them before rerank so duplicate parents neither consume top_k nor get
+        # scored twice by the reranker. Hits whose parent lookup failed stay
+        # separate: those are still distinct child bodies.
+        hits = self._collapse_duplicate_hits(
+            hits, expanded_parent_ids=expanded_parent_ids
+        )
         hits, reranked = await self._rerank(text, hits)
         limited = hits[:limit]
         remaining = self._config.retrieval.max_context_chars
@@ -509,6 +518,39 @@ class KnowledgeService:
             retrieval_mode=retrieval_mode,
             reranked=reranked,
         )
+
+    @staticmethod
+    def _collapse_duplicate_hits(
+        hits: Sequence[SearchHit], *, expanded_parent_ids: set[str]
+    ) -> list[SearchHit]:
+        """Keep one hit per chunk, and one hit per expanded parent.
+
+        Hybrid recall ranks child chunks. For parent-child knowledge types the
+        service then replaces each child body with the parent body, so two
+        siblings of one parent arrive as different chunk IDs carrying identical
+        text. Keeping the first (best-ranked) sibling preserves the fusion order
+        and prevents the UI from rendering the same parent twice. The chunk-ID
+        check is defensive: a vector store must never make one row count twice.
+        """
+        seen_chunks: set[tuple[str, str]] = set()
+        seen_parents: set[tuple[str, str]] = set()
+        output: list[SearchHit] = []
+        for hit in hits:
+            chunk_key = (hit.document_id, hit.chunk_id)
+            if chunk_key in seen_chunks:
+                continue
+            parent_key = (
+                (hit.document_id, hit.parent_id)
+                if hit.parent_id in expanded_parent_ids
+                else None
+            )
+            if parent_key is not None and parent_key in seen_parents:
+                continue
+            seen_chunks.add(chunk_key)
+            if parent_key is not None:
+                seen_parents.add(parent_key)
+            output.append(hit)
+        return output
 
     async def _recall(
         self,

@@ -164,7 +164,7 @@ def tool_store() -> FakeToolStore:
 @pytest.fixture
 def policy() -> ServerUrlPolicy:
     return ServerUrlPolicy(
-        allowed_schemes=["https"],
+        allowed_schemes=["http", "https"],
         allow_private_networks=False,
         max_servers_per_user=3,
     )
@@ -381,16 +381,26 @@ async def test_list_is_owner_scoped(service: McpServerService) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_url_policy_accepts_https_with_path_and_query(policy: ServerUrlPolicy) -> None:
-    url = "https://mcp.example.com/v1/mcp?tenant=acme"
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://mcp.example.com/v1/mcp?tenant=acme",
+        "http://mcp.example.com/v1/mcp?tenant=acme",
+    ],
+)
+def test_url_policy_accepts_http_and_https_with_path_and_query(
+    policy: ServerUrlPolicy, url: str
+) -> None:
     assert policy.validate_url(url) == url
 
 
 @pytest.mark.parametrize(
     "url",
     [
-        "http://mcp.example.com/mcp",
         "https://localhost/mcp",
+        "http://localhost/mcp",
+        "http://127.0.0.1/mcp",
+        "http://169.254.169.254/latest/meta-data/",
         "https://LOCALHOST./mcp",
         "https://api.localhost/mcp",
         "https://127.0.0.1/mcp",
@@ -1138,4 +1148,3 @@ async def test_an_unresolvable_hostname_is_not_rejected_here(
     record = await service.create_server("u1", write())
 
     assert record.url == "https://api.anysearch.com/mcp"
-

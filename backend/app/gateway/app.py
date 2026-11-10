@@ -154,6 +154,11 @@ async def start_mcp_runtime(
         app.state.mcp_server_service = None
         return
     config = app_config.mcp_servers
+    if "http" in config.allowed_schemes:
+        logger.warning(
+            "mcp_servers.allowed_schemes allows http: HTTP MCP endpoints send "
+            "headers and tool traffic in cleartext; use only on a trusted network"
+        )
     app.state.mcp_server_service = McpServerService(
         runtime.server_store,
         runtime.cipher,

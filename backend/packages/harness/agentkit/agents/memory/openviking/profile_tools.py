@@ -5,9 +5,10 @@ independent of the OpenViking switch: a deployment with long-term memory turned
 off still lets the assistant record a name or a language the user stated
 explicitly. Reads/writes of OpenViking memories stay read-only for the model.
 
-The description is normative: it lists every supported field and spells out when
-to call (and when not to). Tests assert those trigger phrases exist, so keep the
-wording in sync with the design document.
+The description is normative: it lists every supported field, requires flat
+dotted keys (never nested objects), and spells out when to call (and when not
+to). Tests assert those trigger phrases exist, so keep the wording in sync with
+the design document.
 """
 
 from __future__ import annotations
@@ -73,7 +74,8 @@ def tool_description() -> str:
             "（密钥、令牌、证件号、联系方式）不要写入。",
             "",
             "所有字段都按自由文本填写；字段说明里的「常见」只是提示，不要求逐字匹配。"
-            "删除字段传 null；列表字段传字符串数组；字段名必须来自下面清单。",
+            "删除字段传 null；列表字段传字符串数组；字段名必须来自下面清单。"
+            "fields 只接受扁平字段名（如 communication.verbosity = \"简洁\"），"
             "与画像无关的普通事实不要写入。",
             "",
             "支持的字段：",

@@ -359,8 +359,9 @@ MCP 工具由 **MyFlow 自己管理**：每个用户把自己的 MCP server 加�
   `mcp_servers.enabled=true` 且 `GATEWAY_WORKERS>1` 时拒绝启动。
 - Milvus 复用现有实例，但 collection 固定 `myflow_mcp_tools`（`tool_search.vector_store.collection`），
   **绝不写** `myflow_knowledge` / `myflow_skills_active`。
-- server URL 默认只允许 `https`（`allowed_schemes`），私网/loopback 默认拒绝
-  （`allow_private_networks=false`）。这是 SSRF 边界，前端勾选不算数。
+- server URL 默认允许 `http` 和 `https`（`allowed_schemes`）。HTTP 的 header/token 是
+  明文传输，只应在可信网络中使用；需要强制 HTTPS 时把它改回 `["https"]`。
+  私网/loopback 仍默认拒绝（`allow_private_networks=false`）。这是 SSRF 边界，前端勾选不算数。
 - SSRF 还查**解析结果**：create/update 与每次建连前都用系统解析器（`getaddrinfo`，取全部地址）
   解析主机名，命中私网/loopback/link-local 就拒绝（同一个 `allow_private_networks` 开关）。
   建连时命中私网按**配置错误**处理：这一次调用失败、server 行被标成 error/unreachable，

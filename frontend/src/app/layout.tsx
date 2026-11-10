@@ -19,7 +19,7 @@ export const metadata: Metadata = {
     default: "MyFlow",
     template: "%s · MyFlow",
   },
-  description: "LangGraph Platform 兼容的 Agent 工作区：工具调用、流式续传、产物预览。",
+  description: "自托管的 Agent 工作区：长任务的过程可见、断点可续，知识库、技能、MCP、长期记忆与沙箱都在同一个会话里。",
 };
 
 export const viewport: Viewport = {

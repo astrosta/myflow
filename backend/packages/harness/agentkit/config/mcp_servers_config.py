@@ -8,7 +8,7 @@ mcp_servers:
   connect_timeout_seconds: 5
   max_servers_per_user: 20
   allow_private_networks: false
-  allowed_schemes: ["https"]
+  allowed_schemes: ["http", "https"]
 ```
 
 Three things this block refuses to let through:
@@ -79,8 +79,11 @@ class McpServersConfig(BaseModel):
         ),
     )
     allowed_schemes: list[str] = Field(
-        default_factory=lambda: ["https"],
-        description="server URL 允许的协议。默认只有 https。",
+        default_factory=lambda: ["http", "https"],
+        description=(
+            "server URL 允许的协议，默认 http/https。http 会明文传输 header，"
+            "仅应在可信网络中使用；私网/loopback 仍由 allow_private_networks 控制。"
+        ),
     )
 
     @field_validator("allowed_schemes")
@@ -93,7 +96,7 @@ class McpServersConfig(BaseModel):
             if not _SCHEME.fullmatch(text):
                 raise ValueError(
                     "mcp_servers.allowed_schemes entries must be bare schemes such as "
-                    f"'https', got {raw!r}"
+                    f"'http' or 'https', got {raw!r}"
                 )
             if text not in schemes:
                 schemes.append(text)
