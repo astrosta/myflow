@@ -237,3 +237,6 @@ config.yaml
 
 # 本地隔离 worktree
 .worktrees/
+
+.cursorignore
+.cursorindexingignore
