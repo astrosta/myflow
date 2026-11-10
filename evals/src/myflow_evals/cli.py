@@ -624,7 +624,11 @@ def _cmd_ingest(
             drafts.append(
                 replace(
                     draft,
-                    metadata={**draft.metadata, "review_status": "pending"},
+                    metadata={
+                        **draft.metadata,
+                        "category": "trace_replay",
+                        "review_status": "pending",
+                    },
                 )
             )
     if args.write and not args.dry_run and drafts:

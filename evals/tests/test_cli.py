@@ -1101,7 +1101,13 @@ def test_build_llm_synthesis_requires_a_judge(
 def test_ingest_write_upserts_trace_replays_for_review(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    traces = [TraceSource(trace_id="trace-abc", query="what is the refund policy?")]
+    traces = [
+        TraceSource(
+            trace_id="trace-abc",
+            query="what is the refund policy?",
+            category="single_tool",
+        )
+    ]
     services, langfuse = _services(Recorder(), traces=traces)
 
     exit_code = main(
