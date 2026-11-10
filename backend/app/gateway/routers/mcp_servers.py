@@ -12,9 +12,10 @@ request for "status" would be matched as a server id.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 
 from agentkit.mcp.errors import McpServerNotFound
 from agentkit.mcp.service import McpServerWrite, url_has_query, url_without_query
@@ -227,12 +228,60 @@ async def refresh_server(
     return await _detail(service, record, caller.user_id)
 
 
+#: Exactly the fields this route serves, so a column it does not serve (content,
+#: content_hash, annotations) never reaches the model even from an ORM row.
+_TOOL_SUMMARY_FIELDS = tuple(McpServerToolSummary.model_fields)
+
+
+def _tool_row_payload(row: Any) -> dict[str, Any]:
+    """The served fields of one mcp_tools row, minus a schema that is not an object.
+
+    mcp_tools.input_schema is a typed JSON column, so a non-object value cannot be
+    written through the service today; if one ever appeared it would be treated as
+    "no schema" -- not repaired and not echoed -- because a validation error here
+    would take the whole list down, including the schema-free call the UI makes.
+    """
+    if isinstance(row, Mapping):
+        payload = {name: row[name] for name in _TOOL_SUMMARY_FIELDS if name in row}
+    else:
+        payload = {
+            name: getattr(row, name)
+            for name in _TOOL_SUMMARY_FIELDS
+            if hasattr(row, name)
+        }
+    if not isinstance(payload.get("input_schema"), Mapping):
+        payload.pop("input_schema", None)
+    return payload
+
+
+def _tool_summary(row: Any, *, include_schema: bool) -> McpServerToolSummary:
+    """Project one mcp_tools row exactly as the caller asked to see it.
+
+    include_schema=true carries the row's stored input_schema verbatim (it is the
+    same object the agent hands the model, so nothing is re-derived); the default
+    clears it, and the model then omits the key, which keeps the browser payload
+    byte-for-byte what it was before the flag existed.
+    """
+    summary = McpServerToolSummary.model_validate(_tool_row_payload(row))
+    if not include_schema:
+        summary.input_schema = None
+    return summary
+
+
 @router.get("/{server_id}/tools", response_model=McpServerToolsResponse)
 async def list_server_tools(
-    server_id: str, caller: McpReader, service: Service
+    server_id: str,
+    caller: McpReader,
+    service: Service,
+    include_schema: bool = Query(default=False),
 ) -> McpServerToolsResponse:
+    """This caller's tools for one server; the stored schema is opt-in.
+
+    The default stays schema-free so the management UI payload does not grow: only
+    a caller that has to build tool arguments needs mcp_tools.input_schema.
+    """
     rows = await service.list_tools(server_id, caller.user_id)
-    tools = [McpServerToolSummary.model_validate(row) for row in rows]
+    tools = [_tool_summary(row, include_schema=include_schema) for row in rows]
     return McpServerToolsResponse(tools=tools, count=len(tools))
 
 

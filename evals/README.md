@@ -1,6 +1,6 @@
 # myflow-evals
 
-MyFlow Agent 的独立黑盒评测工作区。它是仓库 uv 工作区的一员（根 `pyproject.toml` 中的 `evals`），仅通过 HTTP 与 MyFlow Gateway、MCP 服务器和 Langfuse 通信，从不导入 `backend.app` 或 `agentkit`。它以固定的测试账户登录，驱动 Gateway 的 thread/run API，读取持久化的运行事件账本，用规则评测器为每个样本评分，并通过 Langfuse 实验写入分数。数据集构建器会读取每个账户自己的 MCP 工具、私有 Skills、知识文档以及失败/低分追踪，并据此合成确定性草稿。
+MyFlow Agent 的独立黑盒评测工作区。它是仓库 uv 工作区的一员（根 `pyproject.toml` 中的 `evals`），仅通过 HTTP 与 MyFlow Gateway 和 Langfuse 通信，从不导入 `backend.app` 或 `agentkit`。它以固定的测试账户登录，驱动 Gateway 的 thread/run API，读取持久化的运行事件账本，用规则评测器为每个样本评分，并通过 Langfuse 实验写入分数。数据集构建器会读取每个账户自己的 MCP 工具、私有 Skills、知识文档以及失败/低分追踪，并据此合成确定性草稿。
 
 ## 安装与运行
 
@@ -54,29 +54,15 @@ uv run --project evals myflow-evals run \
 | `AGENT_USERS` | 账户标签 -> `{"username": ..., "password": ...}` 的 JSON 映射。每个固定账户一条凭据。 |
 | `USER_ID_SALT` | 哈希用户 ID 的盐值。它必须与 Agent 追踪配置（`user_id_salt`）一致；更改它会改变所有哈希 ID，因此现有数据集必须重建/重新标注。 |
 | `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` | Langfuse HTTP API：数据集读写、实验，以及失败/低分追踪读取。 |
-| `MCP_SERVER_HEADERS` | MCP 服务器名称（或 ID） -> 该服务器认证请求头的 JSON 映射，另可包含可选的 `url`/`transport` 覆盖。 |
 
-机密材料应存放在机密存储中（CI secrets、vault，或未跟踪的本地文件）。它绝不能出现在数据集条目、追踪、日志行、README、测试夹具或提交中。该包会从 dataclass repr 中排除密码，仅按服务器 ID 和异常类型报告 MCP 失败，并且绝不回显请求头值、服务器 URL 查询字符串中的 token 或 Langfuse 密钥。
+机密材料应存放在机密存储中（CI secrets、vault，或未跟踪的本地文件）。它绝不能出现在数据集条目、追踪、日志行、README、测试夹具或提交中。该包会从 dataclass repr 中排除密码，绝不回显 Langfuse 密钥，并且不保存任何 MCP 服务器凭据。
+
+MCP 服务器不需要任何机密信息：构建只读取 Gateway 已存储的工具投影，从不直接调用 MCP 服务器。
 
 机密文件是可选的便利方式：
 
 - `--env-file PATH` 读取 `KEY=VALUE` 行（忽略注释和空行）。真实环境变量值优先于文件，因此 checkout 中的文件绝不会覆盖 CI 机密。
 - `--accounts-file PATH` 替代 `AGENT_USERS` 作为凭据来源。
-- `--mcp-headers-file PATH` 仅在环境变量未设置或为空时填充 `MCP_SERVER_HEADERS`。
-
-`MCP_SERVER_HEADERS` 示例（仅占位符，绝不提交真实值）：
-
-```json
-{
-  "project_db": {
-    "X-Api-Key": "<token>",
-    "url": "https://mcp.internal/rpc?tenant=<tenant>",
-    "transport": "streamable_http"
-  }
-}
-```
-
-`url` 和 `transport` 是保留键，不是请求头：当某个服务器的 `GET /api/mcp-servers` URL 丢失查询字符串，或列出的 transport 有误时，它们用于覆盖该服务器。Gateway 返回的是脱敏后的 MCP 请求头值，因此无法通过该 API 调用服务器；这份机密映射是唯一可用的来源。
 
 ## 命令
 
@@ -88,7 +74,6 @@ uv run --project evals myflow-evals run \
 | `--limit N` | 正整数上限。`build` 限制每种来源类型的草稿数；`run` 在模式选择之后限制所选条目；`ingest` 限制打印的追踪数。 |
 | `--dry-run` | 执行除写入之外的所有操作。各命令的具体区别见对应章节。 |
 | `--accounts-file PATH` | 替代 `AGENT_USERS` 的固定账户机密文件。 |
-| `--mcp-headers-file PATH` | 替代 `MCP_SERVER_HEADERS` 的 MCP 请求头机密文件。 |
 | `--env-file PATH` | `KEY=VALUE` 设置文件；真实环境变量值优先。 |
 | `--seed N` | 仅 `build`。知识库分块抽样的随机种子；同一种子的两次构建会选到同一批分块，条目 ID 本来就与抽样无关。 |
 
@@ -103,7 +88,7 @@ uv run --project evals myflow-evals build \
   --dry-run
 ```
 
-`build` 以每个固定账户登录，并以该账户身份读取：`GET /api/mcp-servers`，再对每个**生效**服务器直接执行 MCP `tools/list` 以获取真实的 `inputSchema`；`GET /api/skills`（仅私有 Skills）；`GET /api/knowledge/bases` -> `/documents` -> 每个文档随机抽取的三个分块中正文最长的一个（见下文）；以及仅在指定 `--include-traces` 时读取该账户自己的失败/低分 Langfuse 追踪。只有**生效**来源会被采样——一个已启用、活跃且可达的 MCP 服务器，其被 Gateway 投影标记为既可调用又已启用的工具，以及已启用且活跃的私有 Skills——因此草稿绝不会来自 Agent 无法访问的内容。每一次因生效性导致的跳过（服务器被禁用、非活跃或不可达；工具未被投影标记为可调用且已启用；私有 Skill 被关闭或非活跃）都会在构建报告中以警告打印，而因作用域、内置类别或缺少 `skill_id`/`name` 被丢弃的 Skill 则按设计保持静默。随后它为每个来源合成一个确定性草稿，并且除非指定 `--dry-run`，否则通过 Langfuse 将每个草稿 upsert 到数据集中。
+`build` 以每个固定账户登录，并以该账户身份读取：`GET /api/mcp-servers`，再对每个**生效**服务器发一次 `GET /api/mcp-servers/{id}/tools?include_schema=true`，一次拿到工具名、`callable`/`enabled` 标记和真实的 `inputSchema`（不再直接开 MCP 会话，也不需要任何服务器凭据）；`GET /api/skills`（仅私有 Skills）；`GET /api/knowledge/bases` -> `/documents` -> 每个文档随机抽取的三个分块中正文最长的一个（见下文）；以及仅在指定 `--include-traces` 时读取该账户自己的失败/低分 Langfuse 追踪。只有**生效**来源会被采样——一个已启用、活跃且可达的 MCP 服务器，其被 Gateway 投影标记为既可调用又已启用的工具，以及已启用且活跃的私有 Skills——因此草稿绝不会来自 Agent 无法访问的内容。每一次因生效性导致的跳过（服务器被禁用、非活跃或不可达；工具未被投影标记为可调用且已启用或没有可用的 `inputSchema`；私有 Skill 被关闭或非活跃）都会在构建报告中以警告打印，而因作用域、内置类别或缺少 `skill_id`/`name` 被丢弃的 Skill 则按设计保持静默。随后它为每个来源合成一个确定性草稿，并且除非指定 `--dry-run`，否则通过 Langfuse 将每个草稿 upsert 到数据集中。
 
 追踪回放不声明任何期望（`expected_output` 为 `{}`），因此没有指标能给它评分，任何针对它的 `run` 都会因 `unscored` 条目失败。因此 `build` 默认排除追踪草稿，也完全不分页读取追踪；传入 `--include-traces` 可构建探索数据集。回归数据集（`agent-eval/regression/v1`）必须在不带该标志的情况下构建，这样它只包含可评分样本。
 
@@ -166,7 +151,7 @@ uv run --project evals myflow-evals ingest \
 
 ## CI 与夜间任务
 
-`.github/workflows/agent-eval.yml` 在拉取请求和夜间（UTC `0 18 * * *`）运行，作业超时为 45 分钟，Gateway/Langfuse 机密信息由 GitHub secrets 注入（运行从不读取 MCP 请求头）。数据集是冻结输入：工作流从不运行 `build`。
+`.github/workflows/agent-eval.yml` 在拉取请求和夜间（UTC `0 18 * * *`）运行，作业超时为 45 分钟，Gateway/Langfuse 机密信息由 GitHub secrets 注入。数据集是冻结输入：工作流从不运行 `build`。
 
 | 触发条件 | 命令 | 覆盖范围 |
 | --- | --- | --- |
@@ -251,7 +236,6 @@ CLI 将该行打印到 stderr 并以 `1` 退出。调查其中列出的条目 ID
 | `api.py` | Gateway thread/run/event 客户端（`AgentApi`、`RunSnapshot`）。 |
 | `evidence.py` | 以纯函数方式将已完成的运行规范化为 `RunEvidence`（答案、工具调用、子代理、检索、引用）。 |
 | `evaluators.py` | 纯逐样本规则指标，以及 `RULE_EVALUATORS`/`THRESHOLDS` 注册表。 |
-| `mcp.py` | 直接 MCP `tools/list` 客户端（`McpClient`），以及 `MCP_SERVER_HEADERS` 机密加载。 |
 | `build_dataset.py` | 数据来源、确定性草稿合成（`build_account_items`）、可选追踪获取，以及 `DatasetWriter` 抽象接口。 |
 | `runner.py` | 实验执行、完整性门禁、紧凑证据交接、指标门禁。 |
 | `cli.py` | `myflow-evals build` / `run` / `ingest` 命令行及其退出码契约。 |
@@ -260,19 +244,19 @@ CLI 将该行打印到 stderr 并以 `1` 退出。调查其中列出的条目 ID
 
 `load_build_sources(session, limit=...)` 以该账户身份读取：
 
-- `GET /api/mcp-servers`，然后——对每个**生效**服务器——直接执行 MCP `tools/list` 获取真实的 `inputSchema`（`GET /api/mcp-servers/{id}/tools` 返回不含 schema 的摘要，因此它不是 schema 来源）；
+- `GET /api/mcp-servers`，然后——对每个**生效**服务器——一次 `GET /api/mcp-servers/{id}/tools?include_schema=true`，它同时给出工具列表、`callable`/`enabled` 标记和逐字的 `inputSchema`；这是工具的唯一来源，包自身从不打开 MCP 会话；
 - `GET /api/skills`，保留 `scope == "private"`，丢弃 builtin/public Skills 以及任何缺少 `skill_id`/`name` 的 Skill；
 - `GET /api/knowledge/bases` -> `/documents` -> 每个文档的分块抽样（随机三个，取最长，见下条）；
 - 账户自己的失败或低分 Langfuse 追踪，仅在调用方要求时读取（`include_traces=True`，即 `--include-traces`）；见下文。
 
 只有生效来源会成为样本，与 Agent 实际能路由到的内容保持一致：
 
-- **MCP 服务器**：摘要必须表明 `enabled: true`、`status: "active"` 和 `reachable: true`（agentkit 的 `is_active`）。缺失标志不能视为 `true`，因此被禁用、仍待处理、出错、不可达或无标志的服务器会被跳过，并给出警告，指出其名称和原因。先检查本地可修复的问题：不支持的 transport 或缺失 url 即使服务器同时未生效也会报告，因为那是运维人员可以采取行动的原因。
-- **MCP 工具**：在 `tools/list` 成功后，`GET /api/mcp-servers/{id}/tools` 提供 Gateway 的投影；只有某一行的 `callable: true` **且** `enabled: true` 时才会采样该工具。行按 `call_name` 匹配，当行没有 `call_name` 时回退到 `name`。已列出但没有投影行的工具会被跳过并给出警告；`/tools` 调用失败会跳过整个服务器并给出警告（无法确认生效性；它绝不会中止构建）。
+- **MCP 服务器**：摘要必须表明 `enabled: true`、`status: "active"` 和 `reachable: true`（agentkit 的 `is_active`）。缺失标志不能视为 `true`，因此被禁用、仍待处理、出错、不可达或无标志的服务器会被跳过，并给出警告，指出其名称和原因。transport 和 url 不再参与判断：构建不调用服务器，只读取 Gateway 已存储的内容。
+- **MCP 工具**：`GET /api/mcp-servers/{id}/tools?include_schema=true` 的每一行就是一个候选工具；只有 `callable: true` **且** `enabled: true`、`call_name` 是 Agent 可回调的、并且该行带有对象形式的 `input_schema` 时才会被采样（参数必须来自真实 schema，没有 schema 就只能猜）。缺少 `call_name`、未标记可调用/已启用、调用名不合法或缺少对象形式 `input_schema` 的行会被跳过并给出警告；`/tools` 调用失败会跳过整个服务器并给出警告（无法确认生效性；它绝不会中止构建）。
 - **Skill**：私有 Skill 必须 `enabled: true`，当行带有 `status` 时还必须 `status == "active"`；被关闭或非活跃的 Skill 会被跳过，并给出警告指出其名称。
 - **知识库分块**：不再固定取第 0 个分块，而是在该文档的分块中随机抽取三个不同位置，取正文最长的那个；比较用 `len(content.strip())`，并列时取 `chunk_index` 最小的，空白分块永不入选（即使它的原始字符串最长）。文档只有 1 个分块时复用计数请求，2-3 个分块时整页读取，更多时发 1 次计数请求加 3 次单分块请求，因此每个文档最多 4 次分块请求。抽样用注入的 `random.Random`：`build --seed N` 让抽号可复现，而条目 ID 由文档 ID 推导、与抽号无关。某个文档的分块页读取失败只跳过该文档并给出警告，不会中断构建；`count` 缺失或格式非法时给出“分块计数缺失或非法”的警告，而不是误报成没有可读分块。
 
-仅支持 `streamable_http` MCP 服务器。每一次生效性跳过和每一个不可用的本地来源——未生效服务器、`sse` 服务器、没有可用 url 的服务器、`tools/list` 或 `/tools` 调用失败的服务器、投影未列出或未标记 `callable`/`enabled` 的工具、未生效 Skill、没有可读分块的文档、不可用的 Langfuse——都会作为警告记录在 `BuildSources.warnings` 上，从而出现在构建报告中；一个损坏来源只损失它自己的条目，而不会使构建失败。因其他原因被丢弃的行按设计保持静默：public、builtin 类别或缺少 `skill_id`/`name` 的 Skill 从来不是该账户可用的样本，因此不会报告。导致账户数据不可用的 Gateway 故障仍会抛出异常。
+transport 不影响采样，只要求服务器生效。每一次生效性跳过和每一个不可用的本地来源——未生效服务器、`/tools` 调用失败的服务器、未标记 `callable`/`enabled` 或没有可用 `input_schema` 的工具、未生效 Skill、没有可读分块的文档、不可用的 Langfuse——都会作为警告记录在 `BuildSources.warnings` 上，从而出现在构建报告中；一个损坏来源只损失它自己的条目，而不会使构建失败。因其他原因被丢弃的行按设计保持静默：public、builtin 类别或缺少 `skill_id`/`name` 的 Skill 从来不是该账户可用的样本，因此不会报告。导致账户数据不可用的 Gateway 故障仍会抛出异常。
 
 `build_account_items(session, sources, limit=...)` 是纯函数：没有 I/O、没有时钟、没有随机性。它为每个来源生成一个带确定性 ID 的草稿（`stable_item_id(kind, source_id, ordinal, hashed_user_id)`），因此重建是幂等的，对同一账户重复运行绝不会重复条目。如果某个工具调用名是 Agent 无法回调的——带点的上游名称，或超出提供方长度限制——则跳过并给出警告，不产生草稿，因为用它构建的样本永远无法通过。
 
@@ -334,7 +318,7 @@ skill: 2 drafts from 11 sources
 knowledge: 2 drafts from 120 sources
 trace: 2 drafts from 4 sources
 total: 8 drafts
-warning: skipped MCP server 'legacy_db': sse transport is not supported (only streamable_http is implemented)
+warning: skipped MCP server 'legacy_db': status=pending is not active
 ```
 
 写入通过 `DatasetWriter.upsert_items(dataset_name, items)` 完成，由 `cli.py` 中的 `LangfuseDatasetWriter` 实现。`write_drafts(..., dry_run=True)` 返回 0 且从不调用 writer，因此试运行无法创建或更改 Langfuse 数据集。`myflow-evals build` 是唯一写入数据集条目的命令；`run` 将数据集视为冻结输入，`ingest` 只打印。
@@ -345,7 +329,8 @@ warning: skipped MCP server 'legacy_db': sse transport is not supported (only st
 - K3 `skill_adherence`、R4 `refusal_ok`、Faithfulness、`answer_correctness`、`answer_quality`、AnswerRelevancy、ContextualPrecision/Recall/Relevancy 以及所有其他 DeepEval 指标都未实现。当前每个 `THRESHOLDS` 条目都是规则指标。
 - 不存在基于 LLM 的数据集合成和可选 DeepEval 附加组件；也没有人工 Golden set。
 - `ingest` 会打印候选的失败/低分追踪，但不会写入探索数据集；将其提升为数据集仍需手动操作。
-- 只有 `streamable_http` MCP 服务器会贡献工具。未生效服务器（未启用、非 `active` 或不可达）、`sse` 服务器、没有 URL 的服务器、`tools/list` 或 `/tools` 调用失败的服务器、Gateway 投影未标记为可调用**且**已启用的工具，以及被关闭或非活跃的私有 Skills 都会被跳过并给出警告。
+- 工具只来自 Gateway 存储的投影。未生效服务器（未启用、非 `active` 或不可达）、`/tools` 调用失败的服务器、Gateway 投影未标记为可调用**且**已启用或缺少对象形式 `input_schema` 的工具，以及被关闭或非活跃的私有 Skills 都会被跳过并给出警告。
+- 构建依赖 Gateway 支持 `GET /api/mcp-servers/{id}/tools?include_schema=true`。旧版 Gateway 会忽略该参数，返回的投影里没有 `input_schema`，于是每次构建只会得到 0 个工具草稿（仅伴随警告）；因此评测包必须与 Gateway 一起升级。
 - 证据携带运行追踪 ID，只是因为运行器将 `RunSnapshot.trace_id` 传给 `collect_evidence`；其他调用方必须显式传入，否则证据的 `trace_id` 为 `None`。
 - 不会对用户 ID、权限、跨用户隔离或长期记忆指标评分；`metadata.user_id` 仅作为账户选择/来源键。
 - 内置 Skills 和斜杠激活被排除在样本之外。只采样 `scope=private` 的 Skills。

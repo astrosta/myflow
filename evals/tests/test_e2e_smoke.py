@@ -39,11 +39,11 @@ from myflow_evals.build_dataset import (
     BuildSources,
     DatasetItemDraft,
     KnowledgeSource,
+    McpTool,
     SkillSource,
     build_account_items,
 )
 from myflow_evals.cli import CliServices, main
-from myflow_evals.mcp import McpTool
 from myflow_evals.runner import ExperimentRunner, IncompleteExperiment
 
 BASE_URL = "http://gateway.test/api"

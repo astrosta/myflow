@@ -488,8 +488,46 @@ def test_state_model_forbids_extra_fields(client: TestClient) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Tools are read-only summaries
+# Tools are read-only summaries; the stored schema is opt-in
 # --------------------------------------------------------------------------- #
+
+#: A stored inputSchema that must come back verbatim: mcp_tools.input_schema keeps
+#: $ref/anyOf/default exactly as the server sent them, and the eval dataset
+#: builder derives its sample arguments from this object.
+REF_SCHEMA = {
+    "$defs": {"Window": {"type": "object", "properties": {"start": {"type": "string"}}}},
+    "type": "object",
+    "required": ["filter"],
+    "properties": {
+        "filter": {"anyOf": [{"$ref": "#/$defs/Window"}, {"type": "null"}]},
+        "limit": {"type": "integer", "default": 10},
+    },
+    "additionalProperties": False,
+}
+
+
+def _schema_tool(
+    name: str,
+    call_name: str,
+    input_schema: Any,
+    *,
+    callable: bool = True,
+    enabled: bool = True,
+) -> SimpleNamespace:
+    """One mcp_tools row as the owner-scoped service hands it back."""
+    return SimpleNamespace(
+        id=f"tool-{name}",
+        server_id="s1",
+        owner_user_id="u1",
+        name=name,
+        call_name=call_name,
+        display_name=name,
+        description=f"{name} things",
+        parameters=[],
+        input_schema=input_schema,
+        callable=callable,
+        enabled=enabled,
+    )
 
 
 def test_tools_returns_summaries_only(client: TestClient) -> None:
@@ -507,6 +545,110 @@ def test_tools_returns_summaries_only(client: TestClient) -> None:
     assert "input_schema" not in tool
     assert "owner_user_id" not in tool
     assert "content" not in tool
+
+
+def test_tools_hides_the_stored_schema_by_default(
+    client: TestClient, service: FakeService
+) -> None:
+    service.tools.append(_schema_tool("resolve", "mcp__anysearch__resolve", REF_SCHEMA))
+
+    response = client.get("/api/mcp-servers/s1/tools")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 2
+    assert [tool["call_name"] for tool in body["tools"]] == [
+        "mcp__anysearch__search",
+        "mcp__anysearch__resolve",
+    ]
+    # Absent, not null: the browser payload must not grow for a UI that never
+    # reads a schema.
+    assert all("input_schema" not in tool for tool in body["tools"])
+    assert "anyOf" not in response.text
+    # An explicit false is byte-for-byte the omitted default.
+    explicit = client.get("/api/mcp-servers/s1/tools?include_schema=false")
+    assert explicit.text == response.text
+
+
+def test_tools_returns_each_stored_schema_verbatim_when_include_schema_is_true(
+    client: TestClient, service: FakeService
+) -> None:
+    service.tools.append(_schema_tool("resolve", "mcp__anysearch__resolve", REF_SCHEMA))
+    service.tools.append(_schema_tool("ping", "mcp__anysearch__ping", {}))
+
+    default = client.get("/api/mcp-servers/s1/tools").json()
+    response = client.get("/api/mcp-servers/s1/tools?include_schema=true")
+
+    assert response.status_code == 200
+    body = response.json()
+    # Same rows in the same order; the flag only adds the schema key.
+    assert [tool["call_name"] for tool in body["tools"]] == [
+        tool["call_name"] for tool in default["tools"]
+    ]
+    assert body["count"] == default["count"] == 3
+    assert body["tools"][0]["input_schema"] == {"type": "object"}
+    schema = body["tools"][1]["input_schema"]
+    assert schema == REF_SCHEMA
+    # A dropped $ref or a flattened anyOf would silently change the arguments a
+    # sample is built from, so pin the pieces a naive re-serialization loses.
+    assert schema["properties"]["filter"]["anyOf"][0] == {"$ref": "#/$defs/Window"}
+    assert schema["properties"]["limit"]["default"] == 10
+    assert schema["additionalProperties"] is False
+    # An empty stored schema stays an empty object, never a repaired one.
+    assert body["tools"][2]["input_schema"] == {}
+    assert "owner_user_id" not in response.text
+    assert "content" not in response.text
+
+
+@pytest.mark.parametrize("stored", ["not-a-schema", ["type", "object"], 7])
+def test_a_non_object_stored_schema_never_breaks_the_projection(
+    client: TestClient, service: FakeService, stored: Any
+) -> None:
+    """One unreadable schema must not take the whole response down.
+
+    mcp_tools.input_schema is a typed JSON column and the sync coerces a non-object
+    to {}, so a row like this cannot be written today; it is defensive anyway,
+    because the schema field is new here and a validation error would break even
+    the schema-free UI call. Such a row is treated as carrying no schema -- not
+    repaired, not echoed -- and the healthy rows still come back.
+    """
+    service.tools.append(_schema_tool("weird", "mcp__anysearch__weird", stored))
+
+    plain = client.get("/api/mcp-servers/s1/tools")
+    asked = client.get("/api/mcp-servers/s1/tools?include_schema=true")
+
+    assert plain.status_code == 200
+    assert asked.status_code == 200
+    assert [tool["call_name"] for tool in plain.json()["tools"]] == [
+        "mcp__anysearch__search",
+        "mcp__anysearch__weird",
+    ]
+    assert all("input_schema" not in tool for tool in plain.json()["tools"])
+    assert asked.json()["count"] == 2
+    # The healthy row keeps its verbatim schema; the broken one simply has none.
+    assert asked.json()["tools"][0]["input_schema"] == {"type": "object"}
+    assert "input_schema" not in asked.json()["tools"][1]
+
+
+def test_include_schema_is_not_an_authorization_shortcut(service: FakeService) -> None:
+    from backend.app.gateway.services import RunPermissionDenied
+
+    app = FastAPI()
+    install_error_handlers(app)
+    app.include_router(router_module.router, prefix="/api")
+    app.state.mcp_server_service = service
+    app.dependency_overrides[mcp_servers_deps.get_mcp_server_service] = lambda: service
+
+    def _no_read_scope() -> RunCaller:
+        raise RunPermissionDenied("missing scope: mcp_servers:read")
+
+    app.dependency_overrides[mcp_servers_deps.require_mcp_reader] = _no_read_scope
+
+    response = TestClient(app).get("/api/mcp-servers/s1/tools?include_schema=true")
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "permission_denied"
+    assert "input_schema" not in response.text
 
 
 # --------------------------------------------------------------------------- #

@@ -11,12 +11,16 @@ a later phase (see evals/README.md).
 
 Rules that shape the drafts:
 
+* Tools come from the Gateway's stored projection only: one
+  GET /api/mcp-servers/{id}/tools?include_schema=true per effective server. This
+  package opens no MCP session of its own and holds no server credentials.
 * Tool arguments come from the required properties of the real inputSchema only
   (first enum value, else a type placeholder); nothing is guessed.
 * Only effective sources are sampled: an MCP server must be enabled, active,
   and reachable, a tool must be both callable and enabled in the Gateway tool
-  index, and the account's own private Skills -- builtin and public Skills are
-  excluded -- must be enabled and active, with a skill_id and a name.
+  index and carry its stored inputSchema, and the account's own private Skills --
+  builtin and public Skills are excluded -- must be enabled and active, with a
+  skill_id and a name.
 * Knowledge drafts carry document/chunk provenance in metadata but emit only
   expected_doc_ids: chunk ids are an implementation detail of the retriever.
 * Traces are optional input: without LANGFUSE_HOST and keys, there are none.
@@ -41,7 +45,6 @@ from typing import Any, Protocol
 import httpx
 
 from myflow_evals.accounts import AccountSession
-from myflow_evals.mcp import McpClient, McpServer, McpServerSecret, McpTool, load_server_secrets
 
 _KIND_TOOL = "tool"
 _KIND_SKILL = "skill"
@@ -51,7 +54,6 @@ _KIND_TRACE = "trace"
 #: Fixed kind order: reports and drafts never depend on dict iteration quirks.
 _KIND_ORDER = (_KIND_TOOL, _KIND_SKILL, _KIND_KNOWLEDGE, _KIND_TRACE)
 
-_STREAMABLE_TRANSPORT = "streamable_http"
 #: Sample this many chunks and keep the longest readable one, not chunk index 0.
 _CHUNK_SAMPLE_SIZE = 3
 #: A chunk without a usable index still competes, but loses every tie.
@@ -89,6 +91,29 @@ _SAFE_CALL_NAME = re.compile(
     rf"^{_CALL_NAME_PREFIX}[A-Za-z0-9_-]{{1,{_MAX_SERVER_NAME_CHARS}}}"
     rf"{_CALL_NAME_SEPARATOR}[A-Za-z0-9][A-Za-z0-9_-]{{0,{_MAX_TOOL_NAME_CHARS - 1}}}$"
 )
+
+
+@dataclass(frozen=True)
+class McpTool:
+    """One tool as the Gateway stores it, including its real input schema.
+
+    Every field comes from one mcp_tools row: the call name the Agent uses, the
+    remote tool name, the description, and the verbatim inputSchema the sample
+    arguments are derived from. Nothing here is re-fetched from the server.
+    """
+
+    call_name: str
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ServerRef:
+    """One effective MCP server of the fixed account, as the Gateway names it."""
+
+    id: str
+    name: str
 
 
 @dataclass(frozen=True)
@@ -197,14 +222,18 @@ def load_build_sources(
     session: AccountSession,
     *,
     limit: int | None = None,
-    server_secrets: Mapping[str, McpServerSecret] | None = None,
     environ: Mapping[str, str] | None = None,
-    mcp_client: McpClient | None = None,
     trace_transport: httpx.BaseTransport | None = None,
     include_traces: bool = True,
     rng: random.Random | None = None,
 ) -> BuildSources:
     """Fetch this account's real tools, private Skills, knowledge documents, and traces.
+
+    Tools are read from the Gateway's own projection of the account's mcp_tools
+    rows: one GET /api/mcp-servers/{id}/tools?include_schema=true per effective
+    server. The Gateway already stores each tool's verbatim inputSchema beside its
+    callable/enabled flags, so this costs one request per server and needs no
+    per-server credential -- this package never opens an MCP session.
 
     A tool whose call name the Agent could not call back (a dot, or a name beyond
     the provider bound) is skipped with a warning: a sample built from it could
@@ -225,23 +254,17 @@ def load_build_sources(
 
     A Gateway failure that makes the account data unusable raises. Everything
     this account cannot use -- a server that is disabled, not active, or
-    unreachable, an unsupported transport, a tool the Gateway tool index does not
-    mark callable and enabled, a Skill that is switched off or not active, a
-    document without a readable chunk, an unavailable Langfuse -- is skipped with
-    a warning on the result, so one broken source never costs more than its own
-    items.
+    unreachable, a tool the Gateway tool index does not mark callable and enabled,
+    a tool whose projection carries no usable schema, a Skill that is switched off
+    or not active, a document without a readable chunk, an unavailable Langfuse --
+    is skipped with a warning on the result, so one broken source never costs more
+    than its own items.
     """
     _validate_limit(limit)
     rng = random.Random() if rng is None else rng
     env = os.environ if environ is None else environ
-    secrets = (
-        dict(server_secrets)
-        if server_secrets is not None
-        else load_server_secrets(environ=env)
-    )
-    client = mcp_client if mcp_client is not None else McpClient()
     warnings: list[str] = []
-    tools = _account_tools(session, secrets=secrets, client=client, warnings=warnings)
+    tools = _account_tools(session, warnings=warnings)
     skills = _account_skills(session, warnings=warnings)
     knowledge, knowledge_total = _account_knowledge(
         session, limit=limit, warnings=warnings, rng=rng
@@ -425,95 +448,48 @@ def write_drafts(
     return len(drafts)
 
 
-def _account_tools(
-    session: AccountSession,
-    *,
-    secrets: Mapping[str, McpServerSecret],
-    client: McpClient,
-    warnings: list[str],
-) -> list[McpTool]:
+def _account_tools(session: AccountSession, *, warnings: list[str]) -> list[McpTool]:
+    """Read every effective server's stored tool projection: the whole tool source.
+
+    One GET /api/mcp-servers/{id}/tools?include_schema=true per effective server
+    yields the call name, both effectiveness flags and the verbatim inputSchema
+    from the same row, so there is no second lookup and no MCP traffic.
+    """
     body = _get_object(session, "/mcp-servers")
     summaries = body.get("servers")
     if not isinstance(summaries, list):
         raise RuntimeError("GET /mcp-servers returned no servers list")
     tools: list[McpTool] = []
     for summary in summaries:
-        server = _mcp_server(summary, secrets, warnings)
+        server = _mcp_server(summary, warnings)
         if server is None:
             continue
-        try:
-            listed = client.list_tools(server)
-        except RuntimeError as exc:
-            # One broken server must cost exactly its own tools, never the build.
-            warnings.append(f"skipped MCP server {server.name!r}: tools/list failed ({exc})")
-            continue
-        index = _server_tool_index(session, server, warnings)
-        if index is None:
-            continue
-        for tool in listed:
-            if not is_safe_call_name(tool.call_name):
-                warnings.append(
-                    f"skipped tool {tool.name!r} of server {server.name!r}: "
-                    f"the Agent cannot call {tool.call_name!r}"
-                )
-                continue
-            row = index.get(tool.call_name)
-            if row is None:
-                row = index.get(tool.name)
-            if row is None:
-                warnings.append(
-                    f"skipped tool {tool.name!r} of server {server.name!r}: "
-                    "the Gateway tool index does not list it"
-                )
-                continue
-            problem = _tool_flag_problem(row, "callable")
-            if problem is None:
-                problem = _tool_flag_problem(row, "enabled")
-            if problem is not None:
-                warnings.append(
-                    f"skipped tool {tool.name!r} of server {server.name!r}: {problem}"
-                )
-                continue
-            tools.append(tool)
+        for row in _server_tool_rows(session, server, warnings):
+            tool = _projected_tool(row, server, warnings)
+            if tool is not None:
+                tools.append(tool)
     return tools
 
 
-def _mcp_server(
-    summary: object,
-    secrets: Mapping[str, McpServerSecret],
-    warnings: list[str],
-) -> McpServer | None:
+def _mcp_server(summary: object, warnings: list[str]) -> _ServerRef | None:
+    """Keep a server the Agent can route to; everything else is a warning.
+
+    Transport and url no longer matter: this build never calls the server, it
+    reads what the Gateway already stored about it.
+    """
     if not isinstance(summary, Mapping):
         warnings.append("skipped an /api/mcp-servers entry that is not an object")
         return None
     server_id = _text(summary.get("id"))
-    name = _text(summary.get("name"))
     if server_id is None:
         warnings.append("skipped an MCP server without an id")
         return None
-    if name is None:
-        warnings.append(f"skipped MCP server {server_id!r}: it has no name to build tool names from")
-        return None
-
-    secret = secrets.get(name) or secrets.get(server_id) or McpServerSecret()
-    transport = secret.transport or summary.get("transport")
-    if transport != _STREAMABLE_TRANSPORT:
-        warnings.append(
-            f"skipped MCP server {name!r}: {transport} transport is not supported "
-            f"(only {_STREAMABLE_TRANSPORT} is implemented)"
-        )
-        return None
-    url = secret.url or summary.get("url")
-    if not isinstance(url, str) or not url:
-        warnings.append(
-            f"skipped MCP server {name!r}: no url to call; set one in MCP_SERVER_HEADERS"
-        )
-        return None
-    # A locally fixable problem is reported before effectiveness: an operator
-    # who can correct the transport or url needs that reason, not a status.
+    # The rows carry their own call names, so the server name is only the label a
+    # warning uses; falling back to the id keeps every warning attributable.
+    name = _text(summary.get("name")) or server_id
     if not _effective_server(summary, name, warnings):
         return None
-    return McpServer(id=server_id, url=url, headers=dict(secret.headers), name=name)
+    return _ServerRef(id=server_id, name=name)
 
 
 def _effective_server(
@@ -574,44 +550,108 @@ def _tool_flag_problem(row: Mapping[str, Any], flag: str) -> str | None:
     return f"the Gateway tool index row has {flag}={value!r}"
 
 
-def _server_tool_index(
-    session: AccountSession, server: McpServer, warnings: list[str]
-) -> dict[str, Mapping[str, Any]] | None:
-    """Index GET /api/mcp-servers/{id}/tools the way tools/list names its tools.
+def _server_tool_rows(
+    session: AccountSession, server: _ServerRef, warnings: list[str]
+) -> list[Mapping[str, Any]]:
+    """Read one server's stored tool projection, schema included, exactly once.
 
-    The projection carries the two flags that decide whether the Agent can call a
-    tool at all, so a server whose index cannot be read contributes nothing:
-    effectiveness cannot be established, and guessing would build samples that
-    could never pass. Rows are keyed by call_name, falling back to name for a row
-    that does not carry one.
+    The projection is the whole tool source: it carries the two flags that decide
+    whether the Agent can call a tool at all and the verbatim inputSchema the
+    sample arguments come from. A server whose projection cannot be read
+    contributes nothing -- effectiveness cannot be established there, and guessing
+    would build samples that could never pass -- but it never aborts the build.
     """
     try:
-        body = _get_object(session, f"/mcp-servers/{server.id}/tools")
+        body = _get_object(
+            session,
+            f"/mcp-servers/{server.id}/tools",
+            params={"include_schema": "true"},
+        )
     except httpx.HTTPStatusError as exc:
         warnings.append(
             f"skipped MCP server {server.name!r}: its tool index request failed "
             f"with HTTP {exc.response.status_code}"
         )
-        return None
+        return []
     except (RuntimeError, httpx.HTTPError) as exc:
         warnings.append(
             f"skipped MCP server {server.name!r}: its tool index is unreadable ({exc})"
         )
-        return None
+        return []
     rows = body.get("tools")
     if not isinstance(rows, list):
         warnings.append(
             f"skipped MCP server {server.name!r}: its tool index returned no tools list"
         )
-        return None
-    index: dict[str, Mapping[str, Any]] = {}
+        return []
+    usable: list[Mapping[str, Any]] = []
     for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        key = _text(row.get("call_name")) or _text(row.get("name"))
-        if key is not None:
-            index[key] = row
-    return index
+        if isinstance(row, Mapping):
+            usable.append(row)
+        else:
+            # Every other skip warns; a row this package cannot read must too.
+            warnings.append(
+                f"skipped a tool of server {server.name!r}: its Gateway tool index "
+                "entry is not an object"
+            )
+    return usable
+
+
+def _projected_tool(
+    row: Mapping[str, Any], server: _ServerRef, warnings: list[str]
+) -> McpTool | None:
+    """Turn one projection row into a sample source, or skip it with a warning.
+
+    A tool is sampled only when the Agent could really call it with arguments
+    derived from a real schema: callable AND enabled in the Gateway index, a call
+    name the provider accepts, and a stored inputSchema that is a JSON object. No
+    schema means no sample -- the arguments would have to be invented.
+    """
+    name = _text(row.get("name"))
+    call_name = _text(row.get("call_name"))
+    if name is None or call_name is None:
+        # Say what is really absent: a row can carry a call_name and no name.
+        label = name or call_name or "an unnamed tool"
+        absent = (
+            "no name to label it by" if name is None else "no call_name to call it by"
+        )
+        warnings.append(
+            f"skipped tool {label!r} of server {server.name!r}: its Gateway tool "
+            f"index row has {absent}"
+        )
+        return None
+    if not is_safe_call_name(call_name):
+        warnings.append(
+            f"skipped tool {name!r} of server {server.name!r}: "
+            f"the Agent cannot call {call_name!r}"
+        )
+        return None
+    problem = _tool_flag_problem(row, "callable")
+    if problem is None:
+        problem = _tool_flag_problem(row, "enabled")
+    if problem is not None:
+        warnings.append(f"skipped tool {name!r} of server {server.name!r}: {problem}")
+        return None
+    if "input_schema" not in row:
+        warnings.append(
+            f"skipped tool {name!r} of server {server.name!r}: its Gateway tool "
+            "index row has no input_schema, so its arguments would be a guess"
+        )
+        return None
+    schema = row.get("input_schema")
+    if not isinstance(schema, Mapping):
+        warnings.append(
+            f"skipped tool {name!r} of server {server.name!r}: its Gateway tool "
+            "index row has a non-object input_schema"
+        )
+        return None
+    description = row.get("description")
+    return McpTool(
+        call_name=call_name,
+        name=name,
+        description=description if isinstance(description, str) else "",
+        input_schema=dict(schema),
+    )
 
 
 def _account_skills(session: AccountSession, *, warnings: list[str]) -> list[SkillSource]:

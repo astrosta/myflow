@@ -24,18 +24,17 @@ from myflow_evals.accounts import AccountCredential, AccountSession, load_accoun
 from myflow_evals.build_dataset import (
     BuildSources,
     DatasetItemDraft,
+    McpTool,
     TraceSource,
     stable_item_id,
 )
 from myflow_evals.cli import CliServices, LangfuseDatasetWriter, dataset_item_prefix, main
-from myflow_evals.mcp import McpTool
 
 BASE_URL = "http://gateway.test/api"
 HASHED_USER_ID = "9f2c4b6d8e0a1c3e5f7a9b1d3c5e7f90"
 OTHER_HASHED_USER_ID = "0123456789abcdef0123456789abcdef"
 RAW_USER_ID = "11111111-1111-4111-8111-111111111111"
 PASSWORD = "alice-password"
-MCP_HEADER_VALUE = "mcp-header-secret-value"
 DATASET = "agent-eval/regression/v1"
 RUN_NAME = "ci-20261109"
 
@@ -564,30 +563,51 @@ def test_cli_reads_shared_settings_from_an_env_file(
     assert recorder.logins[0]["salt"] == "salt-fixture"
 
 
-def test_mcp_headers_file_fills_the_environment_without_echoing_values(
+def test_the_mcp_headers_flag_and_secret_are_gone(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    headers_file = tmp_path / "mcp.json"
-    headers_file.write_text(
-        json.dumps({"project_db": {"X-Api-Key": MCP_HEADER_VALUE}}),
-        encoding="utf-8",
-    )
-    recorder = Recorder()
-    sources = BuildSources(tools=[], source_totals={"tool": 0})
-    services, _ = _services(recorder, sources=sources)
+    """The build reads tools from the Gateway, so per-server secrets are gone.
 
-    exit_code = main(
+    The flag is refused (argparse, exit 2) instead of silently accepted, no help
+    text advertises it, and the environment the source loader receives no longer
+    carries MCP_SERVER_HEADERS.
+    """
+    headers_file = tmp_path / "mcp.json"
+    headers_file.write_text(json.dumps({"project_db": {"X-Api-Key": "stale"}}), encoding="utf-8")
+
+    refused = main(
         ["build", "--dataset", DATASET, "--dry-run", "--mcp-headers-file", str(headers_file)],
-        services=services,
+        services=_services(Recorder())[0],
         environ=dict(ENVIRON),
     )
+    usage = capsys.readouterr().err
 
-    output = _capture(capsys)
-    assert exit_code == 0
-    assert json.loads(recorder.source_calls[0]["environ"]["MCP_SERVER_HEADERS"]) == {
-        "project_db": {"X-Api-Key": MCP_HEADER_VALUE}
-    }
-    assert MCP_HEADER_VALUE not in output
+    assert refused == 2
+    assert "--mcp-headers-file" in usage  # argparse names the flag it rejected
+
+    assert main(["build", "--help"]) == 0
+    assert "--mcp-headers-file" not in _capture(capsys)
+
+    # The environment a build hands the source loader is exactly the process
+    # environment plus --env-file: no MCP header key is invented, and nothing the
+    # old flag used to inject can appear.
+    env_file = tmp_path / "eval.env"
+    env_file.write_text("EXTRA_SETTING=from-file\n", encoding="utf-8")
+    recorder = Recorder()
+    services, _ = _services(recorder, sources=BuildSources(source_totals={"tool": 0}))
+    assert (
+        main(
+            ["build", "--dataset", DATASET, "--dry-run", "--env-file", str(env_file)],
+            services=services,
+            environ=dict(ENVIRON),
+        )
+        == 0
+    )
+    _capture(capsys)
+
+    merged = recorder.source_calls[0]["environ"]
+    assert merged == {**ENVIRON, "EXTRA_SETTING": "from-file"}
+    assert not [key for key in merged if "MCP" in key]
 
 
 def test_accounts_file_is_passed_through_without_being_printed(
