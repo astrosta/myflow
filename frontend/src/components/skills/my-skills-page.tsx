@@ -5,6 +5,7 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
+import { EnabledSwitch } from "@/components/ui/enabled-switch";
 import { BookOpenIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -301,10 +302,12 @@ function SkillCard({
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {skill.status === "active" ? (
-            <SkillEnabledSwitch
-              enabled={Boolean(skill.enabled)}
+            <EnabledSwitch
+              checked={Boolean(skill.enabled)}
+              disabled={toggling}
+              label={skill.enabled ? "停用技能" : "启用技能"}
               onToggle={() => onToggle(skill)}
-              pending={toggling}
+              title={skill.enabled ? "已启用：参与技能检索" : "已停用：不参与技能检索"}
             />
           ) : null}
           <Button
@@ -339,49 +342,6 @@ function SkillCard({
         </p>
       ) : null}
     </li>
-  );
-}
-
-/** 启用开关：轨道 30×16、滑块 12，开=绿色(emerald-500)、关=中性灰，180ms 过渡。
- *
- * 尺寸与配色对齐 DeepSeek Harness 技能中心：细轨 + 小滑块 + 极短动画，
- * 不再用「整体着色 + 大滑块」那种按钮化外观。
- */
-function SkillEnabledSwitch({
-  enabled,
-  onToggle,
-  pending,
-}: {
-  enabled: boolean;
-  onToggle: () => void;
-  pending: boolean;
-}) {
-  return (
-    <button
-      aria-checked={enabled}
-      aria-label={enabled ? "停用技能" : "启用技能"}
-      className="inline-flex shrink-0 cursor-pointer items-center rounded-full border-0 bg-transparent p-0.5 outline-none disabled:cursor-not-allowed disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-emerald-500/40"
-      disabled={pending}
-      onClick={onToggle}
-      role="switch"
-      title={enabled ? "已启用：参与技能检索" : "已停用：不参与技能检索"}
-      type="button"
-    >
-      <span
-        aria-hidden="true"
-        className={
-          "relative block h-4 w-[30px] shrink-0 rounded-full transition-colors duration-[180ms] " +
-          (enabled ? "bg-emerald-500" : "bg-neutral-300")
-        }
-      >
-        <span
-          className={
-            "absolute top-0.5 h-3 w-3 rounded-full bg-white shadow-[0_1px_2px_rgba(0,0,0,0.25)] transition-[left] duration-[180ms] " +
-            (enabled ? "left-4" : "left-0.5")
-          }
-        />
-      </span>
-    </button>
   );
 }
 

@@ -252,6 +252,25 @@ describe("MCP 服务操作", () => {
     await waitFor(() => expect(mockedSetEnabled).toHaveBeenCalledWith("srv-1", false));
   });
 
+  it("启停开关和技能中心使用同一套轨道、滑块和过渡", async () => {
+    const view = renderPage();
+    const card = await view.findByRole("article", { name: "anysearch" });
+
+    const toggle = within(card).getByRole("switch", { name: "停用 anysearch" });
+    expect(toggle.className).toContain("p-0.5");
+    expect(toggle.className).toContain("focus-visible:ring-2");
+
+    const track = toggle.firstElementChild as HTMLElement;
+    expect(track.className).toContain("h-4");
+    expect(track.className).toContain("w-[30px]");
+    expect(track.className).toContain("bg-emerald-500");
+
+    const thumb = track.firstElementChild as HTMLElement;
+    expect(thumb.className).toContain("h-3");
+    expect(thumb.className).toContain("w-3");
+    expect(thumb.className).toContain("left-4");
+  });
+
   it("启停开关的标签带上服务器名，多个服务之间读屏也能区分", async () => {
     mockedList.mockResolvedValue({
       servers: [

@@ -5,6 +5,7 @@ import { useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { EnabledSwitch } from "@/components/ui/enabled-switch";
 import { WrenchIcon } from "@/components/ui/icons";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -460,27 +461,15 @@ function ServerCard({
           </Button>
           {/**
            * 读屏器把每个开关都读成同一个"停用服务"就没法用了：标签必须带上目标。
+           * 尺寸/配色/动效与技能中心共用 EnabledSwitch。
            */}
-          <button
-            aria-checked={server.enabled}
-            aria-label={(server.enabled ? "停用 " : "启用 ") + server.name}
-            className={cn(
-              "relative h-5 w-9 shrink-0 rounded-full transition-colors",
-              server.enabled ? "bg-emerald-500" : "bg-neutral-300",
-              busy && "opacity-50",
-            )}
+          <EnabledSwitch
+            checked={server.enabled}
             disabled={busy}
-            onClick={onToggle}
-            role="switch"
-            type="button"
-          >
-            <span
-              className={cn(
-                "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform",
-                server.enabled ? "translate-x-4" : "translate-x-0.5",
-              )}
-            />
-          </button>
+            label={(server.enabled ? "停用 " : "启用 ") + server.name}
+            onToggle={onToggle}
+            title={server.enabled ? "已启用：参与工具检索与调用" : "已停用：不参与工具检索与调用"}
+          />
         </div>
       </div>
 
