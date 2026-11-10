@@ -372,7 +372,7 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
 
 默认构建全程确定性：没有 LLM 调用、没有时钟、没有随机数，因此对相同账户数据（相同 `--seed`）可逐字节复现，也不产生模型费用。扩展路径产生的类别有 `single_tool`、`missing_params`、`similar_tools`、`multi_tool`、`injection`、`skill_single`、`similar_skills`、`skill_with_tools`、`kb_single_hop`、`kb_multi_hop`、`kb_unanswerable`、`no_tool`，以及 `--include-traces` 时的 `trace_replay`。设计表中的 `kb_conflict` 和 `hybrid` 仍需要 LLM 合成或人工审核，确定性路径不会生成它们。
 
-`--llm-synthesis` 是可选的增强：它用评判模型把确定性问法改写成更自然的用户请求，并从私有 Skill 的描述提炼 `skill_rules`（Gateway 只暴露 Skill 元数据，不暴露 SKILL.md 正文）。任何失败（超时、非 JSON、数量不符）都会原样保留确定性问法/规则并记录一条不含 prompt 内容的警告，绝不会中止构建。改写结果仍要经过同一套去重和质检。
+`--llm-synthesis` 是可选的增强：它用评判模型把确定性问法改写成更自然的用户请求，并从私有 Skill 的描述提炼 `skill_rules`（Gateway 只暴露 Skill 元数据，不暴露 SKILL.md 正文）。任何失败（超时、非 JSON、数量不符）都会原样保留确定性问法/规则并记录一条不含 prompt 内容的警告，绝不会中止构建。改写结果仍要经过同一套去重和质检。该模式会为每条草稿调用一次评判模型，成本随数据集大小增长；先用 `--limit` 小规模试跑。
 
 ### 限制、报告与试运行
 
