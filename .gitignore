@@ -159,6 +159,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# Local eval credentials parked in a .example file; never commit real secrets
+/evals/.env.example
 
 # Spyder project settings
 .spyderproject
