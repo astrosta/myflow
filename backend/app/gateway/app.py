@@ -159,6 +159,11 @@ async def start_mcp_runtime(
             "mcp_servers.allowed_schemes allows http: HTTP MCP endpoints send "
             "headers and tool traffic in cleartext; use only on a trusted network"
         )
+    if config.allow_private_networks:
+        logger.warning(
+            "mcp_servers.allow_private_networks=true: MCP endpoints may reach "
+            "loopback, private and link-local addresses; use only on a trusted network"
+        )
     app.state.mcp_server_service = McpServerService(
         runtime.server_store,
         runtime.cipher,

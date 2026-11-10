@@ -556,11 +556,11 @@ mcp_servers:
   request_timeout_seconds: 30     # tools/call 单次请求超时
   connect_timeout_seconds: 5      # initialize 建连超时
   max_servers_per_user: 20
-  # SSRF 边界：默认只允许公网地址。既查字面 IP，也查主机名的解析结果
-  # （create/update 与每次建连前用系统解析器，命中私网/loopback 就拒绝）；
+  # SSRF 边界：默认放行私网/loopback/link-local，只应在可信部署中使用。
+  # 收紧时设为 false：create/update 与每次建连前都会解析主机名并拒绝私网目标；
   # 解析不出来不拦（离线也要能存），DNS rebinding 是已知残留风险。
-  allow_private_networks: false
-  allowed_schemes: ["http", "https"]  # http 会明文传输 header；私网仍受 allow_private_networks 限制
+  allow_private_networks: true
+  allowed_schemes: ["http", "https"]  # http 会明文传输 header；私网见上方 allow_private_networks
 
 # ------------------------------------------------------------
 # tool_search：模型只看到 tool_search / tool_execute 两个内建工具。

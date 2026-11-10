@@ -196,6 +196,10 @@ async def test_start_registers_the_runtime_and_the_management_service(
         assert service.tool_store is runtime.tool_store
         assert service.sync is runtime
         assert service.policy.allowed_schemes == ("http", "https")
+        assert service.policy.allow_private_networks is True
+        assert service.policy.validate_url("http://127.0.0.1:8080/mcp") == (
+            "http://127.0.0.1:8080/mcp"
+        )
         # A deployment with tool_search off has nothing to retrieve with, so the
         # tool reports that instead of publishing a service with no channels.
         assert get_tool_search_runtime() is None

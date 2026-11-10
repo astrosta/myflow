@@ -853,7 +853,12 @@ async def test_call_tool_refuses_a_stored_url_that_resolves_privately(
     server = await _server(server_store, server_id="s1", name="anysearch")
     record = _record(server_id=server.id, server_name=server.name)
     client = FakeClient()
-    runtime = _runtime(server_store, tool_store, client=client)
+    runtime = _runtime(
+        server_store,
+        tool_store,
+        client=client,
+        config=_config(allow_private_networks=False),
+    )
     monkeypatch.setattr(
         net, "resolve_host_addresses", lambda host, port=None: ("127.0.0.1",)
     )

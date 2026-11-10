@@ -7,7 +7,7 @@ mcp_servers:
   request_timeout_seconds: 30
   connect_timeout_seconds: 5
   max_servers_per_user: 20
-  allow_private_networks: false
+  allow_private_networks: true
   allowed_schemes: ["http", "https"]
 ```
 
@@ -72,10 +72,10 @@ class McpServersConfig(BaseModel):
         default=20, ge=1, le=1000, description="每个用户可创建的 server 数量上限。"
     )
     allow_private_networks: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "是否允许 server URL 指向私网/loopback/link-local。这是 SSRF 边界，"
-            "默认拒绝；前端勾选不算数。"
+            "是否允许 server URL 指向私网/loopback/link-local。默认放行，"
+            "这会打开 SSRF 边界；只应在可信部署中使用。收紧时设为 false。"
         ),
     )
     allowed_schemes: list[str] = Field(

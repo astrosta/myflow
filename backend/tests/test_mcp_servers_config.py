@@ -92,7 +92,7 @@ def test_defaults_match_the_design() -> None:
     assert config.request_timeout_seconds == 30.0
     assert config.connect_timeout_seconds == 5.0
     assert config.max_servers_per_user == 20
-    assert config.allow_private_networks is False
+    assert config.allow_private_networks is True
     assert config.allowed_schemes == ["http", "https"]
 
 
