@@ -11,7 +11,11 @@ import httpx
 import pytest
 from agentkit.knowledge.config import CloudMinerUConfig, LocalMinerUConfig
 from agentkit.knowledge.errors import KnowledgeUnavailable
-from agentkit.knowledge.parsers.mineru import MineruCloudParser, MineruLocalParser
+from agentkit.knowledge.parsers.mineru import (
+    MineruCloudParser,
+    MineruLocalParser,
+    extract_zip_markdown,
+)
 from agentkit.knowledge.parsers.text import LocalTextParser
 from pypdf import PdfReader, PdfWriter
 
@@ -30,6 +34,28 @@ def _pdf_with_pages(path: Path, pages: int) -> None:
         writer.add_blank_page(width=200, height=200)
     with path.open("wb") as handle:
         writer.write(handle)
+
+
+def test_content_list_table_block_is_not_dropped() -> None:
+    payload = [
+        {"type": "text", "text": "业务数据说明如下。"},
+        {
+            "type": "table",
+            "table_caption": ["表 1 业务数据说明"],
+            "table_body": "<table><tr><th>参数</th><th>说明</th></tr>"
+            "<tr><td>idA</td><td>客户端证书</td></tr></table>",
+            "table_footnote": ["注：字段均为必填。"],
+        },
+    ]
+    parsed = extract_zip_markdown(
+        _zip({"content_list.json": json.dumps(payload, ensure_ascii=False).encode()}),
+        max_bytes=1024 * 1024,
+    )
+
+    assert "表 1 业务数据说明" in parsed.markdown
+    assert "<table>" in parsed.markdown
+    assert "客户端证书" in parsed.markdown
+    assert "注：字段均为必填。" in parsed.markdown
 
 
 @pytest.mark.asyncio

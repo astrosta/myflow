@@ -132,6 +132,14 @@ def _extract_markdown_from_json(payload: Any) -> str | None:
     return None
 
 
+def _block_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return " ".join(str(item).strip() for item in value if str(item).strip())
+    return ""
+
+
 def _content_list_to_markdown(payload: Any) -> str | None:
     if not isinstance(payload, list):
         return None
@@ -139,11 +147,24 @@ def _content_list_to_markdown(payload: Any) -> str | None:
     for block in payload:
         if not isinstance(block, dict):
             continue
+        block_type = str(block.get("type") or "")
         text = block.get("text") or block.get("content")
+        if block_type == "table":
+            # MinerU's content_list puts the recognized table in table_body
+            # (HTML), not in text. Dropping it loses the whole table.
+            body = _block_text(block.get("table_body")) or _block_text(text)
+            if not body:
+                continue
+            caption = _block_text(block.get("table_caption"))
+            footnote = _block_text(block.get("table_footnote"))
+            lines.append("\n\n".join(part for part in (caption, body, footnote) if part))
+            continue
         if isinstance(text, str) and text.strip():
-            block_type = str(block.get("type") or "")
             if block_type in {"title", "heading"}:
-                level = int(block.get("text_level") or 1)
+                try:
+                    level = int(block.get("text_level") or 1)
+                except (TypeError, ValueError):
+                    level = 1
                 lines.append("#" * max(1, min(level, 6)) + " " + text.strip())
             else:
                 lines.append(text.strip())

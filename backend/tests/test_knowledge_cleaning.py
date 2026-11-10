@@ -29,6 +29,36 @@ def test_removes_boilerplate_sections_but_keeps_body_and_code_fences() -> None:
     assert "echo ok" in cleaned
 
 
+def test_html_tables_become_markdown_tables_before_tags_are_stripped() -> None:
+    raw = (
+        "<p>接口业务数据说明见表 1。</p>"
+        "<table><thead><tr><th>参数名称</th><th>类型</th><th>是否必填</th><th>说明</th></tr></thead>"
+        "<tbody><tr><td>idA</td><td>String</td><td>是</td><td>客户端的证书</td></tr>"
+        "<tr><td>randomA</td><td>String</td><td>是</td><td>客户端生成的 16 位随机数<br>用于防重放</td></tr></tbody></table>"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "| 参数名称 | 类型 | 是否必填 | 说明 |" in cleaned
+    assert "| --- | --- | --- | --- |" in cleaned
+    assert "| idA | String | 是 | 客户端的证书 |" in cleaned
+    assert "| randomA | String | 是 | 客户端生成的 16 位随机数 用于防重放 |" in cleaned
+    assert "<table>" not in cleaned and "<td>" not in cleaned
+
+
+def test_html_table_colspan_keeps_the_grid_rectangular() -> None:
+    raw = (
+        "<table><tr><th colspan=\"2\">合并表头</th></tr>"
+        "<tr><td>左</td><td>右</td></tr></table>"
+    )
+
+    cleaned = clean_document_text(raw)
+
+    assert "| 合并表头 |  |" in cleaned
+    assert "| --- | --- |" in cleaned
+    assert "| 左 | 右 |" in cleaned
+
+
 def test_removes_toc_block_only_when_it_has_three_or_more_entries() -> None:
     raw = (
         "正文开头。\n\n"

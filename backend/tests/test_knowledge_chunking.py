@@ -58,6 +58,25 @@ def test_clean_text_removes_images_scripts_and_controls() -> None:
     assert "标题" in cleaned and "正文" in cleaned and "结尾" in cleaned
 
 
+def test_cleaned_html_table_survives_chunking_as_markdown() -> None:
+    raw = (
+        "# 接口说明\n\n"
+        "<table><tr><th>参数</th><th>类型</th><th>说明</th></tr>"
+        "<tr><td>idA</td><td>String</td><td>客户端证书</td></tr></table>"
+    )
+
+    chunks = chunk_document(
+        clean_document_text(raw),
+        KnowledgeBaseType.TECHNICAL,
+        _config(),
+        token_counter=CharCounter(),
+    )
+
+    assert any("| 参数 | 类型 | 说明 |" in chunk.content for chunk in chunks)
+    assert any("| idA | String | 客户端证书 |" in chunk.content for chunk in chunks)
+    assert all("<td>" not in chunk.content for chunk in chunks)
+
+
 def test_technical_chunks_follow_headings_and_respect_tokens() -> None:
     text = (
         "# 产品手册\n\n"

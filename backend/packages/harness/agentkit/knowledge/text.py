@@ -12,6 +12,12 @@ _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)", re.IGNORECASE)
 _HTML_BREAK_RE = re.compile(r"<\s*(?:br|hr)\s*/?\s*>", re.IGNORECASE)
 _HTML_BLOCK_RE = re.compile(r"</?\s*(?:p|div|li|tr|h[1-6]|table|section|article)\b[^>]*>", re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+#: MinerU writes detected tables as HTML. Convert them before the generic tag
+#: stripper turns every cell into one concatenated line.
+_HTML_TABLE_RE = re.compile(r"<table\b[^>]*>.*?</table\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_CELL_RE = re.compile(r"<t([dh])\b([^>]*)>(.*?)</t\1\s*>", re.IGNORECASE | re.DOTALL)
+_COLSPAN_RE = re.compile(r"""\bcolspan\s*=\s*["']?(\d+)""", re.IGNORECASE)
 _PAGE_NUMBER_RE = re.compile(r"^\s*(?:[-—–]\s*)?(?:第\s*)?\d{1,5}\s*(?:页)?\s*(?:[-—–])?\s*$")
 
 
@@ -78,6 +84,55 @@ def _is_toc_entry_line(line: str) -> bool:
         or _CHAPTER_ENTRY_RE.match(line)
         or _is_inline_toc_line(line)
     )
+
+
+def _table_cell_text(fragment: str) -> str:
+    """One HTML cell -> a single-line GFM cell."""
+    text = _HTML_BREAK_RE.sub(" ", fragment)
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.replace("|", "\\|")
+
+
+def _html_table_to_markdown(table_html: str) -> str:
+    """Convert MinerU's HTML table into a GFM pipe table.
+
+    The first row becomes the header (MinerU uses th there). colspan is
+    expanded into empty cells so every row has the same width; a malformed
+    table falls back to the old behaviour instead of failing ingestion.
+    """
+    rows: list[list[str]] = []
+    for row_match in _HTML_ROW_RE.finditer(table_html):
+        cells: list[str] = []
+        for cell_match in _HTML_CELL_RE.finditer(row_match.group(1)):
+            cells.append(_table_cell_text(cell_match.group(3)))
+            attr = cell_match.group(2)
+            span_match = _COLSPAN_RE.search(attr) if attr else None
+            if span_match:
+                cells.extend([""] * (min(max(int(span_match.group(1)), 1), 50) - 1))
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    if width == 0:
+        return ""
+    padded = [row + [""] * (width - len(row)) for row in rows]
+    header = padded[0]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * width) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in padded[1:])
+    return "\n\n" + "\n".join(lines) + "\n\n"
+
+
+def _replace_html_table(match: re.Match[str]) -> str:
+    try:
+        return _html_table_to_markdown(match.group(0)) or match.group(0)
+    except (TypeError, ValueError):  # malformed provider table: keep legacy text path
+        return match.group(0)
 
 
 def _strip_noise_sections(text: str) -> str:
@@ -261,6 +316,7 @@ def clean_text(raw: str) -> str:
     value = _SCRIPT_RE.sub("", value)
     value = _COMMENT_RE.sub("", value)
     value = _IMAGE_RE.sub("", value)
+    value = _HTML_TABLE_RE.sub(_replace_html_table, value)
     value = _HTML_BREAK_RE.sub("\n", value)
     value = _HTML_BLOCK_RE.sub("\n", value)
     value = _HTML_TAG_RE.sub("", value)

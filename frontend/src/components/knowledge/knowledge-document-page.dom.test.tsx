@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { AnchorHTMLAttributes, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -142,6 +142,30 @@ describe("知识库文档详情", () => {
     expect(screen.getByText("父块 " + DOCUMENT_ID + ":p0")).toBeTruthy();
     expect(screen.getAllByText(/^父块 /)).toHaveLength(1);
     expect(mockedChunks).toHaveBeenCalledWith(BASE_ID, DOCUMENT_ID, 0, 20);
+  });
+
+  it("切片里的 GFM 表格按表格渲染，而不是纯文本", async () => {
+    primeReadyData();
+    mockedChunks.mockResolvedValue({
+      document_id: DOCUMENT_ID,
+      count: 1,
+      next_offset: null,
+      chunks: [
+        {
+          chunk_id: DOCUMENT_ID + ":0",
+          chunk_index: 0,
+          section: "接口",
+          page: 1,
+          content: "| 参数 | 类型 |\n| --- | --- |\n| idA | String |",
+        },
+      ],
+    });
+
+    renderPage();
+
+    const table = await screen.findByRole("table");
+    expect(within(table).getByText("参数")).toBeTruthy();
+    expect(within(table).getByText("idA")).toBeTruthy();
   });
 
   it("处理中只显示状态提示，不请求切片", async () => {
