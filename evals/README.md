@@ -330,6 +330,7 @@ warning: skipped MCP server 'legacy_db': status=pending is not active
 - 不存在基于 LLM 的数据集合成和可选 DeepEval 附加组件；也没有人工 Golden set。
 - `ingest` 会打印候选的失败/低分追踪，但不会写入探索数据集；将其提升为数据集仍需手动操作。
 - 工具只来自 Gateway 存储的投影。未生效服务器（未启用、非 `active` 或不可达）、`/tools` 调用失败的服务器、Gateway 投影未标记为可调用**且**已启用或缺少对象形式 `input_schema` 的工具，以及被关闭或非活跃的私有 Skills 都会被跳过并给出警告。
+- 构建依赖 Gateway 支持 `GET /api/mcp-servers/{id}/tools?include_schema=true`。旧版 Gateway 会忽略该参数，返回的投影里没有 `input_schema`，于是每次构建只会得到 0 个工具草稿（仅伴随警告）；因此评测包必须与 Gateway 一起升级。
 - 证据携带运行追踪 ID，只是因为运行器将 `RunSnapshot.trace_id` 传给 `collect_evidence`；其他调用方必须显式传入，否则证据的 `trace_id` 为 `None`。
 - 不会对用户 ID、权限、跨用户隔离或长期记忆指标评分；`metadata.user_id` 仅作为账户选择/来源键。
 - 内置 Skills 和斜杠激活被排除在样本之外。只采样 `scope=private` 的 Skills。

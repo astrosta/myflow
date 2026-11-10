@@ -584,7 +584,17 @@ def _server_tool_rows(
             f"skipped MCP server {server.name!r}: its tool index returned no tools list"
         )
         return []
-    return [row for row in rows if isinstance(row, Mapping)]
+    usable: list[Mapping[str, Any]] = []
+    for row in rows:
+        if isinstance(row, Mapping):
+            usable.append(row)
+        else:
+            # Every other skip warns; a row this package cannot read must too.
+            warnings.append(
+                f"skipped a tool of server {server.name!r}: its Gateway tool index "
+                "entry is not an object"
+            )
+    return usable
 
 
 def _projected_tool(
@@ -600,10 +610,14 @@ def _projected_tool(
     name = _text(row.get("name"))
     call_name = _text(row.get("call_name"))
     if name is None or call_name is None:
+        # Say what is really absent: a row can carry a call_name and no name.
         label = name or call_name or "an unnamed tool"
+        absent = (
+            "no name to label it by" if name is None else "no call_name to call it by"
+        )
         warnings.append(
             f"skipped tool {label!r} of server {server.name!r}: its Gateway tool "
-            "index row has no call_name to call it by"
+            f"index row has {absent}"
         )
         return None
     if not is_safe_call_name(call_name):

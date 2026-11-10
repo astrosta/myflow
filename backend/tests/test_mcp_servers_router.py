@@ -600,6 +600,36 @@ def test_tools_returns_each_stored_schema_verbatim_when_include_schema_is_true(
     assert "content" not in response.text
 
 
+@pytest.mark.parametrize("stored", ["not-a-schema", ["type", "object"], 7])
+def test_a_non_object_stored_schema_never_breaks_the_projection(
+    client: TestClient, service: FakeService, stored: Any
+) -> None:
+    """One unreadable schema must not take the whole response down.
+
+    mcp_tools.input_schema is a typed JSON column and the sync coerces a non-object
+    to {}, so a row like this cannot be written today; it is defensive anyway,
+    because the schema field is new here and a validation error would break even
+    the schema-free UI call. Such a row is treated as carrying no schema -- not
+    repaired, not echoed -- and the healthy rows still come back.
+    """
+    service.tools.append(_schema_tool("weird", "mcp__anysearch__weird", stored))
+
+    plain = client.get("/api/mcp-servers/s1/tools")
+    asked = client.get("/api/mcp-servers/s1/tools?include_schema=true")
+
+    assert plain.status_code == 200
+    assert asked.status_code == 200
+    assert [tool["call_name"] for tool in plain.json()["tools"]] == [
+        "mcp__anysearch__search",
+        "mcp__anysearch__weird",
+    ]
+    assert all("input_schema" not in tool for tool in plain.json()["tools"])
+    assert asked.json()["count"] == 2
+    # The healthy row keeps its verbatim schema; the broken one simply has none.
+    assert asked.json()["tools"][0]["input_schema"] == {"type": "object"}
+    assert "input_schema" not in asked.json()["tools"][1]
+
+
 def test_include_schema_is_not_an_authorization_shortcut(service: FakeService) -> None:
     from backend.app.gateway.services import RunPermissionDenied
 

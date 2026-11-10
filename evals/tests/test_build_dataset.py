@@ -833,6 +833,33 @@ def test_a_projection_row_without_a_call_name_cannot_be_sampled() -> None:
     assert "call_name" in sources.warnings[0]
 
 
+def test_a_projection_row_without_a_name_reports_the_missing_name() -> None:
+    """The warn text must name what is really absent, not the key it has."""
+    without_name = {
+        key: value for key, value in PROJECT_TOOL_INDEX[1].items() if key != "name"
+    }
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={
+            STREAMABLE_SERVER["id"]: [
+                without_name if row["name"] == "get_project" else dict(row)
+                for row in PROJECT_TOOL_INDEX
+            ]
+        },
+    )
+
+    sources = load_build_sources(_session(gateway), environ={})
+
+    assert [tool.name for tool in sources.tools] == ["search_projects"]
+    assert len(sources.warnings) == 1
+    warning = sources.warnings[0]
+    # Labelled by the call name it does carry, and honest about what is missing.
+    assert "mcp__project_db__get_project" in warning
+    assert "project_db" in warning
+    assert "no name" in warning
+    assert "call_name" not in warning
+
+
 def test_a_projection_row_without_an_enabled_flag_is_skipped() -> None:
     without_enabled = {
         key: value for key, value in PROJECT_TOOL_INDEX[1].items() if key != "enabled"
@@ -853,6 +880,21 @@ def test_a_projection_row_without_an_enabled_flag_is_skipped() -> None:
     assert len(sources.warnings) == 1
     assert "get_project" in sources.warnings[0]
     assert "no enabled flag" in sources.warnings[0]
+
+
+def test_a_projection_row_that_is_not_an_object_is_skipped_with_a_warning() -> None:
+    """Every other skip warns, so a row the package cannot read must too."""
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={STREAMABLE_SERVER["id"]: [*PROJECT_TOOL_INDEX, "not-a-row", 7]},
+    )
+
+    sources = load_build_sources(_session(gateway), environ={})
+
+    assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
+    assert len(sources.warnings) == 2
+    assert all("project_db" in warning for warning in sources.warnings)
+    assert all("not an object" in warning for warning in sources.warnings)
 
 
 def test_a_projection_row_without_a_stored_schema_is_skipped() -> None:

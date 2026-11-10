@@ -12,6 +12,7 @@ request for "status" would be matched as a server id.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Response
@@ -227,6 +228,32 @@ async def refresh_server(
     return await _detail(service, record, caller.user_id)
 
 
+#: Exactly the fields this route serves, so a column it does not serve (content,
+#: content_hash, annotations) never reaches the model even from an ORM row.
+_TOOL_SUMMARY_FIELDS = tuple(McpServerToolSummary.model_fields)
+
+
+def _tool_row_payload(row: Any) -> dict[str, Any]:
+    """The served fields of one mcp_tools row, minus a schema that is not an object.
+
+    mcp_tools.input_schema is a typed JSON column, so a non-object value cannot be
+    written through the service today; if one ever appeared it would be treated as
+    "no schema" -- not repaired and not echoed -- because a validation error here
+    would take the whole list down, including the schema-free call the UI makes.
+    """
+    if isinstance(row, Mapping):
+        payload = {name: row[name] for name in _TOOL_SUMMARY_FIELDS if name in row}
+    else:
+        payload = {
+            name: getattr(row, name)
+            for name in _TOOL_SUMMARY_FIELDS
+            if hasattr(row, name)
+        }
+    if not isinstance(payload.get("input_schema"), Mapping):
+        payload.pop("input_schema", None)
+    return payload
+
+
 def _tool_summary(row: Any, *, include_schema: bool) -> McpServerToolSummary:
     """Project one mcp_tools row exactly as the caller asked to see it.
 
@@ -235,7 +262,7 @@ def _tool_summary(row: Any, *, include_schema: bool) -> McpServerToolSummary:
     clears it, and the model then omits the key, which keeps the browser payload
     byte-for-byte what it was before the flag existed.
     """
-    summary = McpServerToolSummary.model_validate(row)
+    summary = McpServerToolSummary.model_validate(_tool_row_payload(row))
     if not include_schema:
         summary.input_schema = None
     return summary

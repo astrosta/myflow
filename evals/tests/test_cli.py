@@ -588,13 +588,26 @@ def test_the_mcp_headers_flag_and_secret_are_gone(
     assert main(["build", "--help"]) == 0
     assert "--mcp-headers-file" not in _capture(capsys)
 
+    # The environment a build hands the source loader is exactly the process
+    # environment plus --env-file: no MCP header key is invented, and nothing the
+    # old flag used to inject can appear.
+    env_file = tmp_path / "eval.env"
+    env_file.write_text("EXTRA_SETTING=from-file\n", encoding="utf-8")
     recorder = Recorder()
     services, _ = _services(recorder, sources=BuildSources(source_totals={"tool": 0}))
     assert (
-        main(["build", "--dataset", DATASET, "--dry-run"], services=services, environ=dict(ENVIRON))
+        main(
+            ["build", "--dataset", DATASET, "--dry-run", "--env-file", str(env_file)],
+            services=services,
+            environ=dict(ENVIRON),
+        )
         == 0
     )
-    assert "MCP_SERVER_HEADERS" not in recorder.source_calls[0]["environ"]
+    _capture(capsys)
+
+    merged = recorder.source_calls[0]["environ"]
+    assert merged == {**ENVIRON, "EXTRA_SETTING": "from-file"}
+    assert not [key for key in merged if "MCP" in key]
 
 
 def test_accounts_file_is_passed_through_without_being_printed(
