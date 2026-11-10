@@ -1,12 +1,13 @@
 """Dataset drafts built from the fixed account's real tools, Skills, knowledge, and traces.
 
 This module is a data-source reader plus a pure synthesizer: it imports neither
-backend.app nor agentkit. Every draft is derived deterministically from what the
-account can actually see -- an MCP tool's real inputSchema, a private Skill's
-metadata, a knowledge document's first chunk, or one of the account's own
-failed/low-scored Langfuse traces. There is no LLM in this path, so a build is
-reproducible and costs nothing; the categories that need synthesis or human
-review are left to a later phase (see evals/README.md).
+backend.app nor agentkit. Every draft is derived from what the account can
+actually see -- an MCP tool's real inputSchema, a private Skill's metadata, the
+longest of three sampled chunks of a knowledge document, or one of the account's
+own failed/low-scored Langfuse traces -- and carries an id derived from its
+source. There is no LLM in this path, so a build costs nothing; a seeded build is
+reproducible, and the categories that need synthesis or human review are left to
+a later phase (see evals/README.md).
 
 Rules that shape the drafts:
 
@@ -31,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -50,6 +52,10 @@ _KIND_TRACE = "trace"
 _KIND_ORDER = (_KIND_TOOL, _KIND_SKILL, _KIND_KNOWLEDGE, _KIND_TRACE)
 
 _STREAMABLE_TRANSPORT = "streamable_http"
+#: Sample this many chunks and keep the longest readable one, not chunk index 0.
+_CHUNK_SAMPLE_SIZE = 3
+#: A chunk without a usable index still competes, but loses every tie.
+_UNINDEXED_CHUNK_INDEX = float("inf")
 _PRIVATE_SCOPE = "private"
 _BUILTIN_SCOPE = "builtin"
 #: The only MCP status the Agent can route to; pending/error/disabled are not.
@@ -97,7 +103,7 @@ class SkillSource:
 
 @dataclass(frozen=True)
 class KnowledgeSource:
-    """One knowledge document plus the first chunk that answers questions about it."""
+    """One knowledge document plus the sampled chunk that answers questions about it."""
 
     knowledge_base_id: str
     document_id: str
@@ -196,6 +202,7 @@ def load_build_sources(
     mcp_client: McpClient | None = None,
     trace_transport: httpx.BaseTransport | None = None,
     include_traces: bool = True,
+    rng: random.Random | None = None,
 ) -> BuildSources:
     """Fetch this account's real tools, private Skills, knowledge documents, and traces.
 
@@ -212,6 +219,10 @@ def load_build_sources(
     expectations, so a dataset built for scoring must not contain one. The trace
     count is then a real 0, not a silently skipped kind.
 
+    rng supplies the seeded randomness for knowledge chunk sampling. A build
+    with the same seed sees the same reference answers; item ids never depend on
+    the draw.
+
     A Gateway failure that makes the account data unusable raises. Everything
     this account cannot use -- a server that is disabled, not active, or
     unreachable, an unsupported transport, a tool the Gateway tool index does not
@@ -221,6 +232,7 @@ def load_build_sources(
     items.
     """
     _validate_limit(limit)
+    rng = random.Random() if rng is None else rng
     env = os.environ if environ is None else environ
     secrets = (
         dict(server_secrets)
@@ -232,7 +244,7 @@ def load_build_sources(
     tools = _account_tools(session, secrets=secrets, client=client, warnings=warnings)
     skills = _account_skills(session, warnings=warnings)
     knowledge, knowledge_total = _account_knowledge(
-        session, limit=limit, warnings=warnings
+        session, limit=limit, warnings=warnings, rng=rng
     )
     traces = (
         fetch_account_traces(
@@ -654,7 +666,11 @@ def _private_skill(row: object, warnings: list[str]) -> SkillSource | None:
 
 
 def _account_knowledge(
-    session: AccountSession, *, limit: int | None, warnings: list[str]
+    session: AccountSession,
+    *,
+    limit: int | None,
+    warnings: list[str],
+    rng: random.Random,
 ) -> tuple[list[KnowledgeSource], int]:
     """Return the sampled documents and how many documents the account really has."""
     documents = _knowledge_documents(session)
@@ -662,7 +678,7 @@ def _account_knowledge(
     for base_id, document in documents:
         if limit is not None and len(sources) >= limit:
             break
-        source = _knowledge_source(session, base_id, document, warnings)
+        source = _knowledge_source(session, base_id, document, warnings, rng=rng)
         if source is not None:
             sources.append(source)
     return sources, len(documents)
@@ -694,13 +710,34 @@ def _knowledge_source(
     base_id: str,
     document: object,
     warnings: list[str],
+    *,
+    rng: random.Random,
 ) -> KnowledgeSource | None:
     if not isinstance(document, Mapping):
         return None
     document_id = _text(document.get("id"))
     if document_id is None:
         return None
-    chunk = _first_chunk(session, base_id, document_id)
+    try:
+        chunk = _sampled_chunk(session, base_id, document_id, rng=rng)
+    except _MalformedChunkCount:
+        warnings.append(
+            f"skipped knowledge document {document_id!r} of base {base_id!r}: "
+            "its chunk count is missing or malformed"
+        )
+        return None
+    except httpx.HTTPStatusError as exc:
+        warnings.append(
+            f"skipped knowledge document {document_id!r} of base {base_id!r}: "
+            f"its chunk page could not be read (HTTP {exc.response.status_code})"
+        )
+        return None
+    except (RuntimeError, httpx.HTTPError) as exc:
+        warnings.append(
+            f"skipped knowledge document {document_id!r} of base {base_id!r}: "
+            f"its chunk page could not be read ({exc})"
+        )
+        return None
     if chunk is None:
         warnings.append(
             f"skipped knowledge document {document_id!r} of base {base_id!r}: "
@@ -719,27 +756,73 @@ def _knowledge_source(
     )
 
 
-def _first_chunk(
-    session: AccountSession, base_id: str, document_id: str
+class _MalformedChunkCount(Exception):
+    """The chunk endpoint did not report a usable total chunk count."""
+
+
+def _sampled_chunk(
+    session: AccountSession,
+    base_id: str,
+    document_id: str,
+    *,
+    rng: random.Random,
 ) -> tuple[str, str] | None:
-    body = _get_object(
-        session,
-        f"/knowledge/bases/{base_id}/documents/{document_id}/chunks",
-        params={"offset": 0, "limit": 1},
-    )
-    chunks = body.get("chunks")
-    if not isinstance(chunks, list) or not chunks:
+    """Return the longest readable chunk of a seeded three-chunk sample.
+
+    A single-chunk document reuses the count probe. Two or three chunks need one
+    full page; a larger document gets three distinct random offsets, sorted so a
+    seeded run issues the same requests. Counting costs one request and sampling
+    at most three, so no document ever needs more than four chunk requests.
+    Blank chunks are never candidates, and only a stripped content length ranks
+    them. A missing or malformed count raises _MalformedChunkCount so the caller
+    can report the contract drift instead of calling it unreadable content.
+    """
+    path = f"/knowledge/bases/{base_id}/documents/{document_id}/chunks"
+    probe = _get_object(session, path, params={"offset": 0, "limit": 1})
+    count = probe.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise _MalformedChunkCount
+    if count == 1:
+        chunks = probe.get("chunks")
+    elif count <= _CHUNK_SAMPLE_SIZE:
+        body = _get_object(session, path, params={"offset": 0, "limit": count})
+        chunks = body.get("chunks")
+    else:
+        chunks = []
+        for offset in sorted(rng.sample(range(count), _CHUNK_SAMPLE_SIZE)):
+            body = _get_object(session, path, params={"offset": offset, "limit": 1})
+            page = body.get("chunks")
+            if isinstance(page, list):
+                chunks.extend(page)
+    if not isinstance(chunks, list):
         return None
-    chunk = chunks[0]
+    readable = [
+        candidate
+        for chunk in chunks
+        if (candidate := _readable_chunk(chunk)) is not None
+    ]
+    if not readable:
+        return None
+    _, chunk_id, content = min(
+        readable, key=lambda candidate: (-len(candidate[2].strip()), candidate[0])
+    )
+    return chunk_id, content
+
+
+def _readable_chunk(chunk: object) -> tuple[int | float, str, str] | None:
+    """Return (chunk_index, chunk_id, content) for a non-blank Gateway chunk."""
     if not isinstance(chunk, Mapping):
         return None
     chunk_id = _text(chunk.get("chunk_id"))
+    chunk_index = chunk.get("chunk_index")
     content = chunk.get("content")
     if chunk_id is None:
         return None
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+        chunk_index = _UNINDEXED_CHUNK_INDEX
     if not isinstance(content, str) or not content.strip():
         return None
-    return chunk_id, content
+    return chunk_index, chunk_id, content
 
 
 def _trace_page(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -258,12 +259,14 @@ def _services(
         limit: Any = None,
         environ: Any = None,
         include_traces: bool = True,
+        rng: Any = None,
     ) -> BuildSources:
         recorder.source_calls.append(
             {
                 "limit": limit,
                 "environ": dict(environ or {}),
                 "include_traces": include_traces,
+                "rng": rng,
             }
         )
         if sources_by_session is not None:
@@ -454,6 +457,35 @@ def test_build_dry_run_reports_counts_and_writes_nothing(capsys: pytest.CaptureF
     assert recorder.langfuse_calls == []
     assert langfuse.created_datasets == []
     assert langfuse.created_items == []
+
+
+def test_build_help_names_deterministic_ids_and_the_reproducible_draw(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["build", "--help"]) == 0
+
+    output = " ".join(_capture(capsys).split())
+    assert "deterministic item ids" in output
+    assert "--seed makes the chunk draw reproducible" in output
+
+
+def test_build_passes_a_seeded_random_to_the_source_loader(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recorder = Recorder()
+    services, _ = _services(recorder)
+
+    exit_code = main(
+        ["build", "--dataset", DATASET, "--dry-run", "--seed", "12345"],
+        services=services,
+        environ=dict(ENVIRON),
+    )
+
+    assert exit_code == 0
+    _capture(capsys)
+    rng = recorder.source_calls[0]["rng"]
+    assert isinstance(rng, random.Random)
+    assert rng.random() == random.Random(12345).random()
 
 
 def test_build_writes_every_draft_through_the_langfuse_writer(
