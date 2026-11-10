@@ -74,12 +74,50 @@ PROJECT_TOOLS = [
     },
 ]
 
+#: GET /api/mcp-servers/{id}/tools as the Gateway projects it: only a row that
+#: is both callable and enabled describes a tool the Agent can really call.
+PROJECT_TOOL_INDEX = [
+    {
+        "name": "search_projects",
+        "call_name": "mcp__project_db__search_projects",
+        "display_name": "search_projects",
+        "description": "Search the project database",
+        "parameters": SEARCH_SCHEMA,
+        "callable": True,
+        "enabled": True,
+    },
+    {
+        "name": "get_project",
+        "call_name": "mcp__project_db__get_project",
+        "display_name": "get_project",
+        "description": "Load one project",
+        "parameters": {
+            "type": "object",
+            "required": ["project_id"],
+            "properties": {"project_id": {"type": "string"}},
+        },
+        "callable": True,
+        "enabled": True,
+    },
+    {
+        "name": "list_sectors",
+        "call_name": "mcp__project_db__list_sectors",
+        "display_name": "list_sectors",
+        "description": "",
+        "parameters": {"type": "object"},
+        "callable": True,
+        "enabled": True,
+    },
+]
+
 STREAMABLE_SERVER = {
     "id": "srv-1",
     "name": "project_db",
     "url": MCP_URL,
     "transport": "streamable_http",
     "enabled": True,
+    "status": "active",
+    "reachable": True,
     "tool_count": 2,
 }
 SSE_SERVER = {
@@ -88,6 +126,8 @@ SSE_SERVER = {
     "url": LEGACY_URL,
     "transport": "sse",
     "enabled": True,
+    "status": "active",
+    "reachable": True,
     "tool_count": 1,
 }
 NO_URL_SERVER = {
@@ -96,7 +136,30 @@ NO_URL_SERVER = {
     "url": "",
     "transport": "streamable_http",
     "enabled": True,
+    "status": "active",
+    "reachable": True,
     "tool_count": 1,
+}
+
+PRIVATE_SKILL_ROW = {
+    "name": "daily-finance-brief",
+    "description": "Turn a story into a numbered daily brief",
+    "category": "custom",
+    "scope": "private",
+    "skill_id": "skill-private-1",
+    "git_commit": "alb2c3d",
+    "enabled": True,
+    "status": "active",
+}
+SECOND_PRIVATE_SKILL_ROW = {
+    "name": "risk-brief",
+    "description": "Summarise project risk",
+    "category": "custom",
+    "scope": "private",
+    "skill_id": "skill-private-2",
+    "git_commit": None,
+    "enabled": True,
+    "status": "active",
 }
 
 SKILLS = [
@@ -107,6 +170,8 @@ SKILLS = [
         "scope": "builtin",
         "skill_id": "skill-builtin",
         "git_commit": "aaa1111",
+        "enabled": True,
+        "status": "active",
     },
     {
         "name": "public-helper",
@@ -114,28 +179,18 @@ SKILLS = [
         "category": "public",
         "scope": "public",
         "skill_id": "skill-public",
+        "enabled": True,
+        "status": "active",
     },
-    {
-        "name": "daily-finance-brief",
-        "description": "Turn a story into a numbered daily brief",
-        "category": "custom",
-        "scope": "private",
-        "skill_id": "skill-private-1",
-        "git_commit": "alb2c3d",
-    },
-    {
-        "name": "risk-brief",
-        "description": "Summarise project risk",
-        "category": "custom",
-        "scope": "private",
-        "skill_id": "skill-private-2",
-        "git_commit": None,
-    },
+    PRIVATE_SKILL_ROW,
+    SECOND_PRIVATE_SKILL_ROW,
     {
         "name": "private-without-id",
         "description": "No skill_id",
         "category": "custom",
         "scope": "private",
+        "enabled": True,
+        "status": "active",
     },
 ]
 
@@ -340,12 +395,18 @@ class _FakeGateway:
         bases: list[dict[str, Any]] | None = None,
         documents: dict[str, list[dict[str, Any]]] | None = None,
         chunks: dict[str, list[dict[str, Any]]] | None = None,
+        tool_index: dict[str, list[dict[str, Any]] | int] | None = None,
     ) -> None:
         self.servers = [STREAMABLE_SERVER, SSE_SERVER] if servers is None else servers
         self.skills = SKILLS if skills is None else skills
         self.bases = BASES if bases is None else bases
         self.documents = DOCUMENTS if documents is None else documents
         self.chunks = CHUNKS if chunks is None else chunks
+        self.tool_index = (
+            {STREAMABLE_SERVER["id"]: PROJECT_TOOL_INDEX}
+            if tool_index is None
+            else tool_index
+        )
         self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -353,6 +414,12 @@ class _FakeGateway:
         path = request.url.path
         if path == "/api/mcp-servers":
             return httpx.Response(200, json={"servers": self.servers, "count": len(self.servers)})
+        if path.startswith("/api/mcp-servers/") and path.endswith("/tools"):
+            server_id = path.split("/")[-2]
+            entry = self.tool_index.get(server_id, [])
+            if isinstance(entry, int):
+                return httpx.Response(entry, json={"detail": "tool index unavailable"})
+            return httpx.Response(200, json={"tools": entry, "count": len(entry)})
         if path == "/api/skills":
             return httpx.Response(200, json={"skills": self.skills})
         if path == "/api/knowledge/bases":
@@ -446,6 +513,14 @@ def _sources(
     )
 
 
+def _projection(tool_name: str, **flags: Any) -> list[dict[str, Any]]:
+    """The Gateway tool index with one tool's projection flags overridden."""
+    return [
+        dict(row, **flags) if row["name"] == tool_name else dict(row)
+        for row in PROJECT_TOOL_INDEX
+    ]
+
+
 @pytest.mark.parametrize("base_url", BASE_URLS)
 def test_load_build_sources_reads_the_fixed_accounts_real_data(base_url: str) -> None:
     gateway = _FakeGateway()
@@ -469,6 +544,7 @@ def test_load_build_sources_reads_the_fixed_accounts_real_data(base_url: str) ->
     assert sources.traces == []
     assert {request.url.path for request in gateway.requests} == {
         "/api/mcp-servers",
+        "/api/mcp-servers/srv-1/tools",
         "/api/skills",
         "/api/knowledge/bases",
         "/api/knowledge/bases/kb-1/documents",
@@ -564,6 +640,196 @@ def test_load_build_sources_skips_a_disabled_server() -> None:
     assert len(sources.warnings) == 1
     assert "project_db" in sources.warnings[0]
     assert "disabled" in sources.warnings[0]
+
+
+def test_load_build_sources_skips_a_server_that_is_still_pending() -> None:
+    gateway = _FakeGateway(servers=[dict(STREAMABLE_SERVER, status="pending")])
+    mcp = _Mcp(PROJECT_TOOLS)
+
+    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+
+    assert sources.tools == []
+    assert mcp.requests == []
+    assert len(sources.warnings) == 1
+    assert "project_db" in sources.warnings[0]
+    assert "pending" in sources.warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("summary", "reason"),
+    [
+        (dict(STREAMABLE_SERVER, status="error"), "status=error"),
+        (dict(STREAMABLE_SERVER, reachable=False), "unreachable"),
+    ],
+)
+def test_load_build_sources_skips_a_server_that_is_not_effective(
+    summary: dict[str, Any], reason: str
+) -> None:
+    gateway = _FakeGateway(servers=[summary])
+    mcp = _Mcp(PROJECT_TOOLS)
+
+    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+
+    assert sources.tools == []
+    assert mcp.requests == []
+    assert len(sources.warnings) == 1
+    assert "project_db" in sources.warnings[0]
+    assert reason in sources.warnings[0]
+
+
+def test_load_build_sources_requires_an_explicit_enabled_flag() -> None:
+    summary = {key: value for key, value in STREAMABLE_SERVER.items() if key != "enabled"}
+    gateway = _FakeGateway(servers=[summary])
+    mcp = _Mcp(PROJECT_TOOLS)
+
+    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+
+    assert sources.tools == []
+    assert mcp.requests == []
+    assert len(sources.warnings) == 1
+    assert "project_db" in sources.warnings[0]
+    assert "enabled" in sources.warnings[0]
+
+
+def test_load_build_sources_skips_a_tool_the_gateway_index_marks_uncallable() -> None:
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={STREAMABLE_SERVER["id"]: _projection("get_project", callable=False)},
+    )
+
+    sources = load_build_sources(
+        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
+    )
+    drafts = build_account_items(_offline_session(), sources)
+
+    assert [tool.name for tool in sources.tools] == ["search_projects"]
+    assert [
+        draft.metadata["source_id"]
+        for draft in drafts
+        if draft.metadata["source_kind"] == "tool"
+    ] == ["mcp__project_db__search_projects"]
+    assert len(sources.warnings) == 1
+    assert "get_project" in sources.warnings[0]
+    assert "callable" in sources.warnings[0]
+
+
+def test_load_build_sources_skips_a_tool_disabled_in_the_gateway_index() -> None:
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={STREAMABLE_SERVER["id"]: _projection("get_project", enabled=False)},
+    )
+
+    sources = load_build_sources(
+        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
+    )
+    drafts = build_account_items(_offline_session(), sources)
+
+    assert [tool.name for tool in sources.tools] == ["search_projects"]
+    assert [
+        draft.metadata["source_id"]
+        for draft in drafts
+        if draft.metadata["source_kind"] == "tool"
+    ] == ["mcp__project_db__search_projects"]
+    assert len(sources.warnings) == 1
+    assert "get_project" in sources.warnings[0]
+    assert "disabled" in sources.warnings[0]
+
+
+def test_load_build_sources_skips_a_listed_tool_the_gateway_index_never_saw() -> None:
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={
+            STREAMABLE_SERVER["id"]: [
+                row for row in PROJECT_TOOL_INDEX if row["name"] != "get_project"
+            ]
+        },
+    )
+
+    sources = load_build_sources(
+        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
+    )
+
+    assert [tool.name for tool in sources.tools] == ["search_projects"]
+    assert len(sources.warnings) == 1
+    assert "get_project" in sources.warnings[0]
+    assert "index" in sources.warnings[0]
+
+
+def test_a_server_whose_tool_index_fails_costs_only_its_own_tools() -> None:
+    broken_url = "https://mcp.test/broken-index"
+    gateway = _FakeGateway(
+        servers=[
+            STREAMABLE_SERVER,
+            dict(STREAMABLE_SERVER, id="srv-2", name="broken_db", url=broken_url),
+        ],
+        tool_index={STREAMABLE_SERVER["id"]: PROJECT_TOOL_INDEX, "srv-2": 503},
+    )
+    healthy = _Mcp(PROJECT_TOOLS)
+    broken = _Mcp(PROJECT_TOOLS, url=broken_url)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return broken(request) if str(request.url) == broken_url else healthy(request)
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=McpClient(transport=httpx.MockTransport(handler)),
+    )
+
+    assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
+    assert len(sources.warnings) == 1
+    assert "broken_db" in sources.warnings[0]
+    assert "HTTP 503" in sources.warnings[0]
+
+
+def test_load_build_sources_skips_a_private_skill_that_is_switched_off() -> None:
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER], skills=[dict(PRIVATE_SKILL_ROW, enabled=False)]
+    )
+
+    sources = load_build_sources(
+        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
+    )
+
+    assert sources.skills == []
+    assert len(sources.warnings) == 1
+    assert "daily-finance-brief" in sources.warnings[0]
+    assert "enabled" in sources.warnings[0]
+
+
+def test_load_build_sources_skips_a_private_skill_that_is_not_active() -> None:
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER], skills=[dict(PRIVATE_SKILL_ROW, status="draft")]
+    )
+
+    sources = load_build_sources(
+        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
+    )
+
+    assert sources.skills == []
+    assert len(sources.warnings) == 1
+    assert "daily-finance-brief" in sources.warnings[0]
+    assert "draft" in sources.warnings[0]
+
+
+def test_an_all_effective_account_still_builds_every_source() -> None:
+    gateway = _FakeGateway(servers=[STREAMABLE_SERVER])
+
+    sources = load_build_sources(
+        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
+    )
+    drafts = build_account_items(_offline_session(), sources)
+
+    assert sources.warnings == ()
+    assert sources.source_totals == {"tool": 2, "skill": 2, "knowledge": 2, "trace": 0}
+    assert [draft.metadata["source_kind"] for draft in drafts] == [
+        "tool",
+        "tool",
+        "skill",
+        "skill",
+        "knowledge",
+        "knowledge",
+    ]
 
 
 def test_a_failing_server_costs_only_its_own_tools() -> None:

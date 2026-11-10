@@ -12,8 +12,10 @@ Rules that shape the drafts:
 
 * Tool arguments come from the required properties of the real inputSchema only
   (first enum value, else a type placeholder); nothing is guessed.
-* Only the account's own private Skills are sampled; builtin and public Skills
-  are excluded, and a private Skill without skill_id or name is dropped.
+* Only effective sources are sampled: an MCP server must be enabled, active,
+  and reachable, a tool must be both callable and enabled in the Gateway tool
+  index, and the account's own private Skills -- builtin and public Skills are
+  excluded -- must be enabled and active, with a skill_id and a name.
 * Knowledge drafts carry document/chunk provenance in metadata but emit only
   expected_doc_ids: chunk ids are an implementation detail of the retriever.
 * Traces are optional input: without LANGFUSE_HOST and keys, there are none.
@@ -50,6 +52,8 @@ _KIND_ORDER = (_KIND_TOOL, _KIND_SKILL, _KIND_KNOWLEDGE, _KIND_TRACE)
 _STREAMABLE_TRANSPORT = "streamable_http"
 _PRIVATE_SCOPE = "private"
 _BUILTIN_SCOPE = "builtin"
+#: The only MCP status the Agent can route to; pending/error/disabled are not.
+_ACTIVE_STATUS = "active"
 
 _TRACE_SOURCE = "online_trace"
 _TRACE_REPLAY_CATEGORY = "trace_replay"
@@ -209,10 +213,12 @@ def load_build_sources(
     count is then a real 0, not a silently skipped kind.
 
     A Gateway failure that makes the account data unusable raises. Everything
-    this account cannot use -- an unsupported transport, a disabled or unreachable
-    server, a document without a readable chunk, an unavailable Langfuse -- is
-    skipped with a warning on the result, so one broken source never costs more
-    than its own items.
+    this account cannot use -- a server that is disabled, not active, or
+    unreachable, an unsupported transport, a tool the Gateway tool index does not
+    mark callable and enabled, a Skill that is switched off or not active, a
+    document without a readable chunk, an unavailable Langfuse -- is skipped with
+    a warning on the result, so one broken source never costs more than its own
+    items.
     """
     _validate_limit(limit)
     env = os.environ if environ is None else environ
@@ -224,7 +230,7 @@ def load_build_sources(
     client = mcp_client if mcp_client is not None else McpClient()
     warnings: list[str] = []
     tools = _account_tools(session, secrets=secrets, client=client, warnings=warnings)
-    skills = _account_skills(session)
+    skills = _account_skills(session, warnings=warnings)
     knowledge, knowledge_total = _account_knowledge(
         session, limit=limit, warnings=warnings
     )
@@ -429,14 +435,38 @@ def _account_tools(
             # One broken server must cost exactly its own tools, never the build.
             warnings.append(f"skipped MCP server {server.name!r}: tools/list failed ({exc})")
             continue
+        index = _server_tool_index(session, server, warnings)
+        if index is None:
+            continue
         for tool in listed:
-            if is_safe_call_name(tool.call_name):
-                tools.append(tool)
+            if not is_safe_call_name(tool.call_name):
+                warnings.append(
+                    f"skipped tool {tool.name!r} of server {server.name!r}: "
+                    f"the Agent cannot call {tool.call_name!r}"
+                )
                 continue
-            warnings.append(
-                f"skipped tool {tool.name!r} of server {server.name!r}: "
-                f"the Agent cannot call {tool.call_name!r}"
-            )
+            row = index.get(tool.call_name)
+            if row is None:
+                row = index.get(tool.name)
+            if row is None:
+                warnings.append(
+                    f"skipped tool {tool.name!r} of server {server.name!r}: "
+                    "the Gateway tool index does not list it"
+                )
+                continue
+            if row.get("callable") is not True:
+                warnings.append(
+                    f"skipped tool {tool.name!r} of server {server.name!r}: "
+                    "the Gateway tool index does not mark it callable"
+                )
+                continue
+            if row.get("enabled") is not True:
+                warnings.append(
+                    f"skipped tool {tool.name!r} of server {server.name!r}: "
+                    "the Gateway tool index marks it disabled"
+                )
+                continue
+            tools.append(tool)
     return tools
 
 
@@ -456,8 +486,7 @@ def _mcp_server(
     if name is None:
         warnings.append(f"skipped MCP server {server_id!r}: it has no name to build tool names from")
         return None
-    if summary.get("enabled") is False:
-        warnings.append(f"skipped MCP server {name!r}: it is disabled for this account")
+    if not _effective_server(summary, name, warnings):
         return None
 
     secret = secrets.get(name) or secrets.get(server_id) or McpServerSecret()
@@ -477,21 +506,108 @@ def _mcp_server(
     return McpServer(id=server_id, url=url, headers=dict(secret.headers), name=name)
 
 
-def _account_skills(session: AccountSession) -> list[SkillSource]:
+def _effective_server(
+    summary: Mapping[str, Any], name: str, warnings: list[str]
+) -> bool:
+    """Mirror agentkit's rule: enabled AND status=active AND reachable.
+
+    An absent flag is not True. A summary that does not say the server is
+    enabled and reachable cannot prove the Agent may use it, so it is skipped
+    rather than guessed about.
+    """
+    enabled = summary.get("enabled")
+    if enabled is not True:
+        if enabled is False:
+            warnings.append(f"skipped MCP server {name!r}: it is disabled for this account")
+        else:
+            warnings.append(
+                f"skipped MCP server {name!r}: it has no enabled flag, so it is not effective"
+            )
+        return False
+    status = _text(summary.get("status"))
+    if status is None:
+        warnings.append(
+            f"skipped MCP server {name!r}: it has no status, so it is not effective"
+        )
+        return False
+    if status != _ACTIVE_STATUS:
+        warnings.append(
+            f"skipped MCP server {name!r}: status={status} is not {_ACTIVE_STATUS}"
+        )
+        return False
+    reachable = summary.get("reachable")
+    if reachable is not True:
+        if reachable is False:
+            warnings.append(f"skipped MCP server {name!r}: it is unreachable")
+        else:
+            warnings.append(
+                f"skipped MCP server {name!r}: it has no reachable flag, so it is not effective"
+            )
+        return False
+    return True
+
+
+def _server_tool_index(
+    session: AccountSession, server: McpServer, warnings: list[str]
+) -> dict[str, Mapping[str, Any]] | None:
+    """Index GET /api/mcp-servers/{id}/tools the way tools/list names its tools.
+
+    The projection carries the two flags that decide whether the Agent can call a
+    tool at all, so a server whose index cannot be read contributes nothing:
+    effectiveness cannot be established, and guessing would build samples that
+    could never pass. Rows are keyed by call_name, falling back to name for a row
+    that does not carry one.
+    """
+    try:
+        body = _get_object(session, f"/mcp-servers/{server.id}/tools")
+    except httpx.HTTPStatusError as exc:
+        warnings.append(
+            f"skipped MCP server {server.name!r}: its tool index request failed "
+            f"with HTTP {exc.response.status_code}"
+        )
+        return None
+    except (RuntimeError, httpx.HTTPError) as exc:
+        warnings.append(
+            f"skipped MCP server {server.name!r}: its tool index is unreadable ({exc})"
+        )
+        return None
+    rows = body.get("tools")
+    if not isinstance(rows, list):
+        warnings.append(
+            f"skipped MCP server {server.name!r}: its tool index returned no tools list"
+        )
+        return None
+    index: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        key = _text(row.get("call_name")) or _text(row.get("name"))
+        if key is not None:
+            index[key] = row
+    return index
+
+
+def _account_skills(session: AccountSession, *, warnings: list[str]) -> list[SkillSource]:
     body = _get_object(session, "/skills")
     rows = body.get("skills")
     if not isinstance(rows, list):
         raise RuntimeError("GET /skills returned no skills list")
     skills: list[SkillSource] = []
     for row in rows:
-        skill = _private_skill(row)
+        skill = _private_skill(row, warnings)
         if skill is not None:
             skills.append(skill)
     return skills
 
 
-def _private_skill(row: object) -> SkillSource | None:
-    """Keep the account's own private Skills; drop public, builtin, and incomplete rows."""
+def _private_skill(row: object, warnings: list[str]) -> SkillSource | None:
+    """Keep the account's own effective private Skills.
+
+    Public, builtin, and incomplete rows are dropped silently: they are not
+    samples this account can switch on. A private row that is switched off or
+    not active is dropped with a warning, because a sample built from it could
+    never pass.
+    """
     if not isinstance(row, Mapping):
         return None
     if row.get("scope") != _PRIVATE_SCOPE:
@@ -501,6 +617,17 @@ def _private_skill(row: object) -> SkillSource | None:
     skill_id = _text(row.get("skill_id"))
     name = _text(row.get("name"))
     if skill_id is None or name is None:
+        return None
+    if row.get("enabled") is not True:
+        warnings.append(
+            f"skipped private Skill {name!r} ({skill_id}): it is not enabled for this account"
+        )
+        return None
+    status = row.get("status")
+    if status is not None and status != _ACTIVE_STATUS:
+        warnings.append(
+            f"skipped private Skill {name!r} ({skill_id}): status={status} is not {_ACTIVE_STATUS}"
+        )
         return None
     description = row.get("description")
     return SkillSource(
