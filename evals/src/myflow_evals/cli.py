@@ -59,7 +59,6 @@ _SALT_ENV = "USER_ID_SALT"
 _LANGFUSE_HOST_ENV = "LANGFUSE_HOST"
 _LANGFUSE_PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
 _LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
-_MCP_HEADERS_ENV = "MCP_SERVER_HEADERS"
 
 _INGEST_QUERY_PREVIEW = 100
 #: Drafts from this source kind carry no expectations and are never scored.
@@ -187,9 +186,6 @@ def _build_parser() -> argparse.ArgumentParser:
     shared.add_argument(
         "--accounts-file", type=Path, default=None, help="fixed-account secret file"
     )
-    shared.add_argument(
-        "--mcp-headers-file", type=Path, default=None, help="MCP server header secret file"
-    )
     shared.add_argument("--env-file", type=Path, default=None, help="KEY=VALUE settings file")
 
     build = commands.add_parser(
@@ -241,17 +237,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_environ(base: Mapping[str, str], args: argparse.Namespace) -> dict[str, str]:
-    """Merge --env-file and --mcp-headers-file under the process environment.
+    """Merge --env-file under the process environment.
 
     Real environment values win, so a CI secret is never overridden by a file that
-    happens to sit in the checkout.
+    happens to sit in the checkout.  There is no MCP header file: the dataset
+    build reads tools from the Gateway and holds no per-server credentials.
     """
     environ = dict(base)
     if args.env_file is not None:
         for key, value in _read_env_file(args.env_file).items():
             environ.setdefault(key, value)
-    if args.mcp_headers_file is not None and not (environ.get(_MCP_HEADERS_ENV) or "").strip():
-        environ[_MCP_HEADERS_ENV] = _read_text(args.mcp_headers_file, _MCP_HEADERS_ENV)
     return environ
 
 

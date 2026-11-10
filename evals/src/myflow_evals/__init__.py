@@ -15,6 +15,7 @@ from myflow_evals.build_dataset import (
     DatasetItemDraft,
     DatasetWriter,
     KnowledgeSource,
+    McpTool,
     SkillSource,
     TraceSource,
     build_account_items,
@@ -44,7 +45,6 @@ from myflow_evals.evaluators import (
     skill_routing,
     tool_hit,
 )
-from myflow_evals.mcp import McpClient, McpServer, McpServerSecret, McpTool, load_server_secrets
 from myflow_evals.runner import (
     CI_SUBSET_SIZE,
     DEFAULT_MAX_CONCURRENCY,
@@ -81,9 +81,6 @@ __all__ = [
     "GateResult",
     "IncompleteExperiment",
     "KnowledgeSource",
-    "McpClient",
-    "McpServer",
-    "McpServerSecret",
     "McpTool",
     "RULE_EVALUATORS",
     "RuleMetricAdapter",
@@ -108,7 +105,6 @@ __all__ = [
     "kb_routing",
     "load_accounts",
     "load_build_sources",
-    "load_server_secrets",
     "login_account",
     "login_all",
     "no_tool_ok",

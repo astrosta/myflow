@@ -1,9 +1,10 @@
 """Dataset-build tests.
 
-Both transports are faked: an httpx.MockTransport stands in for the Gateway's
-dataset-source GETs and another for the MCP tools/list and Langfuse trace reads.
-The builder is pure, so most cases hand build_account_items a BuildSources
-directly and prove that no HTTP call happens at all.
+Two transports are faked: an httpx.MockTransport stands in for the Gateway's
+dataset-source GETs (including the tool projection that now replaces the direct
+MCP tools/list calls) and another for the Langfuse trace reads. The builder is
+pure, so most cases hand build_account_items a BuildSources directly and prove
+that no HTTP call happens at all.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from myflow_evals.build_dataset import (
     BuildSources,
     DatasetItemDraft,
     KnowledgeSource,
+    McpTool,
     SkillSource,
     TraceSource,
     build_account_items,
@@ -29,7 +31,6 @@ from myflow_evals.build_dataset import (
     stable_item_id,
     write_drafts,
 )
-from myflow_evals.mcp import McpClient, McpTool
 
 BASE_URLS = ["http://gateway.test/api", "http://gateway.test"]
 CSRF_TOKEN = "csrf-token"
@@ -58,32 +59,25 @@ SEARCH_SCHEMA = {
     },
 }
 
-PROJECT_TOOLS = [
-    {
-        "name": "search_projects",
-        "description": "Search the project database",
-        "inputSchema": SEARCH_SCHEMA,
-    },
-    {
-        "name": "get_project",
-        "description": "Load one project",
-        "inputSchema": {
-            "type": "object",
-            "required": ["project_id"],
-            "properties": {"project_id": {"type": "string"}},
-        },
-    },
-]
+GET_PROJECT_SCHEMA = {
+    "type": "object",
+    "required": ["project_id"],
+    "properties": {"project_id": {"type": "string"}},
+}
 
-#: GET /api/mcp-servers/{id}/tools as the Gateway projects it: only a row that
-#: is both callable and enabled describes a tool the Agent can really call.
+#: GET /api/mcp-servers/{id}/tools?include_schema=true as the Gateway projects it.
+#: One row carries what the dataset needs: the call name the Agent uses, the two
+#: flags that decide whether it may use the tool at all, and the stored input
+#: schema the sample arguments are derived from. This is the only tool source --
+#: the builder never opens an MCP session of its own.
 PROJECT_TOOL_INDEX = [
     {
         "name": "search_projects",
         "call_name": "mcp__project_db__search_projects",
         "display_name": "search_projects",
         "description": "Search the project database",
-        "parameters": SEARCH_SCHEMA,
+        "parameters": ["created_after", "sector"],
+        "input_schema": SEARCH_SCHEMA,
         "callable": True,
         "enabled": True,
     },
@@ -92,20 +86,8 @@ PROJECT_TOOL_INDEX = [
         "call_name": "mcp__project_db__get_project",
         "display_name": "get_project",
         "description": "Load one project",
-        "parameters": {
-            "type": "object",
-            "required": ["project_id"],
-            "properties": {"project_id": {"type": "string"}},
-        },
-        "callable": True,
-        "enabled": True,
-    },
-    {
-        "name": "list_sectors",
-        "call_name": "mcp__project_db__list_sectors",
-        "display_name": "list_sectors",
-        "description": "",
-        "parameters": {"type": "object"},
+        "parameters": ["project_id"],
+        "input_schema": GET_PROJECT_SCHEMA,
         "callable": True,
         "enabled": True,
     },
@@ -126,16 +108,6 @@ SSE_SERVER = {
     "name": "legacy_db",
     "url": LEGACY_URL,
     "transport": "sse",
-    "enabled": True,
-    "status": "active",
-    "reachable": True,
-    "tool_count": 1,
-}
-NO_URL_SERVER = {
-    "id": "srv-3",
-    "name": "no_url_db",
-    "url": "",
-    "transport": "streamable_http",
     "enabled": True,
     "status": "active",
     "reachable": True,
@@ -408,7 +380,7 @@ class _FakeGateway:
         chunk_failures: dict[str, set[int]] | None = None,
         chunk_counts: dict[str, int | None] | None = None,
     ) -> None:
-        self.servers = [STREAMABLE_SERVER, SSE_SERVER] if servers is None else servers
+        self.servers = [STREAMABLE_SERVER] if servers is None else servers
         self.skills = SKILLS if skills is None else skills
         self.bases = BASES if bases is None else bases
         self.documents = DOCUMENTS if documents is None else documents
@@ -432,6 +404,8 @@ class _FakeGateway:
             entry = self.tool_index.get(server_id, [])
             if isinstance(entry, int):
                 return httpx.Response(entry, json={"detail": "tool index unavailable"})
+            # The projection only carries the stored schema when it was asked for.
+            assert request.url.params.get("include_schema") == "true", request.url
             return httpx.Response(200, json={"tools": entry, "count": len(entry)})
         if path == "/api/skills":
             return httpx.Response(200, json={"skills": self.skills})
@@ -461,31 +435,15 @@ class _FakeGateway:
             )
         return httpx.Response(404, json={"detail": "not found"})
 
-
-class _Mcp:
-    """A fake MCP server answering tools/list for one expected url."""
-
-    def __init__(self, tools: list[dict[str, Any]], *, url: str = MCP_URL) -> None:
-        self._tools = tools
-        self._url = url
-        self.requests: list[httpx.Request] = []
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == self._url, f"unexpected MCP url {request.url}"
-        self.requests.append(request)
-        body = json.loads(request.content)
-        if body["method"] == "initialize":
-            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
-        if body["method"] == "notifications/initialized":
-            return httpx.Response(202)
-        assert body["method"] == "tools/list", f"unexpected MCP method {body['method']}"
-        return httpx.Response(
-            200, json={"jsonrpc": "2.0", "id": body["id"], "result": {"tools": self._tools}}
-        )
-
     @property
-    def client(self) -> McpClient:
-        return McpClient(transport=httpx.MockTransport(self))
+    def tool_requests(self) -> list[httpx.Request]:
+        """Every tool-projection GET this build issued, one per effective server."""
+        return [
+            request
+            for request in self.requests
+            if request.url.path.startswith("/api/mcp-servers/")
+            and request.url.path.endswith("/tools")
+        ]
 
 
 def _session(
@@ -533,9 +491,17 @@ def _sources(
 
 
 def _projection(tool_name: str, **flags: Any) -> list[dict[str, Any]]:
-    """The Gateway tool index with one tool's projection flags overridden."""
+    """The Gateway tool projection with one tool's flags overridden."""
     return [
         dict(row, **flags) if row["name"] == tool_name else dict(row)
+        for row in PROJECT_TOOL_INDEX
+    ]
+
+
+def _projection_schema(tool_name: str, stored: Any) -> list[dict[str, Any]]:
+    """The Gateway tool projection with one tool's stored schema replaced."""
+    return [
+        dict(row, input_schema=stored) if row["name"] == tool_name else dict(row)
         for row in PROJECT_TOOL_INDEX
     ]
 
@@ -624,9 +590,8 @@ def _chunk_pattern(requests: list[httpx.Request]) -> list[tuple[str, str]]:
 @pytest.mark.parametrize("base_url", BASE_URLS)
 def test_load_build_sources_reads_the_fixed_accounts_real_data(base_url: str) -> None:
     gateway = _FakeGateway()
-    mcp = _Mcp(PROJECT_TOOLS)
 
-    sources = load_build_sources(_session(gateway, base_url), environ={}, mcp_client=mcp.client)
+    sources = load_build_sources(_session(gateway, base_url), environ={})
 
     assert [tool.call_name for tool in sources.tools] == [
         "mcp__project_db__search_projects",
@@ -659,35 +624,45 @@ def test_load_build_sources_reads_the_fixed_accounts_real_data(base_url: str) ->
         ("0", "2"),
         ("0", "1"),
     ]
+    # One projection GET per effective server, each asking for the stored schema;
+    # no JSON-RPC session and no second request just to learn the flags.
+    tool_requests = gateway.tool_requests
+    assert [request.url.path for request in tool_requests] == ["/api/mcp-servers/srv-1/tools"]
+    assert [request.url.params["include_schema"] for request in tool_requests] == ["true"]
+    assert all(request.method == "GET" for request in tool_requests)
     assert all(request.headers["x-csrf-token"] == CSRF_TOKEN for request in gateway.requests)
 
 
 UNSAFE_TOOL_SCHEMA = {"type": "object", "required": [], "properties": {}}
+
+
+def _tool_row(name: str, call_name: str, **fields: Any) -> dict[str, Any]:
+    """One Gateway tool-projection row; callable, enabled and schema-filled by default."""
+    return {
+        "name": name,
+        "call_name": call_name,
+        "description": f"the {name} tool",
+        "input_schema": UNSAFE_TOOL_SCHEMA,
+        "callable": True,
+        "enabled": True,
+        **fields,
+    }
+
+
 UNCALLABLE_TOOLS = [
-    {
-        "name": "search.projects",
-        "description": "a dotted tool name no provider accepts",
-        "inputSchema": UNSAFE_TOOL_SCHEMA,
-    },
-    {
-        "name": "t" * 200,
-        "description": "a tool name beyond the call-name bound",
-        "inputSchema": UNSAFE_TOOL_SCHEMA,
-    },
-    {
-        "name": "get_project",
-        "description": "a callable tool",
-        "inputSchema": UNSAFE_TOOL_SCHEMA,
-    },
+    _tool_row("search.projects", "mcp__project_db__search.projects"),
+    _tool_row("t" * 200, f"mcp__project_db__{'t' * 200}"),
+    _tool_row("get_project", "mcp__project_db__get_project"),
 ]
 
 
 def test_load_build_sources_skips_tools_the_agent_cannot_call() -> None:
-    sources = load_build_sources(
-        _session(_FakeGateway(servers=[STREAMABLE_SERVER])),
-        environ={},
-        mcp_client=_Mcp(UNCALLABLE_TOOLS).client,
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={STREAMABLE_SERVER["id"]: UNCALLABLE_TOOLS},
     )
+
+    sources = load_build_sources(_session(gateway), environ={})
 
     drafts = build_account_items(_offline_session(), sources)
 
@@ -718,26 +693,33 @@ def test_build_account_items_never_emits_an_uncallable_tool() -> None:
     assert build_account_items(_offline_session(), sources) == []
 
 
-def test_load_build_sources_skips_servers_it_cannot_call() -> None:
-    gateway = _FakeGateway(servers=[STREAMABLE_SERVER, SSE_SERVER, NO_URL_SERVER])
-    mcp = _Mcp(PROJECT_TOOLS)
+def test_an_sse_server_contributes_its_projected_tools() -> None:
+    """Transport no longer disqualifies a server: the build never calls it.
 
-    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+    The deleted direct MCP client implemented streamable_http only, so an sse
+    server had to be skipped. The Gateway already stores an sse server's tools and
+    the Agent can call them, so a sample built from one is valid.
+    """
+    gateway = _FakeGateway(
+        servers=[SSE_SERVER],
+        tool_index={
+            SSE_SERVER["id"]: [_tool_row("legacy_search", "mcp__legacy_db__legacy_search")]
+        },
+    )
 
-    assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
-    assert len(sources.warnings) == 2
-    assert any("legacy_db" in warning and "sse" in warning for warning in sources.warnings)
-    assert any("no_url_db" in warning and "url" in warning for warning in sources.warnings)
+    sources = load_build_sources(_session(gateway), environ={})
+
+    assert [tool.call_name for tool in sources.tools] == ["mcp__legacy_db__legacy_search"]
+    assert sources.warnings == ()
 
 
 def test_load_build_sources_skips_a_disabled_server() -> None:
     gateway = _FakeGateway(servers=[dict(STREAMABLE_SERVER, enabled=False)])
-    mcp = _Mcp(PROJECT_TOOLS)
 
-    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert sources.tools == []
-    assert mcp.requests == []
+    assert gateway.tool_requests == []
     assert len(sources.warnings) == 1
     assert "project_db" in sources.warnings[0]
     assert "disabled" in sources.warnings[0]
@@ -745,12 +727,11 @@ def test_load_build_sources_skips_a_disabled_server() -> None:
 
 def test_load_build_sources_skips_a_server_that_is_still_pending() -> None:
     gateway = _FakeGateway(servers=[dict(STREAMABLE_SERVER, status="pending")])
-    mcp = _Mcp(PROJECT_TOOLS)
 
-    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert sources.tools == []
-    assert mcp.requests == []
+    assert gateway.tool_requests == []
     assert len(sources.warnings) == 1
     assert "project_db" in sources.warnings[0]
     assert "pending" in sources.warnings[0]
@@ -767,12 +748,11 @@ def test_load_build_sources_skips_a_server_that_is_not_effective(
     summary: dict[str, Any], reason: str
 ) -> None:
     gateway = _FakeGateway(servers=[summary])
-    mcp = _Mcp(PROJECT_TOOLS)
 
-    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert sources.tools == []
-    assert mcp.requests == []
+    assert gateway.tool_requests == []
     assert len(sources.warnings) == 1
     assert "project_db" in sources.warnings[0]
     assert reason in sources.warnings[0]
@@ -781,30 +761,14 @@ def test_load_build_sources_skips_a_server_that_is_not_effective(
 def test_load_build_sources_requires_an_explicit_enabled_flag() -> None:
     summary = {key: value for key, value in STREAMABLE_SERVER.items() if key != "enabled"}
     gateway = _FakeGateway(servers=[summary])
-    mcp = _Mcp(PROJECT_TOOLS)
 
-    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert sources.tools == []
-    assert mcp.requests == []
+    assert gateway.tool_requests == []
     assert len(sources.warnings) == 1
     assert "project_db" in sources.warnings[0]
     assert "enabled" in sources.warnings[0]
-
-
-def test_an_sse_server_reports_its_transport_before_a_pending_status() -> None:
-    gateway = _FakeGateway(servers=[dict(SSE_SERVER, status="pending")])
-    mcp = _Mcp(PROJECT_TOOLS)
-
-    sources = load_build_sources(_session(gateway), environ={}, mcp_client=mcp.client)
-
-    assert sources.tools == []
-    assert mcp.requests == []
-    assert len(sources.warnings) == 1
-    assert "legacy_db" in sources.warnings[0]
-    assert "sse" in sources.warnings[0]
-    assert "transport" in sources.warnings[0]
-    assert "pending" not in sources.warnings[0]
 
 
 def test_load_build_sources_skips_a_tool_the_gateway_index_marks_uncallable() -> None:
@@ -813,9 +777,7 @@ def test_load_build_sources_skips_a_tool_the_gateway_index_marks_uncallable() ->
         tool_index={STREAMABLE_SERVER["id"]: _projection("get_project", callable=False)},
     )
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
     drafts = build_account_items(_offline_session(), sources)
 
     assert [tool.name for tool in sources.tools] == ["search_projects"]
@@ -835,9 +797,7 @@ def test_load_build_sources_skips_a_tool_disabled_in_the_gateway_index() -> None
         tool_index={STREAMABLE_SERVER["id"]: _projection("get_project", enabled=False)},
     )
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
     drafts = build_account_items(_offline_session(), sources)
 
     assert [tool.name for tool in sources.tools] == ["search_projects"]
@@ -851,7 +811,8 @@ def test_load_build_sources_skips_a_tool_disabled_in_the_gateway_index() -> None
     assert "enabled=false" in sources.warnings[0]
 
 
-def test_a_projection_row_without_a_call_name_still_matches_its_tool() -> None:
+def test_a_projection_row_without_a_call_name_cannot_be_sampled() -> None:
+    """The row IS the tool now, so an incomplete row is a skip, not a name guess."""
     without_call_name = {"name": "get_project", "callable": True, "enabled": True}
     gateway = _FakeGateway(
         servers=[STREAMABLE_SERVER],
@@ -863,12 +824,13 @@ def test_a_projection_row_without_a_call_name_still_matches_its_tool() -> None:
         },
     )
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
 
-    assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
-    assert sources.warnings == ()
+    assert [tool.name for tool in sources.tools] == ["search_projects"]
+    assert len(sources.warnings) == 1
+    assert "get_project" in sources.warnings[0]
+    assert "project_db" in sources.warnings[0]
+    assert "call_name" in sources.warnings[0]
 
 
 def test_a_projection_row_without_an_enabled_flag_is_skipped() -> None:
@@ -885,9 +847,7 @@ def test_a_projection_row_without_an_enabled_flag_is_skipped() -> None:
         },
     )
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert [tool.name for tool in sources.tools] == ["search_projects"]
     assert len(sources.warnings) == 1
@@ -895,48 +855,100 @@ def test_a_projection_row_without_an_enabled_flag_is_skipped() -> None:
     assert "no enabled flag" in sources.warnings[0]
 
 
-def test_load_build_sources_skips_a_listed_tool_the_gateway_index_never_saw() -> None:
+def test_a_projection_row_without_a_stored_schema_is_skipped() -> None:
+    """No schema, no sample: the arguments must come from the real inputSchema."""
+    without_schema = {
+        key: value
+        for key, value in PROJECT_TOOL_INDEX[1].items()
+        if key != "input_schema"
+    }
     gateway = _FakeGateway(
         servers=[STREAMABLE_SERVER],
         tool_index={
             STREAMABLE_SERVER["id"]: [
-                row for row in PROJECT_TOOL_INDEX if row["name"] != "get_project"
+                without_schema if row["name"] == "get_project" else dict(row)
+                for row in PROJECT_TOOL_INDEX
             ]
         },
     )
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert [tool.name for tool in sources.tools] == ["search_projects"]
     assert len(sources.warnings) == 1
     assert "get_project" in sources.warnings[0]
-    assert "index" in sources.warnings[0]
+    assert "project_db" in sources.warnings[0]
+    assert "input_schema" in sources.warnings[0]
 
 
-def test_a_server_whose_tool_index_fails_costs_only_its_own_tools() -> None:
-    broken_url = "https://mcp.test/broken-index"
+@pytest.mark.parametrize("stored", [None, "not-a-schema", ["type", "object"], 7])
+def test_a_projection_row_whose_stored_schema_is_not_an_object_is_skipped(
+    stored: Any,
+) -> None:
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={STREAMABLE_SERVER["id"]: _projection_schema("get_project", stored)},
+    )
+
+    sources = load_build_sources(_session(gateway), environ={})
+
+    assert [tool.name for tool in sources.tools] == ["search_projects"]
+    assert len(sources.warnings) == 1
+    assert "get_project" in sources.warnings[0]
+    assert "input_schema" in sources.warnings[0]
+
+
+def test_the_sample_arguments_come_from_the_stored_schema_on_the_projection() -> None:
+    gateway = _FakeGateway()
+
+    sources = load_build_sources(_session(gateway), environ={})
+    drafts = build_account_items(_offline_session(), sources)
+    tool_drafts = {
+        draft.metadata["source_id"]: draft
+        for draft in drafts
+        if draft.metadata["source_kind"] == "tool"
+    }
+
+    search = tool_drafts["mcp__project_db__search_projects"]
+    assert search.expected_output["expected_calls"] == [
+        {
+            "tool": "mcp__project_db__search_projects",
+            # SEARCH_SCHEMA's two required properties: the enum's first value and a
+            # type placeholder, derived from the schema the Gateway returned.
+            "args": {"sector": "solar", "created_after": ""},
+            "check_keys": ["created_after", "sector"],
+        }
+    ]
+    project = tool_drafts["mcp__project_db__get_project"]
+    assert project.expected_output["expected_calls"] == [
+        {
+            "tool": "mcp__project_db__get_project",
+            "args": {"project_id": ""},
+            "check_keys": ["project_id"],
+        }
+    ]
+    # tool_schema_hash still hashes the canonical schema, so a schema edit is
+    # visible in the item while a description edit is not.
+    assert len(search.metadata["tool_schema_hash"]) == 16
+    assert search.metadata["tool_schema_hash"] != project.metadata["tool_schema_hash"]
+
+
+def test_a_server_whose_tool_projection_fails_costs_only_its_own_tools() -> None:
     gateway = _FakeGateway(
         servers=[
             STREAMABLE_SERVER,
-            dict(STREAMABLE_SERVER, id="srv-2", name="broken_db", url=broken_url),
+            dict(STREAMABLE_SERVER, id="srv-2", name="broken_db"),
         ],
         tool_index={STREAMABLE_SERVER["id"]: PROJECT_TOOL_INDEX, "srv-2": 503},
     )
-    healthy = _Mcp(PROJECT_TOOLS)
-    broken = _Mcp(PROJECT_TOOLS, url=broken_url)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return broken(request) if str(request.url) == broken_url else healthy(request)
-
-    sources = load_build_sources(
-        _session(gateway),
-        environ={},
-        mcp_client=McpClient(transport=httpx.MockTransport(handler)),
-    )
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
+    assert [request.url.path for request in gateway.tool_requests] == [
+        "/api/mcp-servers/srv-1/tools",
+        "/api/mcp-servers/srv-2/tools",
+    ]
     assert len(sources.warnings) == 1
     assert "broken_db" in sources.warnings[0]
     assert "HTTP 503" in sources.warnings[0]
@@ -947,9 +959,7 @@ def test_load_build_sources_skips_a_private_skill_that_is_switched_off() -> None
         servers=[STREAMABLE_SERVER], skills=[dict(PRIVATE_SKILL_ROW, enabled=False)]
     )
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert sources.skills == []
     assert len(sources.warnings) == 1
@@ -962,9 +972,7 @@ def test_load_build_sources_skips_a_private_skill_that_is_not_active() -> None:
         servers=[STREAMABLE_SERVER], skills=[dict(PRIVATE_SKILL_ROW, status="draft")]
     )
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert sources.skills == []
     assert len(sources.warnings) == 1
@@ -975,9 +983,7 @@ def test_load_build_sources_skips_a_private_skill_that_is_not_active() -> None:
 def test_an_all_effective_account_still_builds_every_source() -> None:
     gateway = _FakeGateway(servers=[STREAMABLE_SERVER])
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
     drafts = build_account_items(_offline_session(), sources)
 
     assert sources.warnings == ()
@@ -997,39 +1003,6 @@ def test_an_all_effective_account_still_builds_every_source() -> None:
     assert "skill: 2 drafts from 2 sources" in report.render()
 
 
-def test_a_failing_server_costs_only_its_own_tools() -> None:
-    broken_url = "https://mcp.test/broken"
-    gateway = _FakeGateway(
-        servers=[
-            STREAMABLE_SERVER,
-            dict(STREAMABLE_SERVER, id="srv-2", name="broken_db", url=broken_url),
-        ]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == broken_url:
-            return httpx.Response(503, text="upstream down")
-        body = json.loads(request.content)
-        if body["method"] == "initialize":
-            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {}})
-        if body["method"] == "notifications/initialized":
-            return httpx.Response(202)
-        return httpx.Response(
-            200, json={"jsonrpc": "2.0", "id": body["id"], "result": {"tools": PROJECT_TOOLS}}
-        )
-
-    sources = load_build_sources(
-        _session(gateway),
-        environ={},
-        mcp_client=McpClient(transport=httpx.MockTransport(handler)),
-    )
-
-    assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
-    assert len(sources.warnings) == 1
-    assert "broken_db" in sources.warnings[0]
-    assert "HTTP 503" in sources.warnings[0]
-
-
 def test_langfuse_failures_cost_only_the_traces() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="langfuse down")
@@ -1037,7 +1010,6 @@ def test_langfuse_failures_cost_only_the_traces() -> None:
     sources = load_build_sources(
         _session(_FakeGateway(servers=[STREAMABLE_SERVER])),
         environ=LANGFUSE_ENVIRON,
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         trace_transport=httpx.MockTransport(handler),
     )
 
@@ -1059,7 +1031,6 @@ def test_load_build_sources_skips_trace_paging_unless_included() -> None:
     sources = load_build_sources(
         _session(_FakeGateway(servers=[STREAMABLE_SERVER])),
         environ=LANGFUSE_ENVIRON,
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         trace_transport=httpx.MockTransport(handler),
         include_traces=False,
     )
@@ -1087,7 +1058,6 @@ def test_load_build_sources_reads_traces_when_included() -> None:
     sources = load_build_sources(
         _session(_FakeGateway(servers=[STREAMABLE_SERVER])),
         environ=LANGFUSE_ENVIRON,
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         trace_transport=httpx.MockTransport(handler),
         include_traces=True,
     )
@@ -1097,32 +1067,29 @@ def test_load_build_sources_reads_traces_when_included() -> None:
     assert [trace.trace_id for trace in sources.traces] == ["trace-1"]
     assert "trace" in {draft.metadata["source_kind"] for draft in drafts}
 
-def test_load_build_sources_takes_mcp_auth_and_a_url_override_from_the_secret_map() -> None:
-    secret_value = "fixture-header-value"
-    override_url = "https://mcp.test/projects?token=query-secret"
-    gateway = _FakeGateway(servers=[dict(STREAMABLE_SERVER, url="")])
-    mcp = _Mcp(PROJECT_TOOLS, url=override_url)
-    environ = {
-        "MCP_SERVER_HEADERS": json.dumps(
-            {"project_db": {"X-Api-Key": secret_value, "url": override_url}}
-        )
-    }
+def test_a_build_needs_no_per_server_credentials() -> None:
+    """The Gateway holds the server credentials; the build holds none.
 
-    sources = load_build_sources(_session(gateway), environ=environ, mcp_client=mcp.client)
+    A stale MCP_SERVER_HEADERS in the environment must change nothing: no header
+    from it may travel on a Gateway request, and tools still arrive from the
+    stored projection.
+    """
+    stale = "fixture-header-value"
+    gateway = _FakeGateway()
+    environ = {"MCP_SERVER_HEADERS": json.dumps({"project_db": {"X-Api-Key": stale}})}
+
+    sources = load_build_sources(_session(gateway), environ=environ)
 
     assert [tool.name for tool in sources.tools] == ["search_projects", "get_project"]
-    assert all(request.headers["x-api-key"] == secret_value for request in mcp.requests)
-    assert secret_value not in " ".join(sources.warnings)
-    assert "query-secret" not in " ".join(sources.warnings)
+    assert all("x-api-key" not in request.headers for request in gateway.requests)
+    assert stale not in " ".join(gateway.requests[0].headers.values())
+    assert stale not in " ".join(sources.warnings)
 
 
 def test_load_build_sources_caps_each_kind_at_the_limit() -> None:
     gateway = _FakeGateway()
-    mcp = _Mcp(PROJECT_TOOLS)
 
-    sources = load_build_sources(
-        _session(gateway), limit=1, environ={}, mcp_client=mcp.client
-    )
+    sources = load_build_sources(_session(gateway), limit=1, environ={})
 
     assert [tool.name for tool in sources.tools] == ["search_projects"]
     assert [skill.name for skill in sources.skills] == ["daily-finance-brief"]
@@ -1137,11 +1104,18 @@ def test_load_build_sources_caps_each_kind_at_the_limit() -> None:
 
 
 def test_the_report_shows_true_source_counts_when_the_limit_caps_the_build() -> None:
-    gateway = _FakeGateway(servers=[STREAMABLE_SERVER])
+    gateway = _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        tool_index={
+            STREAMABLE_SERVER["id"]: [
+                *PROJECT_TOOL_INDEX,
+                _tool_row("list_sectors", "mcp__project_db__list_sectors"),
+            ]
+        },
+    )
     session = _session(gateway)
-    tools = [*PROJECT_TOOLS, {"name": "list_sectors", "description": "", "inputSchema": {}}]
 
-    sources = load_build_sources(session, limit=1, environ={}, mcp_client=_Mcp(tools).client)
+    sources = load_build_sources(session, limit=1, environ={})
     drafts = build_account_items(session, sources, limit=1)
     report = build_report("myflow-eval", sources, drafts, limit=1, dry_run=True)
 
@@ -1154,9 +1128,7 @@ def test_the_report_shows_true_source_counts_when_the_limit_caps_the_build() -> 
 def test_load_build_sources_warns_about_documents_without_a_readable_chunk() -> None:
     gateway = _FakeGateway(servers=[STREAMABLE_SERVER], chunks={})
 
-    sources = load_build_sources(
-        _session(gateway), environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(_session(gateway), environ={})
 
     assert sources.knowledge == []
     assert len(sources.warnings) == 2
@@ -1167,9 +1139,7 @@ def test_a_full_build_turns_the_fetched_sources_into_drafts() -> None:
     gateway = _FakeGateway(servers=[STREAMABLE_SERVER])
     session = _session(gateway)
 
-    sources = load_build_sources(
-        session, environ={}, mcp_client=_Mcp(PROJECT_TOOLS).client
-    )
+    sources = load_build_sources(session, environ={})
     drafts = build_account_items(session, sources, limit=1)
     report = build_report("myflow-eval", sources, drafts, limit=1, dry_run=True)
 
@@ -1194,7 +1164,6 @@ def test_a_large_document_requests_three_seeded_samples_and_keeps_the_longest() 
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(7),
     )
 
@@ -1219,7 +1188,6 @@ def test_a_sampled_blank_chunk_is_never_chosen_even_when_it_is_the_longest() -> 
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(0),
     )
 
@@ -1236,7 +1204,6 @@ def test_a_two_chunk_document_fetches_both_in_one_request_and_keeps_the_longest(
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(0),
     )
 
@@ -1257,7 +1224,6 @@ def test_equal_length_sampled_chunks_tie_break_on_the_smallest_chunk_index() -> 
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(0),
     )
 
@@ -1271,7 +1237,6 @@ def test_a_document_whose_sampled_chunks_are_all_blank_is_skipped_once() -> None
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(0),
     )
 
@@ -1294,7 +1259,6 @@ def test_the_same_seed_reproduces_the_reference_answer_and_the_item_id() -> None
         sources = load_build_sources(
             _session(gateway),
             environ={},
-            mcp_client=_Mcp(PROJECT_TOOLS).client,
             rng=random.Random(11),
         )
         drafts = build_account_items(
@@ -1321,7 +1285,6 @@ def test_a_failing_chunk_page_skips_only_its_own_document() -> None:
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(7),
     )
 
@@ -1340,7 +1303,6 @@ def test_a_malformed_chunk_count_is_reported_distinctly() -> None:
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(0),
     )
 
@@ -1359,7 +1321,6 @@ def test_a_space_padded_chunk_loses_to_a_shorter_dense_one() -> None:
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(0),
     )
 
@@ -1374,7 +1335,6 @@ def test_an_unindexed_chunk_can_be_chosen_but_loses_a_tie() -> None:
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(0),
     )
 
@@ -1387,7 +1347,6 @@ def test_an_unindexed_chunk_can_be_chosen_but_loses_a_tie() -> None:
     tied = load_build_sources(
         _session(tie_gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(0),
     )
 
@@ -1409,7 +1368,6 @@ def test_different_seeds_keep_the_item_id_but_may_change_the_reference_answer() 
         sources = load_build_sources(
             _session(gateway),
             environ={},
-            mcp_client=_Mcp(PROJECT_TOOLS).client,
             rng=random.Random(seed),
         )
         drafts = build_account_items(
@@ -1432,7 +1390,6 @@ def test_a_large_document_never_issues_more_than_four_chunk_requests() -> None:
     sources = load_build_sources(
         _session(gateway),
         environ={},
-        mcp_client=_Mcp(PROJECT_TOOLS).client,
         rng=random.Random(7),
     )
 
