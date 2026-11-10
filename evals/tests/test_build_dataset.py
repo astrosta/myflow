@@ -405,12 +405,16 @@ class _FakeGateway:
         documents: dict[str, list[dict[str, Any]]] | None = None,
         chunks: dict[str, list[dict[str, Any]]] | None = None,
         tool_index: dict[str, list[dict[str, Any]] | int] | None = None,
+        chunk_failures: dict[str, set[int]] | None = None,
+        chunk_counts: dict[str, int | None] | None = None,
     ) -> None:
         self.servers = [STREAMABLE_SERVER, SSE_SERVER] if servers is None else servers
         self.skills = SKILLS if skills is None else skills
         self.bases = BASES if bases is None else bases
         self.documents = DOCUMENTS if documents is None else documents
         self.chunks = CHUNKS if chunks is None else chunks
+        self.chunk_failures = chunk_failures or {}
+        self.chunk_counts = chunk_counts or {}
         self.tool_index = (
             {STREAMABLE_SERVER["id"]: PROJECT_TOOL_INDEX}
             if tool_index is None
@@ -442,6 +446,8 @@ class _FakeGateway:
             rows = self.chunks.get(document_id, [])
             offset = int(request.url.params.get("offset", "0"))
             limit = int(request.url.params.get("limit", str(len(rows) or 1)))
+            if offset in self.chunk_failures.get(document_id, set()):
+                return httpx.Response(503, json={"detail": "chunk page unavailable"})
             page = rows[offset : offset + limit]
             next_offset = offset + len(page)
             return httpx.Response(
@@ -449,7 +455,7 @@ class _FakeGateway:
                 json={
                     "document_id": document_id,
                     "chunks": page,
-                    "count": len(rows),
+                    "count": self.chunk_counts.get(document_id, len(rows)),
                     "next_offset": next_offset if next_offset < len(rows) else None,
                 },
             )
@@ -545,11 +551,8 @@ def _chunk(document_id: str, index: int, content: str) -> dict[str, Any]:
     }
 
 
-def _knowledge_gateway(
-    contents: list[str], *, document_id: str = "doc-1"
-) -> _FakeGateway:
-    """A Gateway serving one knowledge document with the given chunk contents."""
-    document = {
+def _knowledge_document(document_id: str, contents: list[str]) -> dict[str, Any]:
+    return {
         "id": document_id,
         "knowledge_base_id": "kb-1",
         "filename": "policy.md",
@@ -559,11 +562,47 @@ def _knowledge_gateway(
         "chunk_count": len(contents),
         "error_message": None,
     }
-    chunks = [_chunk(document_id, index, content) for index, content in enumerate(contents)]
+
+
+def _documents_gateway(
+    contents_by_document: dict[str, list[str]],
+    *,
+    chunk_failures: dict[str, set[int]] | None = None,
+    chunk_counts: dict[str, int | None] | None = None,
+) -> _FakeGateway:
+    """A Gateway serving knowledge documents with the given chunk contents."""
     return _FakeGateway(
         servers=[STREAMABLE_SERVER],
-        documents={"kb-1": [document]},
-        chunks={document_id: chunks},
+        documents={
+            "kb-1": [
+                _knowledge_document(document_id, contents)
+                for document_id, contents in contents_by_document.items()
+            ]
+        },
+        chunks={
+            document_id: [
+                _chunk(document_id, index, content)
+                for index, content in enumerate(contents)
+            ]
+            for document_id, contents in contents_by_document.items()
+        },
+        chunk_failures=chunk_failures,
+        chunk_counts=chunk_counts,
+    )
+
+
+def _knowledge_gateway(
+    contents: list[str],
+    *,
+    document_id: str = "doc-1",
+    chunk_failures: dict[str, set[int]] | None = None,
+    chunk_counts: dict[str, int | None] | None = None,
+) -> _FakeGateway:
+    """A Gateway serving one knowledge document with the given chunk contents."""
+    return _documents_gateway(
+        {document_id: contents},
+        chunk_failures=chunk_failures,
+        chunk_counts=chunk_counts,
     )
 
 
@@ -1271,6 +1310,120 @@ def test_the_same_seed_reproduces_the_reference_answer_and_the_item_id() -> None
     assert first.expected_output["reference_answer"] == second.expected_output["reference_answer"]
     assert first.id == second.id == stable_item_id("knowledge", "doc-1", 0, HASHED_USER_ID)
     assert first.metadata["chunk_id"] == second.metadata["chunk_id"] == "doc-1:3"
+
+
+def test_a_failing_chunk_page_skips_only_its_own_document() -> None:
+    gateway = _documents_gateway(
+        {"doc-1": ["zero", "one", "two", "three", "four"], "doc-2": ["Only answer."]},
+        chunk_failures={"doc-1": {2}},
+    )
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(7),
+    )
+
+    assert [document.document_id for document in sources.knowledge] == ["doc-2"]
+    assert len(sources.warnings) == 1
+    warning = sources.warnings[0]
+    assert "doc-1" in warning and "kb-1" in warning
+    assert "chunk page could not be read" in warning
+    assert "HTTP 503" in warning
+    assert "no readable chunk" not in warning
+
+
+def test_a_malformed_chunk_count_is_reported_distinctly() -> None:
+    gateway = _knowledge_gateway(["An otherwise readable chunk."], chunk_counts={"doc-1": None})
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(0),
+    )
+
+    assert sources.knowledge == []
+    assert len(sources.warnings) == 1
+    warning = sources.warnings[0]
+    assert "doc-1" in warning and "kb-1" in warning
+    assert "chunk count is missing or malformed" in warning
+    assert "no readable chunk" not in warning
+
+
+def test_a_space_padded_chunk_loses_to_a_shorter_dense_one() -> None:
+    contents = [" " * 200 + "tiny", "A dense answer."]
+    gateway = _knowledge_gateway(contents)
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(0),
+    )
+
+    assert len(sources.knowledge) == 1
+    assert sources.knowledge[0].chunk_content == contents[1]
+
+
+def test_an_unindexed_chunk_can_be_chosen_but_loses_a_tie() -> None:
+    gateway = _knowledge_gateway(["An unindexed answer that is longer.", "Indexed short."])
+    gateway.chunks["doc-1"][0].pop("chunk_index")
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(0),
+    )
+
+    assert len(sources.knowledge) == 1
+    assert sources.knowledge[0].chunk_id == "doc-1:0"
+
+    tie_gateway = _knowledge_gateway(["Equal content", "Equal content"])
+    tie_gateway.chunks["doc-1"][0].pop("chunk_index")
+
+    tied = load_build_sources(
+        _session(tie_gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(0),
+    )
+
+    assert len(tied.knowledge) == 1
+    assert tied.knowledge[0].chunk_id == "doc-1:1"
+
+
+def test_different_seeds_keep_the_item_id_but_may_change_the_reference_answer() -> None:
+    contents = [
+        "zero",
+        "one",
+        "seed seven samples index two, the longest of its draw",
+        "three",
+        "seed eleven samples index four, the longest of its draw",
+    ]
+
+    def build_with(seed: int) -> DatasetItemDraft:
+        gateway = _knowledge_gateway(contents)
+        sources = load_build_sources(
+            _session(gateway),
+            environ={},
+            mcp_client=_Mcp(PROJECT_TOOLS).client,
+            rng=random.Random(seed),
+        )
+        drafts = build_account_items(
+            _offline_session(), _sources(knowledge=sources.knowledge)
+        )
+        assert len(drafts) == 1
+        return drafts[0]
+
+    first = build_with(7)
+    second = build_with(11)
+
+    assert first.id == second.id == stable_item_id("knowledge", "doc-1", 0, HASHED_USER_ID)
+    assert first.metadata["chunk_id"] != second.metadata["chunk_id"]
+    assert first.expected_output["reference_answer"] != second.expected_output["reference_answer"]
 
 
 def test_a_large_document_never_issues_more_than_four_chunk_requests() -> None:

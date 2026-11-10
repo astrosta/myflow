@@ -196,7 +196,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "build",
         parents=[shared],
         help="build dataset drafts from the fixed accounts",
-        description="Read each fixed account data and upsert deterministic drafts.",
+        description=(
+            "Read each account's data and upsert drafts with deterministic item "
+            "ids; --seed makes the chunk draw reproducible."
+        ),
     )
     build.add_argument(
         "--include-traces",

@@ -54,6 +54,8 @@ _KIND_ORDER = (_KIND_TOOL, _KIND_SKILL, _KIND_KNOWLEDGE, _KIND_TRACE)
 _STREAMABLE_TRANSPORT = "streamable_http"
 #: Sample this many chunks and keep the longest readable one, not chunk index 0.
 _CHUNK_SAMPLE_SIZE = 3
+#: A chunk without a usable index still competes, but loses every tie.
+_UNINDEXED_CHUNK_INDEX = float("inf")
 _PRIVATE_SCOPE = "private"
 _BUILTIN_SCOPE = "builtin"
 #: The only MCP status the Agent can route to; pending/error/disabled are not.
@@ -668,10 +670,9 @@ def _account_knowledge(
     *,
     limit: int | None,
     warnings: list[str],
-    rng: random.Random | None = None,
+    rng: random.Random,
 ) -> tuple[list[KnowledgeSource], int]:
     """Return the sampled documents and how many documents the account really has."""
-    rng = random.Random() if rng is None else rng
     documents = _knowledge_documents(session)
     sources: list[KnowledgeSource] = []
     for base_id, document in documents:
@@ -710,14 +711,33 @@ def _knowledge_source(
     document: object,
     warnings: list[str],
     *,
-    rng: random.Random | None = None,
+    rng: random.Random,
 ) -> KnowledgeSource | None:
     if not isinstance(document, Mapping):
         return None
     document_id = _text(document.get("id"))
     if document_id is None:
         return None
-    chunk = _sampled_chunk(session, base_id, document_id, rng=rng)
+    try:
+        chunk = _sampled_chunk(session, base_id, document_id, rng=rng)
+    except _MalformedChunkCount:
+        warnings.append(
+            f"skipped knowledge document {document_id!r} of base {base_id!r}: "
+            "its chunk count is missing or malformed"
+        )
+        return None
+    except httpx.HTTPStatusError as exc:
+        warnings.append(
+            f"skipped knowledge document {document_id!r} of base {base_id!r}: "
+            f"its chunk page could not be read (HTTP {exc.response.status_code})"
+        )
+        return None
+    except (RuntimeError, httpx.HTTPError) as exc:
+        warnings.append(
+            f"skipped knowledge document {document_id!r} of base {base_id!r}: "
+            f"its chunk page could not be read ({exc})"
+        )
+        return None
     if chunk is None:
         warnings.append(
             f"skipped knowledge document {document_id!r} of base {base_id!r}: "
@@ -736,12 +756,16 @@ def _knowledge_source(
     )
 
 
+class _MalformedChunkCount(Exception):
+    """The chunk endpoint did not report a usable total chunk count."""
+
+
 def _sampled_chunk(
     session: AccountSession,
     base_id: str,
     document_id: str,
     *,
-    rng: random.Random | None = None,
+    rng: random.Random,
 ) -> tuple[str, str] | None:
     """Return the longest readable chunk of a seeded three-chunk sample.
 
@@ -749,15 +773,15 @@ def _sampled_chunk(
     full page; a larger document gets three distinct random offsets, sorted so a
     seeded run issues the same requests. Counting costs one request and sampling
     at most three, so no document ever needs more than four chunk requests.
-    Blank chunks are never candidates, even when their whitespace makes them the
-    longest strings.
+    Blank chunks are never candidates, and only a stripped content length ranks
+    them. A missing or malformed count raises _MalformedChunkCount so the caller
+    can report the contract drift instead of calling it unreadable content.
     """
-    rng = random.Random() if rng is None else rng
     path = f"/knowledge/bases/{base_id}/documents/{document_id}/chunks"
     probe = _get_object(session, path, params={"offset": 0, "limit": 1})
     count = probe.get("count")
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-        return None
+        raise _MalformedChunkCount
     if count == 1:
         chunks = probe.get("chunks")
     elif count <= _CHUNK_SAMPLE_SIZE:
@@ -780,20 +804,22 @@ def _sampled_chunk(
     if not readable:
         return None
     _, chunk_id, content = min(
-        readable, key=lambda candidate: (-len(candidate[2]), candidate[0])
+        readable, key=lambda candidate: (-len(candidate[2].strip()), candidate[0])
     )
     return chunk_id, content
 
 
-def _readable_chunk(chunk: object) -> tuple[int, str, str] | None:
+def _readable_chunk(chunk: object) -> tuple[int | float, str, str] | None:
     """Return (chunk_index, chunk_id, content) for a non-blank Gateway chunk."""
     if not isinstance(chunk, Mapping):
         return None
     chunk_id = _text(chunk.get("chunk_id"))
     chunk_index = chunk.get("chunk_index")
     content = chunk.get("content")
-    if chunk_id is None or isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+    if chunk_id is None:
         return None
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+        chunk_index = _UNINDEXED_CHUNK_INDEX
     if not isinstance(content, str) or not content.strip():
         return None
     return chunk_index, chunk_id, content

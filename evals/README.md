@@ -157,15 +157,19 @@ one draft per source and, unless `--dry-run` is given, upserts every draft into
 the dataset through Langfuse.
 
 For each knowledge document the builder first reads the total chunk count, then
-samples three distinct chunks at random and uses the **longest non-blank** one as
-the draft's `reference_answer`; a document with three or fewer chunks is read
-whole instead. This avoids the table of contents, cover page, or blank fragment
-that chunk index 0 often is. A document whose sample has no non-blank content is
-skipped with a `no readable chunk` warning. Sampling needs one request for a
-single-chunk document, two for two or three chunks, and four for a larger one
-(one count probe plus three samples), so it never exceeds four chunk requests per
-document. `--seed N` makes the draw reproducible across builds; item ids still
-derive from the document id and never change with the draw.
+samples three distinct chunks at random and uses the one with the **longest
+trimmed content** as the draft's `reference_answer`; a document with three or
+fewer chunks is read whole instead. This avoids the table of contents, cover
+page, or blank fragment that chunk index 0 often is. Whitespace-padded chunks do
+not win on padding, and a chunk without a `chunk_index` still competes but loses
+a length tie. A document whose sample has no non-blank content is skipped with a
+`no readable chunk` warning. Sampling needs one request for a single-chunk
+document, two for two or three chunks, and four for a larger one (one count probe
+plus three samples), so it never exceeds four chunk requests per document. A
+chunk page that cannot be read, or a missing/malformed chunk count, skips only
+that document with its own warning instead of failing the build. `--seed N`
+makes the draw reproducible across builds; item ids still derive from the
+document id and never change with the draw.
 
 A trace replay declares no expectations (`expected_output` is `{}`), so no metric
 can score it and any `run` over it fails on an `unscored` item. `build` therefore
@@ -435,7 +439,8 @@ Only `streamable_http` MCP servers are supported. Every effectiveness skip and
 every unusable local source -- a non-effective server, an `sse` server, a server
 without a usable url, a server whose `tools/list` or `/tools` call fails, a tool
 the projection does not list or does not mark `callable`/`enabled`, a
-non-effective Skill, a document without a readable chunk, an unavailable
+non-effective Skill, a document without a readable chunk or with an unreadable
+chunk page or malformed chunk count, an unavailable
 Langfuse -- is reported as a warning on `BuildSources.warnings` and therefore in
 the build report, and a broken source costs exactly its own items instead of
 failing the build. Rows dropped for a different reason are silent by design: a

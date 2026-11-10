@@ -459,6 +459,16 @@ def test_build_dry_run_reports_counts_and_writes_nothing(capsys: pytest.CaptureF
     assert langfuse.created_items == []
 
 
+def test_build_help_names_deterministic_ids_and_the_reproducible_draw(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["build", "--help"]) == 0
+
+    output = " ".join(_capture(capsys).split())
+    assert "deterministic item ids" in output
+    assert "--seed makes the chunk draw reproducible" in output
+
+
 def test_build_passes_a_seeded_random_to_the_source_loader(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
