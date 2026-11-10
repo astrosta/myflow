@@ -9,6 +9,10 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+# The DeepEval metric engine; the package still runs rule-only without it.
+llm = ["deepeval>=4.3,<5"]
+
 [project.scripts]
 myflow-evals = "myflow_evals.cli:main"
 
