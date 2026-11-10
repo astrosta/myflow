@@ -148,7 +148,7 @@ uv run --project evals myflow-evals ingest \
   --limit 50
 ```
 
-`ingest` 登录固定账户，按哈希用户 ID 读取每个账户失败或低分的 Langfuse 追踪，并为每个候选项打印一行：`<category>: <trace id> -> <question preview>`。默认不写入任何内容；传入 `--write` 才把候选项作为 `category=trace_replay`、`expected_output={}`、`review_status=pending` 的条目 upsert 到 `--dataset`。`--dry-run` 与 `--write` 同时出现时仍不写，只打印。追踪回放没有期望，所以只应放进探索集，不要放进回归运行。
+`ingest` 登录固定账户，按哈希用户 ID 读取每个账户失败或低分的 Langfuse 追踪，并为每个候选项打印一行：`<category>: <trace id> -> <question preview>`。默认不写入任何内容；传入 `--write` 才把候选项作为 `category=trace_replay`、`expected_output={}`、`review_status=pending` 的条目 upsert 到 `--dataset`。`--dry-run` 与 `--write` 同时出现时仍不写，只打印。追踪回放没有期望，所以只应放进探索集，不要放进回归运行。`ingest --write` 写入的是原始 query；需要中文 query 时用 `build --llm-synthesis` 重建。
 
 ## 评测环境前置条件
 
@@ -308,7 +308,7 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
 
 ```json
 // 工具：single_tool / similar_tools / multi_tool / missing_params
-{"id": "tool-<16 hex>", "input": {"query": "Please use the <tool> tool to <description>."},
+{"id": "tool-<16 hex>", "input": {"query": "请使用 <tool> 工具完成：<description>。"},
  "expected_output": {"expected_tools": ["mcp__<server>__<tool>"],
    "expected_calls": [{"tool": "mcp__<server>__<tool>", "args": {}, "check_keys": []}],
    "forbidden_tools": [], "expect_kb": false, "expect_skill": false, "judge_rule": "..."},
@@ -317,14 +317,14 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
    "tool_schema_hash": "<16 hex>"}}
 
 // 工具：缺参数，期望追问而不是猜参数
-{"input": {"query": "Please use <tool> to <description>, but I have not provided the required details yet."},
+{"input": {"query": "请使用 <tool> 完成：<description>；不过我还没有提供必需的信息。"},
  "expected_output": {"expected_tools": [], "expected_calls": [], "forbidden_tools": [],
    "expect_clarification": true, "expect_kb": false, "expect_skill": false, "judge_rule": "..."},
  "metadata": {"user_id": "<hashed>", "source_id": "mcp__<server>__<tool>", "source_kind": "tool",
    "category": "missing_params", "source": "synthetic_from_tools"}}
 
 // 私有 Skill：skill_single / similar_skills / skill_with_tools
-{"input": {"query": "Use the <skill> skill to <description>."},
+{"input": {"query": "请使用 <skill> 技能完成：<description>。"},
  "expected_output": {"expect_skill": true, "expected_skills": ["<skill>"],
    "skill_rules": ["<从描述提炼的可检查规则>"], "skill_rules_source": "description",
    "expect_kb": false, "expected_tools": []},
@@ -332,7 +332,7 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
    "category": "skill_single", "source": "synthetic_from_skill", "skill_commit": "<sha or null>"}}
 
 // 知识库：kb_single_hop / kb_multi_hop / kb_unanswerable
-{"input": {"query": "According to <filename>, what are the key points?"},
+{"input": {"query": "根据《<filename>》，要点是什么？"},
  "expected_output": {"expect_kb": true, "expected_doc_ids": ["<document_id>"],
    "reference_answer": "<主分块正文>", "key_points": ["<主分块正文>"],
    "expect_refusal": false, "expected_tools": []},
@@ -341,21 +341,21 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
    "chunk_id": "<document_id>:<chunk_index>", "knowledge_base_id": "...", "kb_version": "..."}}
 
 // 知识库：无答案，期望明确说明没有相关信息
-{"input": {"query": "What is the 2099 refund policy for the Mars office?"},
+{"input": {"query": "火星办公室 2099 年的退款政策是什么？"},
  "expected_output": {"expect_kb": true, "expected_doc_ids": [],
    "reference_answer": "知识库中没有相关信息", "expect_refusal": true},
  "metadata": {"user_id": "<hashed>", "source_id": "kb_unanswerable", "source_kind": "knowledge",
    "category": "kb_unanswerable", "source": "synthetic_from_docs"}}
 
 // 边界与安全：no_tool / injection
-{"input": {"query": "What is the capital of France?"},
+{"input": {"query": "法国的首都是哪里？"},
  "expected_output": {"no_tool_ok": true, "expect_kb": false, "expect_skill": false,
    "expected_calls": [], "judge_rule": "..."},
  "metadata": {"user_id": "<hashed>", "source_kind": "tool", "category": "no_tool",
    "source": "synthetic_boundary"}}
 
 // 回放的在线追踪
-{"input": {"query": "<the trace's question>"}, "expected_output": {},
+{"input": {"query": "<追踪问题（LLM 增强构建会翻译为中文）>"}, "expected_output": {},
  "metadata": {"user_id": "<hashed>", "source_id": "<trace id>", "source_kind": "trace",
    "source": "online_trace", "trace_id": "<trace id>", "category": "trace_replay",
    "review_status": "pending"}}
@@ -367,12 +367,13 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
 - 知识条目在元数据中携带 `document_id`/`chunk_id` 来源信息，但只输出 `expected_doc_ids`——chunk ID 是检索器实现细节。`kb_version` 为 `<base_id>:<chunk_count>`，因为知识 API 不暴露版本字符串；当文档重新分块时它仍会变化。
 - 追踪草稿完全没有期望，因此评测器会将其报告为不适用（`None`），而不是评分——这也意味着它对完整性门禁是 `unscored`，所以请将回放排除在回归运行之外。
 - `metadata.user_id` 始终是 Langfuse 哈希用户 ID（`HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`）。原始 `/me.id`、用户名和密码绝不会进入草稿、日志或报告。
+- 所有合成 query 的模板和固定问题使用简体中文；工具名、Skill 名、文档标题/文件名、ID 等专有标识保留原样。LLM 增强构建会把源描述和 `trace_replay` 也翻译成中文；纯确定性路径只保证模板中文，源描述/追踪原文可能保留原语言。语言变化会改变 query/fingerprint，已有数据集请用新名称重建。
 
 ### 确定性扩展与可选 LLM 改写
 
 默认构建全程确定性：没有 LLM 调用、没有时钟、没有随机数，因此对相同账户数据（相同 `--seed`）可逐字节复现，也不产生模型费用。扩展路径产生的类别有 `single_tool`、`missing_params`、`similar_tools`、`multi_tool`、`injection`、`skill_single`、`similar_skills`、`skill_with_tools`、`kb_single_hop`、`kb_multi_hop`、`kb_unanswerable`、`no_tool`，以及 `--include-traces` 时的 `trace_replay`。设计表中的 `kb_conflict` 和 `hybrid` 仍需要 LLM 合成或人工审核，确定性路径不会生成它们。
 
-`--llm-synthesis` 是可选的增强：它用评判模型把确定性问法改写成更自然的用户请求，并从私有 Skill 的描述提炼 `skill_rules`（Gateway 只暴露 Skill 元数据，不暴露 SKILL.md 正文）。任何失败（超时、非 JSON、数量不符）都会原样保留确定性问法/规则并记录一条不含 prompt 内容的警告，绝不会中止构建。改写结果仍要经过同一套去重和质检。该模式会为每条草稿调用一次评判模型，成本随数据集大小增长；先用 `--limit` 小规模试跑。为避免把超长工具/Skill 描述及其中的操作规则带进问题，查询模板和改写上下文只使用描述的前两句（最多 320 字符）；相似度配对和 Skill 规则提炼仍读取完整描述。
+`--llm-synthesis` 是可选的增强：它用评判模型把确定性问法改写成更自然的中文用户请求，并从私有 Skill 的描述提炼 `skill_rules`（Gateway 只暴露 Skill 元数据，不暴露 SKILL.md 正文）。任何失败（超时、非 JSON、数量不符）都会原样保留确定性问法/规则并记录一条不含 prompt 内容的警告，绝不会中止构建。改写结果仍要经过同一套去重和质检；所有 query 必须为简体中文，非中文输出会被拒绝并回退，工具名/Skill 名/文档标题/ID 等专有标识保留原样。该模式会为每条草稿（含 `trace_replay`）调用一次改写，并给每个 Skill 草稿再加一次规则提炼，成本随数据集大小增长；先用 `--limit` 小规模试跑。为避免把超长工具/Skill 描述及其中的操作规则带进问题，查询模板和改写上下文只使用描述的前两句（最多 320 字符）；相似度配对和 Skill 规则提炼仍读取完整描述。
 
 ### 限制、报告与试运行
 

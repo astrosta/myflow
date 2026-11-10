@@ -1476,7 +1476,7 @@ def test_build_account_items_emits_one_tool_draft_per_real_tool() -> None:
     assert first.id == stable_item_id(
         "tool", "mcp__project_db__search_projects", 0, HASHED_USER_ID
     )
-    assert first.input["query"] == "Use the search_projects tool: Search the project database."
+    assert first.input["query"] == "请使用 search_projects 工具：Search the project database。"
     assert first.expected_output["expected_tools"] == ["mcp__project_db__search_projects"]
     assert first.expected_output["expected_calls"] == [
         {
@@ -1517,7 +1517,7 @@ def test_build_account_items_emits_skill_drafts_from_private_skill_metadata() ->
     draft = drafts[0]
     assert draft.id == stable_item_id("skill", "skill-private-1", 0, HASHED_USER_ID)
     assert draft.input["query"] == (
-        "Use the daily-finance-brief skill: Turn a story into a numbered daily brief."
+        "请使用 daily-finance-brief 技能：Turn a story into a numbered daily brief。"
     )
     assert draft.expected_output == {
         "expect_skill": True,
@@ -1541,7 +1541,7 @@ def test_knowledge_drafts_keep_provenance_but_emit_expected_doc_ids_only() -> No
 
     draft = drafts[0]
     assert draft.id == stable_item_id("knowledge", "doc-1", 0, HASHED_USER_ID)
-    assert draft.input["query"] == "According to policy.md, what are the key points?"
+    assert draft.input["query"] == "根据《policy.md》，要点是什么？"
     assert draft.expected_output["expect_kb"] is True
     assert draft.expected_output["expected_doc_ids"] == ["doc-1"]
     assert draft.expected_output["reference_answer"] == "Refunds take five business days."

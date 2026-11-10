@@ -512,7 +512,7 @@ def test_build_writes_every_draft_through_the_langfuse_writer(
         f"{dataset_item_prefix(DATASET)}-"
         + stable_item_id("tool", "mcp__db__search", 0, HASHED_USER_ID)
     )
-    assert created["input"]["query"].startswith("Use the search tool")
+    assert created["input"]["query"].startswith("请使用 search 工具")
     assert created["metadata"]["user_id"] == HASHED_USER_ID
     assert f"written: 1 item(s) to {DATASET}" in output
     assert PASSWORD not in output

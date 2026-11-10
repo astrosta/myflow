@@ -478,6 +478,21 @@ def test_trace_sources_become_unscored_trace_replay_drafts() -> None:
     assert trace[0].metadata["review_status"] == "pending"
 
 
+def test_all_synthetic_queries_are_chinese() -> None:
+    result = synthesize_account_items(
+        _session(),
+        _sources(
+            tools=[SEARCH, CREATE, DELETE, FIND, UPDATE, LIST],
+            skills=[SKILL_WITH_TOOL, SKILL_SIMILAR, SKILL_OTHER],
+            knowledge=[POLICY, SLA],
+        ),
+    )
+
+    queries = [draft.input["query"] for draft in result.drafts]
+    assert queries
+    assert all(re.search(r"[\u4e00-\u9fff]", query) for query in queries)
+
+
 def test_generation_is_deterministic_and_ids_are_unique() -> None:
     sources = _sources(
         tools=[SEARCH, CREATE, DELETE, FIND, UPDATE, LIST],
@@ -927,14 +942,14 @@ def test_no_writer_never_constructs_a_judge_client(monkeypatch: pytest.MonkeyPat
 
 
 def test_openai_writer_parses_fenced_json_and_preserves_count() -> None:
-    judge = _FakeJudge('```json\n{"queries": ["Rewrite one", "Rewrite two"]}\n```')
+    judge = _FakeJudge('```json\n{"queries": ["改写一", "改写二"]}\n```')
     writer = OpenAIQuestionWriter(judge)
 
     rewritten = writer.rewrite(
-        kind="single_tool", queries=["one", "two"], context="source"
+        kind="single_tool", queries=["一", "二"], context="source"
     )
 
-    assert rewritten == ["Rewrite one", "Rewrite two"]
+    assert rewritten == ["改写一", "改写二"]
     assert len(judge.calls) == 1
     system, prompt = judge.calls[0]
     assert "JSON" in system
@@ -966,19 +981,20 @@ def test_long_descriptions_are_bounded_for_queries_and_writer_context() -> None:
 
 
 def test_openai_writer_rewrite_prompt_encodes_evaluation_constraints() -> None:
-    judge = _FakeJudge('{"queries": ["rewritten"]}')
+    judge = _FakeJudge('{"queries": ["改写后的问题"]}')
     writer = OpenAIQuestionWriter(judge)
 
     writer.rewrite(
         kind="missing_params",
-        queries=["Please use search without the required sector."],
+        queries=["请使用 search，但我没有提供必需的参数。"],
         context="Tool search: Search projects.",
     )
 
     system, prompt = judge.calls[0]
     payload = json.loads(prompt)
     assert "untrusted data" in system.lower()
-    assert "same language" in system.lower()
+    assert "simplified chinese" in system.lower()
+    assert payload["output_language"] == "zh-CN"
     assert "do not answer" in system.lower()
     assert "do not copy" in system.lower()
     assert "no longer than the original" in system.lower()
@@ -990,7 +1006,7 @@ def test_openai_writer_rewrite_prompt_encodes_evaluation_constraints() -> None:
 
 
 def test_openai_writer_single_tool_prompt_condenses_verbose_context() -> None:
-    judge = _FakeJudge('{"queries": ["rewritten"]}')
+    judge = _FakeJudge('{"queries": ["改写后的问题"]}')
     writer = OpenAIQuestionWriter(judge)
 
     writer.rewrite(
@@ -1011,7 +1027,7 @@ def test_openai_writer_single_tool_prompt_condenses_verbose_context() -> None:
 
 
 def test_openai_writer_injection_prompt_preserves_adversarial_text() -> None:
-    judge = _FakeJudge('{"queries": ["rewritten"]}')
+    judge = _FakeJudge('{"queries": ["改写后的问题"]}')
     writer = OpenAIQuestionWriter(judge)
 
     writer.rewrite(
@@ -1041,6 +1057,32 @@ def test_openai_writer_skill_rules_prompt_is_grounded_and_never_empty() -> None:
     assert '"rules"' in system.lower()
     assert payload["body_available"] is False
     assert payload["output_format"]["rules"]
+
+
+def test_openai_writer_rejects_non_chinese_rewrite() -> None:
+    writer = OpenAIQuestionWriter(
+        _FakeJudge('{"queries": ["Use the search tool."]}')
+    )
+
+    rewritten = writer.rewrite(
+        kind="single_tool",
+        queries=["请使用搜索工具。"],
+        context="Tool search: Search projects.",
+    )
+
+    assert rewritten == ["请使用搜索工具。"]
+    assert any("rewrite failed" in warning for warning in writer.warnings)
+
+
+def test_writer_translates_trace_replay_to_chinese() -> None:
+    writer = OpenAIQuestionWriter(_FakeJudge('{"queries": ["退款为什么失败？"]}'))
+
+    result = synthesize_account_items(
+        _session(), _sources(traces=[TRACE]), plan=_tool_only_plan(), writer=writer
+    )
+
+    trace = _by_category(result.drafts, "trace_replay")[0]
+    assert trace.input == {"query": "退款为什么失败？"}
 
 
 def test_openai_writer_returns_deterministic_input_on_malformed_reply() -> None:

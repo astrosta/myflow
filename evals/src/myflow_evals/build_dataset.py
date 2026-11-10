@@ -1128,14 +1128,15 @@ def _trace_draft(trace: TraceSource, user_hash: str) -> DatasetItemDraft:
 def _template_query(kind: str, name: str, description: str) -> str:
     """The deterministic query template: the source name plus its own description."""
     detail = " ".join(description.split()).rstrip(".")
+    label = {"tool": "工具", "skill": "技能"}.get(kind, kind)
     if detail:
-        return f"Use the {name} {kind}: {detail}."
-    return f"Use the {name} {kind}."
+        return f"请使用 {name} {label}：{detail}。"
+    return f"请使用 {name} {label}。"
 
 
 def _knowledge_query(document: KnowledgeSource) -> str:
-    title = document.filename.strip() or "the document"
-    return f"According to {title}, what are the key points?"
+    title = document.filename.strip() or "该文档"
+    return f"根据《{title}》，要点是什么？"
 
 
 def _schema_hash(schema: Mapping[str, Any]) -> str:
