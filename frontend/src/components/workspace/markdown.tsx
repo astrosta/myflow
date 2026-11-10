@@ -8,6 +8,8 @@ import remarkMath from "remark-math";
 
 import { cn } from "@/lib/utils";
 
+import { rehypeMergeEmptyHeaderCells } from "./merge-empty-header-cells";
+
 /**
  * Markdown 渲染（M5 §6.4）。
  *
@@ -21,7 +23,7 @@ import { cn } from "@/lib/utils";
  */
 
 const REMARK_PLUGINS = [remarkGfm, remarkMath];
-const REHYPE_PLUGINS = [rehypeKatex];
+const REHYPE_PLUGINS = [rehypeMergeEmptyHeaderCells, rehypeKatex];
 
 /**
  * remark-math 把同一行里的 `$$...$$` 当行内公式；检索文档里常见的

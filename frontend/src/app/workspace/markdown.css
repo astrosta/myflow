@@ -102,6 +102,11 @@
   font-weight: 600;
 }
 
+/* 合并表头居中，避免「准入标准」这类跨列标题贴在左侧 */
+.md-body th[colspan] {
+  text-align: center;
+}
+
 /* ---------- 代码 ---------- */
 
 .md-body pre {
