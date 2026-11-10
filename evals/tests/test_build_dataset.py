@@ -9,6 +9,7 @@ directly and prove that no HTTP call happens at all.
 from __future__ import annotations
 
 import json
+import random
 from typing import Any
 
 import httpx
@@ -239,7 +240,15 @@ CHUNKS = {
             "page": 1,
             "content": "Refunds take five business days.",
             "parent_id": None,
-        }
+        },
+        {
+            "chunk_id": "doc-1:1",
+            "chunk_index": 1,
+            "section": "returns",
+            "page": 2,
+            "content": "Returns need a receipt.",
+            "parent_id": None,
+        },
     ],
     "doc-2": [
         {
@@ -431,13 +440,17 @@ class _FakeGateway:
         if path.endswith("/chunks"):
             document_id = path.split("/")[-2]
             rows = self.chunks.get(document_id, [])
+            offset = int(request.url.params.get("offset", "0"))
+            limit = int(request.url.params.get("limit", str(len(rows) or 1)))
+            page = rows[offset : offset + limit]
+            next_offset = offset + len(page)
             return httpx.Response(
                 200,
                 json={
                     "document_id": document_id,
-                    "chunks": rows,
+                    "chunks": page,
                     "count": len(rows),
-                    "next_offset": None,
+                    "next_offset": next_offset if next_offset < len(rows) else None,
                 },
             )
         return httpx.Response(404, json={"detail": "not found"})
@@ -521,6 +534,54 @@ def _projection(tool_name: str, **flags: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _chunk(document_id: str, index: int, content: str) -> dict[str, Any]:
+    return {
+        "chunk_id": f"{document_id}:{index}",
+        "chunk_index": index,
+        "section": f"section-{index}",
+        "page": 1,
+        "content": content,
+        "parent_id": None,
+    }
+
+
+def _knowledge_gateway(
+    contents: list[str], *, document_id: str = "doc-1"
+) -> _FakeGateway:
+    """A Gateway serving one knowledge document with the given chunk contents."""
+    document = {
+        "id": document_id,
+        "knowledge_base_id": "kb-1",
+        "filename": "policy.md",
+        "mime_type": "text/markdown",
+        "size_bytes": 120,
+        "status": "ready",
+        "chunk_count": len(contents),
+        "error_message": None,
+    }
+    chunks = [_chunk(document_id, index, content) for index, content in enumerate(contents)]
+    return _FakeGateway(
+        servers=[STREAMABLE_SERVER],
+        documents={"kb-1": [document]},
+        chunks={document_id: chunks},
+    )
+
+
+def _chunk_requests(gateway: _FakeGateway, document_id: str = "doc-1") -> list[httpx.Request]:
+    return [
+        request
+        for request in gateway.requests
+        if request.url.path.endswith(f"/documents/{document_id}/chunks")
+    ]
+
+
+def _chunk_pattern(requests: list[httpx.Request]) -> list[tuple[str, str]]:
+    return [
+        (request.url.params["offset"], request.url.params["limit"])
+        for request in requests
+    ]
+
+
 @pytest.mark.parametrize("base_url", BASE_URLS)
 def test_load_build_sources_reads_the_fixed_accounts_real_data(base_url: str) -> None:
     gateway = _FakeGateway()
@@ -554,10 +615,11 @@ def test_load_build_sources_reads_the_fixed_accounts_real_data(base_url: str) ->
     chunk_requests = [
         request for request in gateway.requests if request.url.path.endswith("/chunks")
     ]
-    assert all(
-        request.url.params["offset"] == "0" and request.url.params["limit"] == "1"
-        for request in chunk_requests
-    )
+    assert _chunk_pattern(chunk_requests) == [
+        ("0", "1"),
+        ("0", "2"),
+        ("0", "1"),
+    ]
     assert all(request.headers["x-csrf-token"] == CSRF_TOKEN for request in gateway.requests)
 
 
@@ -1029,7 +1091,10 @@ def test_load_build_sources_caps_each_kind_at_the_limit() -> None:
     chunk_requests = [
         request for request in gateway.requests if request.url.path.endswith("/chunks")
     ]
-    assert len(chunk_requests) == 1
+    assert [request.url.path for request in chunk_requests] == [
+        "/api/knowledge/bases/kb-1/documents/doc-1/chunks",
+        "/api/knowledge/bases/kb-1/documents/doc-1/chunks",
+    ]
 
 
 def test_the_report_shows_true_source_counts_when_the_limit_caps_the_build() -> None:
@@ -1075,6 +1140,151 @@ def test_a_full_build_turns_the_fetched_sources_into_drafts() -> None:
     assert {draft.metadata["user_id"] for draft in drafts} == {HASHED_USER_ID}
     assert len({draft.id for draft in drafts}) == 3
     assert write_drafts("myflow-eval", drafts, None, dry_run=True) == 0
+
+
+def test_a_large_document_requests_three_seeded_samples_and_keeps_the_longest() -> None:
+    contents = [
+        "A table of contents that is much longer than the sampled chunks.",
+        "short",
+        "The longest sampled chunk, which is the reference answer.",
+        "middle",
+        "A cover page that was never sampled but is the longest string.",
+    ]
+    gateway = _knowledge_gateway(contents)
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(7),
+    )
+
+    assert len(sources.knowledge) == 1
+    requests = _chunk_requests(gateway)
+    assert _chunk_pattern(requests) == [
+        ("0", "1"),
+        ("1", "1"),
+        ("2", "1"),
+        ("3", "1"),
+    ]
+    sampled_offsets = [request.url.params["offset"] for request in requests[1:]]
+    assert len(set(sampled_offsets)) == 3
+    document = sources.knowledge[0]
+    assert (document.chunk_id, document.chunk_content) == ("doc-1:2", contents[2])
+
+
+def test_a_sampled_blank_chunk_is_never_chosen_even_when_it_is_the_longest() -> None:
+    contents = [" " * 200, "The useful answer.", "Short."]
+    gateway = _knowledge_gateway(contents)
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(0),
+    )
+
+    assert len(sources.knowledge) == 1
+    document = sources.knowledge[0]
+    assert (document.chunk_id, document.chunk_content) == ("doc-1:1", contents[1])
+    assert _chunk_pattern(_chunk_requests(gateway)) == [("0", "1"), ("0", "3")]
+
+
+def test_a_two_chunk_document_fetches_both_in_one_request_and_keeps_the_longest() -> None:
+    contents = ["The first chunk is short.", "The second chunk is clearly longer."]
+    gateway = _knowledge_gateway(contents)
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(0),
+    )
+
+    assert len(sources.knowledge) == 1
+    document = sources.knowledge[0]
+    assert (document.chunk_id, document.chunk_content) == ("doc-1:1", contents[1])
+    requests = _chunk_requests(gateway)
+    assert _chunk_pattern(requests) == [("0", "1"), ("0", "2")]
+    assert sum(
+        request.url.params["offset"] == "0" and request.url.params["limit"] == "2"
+        for request in requests
+    ) == 1
+
+
+def test_equal_length_sampled_chunks_tie_break_on_the_smallest_chunk_index() -> None:
+    gateway = _knowledge_gateway(["same size", "SAME SIZE"])
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(0),
+    )
+
+    assert len(sources.knowledge) == 1
+    assert sources.knowledge[0].chunk_id == "doc-1:0"
+
+
+def test_a_document_whose_sampled_chunks_are_all_blank_is_skipped_once() -> None:
+    gateway = _knowledge_gateway(["", "\n\t ", "   "])
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(0),
+    )
+
+    assert sources.knowledge == []
+    assert len(sources.warnings) == 1
+    assert "no readable chunk" in sources.warnings[0]
+
+
+def test_the_same_seed_reproduces_the_reference_answer_and_the_item_id() -> None:
+    contents = [
+        "first",
+        "second",
+        "third",
+        "the fourth chunk is the longest sampled one",
+        "fifth",
+    ]
+
+    def build_once() -> DatasetItemDraft:
+        gateway = _knowledge_gateway(contents)
+        sources = load_build_sources(
+            _session(gateway),
+            environ={},
+            mcp_client=_Mcp(PROJECT_TOOLS).client,
+            rng=random.Random(11),
+        )
+        drafts = build_account_items(
+            _offline_session(), _sources(knowledge=sources.knowledge)
+        )
+        assert len(drafts) == 1
+        return drafts[0]
+
+    first = build_once()
+    second = build_once()
+
+    assert first.expected_output["reference_answer"] == contents[3]
+    assert first.expected_output["reference_answer"] == second.expected_output["reference_answer"]
+    assert first.id == second.id == stable_item_id("knowledge", "doc-1", 0, HASHED_USER_ID)
+    assert first.metadata["chunk_id"] == second.metadata["chunk_id"] == "doc-1:3"
+
+
+def test_a_large_document_never_issues_more_than_four_chunk_requests() -> None:
+    gateway = _knowledge_gateway(["one", "two", "three", "four", "five"])
+
+    sources = load_build_sources(
+        _session(gateway),
+        environ={},
+        mcp_client=_Mcp(PROJECT_TOOLS).client,
+        rng=random.Random(7),
+    )
+
+    assert len(sources.knowledge) == 1
+    assert len(_chunk_requests(gateway)) == 4
 
 
 def test_build_account_items_emits_one_tool_draft_per_real_tool() -> None:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import random
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -202,6 +203,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also emit trace replays (unscorable: keep them out of a regression dataset)",
     )
+    build.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="seed the knowledge chunk sample for a reproducible build",
+    )
     run = commands.add_parser(
         "run",
         parents=[shared],
@@ -359,6 +366,7 @@ def _cmd_build(
     try:
         drafts: list[DatasetItemDraft] = []
         per_account: list[BuildSources] = []
+        rng = random.Random(args.seed)
         for hashed_user_id in sorted(sessions):
             session = sessions[hashed_user_id]
             sources = services.load_sources(
@@ -366,6 +374,7 @@ def _cmd_build(
                 limit=args.limit,
                 environ=environ,
                 include_traces=args.include_traces,
+                rng=rng,
             )
             per_account.append(sources)
             drafts.extend(build_account_items(session, sources, limit=args.limit))
