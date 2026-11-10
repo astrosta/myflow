@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import json
 import os
 import re
 import threading
@@ -39,10 +40,20 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from langfuse import Evaluation
+
 from myflow_evals.accounts import AccountSession
 from myflow_evals.api import AgentApi
 from myflow_evals.evidence import RunEvidence, collect_evidence
 from myflow_evals.evaluators import RULE_EVALUATORS, THRESHOLDS
+from myflow_evals.llm_metrics import (
+    FULL_ONLY_LLM_METRICS,
+    LLM_METRICS,
+    LLM_THRESHOLDS,
+    LLMEngine,
+    JudgeCase,
+    metric_applicable,
+)
 
 #: The two experiment modes the design distinguishes.
 MODE_CI = "ci"
@@ -58,6 +69,11 @@ DEFAULT_MAX_CONCURRENCY = 2
 
 #: Design: an LLM metric needs this many scored samples before it can gate.
 LLM_MIN_SAMPLES = 20
+
+#: Design 6.4: CI samples LLM metrics instead of scoring every item.
+DEFAULT_CI_LLM_SAMPLE = 0.2
+_FULL_LLM_SAMPLE = 1.0
+_DEFAULT_LLM_SEED = "agent-eval"
 
 #: Rule metrics that fail a run on a single bad sample.
 _CITATION_METRIC = "citation_valid"
@@ -87,6 +103,7 @@ _HASHED_USER_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 __all__ = [
     "CI_SUBSET_SIZE",
+    "DEFAULT_CI_LLM_SAMPLE",
     "DEFAULT_MAX_CONCURRENCY",
     "DEFAULT_MODE",
     "EvidenceStore",
@@ -96,6 +113,8 @@ __all__ = [
     "FailedItem",
     "GateResult",
     "IncompleteExperiment",
+    "LLMMetricAdapter",
+    "LLMSamplingPolicy",
     "LLM_MIN_SAMPLES",
     "MODES",
     "RuleMetricAdapter",
@@ -159,13 +178,22 @@ class EvidenceStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._evidence: dict[str, RunEvidence] = {}
+        self._item_ids: dict[str, str] = {}
 
     def put(self, item_id: str, evidence: RunEvidence) -> str:
         """Store one item's evidence and return the id evaluators read it by."""
         evidence_id = self.evidence_id(item_id)
         with self._lock:
             self._evidence[evidence_id] = evidence
+            self._item_ids[evidence_id] = item_id
         return evidence_id
+
+    def item_id(self, evidence_id: str) -> str | None:
+        """Return the dataset item id behind an evidence id, or None."""
+        if not isinstance(evidence_id, str):
+            return None
+        with self._lock:
+            return self._item_ids.get(evidence_id)
 
     def get(self, evidence_id: str) -> RunEvidence | None:
         """Return the evidence stored under ``evidence_id``, or ``None``."""
@@ -228,7 +256,13 @@ class ExperimentResult:
     gates: tuple[GateResult, ...] = ()
     citation_violations: tuple[str, ...] = ()
     forbidden_violations: tuple[str, ...] = ()
+    llm_errors: tuple[str, ...] = ()
     experiment_url: str | None = None
+
+    @property
+    def llm_error_count(self) -> int:
+        """How many LLM metric calls failed; the run does not fail on these."""
+        return len(self.llm_errors)
 
     @property
     def passed(self) -> bool:
@@ -270,6 +304,8 @@ class ExperimentResult:
             lines.append("citation violation: " + ", ".join(self.citation_violations))
         if self.forbidden_violations:
             lines.append("forbidden violation: " + ", ".join(self.forbidden_violations))
+        if self.llm_errors:
+            lines.append("llm metric errors: " + ", ".join(self.llm_errors))
         lines.append("result: " + ("PASS" if self.passed else "FAIL"))
         if self.experiment_url:
             lines.append(f"experiment: {self.experiment_url}")
@@ -321,8 +357,131 @@ class RuleMetricAdapter:
                 metadata=item_metadata,
             )
             if evaluation is not None:
-                evaluations.append(evaluation)
+                evaluations.append(_with_user_metadata(evaluation, item_metadata))
         return evaluations
+
+
+@dataclass(frozen=True)
+class LLMSamplingPolicy:
+    """Which LLM metrics run, and which items they run on.
+
+    The design samples LLM metrics in CI rather than scoring every sample, and
+    the selection must be reproducible: the same dataset item, metric, seed, and
+    mode always yields the same decision, so two CI runs of the same commit are
+    comparable. A stable hash of those four values replaces a random generator.
+    """
+
+    mode: str = MODE_CI
+    ratio: float = DEFAULT_CI_LLM_SAMPLE
+    seed: str = _DEFAULT_LLM_SEED
+
+    def __post_init__(self) -> None:
+        _validate_mode(self.mode)
+        _validate_ratio(self.ratio)
+        if not isinstance(self.seed, str) or not self.seed.strip():
+            raise ExperimentConfigError("llm sampling seed must be a non-empty string")
+
+    def metric_enabled(self, metric: str) -> bool:
+        """Full-only metrics are skipped in ci mode."""
+        if metric not in LLM_METRICS:
+            return False
+        return not (self.mode == MODE_CI and metric in FULL_ONLY_LLM_METRICS)
+
+    def should_score(self, item_id: str, metric: str) -> bool:
+        """Deterministically decide whether this item/metric is sampled."""
+        if not self.metric_enabled(metric):
+            return False
+        if self.ratio >= 1.0:
+            return True
+        if self.ratio <= 0.0:
+            return False
+        material = f"{self.seed}\x1f{self.mode}\x1f{metric}\x1f{item_id}"
+        digest = hashlib.sha256(material.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big") / 2**64 < self.ratio
+
+
+class LLMMetricAdapter:
+    """Langfuse item evaluator that scores the judge metrics for one item.
+
+    Applicability is decided before the judge is touched, so a trace replay, a
+    no-answer sample, or a truncated retrieval costs nothing. A judge failure is
+    recorded as metric plus exception class and skipped: rule gates still decide
+    the run, and the summary reports that some LLM scores are missing.
+    """
+
+    __name__ = "llm_metrics"
+
+    def __init__(
+        self, store: EvidenceStore, engine: LLMEngine, policy: LLMSamplingPolicy
+    ) -> None:
+        self._store = store
+        self._engine = engine
+        self._policy = policy
+        self._lock = threading.Lock()
+        self._errors: set[str] = set()
+
+    def __call__(
+        self,
+        *,
+        input: Any = None,
+        output: Any = None,
+        expected_output: Any = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> list[Any]:
+        evidence_id = output.get("evidence_id") if isinstance(output, Mapping) else None
+        evidence = self._store.get(evidence_id) if evidence_id is not None else None
+        if evidence is None:
+            return []
+        item_id = (
+            self._store.item_id(evidence_id)
+            if isinstance(evidence_id, str)
+            else None
+        ) or (evidence_id if isinstance(evidence_id, str) else "")
+        declared = expected_output if isinstance(expected_output, Mapping) else None
+        item_metadata = metadata if isinstance(metadata, Mapping) else None
+        case = JudgeCase(
+            item_id=item_id,
+            query=_query_from_input(input),
+            answer=evidence.answer,
+            expected_output=declared,
+            evidence=evidence,
+            metadata=item_metadata,
+        )
+        evaluations: list[Any] = []
+        for metric in LLM_METRICS:
+            if not self._policy.metric_enabled(metric):
+                continue
+            if not metric_applicable(metric, case):
+                continue
+            if not self._policy.should_score(item_id, metric):
+                continue
+            try:
+                score = self._engine.score(metric, case)
+            except Exception as exc:  # noqa: BLE001 - one judge failure is not the experiment
+                self._record(metric, exc)
+                continue
+            if score is None:
+                continue
+            evaluations.append(
+                Evaluation(
+                    name=metric,
+                    value=score.value,
+                    comment=score.comment,
+                    metadata=_evaluation_metadata(item_metadata),
+                )
+            )
+        return evaluations
+
+    def _record(self, metric: str, exc: BaseException) -> None:
+        with self._lock:
+            self._errors.add(f"{metric}: {type(exc).__name__}")
+
+    @property
+    def errors(self) -> tuple[str, ...]:
+        """Sorted, secret-free labels of the judge calls that failed."""
+        with self._lock:
+            return tuple(sorted(self._errors))
 
 
 @dataclass(frozen=True)
@@ -424,6 +583,10 @@ class ExperimentRunner:
         store: EvidenceStore | None = None,
         salt: str | None = None,
         environment: Mapping[str, str] | None = None,
+        llm_engine: LLMEngine | None = None,
+        llm_sample_ratio: float | None = None,
+        llm_seed: str = _DEFAULT_LLM_SEED,
+        judge_model: str | None = None,
     ) -> None:
         self._client = client
         self._sessions = dict(sessions)
@@ -432,6 +595,12 @@ class ExperimentRunner:
         # Only a fingerprint of the salt ever leaves this process.
         self._salt = salt
         self._environment = environment
+        self._llm_engine = llm_engine
+        if llm_sample_ratio is not None:
+            _validate_ratio(llm_sample_ratio)
+        self._llm_sample_ratio = llm_sample_ratio
+        self._llm_seed = llm_seed
+        self._judge_model = judge_model
 
     def run(
         self,
@@ -468,6 +637,19 @@ class ExperimentRunner:
         task = _ItemTask(
             api=self._api, plans=plans, store=self._store, run_name=run_name
         )
+        llm_sample_ratio = self._llm_ratio_for(mode)
+        evaluators: list[Any] = [RuleMetricAdapter(self._store)]
+        llm_adapter: LLMMetricAdapter | None = None
+        if self._llm_engine is not None:
+            llm_adapter = LLMMetricAdapter(
+                self._store,
+                self._llm_engine,
+                LLMSamplingPolicy(
+                    mode=mode, ratio=llm_sample_ratio, seed=self._llm_seed
+                ),
+            )
+            evaluators.append(llm_adapter)
+        thresholds = _thresholds_for(self._llm_engine)
         # The dataset client would run every item it holds, so the selected subset
         # travels as explicit data: the plain client still derives the experiment
         # dataset id from the first item, keeping the experiment linked to it.
@@ -476,7 +658,7 @@ class ExperimentRunner:
             run_name=run_name,
             data=list(selected),
             task=task,
-            evaluators=[RuleMetricAdapter(self._store)],
+            evaluators=evaluators,
             max_concurrency=max_concurrency,
             metadata=_experiment_metadata(
                 mode=mode,
@@ -484,6 +666,10 @@ class ExperimentRunner:
                 max_concurrency=max_concurrency,
                 salt=self._salt,
                 environment=self._environment,
+                llm_engine=self._llm_engine,
+                judge_model=self._judge_model,
+                llm_sample_ratio=llm_sample_ratio,
+                dataset_fingerprint=_dataset_fingerprint(selected),
             ),
         )
 
@@ -505,13 +691,19 @@ class ExperimentRunner:
             mode=mode,
             item_count=len(plans),
             result_count=len(item_results),
-            scorable_items=_scorable_items(item_results),
+            scorable_items=_scorable_items(item_results, thresholds),
             failed_items=_failed_items(task.snapshot, item_results, store=self._store),
-            gates=evaluate_gates(scores, mode=mode),
+            gates=evaluate_gates(scores, mode=mode, thresholds=thresholds),
             citation_violations=citation_violations(item_results),
             forbidden_violations=forbidden_violations(item_results),
+            llm_errors=llm_adapter.errors if llm_adapter is not None else (),
             experiment_url=getattr(outcome, "experiment_url", None),
         )
+
+    def _llm_ratio_for(self, mode: str) -> float:
+        if self._llm_sample_ratio is not None:
+            return float(self._llm_sample_ratio)
+        return _FULL_LLM_SAMPLE if mode == MODE_FULL else DEFAULT_CI_LLM_SAMPLE
 
     def _plan(self, items: Sequence[Any]) -> list[_ItemPlan]:
         """Resolve account and query for every item before the first thread exists."""
@@ -708,7 +900,9 @@ def _failed_items(
     return tuple(sorted(failures.values(), key=lambda failure: failure.item_id))
 
 
-def _scorable_items(item_results: Sequence[Any]) -> int:
+def _scorable_items(
+    item_results: Sequence[Any], thresholds: Mapping[str, Mapping[str, Any]]
+) -> int:
     """How many items produced at least one score that a threshold covers.
 
     Zero means the run measured nothing it can gate. That must fail loudly: an
@@ -717,7 +911,7 @@ def _scorable_items(item_results: Sequence[Any]) -> int:
     scorable = 0
     for result in item_results:
         names = {getattr(evaluation, "name", None) for evaluation in _evaluations_of(result)}
-        if names & set(THRESHOLDS):
+        if names & set(thresholds):
             scorable += 1
     return scorable
 
@@ -781,6 +975,31 @@ def _expected_output_of(item: Any) -> Any:
     return getattr(item, "expected_output", None)
 
 
+def _thresholds_for(engine: LLMEngine | None) -> dict[str, dict[str, Any]]:
+    """Rule thresholds always; LLM thresholds only when a judge engine is wired."""
+    thresholds = {name: dict(spec) for name, spec in THRESHOLDS.items()}
+    if engine is not None:
+        thresholds.update({name: dict(spec) for name, spec in LLM_THRESHOLDS.items()})
+    return thresholds
+
+
+def _dataset_fingerprint(items: Sequence[Any]) -> str:
+    """A stable 16-hex fingerprint of the selected items' identities and expectations."""
+    rows: list[str] = []
+    for item in sorted(items, key=_item_id):
+        expected = _expected_output_of(item)
+        canonical = json.dumps(
+            expected if isinstance(expected, Mapping) else {},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        rows.append(f"{_item_id(item)}\x1f{_category_of(item)}\x1f{digest}")
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()[:16]
+
+
 def _experiment_metadata(
     *,
     mode: str,
@@ -788,6 +1007,10 @@ def _experiment_metadata(
     max_concurrency: int,
     salt: str | None,
     environment: Mapping[str, str] | None,
+    llm_engine: LLMEngine | None,
+    judge_model: str | None,
+    llm_sample_ratio: float,
+    dataset_fingerprint: str,
 ) -> dict[str, str]:
     """Describe the run so two experiments are comparable; never the salt itself."""
     return {
@@ -797,6 +1020,10 @@ def _experiment_metadata(
         "package_version": _package_version(),
         "git_sha": _git_sha(environment),
         "salt_fingerprint": _salt_fingerprint(salt),
+        "dataset_fingerprint": dataset_fingerprint,
+        "llm_engine": type(llm_engine).__name__ if llm_engine is not None else "none",
+        "judge_model": judge_model or "none",
+        "llm_sample_ratio": f"{llm_sample_ratio:g}",
     }
 
 
@@ -821,6 +1048,39 @@ def _salt_fingerprint(salt: str | None) -> str:
     if not salt:
         return _UNKNOWN_VALUE
     return hashlib.sha256(salt.encode("utf-8")).hexdigest()[:8]
+
+
+def _with_user_metadata(evaluation: Any, metadata: Mapping[str, Any] | None) -> Any:
+    """Attach the hashed user id to a rule Evaluation when the item carries one."""
+    user_id = _user_id(metadata)
+    if not user_id or not isinstance(evaluation, Evaluation):
+        return evaluation
+    existing = getattr(evaluation, "metadata", None)
+    merged = dict(existing) if isinstance(existing, Mapping) else {}
+    merged["user_id"] = user_id
+    return Evaluation(
+        name=evaluation.name,
+        value=evaluation.value,
+        comment=evaluation.comment,
+        metadata=merged,
+    )
+
+
+def _evaluation_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    user_id = _user_id(metadata)
+    return {"user_id": user_id} if user_id else None
+
+
+def _user_id(metadata: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    value = metadata.get("user_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _query_from_input(input_data: Any) -> str:
+    query = input_data.get("query") if isinstance(input_data, Mapping) else None
+    return query if isinstance(query, str) else ""
 
 
 def _evaluations_of(result: Any) -> list[Any]:
@@ -941,3 +1201,10 @@ def _validate_max_items(max_items: int | None) -> None:
 def _validate_positive_int(value: Any, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ExperimentConfigError(f"{name} must be a positive integer")
+
+
+def _validate_ratio(value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ExperimentConfigError("llm_sample_ratio must be a number between 0 and 1")
+    if value != value or value < 0.0 or value > 1.0:
+        raise ExperimentConfigError("llm_sample_ratio must be between 0 and 1")

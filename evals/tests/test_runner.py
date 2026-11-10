@@ -476,6 +476,9 @@ def _runner(
     langfuse: FakeLangfuse | None = None,
     salt: str | None = None,
     environment: Mapping[str, str] | None = None,
+    llm_engine: Any = None,
+    llm_sample_ratio: float | None = None,
+    judge_model: str | None = None,
 ) -> ExperimentRunner:
     client = langfuse if langfuse is not None else FakeLangfuse(
         dataset, expected_item_ids=expected_item_ids
@@ -487,6 +490,9 @@ def _runner(
         store=store,
         salt=salt,
         environment=environment,
+        llm_engine=llm_engine,
+        llm_sample_ratio=llm_sample_ratio,
+        judge_model=judge_model,
     )
 
 
@@ -965,6 +971,10 @@ def test_run_passes_concurrency_and_full_experiment_metadata_to_the_sdk() -> Non
         "package_version",
         "git_sha",
         "salt_fingerprint",
+        "dataset_fingerprint",
+        "llm_engine",
+        "judge_model",
+        "llm_sample_ratio",
     }
     assert all(isinstance(value, str) for value in metadata.values())
     assert metadata["mode"] == "full"
@@ -1180,3 +1190,164 @@ def test_rule_metric_adapter_scores_every_metric_from_stored_evidence() -> None:
     assert by_name["retrieval_recall@5"] == 1.0
     assert by_name["tool_hit"] == 0.0
     assert adapter(input={}, output={}, expected_output={}, metadata={}) == []
+
+class _FakeLLMEngine:
+    def __init__(self, *, score: float = 0.9, fail_metrics: Sequence[str] = ()) -> None:
+        self.score_value = score
+        self.fail_metrics = set(fail_metrics)
+        self.calls: list[tuple[str, str]] = []
+
+    def score(self, metric: str, case: Any) -> Any:
+        self.calls.append((metric, case.item_id))
+        if metric in self.fail_metrics:
+            raise RuntimeError("judge exploded")
+        from myflow_evals.llm_metrics import JudgeScore
+
+        return JudgeScore(value=self.score_value, comment="fake score")
+
+
+def test_llm_sampling_policy_is_deterministic_and_bounded() -> None:
+    from myflow_evals.runner import LLMSamplingPolicy
+
+    policy = LLMSamplingPolicy(mode="ci", ratio=0.5, seed="seed-1")
+    item_ids = [f"item-{index}" for index in range(200)]
+    first = [item_id for item_id in item_ids if policy.should_score(item_id, "faithfulness")]
+    second = [item_id for item_id in item_ids if policy.should_score(item_id, "faithfulness")]
+    assert first == second
+    assert 0 < len(first) < len(item_ids)
+    assert LLMSamplingPolicy(mode="ci", ratio=0.0).should_score("item-1", "faithfulness") is False
+    assert LLMSamplingPolicy(mode="ci", ratio=1.0).should_score("item-1", "faithfulness") is True
+    assert policy.metric_enabled("contextual_precision") is False
+    assert policy.metric_enabled("faithfulness") is True
+    assert LLMSamplingPolicy(mode="full", ratio=1.0).metric_enabled("contextual_precision") is True
+
+
+def test_llm_metric_adapter_scores_applicable_metrics_and_records_errors() -> None:
+    from myflow_evals.runner import LLMMetricAdapter, LLMSamplingPolicy
+
+    store = EvidenceStore()
+    evidence_id = store.put(
+        "item-1", _evidence(answer="the answer", retrieved_chunks=[CHUNK])
+    )
+    engine = _FakeLLMEngine(fail_metrics={"faithfulness"})
+    adapter = LLMMetricAdapter(store, engine, LLMSamplingPolicy(mode="full", ratio=1.0))
+
+    scores = adapter(
+        input={"query": "what is the answer?"},
+        output={"evidence_id": evidence_id},
+        expected_output={"expect_kb": True, "reference_answer": "reference"},
+        metadata={"category": "kb_single_hop", "user_id": HASHED_USER_ID},
+    )
+
+    names = {score.name for score in scores}
+    assert "faithfulness" not in names
+    assert {"answer_correctness", "contextual_recall", "contextual_precision"} <= names
+    assert all(score.metadata["user_id"] == HASHED_USER_ID for score in scores)
+    assert adapter.errors == ("faithfulness: RuntimeError",)
+
+
+def test_llm_metric_adapter_skips_full_only_metrics_in_ci_mode() -> None:
+    from myflow_evals.runner import LLMMetricAdapter, LLMSamplingPolicy
+
+    store = EvidenceStore()
+    evidence_id = store.put(
+        "item-1", _evidence(answer="the answer", retrieved_chunks=[CHUNK])
+    )
+    adapter = LLMMetricAdapter(
+        store, _FakeLLMEngine(), LLMSamplingPolicy(mode="ci", ratio=1.0)
+    )
+
+    scores = adapter(
+        input={"query": "q"},
+        output={"evidence_id": evidence_id},
+        expected_output={"expect_kb": True, "reference_answer": "reference"},
+        metadata={"category": "kb_single_hop", "user_id": HASHED_USER_ID},
+    )
+
+    names = {score.name for score in scores}
+    assert "faithfulness" in names
+    assert "contextual_precision" not in names
+    assert "contextual_relevancy" not in names
+    assert "answer_relevancy" not in names
+
+
+def test_rule_evaluations_carry_the_hashed_user_id_metadata() -> None:
+    store = EvidenceStore()
+    evidence_id = store.put("item-1", _evidence(retrieved_tools=["search_projects"]))
+    adapter = RuleMetricAdapter(store)
+
+    scores = adapter(
+        input={"query": "q"},
+        output={"evidence_id": evidence_id},
+        expected_output={"expected_tools": ["search_projects"]},
+        metadata={"category": "single_tool", "user_id": HASHED_USER_ID},
+    )
+
+    assert scores
+    assert all(score.metadata == {"user_id": HASHED_USER_ID} for score in scores)
+
+
+def test_runner_wires_the_llm_engine_into_adapters_thresholds_and_metadata() -> None:
+    dataset = FakeDataset(
+        [
+            _item(
+                "item-1",
+                category="kb_single_hop",
+                expected_output={"expect_kb": True, "reference_answer": "reference"},
+            )
+        ]
+    )
+    gateway = FakeGateway(chunks_by_item={"item-1": [CHUNK]})
+    engine = _FakeLLMEngine()
+    runner = _runner(
+        gateway,
+        dataset,
+        llm_engine=engine,
+        llm_sample_ratio=1.0,
+        judge_model="judge-model-x",
+    )
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="full")
+
+    call = dataset.calls[0]
+    assert call["evaluator_names"] == ["rule_metrics", "llm_metrics"]
+    metadata = call["metadata"]
+    assert metadata["llm_engine"] == "_FakeLLMEngine"
+    assert metadata["judge_model"] == "judge-model-x"
+    assert metadata["llm_sample_ratio"] == "1"
+    assert re.fullmatch(r"[0-9a-f]{16}", metadata["dataset_fingerprint"])
+    assert "judge-secret" not in json.dumps(metadata)
+    names = {evaluation.name for evaluation in dataset.evaluations["item-1"]}
+    assert "faithfulness" in names
+    gates = {gate.metric: gate for gate in result.gates}
+    assert gates["faithfulness"].kind == "llm"
+    assert result.llm_errors == ()
+
+
+def test_runner_reports_judge_errors_without_changing_rule_gates() -> None:
+    dataset = FakeDataset(
+        [
+            _item(
+                "item-1",
+                category="kb_single_hop",
+                expected_output={"expect_kb": True, "reference_answer": "reference"},
+            )
+        ]
+    )
+    gateway = FakeGateway(
+        subagents_by_item={"item-1": ["knowledge-researcher"]},
+        chunks_by_item={"item-1": [CHUNK]},
+        citations_by_item={"item-1": [CITATION]},
+    )
+    engine = _FakeLLMEngine(fail_metrics=("faithfulness", "answer_correctness"))
+    runner = _runner(gateway, dataset, llm_engine=engine, llm_sample_ratio=1.0)
+
+    result = runner.run("agent-eval/regression/v1", RUN_NAME, mode="full")
+
+    assert result.llm_errors == (
+        "answer_correctness: RuntimeError",
+        "faithfulness: RuntimeError",
+    )
+    assert result.passed is True
+    assert result.render().count("llm metric errors:") == 1
+

@@ -839,6 +839,126 @@ def test_run_forwards_the_salt_fingerprint_to_the_experiment(
     assert "salt-fixture" not in json.dumps(metadata)
 
 
+
+
+JUDGE_ENVIRON = {
+    **ENVIRON,
+    "EVAL_JUDGE_BASE_URL": "https://judge.test/v1",
+    "EVAL_JUDGE_API_KEY": "judge-secret-key",
+    "EVAL_JUDGE_MODEL": "judge-model-x",
+}
+
+
+def test_run_warns_and_disables_llm_metrics_without_a_judge(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset = _passing_dataset()
+    services, _ = _services(Recorder(), dataset=dataset)
+
+    assert main(_run_args(), services=services, environ=dict(ENVIRON)) == 0
+
+    output = _capture(capsys)
+    assert "LLM metrics are disabled" in output
+    assert dataset.calls[0]["metadata"]["llm_engine"] == "none"
+    assert dataset.calls[0]["metadata"]["judge_model"] == "none"
+
+
+def test_run_builds_the_judge_engine_from_the_environment(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset = _passing_dataset()
+    services, _ = _services(Recorder(), dataset=dataset)
+    calls: list[tuple[Any, ...]] = []
+
+    class FakeEngine:
+        pass
+
+    def fake_judge_client(config: Any) -> str:
+        calls.append(("client", config.model))
+        return "judge-client"
+
+    def fake_build_engine(judge: Any, *, preference: str, model_name: str) -> FakeEngine:
+        calls.append(("engine", judge, preference, model_name))
+        return FakeEngine()
+
+    services = replace(
+        services, judge_client=fake_judge_client, build_engine=fake_build_engine
+    )
+
+    assert main(_run_args(), services=services, environ=dict(JUDGE_ENVIRON)) == 0
+
+    output = _capture(capsys)
+    assert calls == [
+        ("client", "judge-model-x"),
+        ("engine", "judge-client", "auto", "judge-model-x"),
+    ]
+    metadata = dataset.calls[0]["metadata"]
+    assert metadata["llm_engine"] == "FakeEngine"
+    assert metadata["judge_model"] == "judge-model-x"
+    assert metadata["llm_sample_ratio"] == "0.2"
+    assert "judge-secret-key" not in output
+
+
+def test_run_forwards_the_llm_sample_fraction(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset = _passing_dataset()
+    services, _ = _services(Recorder(), dataset=dataset)
+
+    class FakeEngine:
+        pass
+
+    services = replace(
+        services,
+        judge_client=lambda config: "judge",
+        build_engine=lambda judge, *, preference, model_name: FakeEngine(),
+    )
+
+    assert (
+        main(_run_args("--llm-sample", "0.5"), services=services, environ=dict(JUDGE_ENVIRON))
+        == 0
+    )
+    assert dataset.calls[0]["metadata"]["llm_sample_ratio"] == "0.5"
+
+
+def test_run_rejects_an_explicit_engine_without_a_judge(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    services, _ = _services(Recorder(), dataset=_passing_dataset())
+
+    exit_code = main(
+        _run_args("--metric-engine", "prompt"), services=services, environ=dict(ENVIRON)
+    )
+
+    output = _capture(capsys)
+    assert exit_code == 2
+    assert "EVAL_JUDGE_BASE_URL" in output
+
+
+def test_run_returns_two_when_the_engine_cannot_be_built(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from myflow_evals.llm import JudgeError
+
+    services, _ = _services(Recorder(), dataset=_passing_dataset())
+
+    def failing_build_engine(judge: Any, *, preference: str, model_name: str) -> Any:
+        raise JudgeError("DeepEval is not installed")
+
+    services = replace(
+        services,
+        judge_client=lambda config: "judge",
+        build_engine=failing_build_engine,
+    )
+
+    exit_code = main(_run_args(), services=services, environ=dict(JUDGE_ENVIRON))
+
+    output = _capture(capsys)
+    assert exit_code == 2
+    assert "DeepEval is not installed" in output
+    assert "judge-secret-key" not in output
+
+
 def test_writer_namespaces_item_ids_per_dataset() -> None:
     client = FakeLangfuse()
     drafts = [_draft("tool-1")]

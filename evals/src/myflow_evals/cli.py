@@ -28,6 +28,8 @@ from langfuse import Langfuse
 
 from myflow_evals.accounts import AccountCredential, AccountSession, load_accounts, login_all
 from myflow_evals.api import AgentApi
+from myflow_evals.deepeval_engine import build_engine
+from myflow_evals.llm import OpenAICompatibleChat, judge_config_from_env
 from myflow_evals.build_dataset import (
     BuildSources,
     DatasetItemDraft,
@@ -98,6 +100,8 @@ class CliServices:
     langfuse_client: Callable[[Mapping[str, str]], Any] = _langfuse_client
     load_sources: Callable[..., BuildSources] = load_build_sources
     fetch_traces: Callable[..., list[TraceSource]] = fetch_account_traces
+    judge_client: Callable[[Any], Any] = OpenAICompatibleChat
+    build_engine: Callable[..., Any] = build_engine
     api: Any = AgentApi
 
 
@@ -227,6 +231,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_CONCURRENCY,
         help="parallel agent runs (keep small)",
     )
+    run.add_argument(
+        "--metric-engine",
+        choices=("auto", "prompt", "deepeval"),
+        default="auto",
+        help="LLM metric engine: auto prefers DeepEval when installed",
+    )
+    run.add_argument(
+        "--llm-sample",
+        type=float,
+        default=None,
+        help="fraction of applicable items scored by LLM metrics (default: 0.2 ci, 1.0 full)",
+    )
     commands.add_parser(
         "ingest",
         parents=[shared],
@@ -309,6 +325,7 @@ def _cmd_run(
     run_name = args.run_name or _default_run_name(args.mode)
     if args.dry_run:
         return _plan_run(args, environ, services, run_name)
+    engine, judge_model = _llm_engine_for(args, environ, services)
     salt = _require(environ, _SALT_ENV)
     sessions = _login(environ, services, args.accounts_file)
     try:
@@ -318,6 +335,9 @@ def _cmd_run(
             api=services.api,
             salt=salt,
             environment=environ,
+            llm_engine=engine,
+            llm_sample_ratio=args.llm_sample,
+            judge_model=judge_model,
         )
         result = runner.run(
             args.dataset,
@@ -350,6 +370,33 @@ def _plan_run(
     print(f"items: {len(selected)} of {len(items)} selected")
     print("dry-run: nothing was written and no run was started")
     return EXIT_OK
+
+
+def _llm_engine_for(
+    args: argparse.Namespace, environ: Mapping[str, str], services: CliServices
+) -> tuple[Any, str | None]:
+    """Build the judge engine, or disable LLM metrics with a loud warning.
+
+    Rule metrics never need a judge. An explicitly requested engine without a
+    judge is a configuration error, not something to silently downgrade.
+    """
+    config = judge_config_from_env(environ)
+    if config is None:
+        if args.metric_engine != "auto":
+            raise CliError(
+                f"--metric-engine {args.metric_engine} needs EVAL_JUDGE_BASE_URL, "
+                "EVAL_JUDGE_MODEL and an API key"
+            )
+        print(
+            "warning: no EVAL_JUDGE_* configuration; LLM metrics are disabled",
+            file=sys.stderr,
+        )
+        return None, None
+    judge = services.judge_client(config)
+    engine = services.build_engine(
+        judge, preference=args.metric_engine, model_name=config.model
+    )
+    return engine, config.model
 
 
 def _default_run_name(mode: str) -> str:
