@@ -5,7 +5,7 @@ import { useCallback } from "react";
 import type { ArtifactPreviewLoader } from "@/components/workspace/artifact-panel";
 import type { ModelControlProps } from "@/components/workspace/composer";
 import { ChatView } from "@/components/workspace/chat-view";
-import { fetchArtifactPreview } from "@/core/api/artifacts";
+import { artifactContentUrl, fetchArtifactPreview } from "@/core/api/artifacts";
 import type { ChatController } from "@/core/threads/chat-controller";
 
 export interface ChatPageProps {
@@ -38,8 +38,20 @@ export function ChatPage({ controller, modelControl, scrollToBottomRequest }: Ch
     [threadId],
   );
 
+  const artifactDownloadUrl = useCallback(
+    (path: string) => {
+      if (threadId === null) {
+        // 下载链接只在有 thread 时注入；走到这里说明状态不一致。
+        throw new Error("这个会话还没有 thread，下载不了产物");
+      }
+      return artifactContentUrl(threadId, path, true);
+    },
+    [threadId],
+  );
+
   return (
     <ChatView
+      artifactDownloadUrl={threadId === null ? undefined : artifactDownloadUrl}
       controller={controller}
       loadArtifactPreview={loadArtifactPreview}
       modelControl={modelControl}

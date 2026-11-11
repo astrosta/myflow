@@ -55,7 +55,7 @@ uv run --project evals myflow-evals run \
 
 | 变量 | 用途 |
 | --- | --- |
-| `AGENT_API` | Gateway 基础 URL。文档中的形式包含 `/api`（例如 `http://127.0.0.1:8001/api`）；客户端接受带或不带该后缀的基础地址，并相应地追加 `/api` 或 `/api/v1`。 |
+| `AGENT_API` | Gateway 基础 URL。文档中的形式包含 `/api`（例如 `http://0.0.0.0:8001/api`）；客户端接受带或不带该后缀的基础地址，并相应地追加 `/api` 或 `/api/v1`。 |
 | `AGENT_USERS` | 账户标签 -> `{"username": ..., "password": ...}` 的 JSON 映射。每个固定账户一条凭据。 |
 | `USER_ID_SALT` | 哈希用户 ID 的盐值。它必须与 Agent 追踪配置（`user_id_salt`）一致；更改它会改变所有哈希 ID，因此现有数据集必须重建/重新标注。 |
 | `LANGFUSE_HOST`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` | Langfuse HTTP API：数据集读写、实验，以及失败/低分追踪读取。 |

@@ -76,4 +76,30 @@ describe("artifact 面板的 UI 状态（sessionStorage）", () => {
       expect(storedState()).toEqual({ open: true, path: "a.txt" });
     });
   });
+
+  it("选中产物时提供带 download=true 的下载链接", async () => {
+    window.sessionStorage.setItem(
+      ARTIFACT_PANEL_STORAGE_KEY,
+      JSON.stringify({ open: true, path: "flow-field-particles.html" }),
+    );
+    const loadPreview = vi.fn(async (path: string) => previewOf(path));
+    const artifactDownloadUrl = vi.fn(
+      (path: string) => `/api/threads/t1/artifacts/${path}?download=true`,
+    );
+
+    const view = render(
+      <ArtifactPanel
+        artifactDownloadUrl={artifactDownloadUrl}
+        artifacts={["flow-field-particles.html"]}
+        loadPreview={loadPreview}
+      />,
+    );
+
+    const link = await view.findByRole("link", { name: "下载 flow-field-particles.html" });
+    expect(link.getAttribute("href")).toBe(
+      "/api/threads/t1/artifacts/flow-field-particles.html?download=true",
+    );
+    expect(link.hasAttribute("download")).toBe(true);
+    expect(artifactDownloadUrl).toHaveBeenCalledWith("flow-field-particles.html");
+  });
 });

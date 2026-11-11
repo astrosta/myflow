@@ -35,7 +35,7 @@ EVAL_ARGS ?=
 .DEFAULT_GOAL := help
 
 .PHONY: help init install install-all check-config check-deploy check-eval-env \
-	dev-backend dev-frontend up deploy down restart build ps \
+	dev-backend dev-frontend up up-backend up-frontend deploy down restart build ps \
 	logs-backend logs-frontend logs-deps health \
 	test test-backend test-frontend test-evals \
 	eval-install eval-install-llm \
@@ -74,12 +74,12 @@ check-deploy: check-config
 	@$(COMPOSE) version >/dev/null 2>&1 || { printf 'docker compose unavailable: install Compose v2.\n' >&2; exit 1; }
 	@docker info >/dev/null 2>&1 || { printf 'Docker daemon is not running: start Docker first.\n' >&2; exit 1; }
 
-dev-backend: check-config ## 本机启动网关（127.0.0.1:8001）
+dev-backend: check-config ## 本机启动网关（0.0.0.0:8001）
 	MYFLOW_CONFIG_PATH=$(CONFIG_FILE) \
 		uv run --env-file $(ENV_FILE) --with uvicorn \
-		uvicorn backend.app.gateway.app:app --host 127.0.0.1 --port $(BACKEND_PORT) $(BACKEND_ARGS)
+		uvicorn backend.app.gateway.app:app --host 0.0.0.0 --port $(BACKEND_PORT) $(BACKEND_ARGS)
 
-dev-frontend: ## 本机启动前端（127.0.0.1:3000）
+dev-frontend: ## 本机启动前端（0.0.0.0:3000）
 	@test -f frontend/.env.local || { printf 'Missing frontend/.env.local: run "make init" first.\n' >&2; exit 1; }
 	cd frontend && pnpm dev
 
@@ -87,8 +87,19 @@ up: check-deploy ## 构建并启动全部容器（依赖 + 网关 + 前端）
 	$(DEPS_COMPOSE) up -d
 	$(BACKEND_COMPOSE) up -d --build
 	$(FRONTEND_COMPOSE) up -d --build
-	@printf '\nStarted: frontend http://127.0.0.1:2026/workspace , gateway http://127.0.0.1:8001/docs\n'
+	@printf '\nStarted: frontend http://0.0.0.0:2026/workspace , gateway http://0.0.0.0:8001/docs\n'
 	@printf 'Status: make ps    Health: make health    Logs: make logs-backend\n'
+
+up-backend: check-deploy ## 构建并启动后端容器（先起依赖，再起网关）
+	$(DEPS_COMPOSE) up -d
+	$(BACKEND_COMPOSE) up -d --build
+	@printf '\nStarted: gateway http://0.0.0.0:$(BACKEND_PORT)/docs\n'
+	@printf 'Status: make ps    Health: make health    Logs: make logs-backend\n'
+
+up-frontend: check-deploy ## 构建并启动前端容器
+	$(FRONTEND_COMPOSE) up -d --build
+	@printf '\nStarted: frontend http://0.0.0.0:$(FRONTEND_PORT)/workspace\n'
+	@printf 'Status: make ps    Health: make health    Logs: make logs-frontend\n'
 
 deploy: up ## up 的别名
 
@@ -125,7 +136,7 @@ logs-deps: check-deploy ## 跟踪依赖服务日志
 
 health: ## 探测网关与前端 HTTP 状态
 	@status=0; \
-	for entry in "gateway http://127.0.0.1:$(BACKEND_PORT)/docs" "frontend http://127.0.0.1:$(FRONTEND_PORT)/workspace"; do \
+	for entry in "gateway http://0.0.0.0:$(BACKEND_PORT)/docs" "frontend http://0.0.0.0:$(FRONTEND_PORT)/workspace"; do \
 		set -- $$entry; \
 		code=$$(curl -sS -o /dev/null -w '%{http_code}' "$$2" 2>/dev/null || true); \
 		printf '%-8s %s  %s\n' "$$1" "$$code" "$$2"; \

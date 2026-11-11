@@ -43,6 +43,8 @@ MCP 服务（每个用户自己添加的 MCP server）也默认关闭：在 `/wo
 | 本机启动网关 | `make dev-backend` |
 | 本机启动前端 | `make dev-frontend` |
 | 构建并启动全部容器 | `make up`（别名 `make deploy`） |
+| 只构建并启动网关容器 | `make up-backend`（会先起依赖） |
+| 只构建并启动前端容器 | `make up-frontend` |
 | 查看状态 / 探活 | `make ps` / `make health` |
 | 重建并重启全部容器 | `make restart` |
 | 停止容器（保留数据卷） | `make down` |
@@ -115,14 +117,17 @@ uv run --env-file .env --with uvicorn \
 make init           # 仅补齐缺失文件
 # 编辑 .env / config.yaml，填入真实密钥、路径和服务地址
 make up             # 依赖 + 网关 + 前端（也可用 make deploy）
+make up-backend     # 只构建并启动网关（会先起依赖）
+make up-frontend    # 只构建并启动前端
 make ps             # 查看状态
 make health         # 探活
 make logs-backend   # 跟踪网关日志
 make down           # 停止；数据卷保留
 ```
 
-`make up` 先后台启动依赖，再构建并启动网关与前端。首次启动时依赖的健康检查可能需要几十秒，
-用 `make ps` 观察，就绪后再 `make health`。`make restart` 等价于 `make down` + `make up`。
+`make up` 先后台启动依赖，再构建并启动网关与前端；`make up-backend` / `make up-frontend` 可单独重建一侧。
+首次启动时依赖的健康检查可能需要几十秒，用 `make ps` 观察，就绪后再 `make health`。
+`make restart` 等价于 `make down` + `make up`。
 
 网关容器加入依赖项目的 Docker 网络 `myflow-deps_default`，用服务名访问 Postgres / Redis 等
 （见 `.env.example`）。依赖对外仍多绑 `127.0.0.1`，容器互访不走宿主机端口。
@@ -192,9 +197,9 @@ docker compose -f docker/frontend-compose.yml down
 `backend.app` 或 `agentkit`，只通过 HTTP 与 Gateway、Langfuse 通信：
 
 - **构建数据集**：以固定测试账户读取该账户自己的 MCP 工具、私有 Skills、知识库文档（可选失败/低分
-  追踪），扩展成草稿，去重和结构质检后写入 Langfuse 数据集；`--llm-synthesis` 用评判模型生成中文 query。
+追踪），扩展成草稿，去重和结构质检后写入 Langfuse 数据集；`--llm-synthesis` 用评判模型生成中文 query。
 - **运行实验**：按数据集条目启动 thread / run，读取运行事件账本与 thread checkpoint，用规则评测器
-  评分；配置评判模型后叠加 LLM 指标（DeepEval 是可选 extra）。
+评分；配置评判模型后叠加 LLM 指标（DeepEval 是可选 extra）。
 - **输出结果**：把分数、门禁和实验写回 Langfuse；控制台摘要与退出码可直接用于 CI。
 
 日常构建、跑分、读结果和排障看 [`evals/使用指南.md`](evals/使用指南.md)；命令契约、指标定义和

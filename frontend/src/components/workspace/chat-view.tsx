@@ -5,7 +5,11 @@ import { useCallback, useState } from "react";
 import type { ChatController } from "@/core/threads/chat-controller";
 import { cn } from "@/lib/utils";
 
-import { ArtifactPanel, type ArtifactPreviewLoader } from "./artifact-panel";
+import {
+  ArtifactPanel,
+  type ArtifactDownloadUrlBuilder,
+  type ArtifactPreviewLoader,
+} from "./artifact-panel";
 import { Composer, type ModelControlProps } from "./composer";
 import { InterruptPanel } from "./interrupt-panel";
 import { MessageList } from "./message-list";
@@ -24,6 +28,8 @@ import { TodoPanel } from "./todo-panel";
 export interface ChatViewProps {
   controller: ChatController;
   loadArtifactPreview: ArtifactPreviewLoader;
+  /** 产物下载 URL 由容器层按当前 thread 构造；组件层不拼网关路径 */
+  artifactDownloadUrl?: ArtifactDownloadUrlBuilder;
   /** 模型 / 推理等级选择条；由容器层从 `/api/models` 取数后注入 */
   modelControl?: ModelControlProps;
   /** 侧栏点击会话标题的次数；变化时消息列表滚到最新一条 */
@@ -53,6 +59,7 @@ function ChatHero() {
 export function ChatView({
   controller,
   loadArtifactPreview,
+  artifactDownloadUrl,
   modelControl,
   scrollToBottomRequest,
   className,
@@ -169,6 +176,7 @@ export function ChatView({
          */}
         {isEmpty || controller.artifacts.length === 0 ? null : (
           <ArtifactPanel
+            artifactDownloadUrl={artifactDownloadUrl}
             artifacts={controller.artifacts}
             className="max-h-[45vh] lg:max-h-none lg:w-80 lg:shrink-0"
             loadPreview={loadArtifactPreview}

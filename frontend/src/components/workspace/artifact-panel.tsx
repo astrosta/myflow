@@ -42,6 +42,9 @@ export type ArtifactPreviewLoader = (
   options?: ArtifactPreviewLoadOptions,
 ) => Promise<ArtifactPreview>;
 
+/** 由应用层构造下载 URL；组件本身不认识网关地址。 */
+export type ArtifactDownloadUrlBuilder = (path: string) => string;
+
 export const ARTIFACT_PANEL_STORAGE_KEY = "myflow.artifact-panel.v1";
 
 interface StoredPanelState {
@@ -99,6 +102,8 @@ export interface ArtifactPanelProps {
   /** 首屏历史还没加载完。加载完之前不要用空清单覆盖恢复出来的状态 */
   threadLoading?: boolean;
   loadPreview: ArtifactPreviewLoader;
+  /** 选中产物的下载 URL；没注入时不显示下载入口。 */
+  artifactDownloadUrl?: ArtifactDownloadUrlBuilder;
   className?: string;
 }
 
@@ -106,6 +111,7 @@ export function ArtifactPanel({
   artifacts,
   threadLoading = false,
   loadPreview,
+  artifactDownloadUrl,
   className,
 }: ArtifactPanelProps) {
   const rawStored = useSyncExternalStore(
@@ -246,13 +252,25 @@ export function ArtifactPanel({
       <header className="flex items-center gap-2 border-b border-neutral-200 px-3 py-2">
         <h2 className="text-xs font-semibold text-neutral-700">产物</h2>
         <Badge variant="neutral">{artifacts.length}</Badge>
-        <button
-          className="ml-auto rounded px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-800"
-          onClick={() => applyPanelState({ open: false })}
-          type="button"
-        >
-          收起
-        </button>
+        <div className="ml-auto flex items-center gap-1">
+          {selectedPath && artifactDownloadUrl ? (
+            <a
+              aria-label={`下载 ${selectedPath}`}
+              className="rounded px-2 py-1 text-[11px] font-medium text-neutral-700 transition-colors hover:bg-neutral-100 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900/20"
+              download
+              href={artifactDownloadUrl(selectedPath)}
+            >
+              下载
+            </a>
+          ) : null}
+          <button
+            className="rounded px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-800"
+            onClick={() => applyPanelState({ open: false })}
+            type="button"
+          >
+            收起
+          </button>
+        </div>
       </header>
 
       <ul className="max-h-40 shrink-0 overflow-auto border-b border-neutral-200 px-1 py-1 lg:max-h-56">
