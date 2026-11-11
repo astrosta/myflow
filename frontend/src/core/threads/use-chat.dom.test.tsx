@@ -3,7 +3,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { captured, streamMock, fetchMessagePageMock, stateMock } = vi.hoisted(() => {
+const { captured, streamMock, fetchMessagePageMock, stateMock, latestRunMock } = vi.hoisted(() => {
   const streamMock = {
     messages: [] as unknown[],
     values: {},
@@ -32,6 +32,14 @@ const { captured, streamMock, fetchMessagePageMock, stateMock } = vi.hoisted(() 
       checkpoint_id: null,
       checkpoint_ns: null,
     })),
+    latestRunMock: vi.fn(async (): Promise<{
+      run_id: string;
+      thread_id: string;
+      status: string;
+      error: string | null;
+      created_at: string | null;
+      updated_at: string | null;
+    } | null> => null),
   };
 });
 
@@ -51,7 +59,11 @@ vi.mock("@/core/api/messages-feed", () => ({
   OLDER_PAGE_SIZE: 10,
   fetchMessagePage: fetchMessagePageMock,
 }));
-vi.mock("@/core/api/threads", () => ({ createThread: vi.fn(), getThreadState: stateMock }));
+vi.mock("@/core/api/threads", () => ({
+  createThread: vi.fn(),
+  getThreadState: stateMock,
+  fetchLatestRun: latestRunMock,
+}));
 vi.mock("@/core/api/uploads", () => ({ uploadFiles: vi.fn() }));
 
 import { createThread } from "@/core/api/threads";
@@ -370,6 +382,29 @@ describe("useChat 的持久化状态", () => {
         checkpoint_id: null,
         checkpoint_ns: null,
       });
+    }
+  });
+
+  it("刷新后从最新 run 恢复失败原因，而不是静默显示就绪", async () => {
+    latestRunMock.mockResolvedValue({
+      run_id: "run-1",
+      thread_id: "t1",
+      status: "error",
+      error: "GraphRecursionError: 模型在 1000 步内没有收敛",
+      created_at: null,
+      updated_at: null,
+    });
+
+    try {
+      const { result } = renderHook(() => useChat({ threadId: "t1" }), { wrapper });
+
+      await waitFor(() =>
+        expect(result.current.error).toBe(
+          "GraphRecursionError: 模型在 1000 步内没有收敛",
+        ),
+      );
+    } finally {
+      latestRunMock.mockResolvedValue(null);
     }
   });
 

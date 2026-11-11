@@ -2,13 +2,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class TitleConfig(BaseModel):
-    """First-turn thread title. ``model_name`` empty means truncate the user's words."""
+    """First-turn thread title. ``model_name`` empty means use the default model."""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
+    #: Use an LLM to extract a title. False keeps the local truncation path.
+    use_model: bool = True
     max_words: int = Field(default=6, ge=1, le=20)
     max_chars: int = Field(default=60, ge=10, le=200)
+    #: None = agents.default_model; set an explicit model when titles need a cheaper one.
     model_name: str | None = None
     prompt_template: str = (
         "为下面这段对话生成一个简洁标题（最多 {max_words} 个词）。\n"

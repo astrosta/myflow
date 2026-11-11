@@ -33,6 +33,15 @@ export interface Page<T> {
   has_more: boolean;
 }
 
+export interface ThreadRunRow {
+  run_id: string;
+  thread_id: string;
+  status: string;
+  error: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
 /** 后端 ThreadId 的约束：^[A-Za-z0-9_-]{1,64}$ */
 export const THREAD_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -68,6 +77,28 @@ export async function listThreads(options: ListThreadsOptions = {}): Promise<Pag
     throw new Error("Failed to list threads: HTTP " + response.status);
   }
   return parsePage<ThreadRow>(await response.json(), "/threads");
+}
+
+/**
+ * The newest run for a thread. A finished errored run is persisted here even
+ * when no browser was connected to its SSE stream; the chat page uses it to
+ * restore the failure banner after a refresh.
+ */
+export async function fetchLatestRun(
+  threadId: string,
+  options: { signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
+): Promise<ThreadRunRow | null> {
+  const { signal, fetchImpl = apiFetch } = options;
+  const params = new URLSearchParams({ limit: "1", order: "desc" });
+  const response = await fetchImpl(
+    apiUrl("/threads/" + encodeURIComponent(threadId) + "/runs?" + params.toString()),
+    { signal },
+  );
+  if (!response.ok) {
+    throw new Error("Failed to read the latest run: HTTP " + response.status);
+  }
+  const page = parsePage<ThreadRunRow>(await response.json(), "/threads/{id}/runs");
+  return page.data[0] ?? null;
 }
 
 export interface CreateThreadOptions {

@@ -150,6 +150,25 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         """Sync path never calls a model."""
         return self._local_title(state, allow_partial_exchange=allow_partial_exchange)
 
+    def _title_model_name(self, config: TitleConfig) -> str | None:
+        """Resolve the model used for title extraction.
+
+        An explicit ``model_name`` wins. Otherwise production assemblies use the
+        same default model as the conversation; only a standalone middleware
+        (tests / CLI without an app snapshot) keeps the local truncation path.
+        """
+
+        if not config.use_model:
+            return None
+        if config.model_name:
+            return config.model_name
+        if self._app_config is not None:
+            if self._app_config.agents.default_model:
+                return self._app_config.agents.default_model
+            # Match the chat factory's "no explicit default = first model" rule.
+            return self._app_config.models[0].name if self._app_config.models else None
+        return None
+
     async def _agenerate_title_result(self, state: Mapping) -> dict | None:
         if not self._should_generate_title(state):
             return None
@@ -157,11 +176,12 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         if not user_msg.strip():
             return {"title": _DEFAULT_TITLE}
         config = self._resolved_config()
-        if not config.model_name:
+        model_name = self._title_model_name(config)
+        if not model_name:
             return {"title": self._fallback_title(user_msg)}
         try:
             model_kwargs: dict[str, Any] = {
-                "name": config.model_name,
+                "name": model_name,
                 "thinking_enabled": False,
                 "attach_tracing": False,
             }
@@ -173,7 +193,7 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
             if title:
                 return {"title": title}
         except Exception:
-            logger.debug("Title model call failed; using the local title", exc_info=True)
+            logger.warning("Title model call failed; using the local title", exc_info=True)
         return {"title": self._fallback_title(user_msg)}
 
     def after_model(self, state: TitleMiddlewareState, runtime: Runtime) -> dict | None:

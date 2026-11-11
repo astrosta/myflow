@@ -14,7 +14,7 @@ import {
   fetchMessagePage,
 } from "../api/messages-feed";
 import { sanitizeChatStreamModes } from "../api/stream-mode";
-import { createThread, getThreadState } from "../api/threads";
+import { createThread, fetchLatestRun, getThreadState } from "../api/threads";
 import { uploadFiles } from "../api/uploads";
 import { buildMessageGroups } from "../messages/group";
 import {
@@ -210,6 +210,21 @@ export function useChat({
   });
   const persistedValues = stateQuery.data?.values ?? EMPTY_THREAD_VALUES;
 
+  /** Latest run is the durable error channel when the browser missed the SSE error frame. */
+  const latestRun = useQuery({
+    queryKey: ["latest-run", effectiveThreadId],
+    queryFn: ({ signal }) => {
+      if (effectiveThreadId === null) throw new Error("no thread yet");
+      return fetchLatestRun(effectiveThreadId, { signal });
+    },
+    enabled: hasThread,
+  });
+  const durableRunError = useMemo(() => {
+    const run = latestRun.data;
+    if (!run || (run.status !== "error" && run.status !== "timeout")) return null;
+    return run.error || `本次运行以 ${run.status} 结束`;
+  }, [latestRun.data]);
+
   const history = useMemo(() => loadedMessages(historyWindow), [historyWindow]);
   const floorSeq = useMemo(() => loadedFloorSeq(historyWindow), [historyWindow]);
   const moreBefore = useMemo(() => hasMoreBefore(historyWindow), [historyWindow]);
@@ -309,6 +324,7 @@ export function useChat({
       // Artifacts are scanned when the run finalizes; pull the durable state
       // again so a file written through bash/run_code appears in the panel.
       queryClient.invalidateQueries({ queryKey: ["thread-state"] });
+      queryClient.invalidateQueries({ queryKey: ["latest-run"] });
       /**
        * 标题也是这一轮收尾时才落库的：worker 在 finally 里把 checkpoint 的
        * `title` 投影到 `threads_meta.display_name`（M4 §4.1），然后才发 end 帧。
@@ -323,6 +339,7 @@ export function useChat({
       // file the agent already wrote.
       queryClient.invalidateQueries({ queryKey: ["messages"] });
       queryClient.invalidateQueries({ queryKey: ["thread-state"] });
+      queryClient.invalidateQueries({ queryKey: ["latest-run"] });
       queryClient.invalidateQueries({ queryKey: ["threads"] });
     },
   });
@@ -374,6 +391,7 @@ export function useChat({
         // 同样用前缀：恢复回调也可能被旧闭包调用
         queryClient.invalidateQueries({ queryKey: ["messages"] });
         queryClient.invalidateQueries({ queryKey: ["thread-state"] });
+        queryClient.invalidateQueries({ queryKey: ["latest-run"] });
       },
     });
   }, [effectiveThreadId, client, queryClient]);
@@ -581,6 +599,7 @@ export function useChat({
     // §5.1：立刻失效相关缓存，**并安排一次跟进刷新**
     queryClient.invalidateQueries({ queryKey: messagesQueryKey(effectiveThreadId) });
     queryClient.invalidateQueries({ queryKey: ["thread-state"] });
+    queryClient.invalidateQueries({ queryKey: ["latest-run"] });
     queryClient.invalidateQueries({ queryKey: ["threads"] });
     globalThis.setTimeout(() => {
       queryClient.invalidateQueries({ queryKey: ["threads"] });
@@ -600,7 +619,9 @@ export function useChat({
     threadLoading: Boolean(stream.isThreadLoading) || newestPage.isLoading || stateQuery.isLoading,
     loadingOlder,
     hasMoreBefore: moreBefore,
-    error: stream.error ? String((stream.error as Error).message ?? stream.error) : null,
+    error: stream.error
+      ? String((stream.error as Error).message ?? stream.error)
+      : durableRunError,
     interrupt,
     interruptBusy,
     respondToInterrupt,

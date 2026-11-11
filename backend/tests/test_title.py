@@ -101,6 +101,88 @@ def test_async_model_call_carries_nostream_and_strips_think_blocks(monkeypatch: 
     assert parent["tags"] == ["keep"]
 
 
+def test_default_title_model_falls_back_to_the_agents_default_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict = {}
+
+    class _Model:
+        async def ainvoke(self, prompt: str, config: dict | None = None) -> AIMessage:
+            seen["prompt"] = prompt
+            return AIMessage(content="自动标题")
+
+    def create_chat_model(**kwargs: object) -> _Model:
+        seen["create"] = kwargs
+        return _Model()
+
+    monkeypatch.setattr("agentkit.agents.middlewares.title_middleware.create_chat_model", create_chat_model)
+    app_config = AppConfig(
+        agents={"default_model": "lead"},
+        models=[ModelConfig(name="lead", use="langchain_openai:ChatOpenAI")],
+    )
+    middleware = TitleMiddleware(app_config=app_config, title_config=TitleConfig())
+
+    async def run() -> dict | None:
+        return await middleware.aafter_model(
+            _state(HumanMessage(content="今天天气怎么样"), AIMessage(content="晴天")),
+            None,
+        )
+
+    assert asyncio.run(run()) == {"title": "自动标题"}
+    assert seen["create"]["name"] == "lead"
+
+
+def test_title_middleware_extracts_a_title_inside_a_real_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    from langchain.agents import create_agent
+
+    from agentkit.agents.thread_state import ThreadState
+    from fakes.chat_model import ScriptedChatModel
+
+    class _TitleModel:
+        async def ainvoke(self, prompt: str, config: dict | None = None) -> AIMessage:
+            return AIMessage(content="自动标题")
+
+    monkeypatch.setattr(
+        "agentkit.agents.middlewares.title_middleware.create_chat_model",
+        lambda **kwargs: _TitleModel(),
+    )
+    app_config = AppConfig(
+        agents={"default_model": "lead"},
+        models=[ModelConfig(name="lead", use="langchain_openai:ChatOpenAI")],
+    )
+    graph = create_agent(
+        model=ScriptedChatModel(replies=["晴天"]),
+        tools=[],
+        middleware=[TitleMiddleware(app_config=app_config, title_config=TitleConfig())],
+        state_schema=ThreadState,
+        checkpointer=False,
+    )
+
+    result = asyncio.run(graph.ainvoke({"messages": [HumanMessage(content="今天天气怎么样")]}))
+
+    assert result["title"] == "自动标题"
+
+
+def test_use_model_false_keeps_the_local_title_without_a_model_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    def explode(**kwargs: object) -> None:
+        raise AssertionError(kwargs)
+
+    monkeypatch.setattr("agentkit.agents.middlewares.title_middleware.create_chat_model", explode)
+    app_config = AppConfig(
+        agents={"default_model": "lead"},
+        models=[ModelConfig(name="lead", use="langchain_openai:ChatOpenAI")],
+    )
+    middleware = TitleMiddleware(
+        app_config=app_config, title_config=TitleConfig(use_model=False)
+    )
+
+    async def run() -> dict | None:
+        return await middleware.aafter_model(
+            _state(HumanMessage(content="今天天气怎么样"), AIMessage(content="晴天")),
+            None,
+        )
+
+    assert asyncio.run(run()) == {"title": "今天天气怎么样"}
+
+
 def test_sync_path_truncates_locally_even_when_a_model_is_configured() -> None:
     human = HumanMessage(content="abcdefghijklmnop")
     result = _middleware(model_name="lead", max_chars=12).after_model(

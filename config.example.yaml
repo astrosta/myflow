@@ -16,6 +16,9 @@ agents:
 
 title:
   enabled: true
+  # 默认用 agents.default_model 生成标题；设为 false 时只截断用户原话。
+  use_model: true
+  # model_name: null  # 不写 = 用 agents.default_model；也可以指定更便宜的模型。
 # startup-only: 改了要重启（按 type 创建的单例不会随热重载重建）。
 # Gateway 的 lifespan 实际按 database.backend 创建 checkpointer；这一节供
 # AgentClient / CLI 使用。memory | sqlite | postgres；postgres 还要求
