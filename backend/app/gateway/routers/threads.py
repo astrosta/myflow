@@ -120,7 +120,9 @@ async def get_state(
     checkpoint_id: Annotated[str | None, Query(max_length=128, pattern=r"^[A-Za-z0-9_.:-]{1,128}$")] = None,
 ) -> ThreadStateResponse:
     await require_visible_thread(services, thread_id, caller)
-    return await read_thread_state(services, thread_id, checkpoint_id=checkpoint_id)
+    return await read_thread_state(
+        services, thread_id, checkpoint_id=checkpoint_id, user_id=caller.user_id
+    )
 
 
 @router.get("/{thread_id}/messages", response_model=Page[MessageResponse])
@@ -167,7 +169,7 @@ async def update_thread_state(
             values=body.values,
             checkpoint_id=checkpoint_id,
         )
-    return await read_thread_state(services, thread_id)
+    return await read_thread_state(services, thread_id, user_id=caller.user_id)
 
 
 @router.post("/{thread_id}/compact", response_model=ThreadCompactResponse)

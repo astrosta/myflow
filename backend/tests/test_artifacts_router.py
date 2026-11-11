@@ -17,12 +17,21 @@ from backend.app.gateway.auth_middleware import PUBLIC_EXACT_PATHS, PUBLIC_PATH_
 from backend.app.gateway.routers import artifacts, threads
 
 
+class _EmptyCheckpointer:
+    async def aget_tuple(self, _config):
+        return None
+
+
 def _client(tmp_path, monkeypatch) -> TestClient:
-    monkeypatch.setattr("backend.app.gateway.thread_files.get_paths", lambda: Paths(tmp_path))
+    paths = Paths(tmp_path)
+    monkeypatch.setattr("backend.app.gateway.thread_files.get_paths", lambda: paths)
+    monkeypatch.setattr("agentkit.sandbox.artifacts.get_paths", lambda: paths)
     services = SimpleNamespace(
         run_manager=SimpleNamespace(),
         bridge=SimpleNamespace(supports_cross_process=False),
-        run_context=SimpleNamespace(thread_store=MemoryThreadMetaStore(), checkpointer=SimpleNamespace()),
+        run_context=SimpleNamespace(
+            thread_store=MemoryThreadMetaStore(), checkpointer=_EmptyCheckpointer()
+        ),
         run_store=MemoryRunStore(),
         event_store=SimpleNamespace(),
     )
@@ -56,6 +65,45 @@ def test_outputs_file_is_served_and_html_is_an_attachment(tmp_path, monkeypatch)
     assert "inline" in note.headers["content-disposition"]
     assert "attachment" in page.headers["content-disposition"]
     assert "attachment" in icon.headers["content-disposition"]
+
+
+def test_outputs_are_listed_without_guessing_a_file_name(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    assert client.post("/api/threads", json={"thread_id": "thread-1"}).status_code == 201
+    paths = Paths(tmp_path)
+    paths.ensure_thread_dirs("thread-1", user_id="default")
+    outputs = paths.sandbox_outputs_dir("thread-1", user_id="default")
+    (outputs / "report.txt").write_text("hello", encoding="utf-8")
+    (outputs / "nested").mkdir()
+    (outputs / "nested" / "chart.svg").write_text("<svg/>", encoding="utf-8")
+
+    response = client.get("/api/threads/thread-1/artifacts")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "artifacts": [
+            "/mnt/user-data/outputs/nested/chart.svg",
+            "/mnt/user-data/outputs/report.txt",
+        ],
+        "count": 2,
+    }
+
+
+def test_thread_state_uses_the_same_outputs_scan(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    assert client.post("/api/threads", json={"thread_id": "thread-1"}).status_code == 201
+    paths = Paths(tmp_path)
+    paths.ensure_thread_dirs("thread-1", user_id="default")
+    (paths.sandbox_outputs_dir("thread-1", user_id="default") / "report.txt").write_text(
+        "hello", encoding="utf-8"
+    )
+
+    response = client.get("/api/threads/thread-1/state")
+
+    assert response.status_code == 200
+    assert response.json()["values"]["artifacts"] == [
+        "/mnt/user-data/outputs/report.txt"
+    ]
 
 
 def test_non_output_paths_and_missing_files(tmp_path, monkeypatch) -> None:

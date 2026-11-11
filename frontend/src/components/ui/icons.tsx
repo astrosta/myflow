@@ -131,6 +131,27 @@ export function BookOpenIcon(props: IconProps) {
   );
 }
 
+/** 资料库。一排书脊——首页「知识库」能力卡片 */
+export function LibraryIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="m16 6 4 14" />
+      <path d="M12 6v14" />
+      <path d="M8 8v12" />
+      <path d="M4 4v16" />
+    </Icon>
+  );
+}
+
+/** 评测与观测。脉冲折线——首页「可评测、可观测」能力卡片 */
+export function ActivityIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+    </Icon>
+  );
+}
+
 /** 停止。实心方块，比 "■" 字符的基线更可控 */
 export function StopIcon({ size = 18, ...props }: IconProps) {
   return (

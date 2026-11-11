@@ -43,6 +43,7 @@ from myflow_evals.build_dataset import (
     TraceSource,
     _schema_arguments,
     _schema_hash,
+    attach_thread_ids,
     is_safe_call_name,
     stable_item_id,
 )
@@ -631,6 +632,7 @@ def synthesize_account_items(
     deduped, dropped = dedupe_drafts(drafts, embedder=embedder)
     if plan.max_total is not None:
         deduped = deduped[: plan.max_total]
+    deduped = attach_thread_ids(deduped)
     _drain_writer_warnings(writer, warnings)
     return SynthesisResult(
         drafts=tuple(deduped),

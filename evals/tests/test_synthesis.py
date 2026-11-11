@@ -510,6 +510,23 @@ def test_generation_is_deterministic_and_ids_are_unique() -> None:
     assert first.dropped_duplicates == second.dropped_duplicates
 
 
+def test_every_synthesized_draft_carries_a_stable_thread_id() -> None:
+    sources = _sources(
+        tools=[SEARCH, CREATE, DELETE, FIND, UPDATE, LIST],
+        skills=[SKILL_WITH_TOOL, SKILL_SIMILAR, SKILL_OTHER],
+        knowledge=[POLICY, SLA],
+        traces=[TRACE],
+    )
+
+    first = synthesize_account_items(_session(), sources)
+    second = synthesize_account_items(_session(), sources)
+
+    thread_ids = [draft.metadata["thread_id"] for draft in first.drafts]
+    assert thread_ids == [draft.id for draft in first.drafts]
+    assert thread_ids == [draft.metadata["thread_id"] for draft in second.drafts]
+    assert len(set(thread_ids)) == len(thread_ids)
+
+
 def test_max_total_caps_the_result_without_losing_duplicate_accounting() -> None:
     result = synthesize_account_items(
         _session(),

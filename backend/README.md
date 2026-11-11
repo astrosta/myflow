@@ -617,7 +617,8 @@ PAT 的**校验链路**已经就位（`Authorization: Bearer dfp_...`、固定 s
 | `GET` | `/api/models` | 模型目录（`models[]` + `reasoning_efforts` + `default_model`），输入框的模型/推理等级下拉读它 |
 | `GET` | `/api/models/{model_name}` | 单个模型（`models:read`） |
 | `POST` | `/api/threads/{id}/uploads` | 上传 |
-| `GET` | `/api/threads/{id}/artifacts/...` | 产物 |
+| `GET` | `/api/threads/{id}/artifacts` | 产物清单（扫描 `outputs/`，返回虚拟路径与数量） |
+| `GET` | `/api/threads/{id}/artifacts/...` | 读取单个产物（只允许 `outputs/` 下） |
 | `GET` | `/api/skills` | 内置技能 + 当前用户已生效的私有技能（`skills:read`）；没有公共目录 |
 | `GET` | `/api/skills/mine` | 当前用户全部私有技能（含草稿、提炼来源与扫描状态，`skills:read`） |
 | `POST` | `/api/skills` | 新建私有草稿（`skills:write`） |

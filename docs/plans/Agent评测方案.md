@@ -27,12 +27,12 @@
 | 规则 Evaluator | 自研代码 | 工具检索 Recall@k、参数比对、禁用工具检查、Skills 检索命中率、知识库检索命中率（按切片或文档 ID） |
 | Agent API | 被测对象 | 以认证身份隔离用户；使用 thread/run 两阶段接口；评测侧需补只读的 run_event 证据查询（不提供 debug 模式） |
 
-**数据流**：固定测试账号的真实数据 → 合成 Langfuse Dataset（样本 `metadata.user_id` 存 Langfuse hashed user id）→ 评测脚本按 hashed user id 映射到已登录的固定账号、用独立 thread_id 调用 Agent API（建 thread、起 run）→ 读取 run 终态和 run_event 账本，得到回答、工具检索结果、工具调用、Skills 检索与加载结果、知识库检索切片 → 规则 Evaluator + DeepEval 打分（不评 user_id 相关因素）→ 分数写回 Langfuse → 网页对比实验。
+**数据流**：固定测试账号的真实数据 → 合成 Langfuse Dataset（样本 `metadata.user_id` 存 Langfuse hashed user id）→ 评测脚本按 hashed user id 映射到已登录的固定账号、用样本 `metadata.thread_id` 调用 Agent API（建 thread、起 run）→ 读取 run 终态和 run_event 账本，得到回答、工具检索结果、工具调用、Skills 检索与加载结果、知识库检索切片 → 规则 Evaluator + DeepEval 打分（不评 user_id 相关因素）→ 分数写回 Langfuse → 网页对比实验。
 
 **原则**
 
 - 能用规则判断的不用 LLM。工具检索、工具调用、Skills 检索、知识库检索命中中都优先用名称或 ID 比对。
-- 每次调用 Agent 都必须以固定测试账号身份认证（user_id 由 token/会话决定，不放在请求体）；user_id 只用于数据过滤和 trace 归属，不进入 query/expectedOutput/评分；每条样本使用独立 thread_id。
+- 每次调用 Agent 都必须以固定测试账号身份认证（user_id 由 token/会话决定，不放在请求体）；user_id 只用于数据过滤和 trace 归属，不进入 query/expectedOutput/评分；同一轮对话的样本共享 `metadata.thread_id`，不同轮次使用不同 thread_id。
 - LLM 评测只用于无法用规则判断的维度：回答是否忠于资料、是否切题、是否满足判定规则。
 - 评测集只在 Langfuse 维护一份。
 
@@ -169,7 +169,7 @@ Skills 检索与工具检索结构类似（Milvus 混合检索 + 按 user_id 过
 
 `metadata.user_id` 必填，值是 **Langfuse hashed user id**，不是原始 `users.id`。构建集时测试人员填入固定账号 username/password；构建脚本登录后取得实际 user_id，用与 Agent tracing 相同的 `user_id_salt` 计算 `HMAC-SHA256(user_id_salt, agent_user_id)` 并取前 32 位十六进制，写入 `metadata.user_id`。这里的 `agent_user_id` 是 Agent 认证后使用的 storage-safe ID（`make_safe_user_id(users.id)`）；普通 UUID 测试账号与 `/me.id` 相同，若不是 UUID，必须用同样规则归一后再算哈希。`user_id_salt` 来自与 Agent 相同的 Langfuse 配置/secret，构建器和 runner 必须共用。真实 user_id 只在构建阶段用于访问/过滤该账号的工具、Skill、知识库和计算哈希，不写入样本；密码也不落 Dataset。`input` 只放 query，不放 user_id/user_role；`user_id` 只用于账号映射和数据过滤，不进入 query、expectedOutput 或评分。不要把整份样本 metadata 原样塞进 run 请求：run 侧身份只来自认证，metadata 里的 hashed user_id 也不应被当成运行时身份。
 
-评测脚本还要为每条样本生成/携带唯一的 `thread_id`（例如 `eval-<run_name>-<item_id>`，满足 `^[A-Za-z0-9_-]{1,64}$`），通过 run URL 传递；不要复用历史 thread，否则旧消息会污染本轮评测。`thread_id` 不需要写进 Dataset，运行时生成即可。
+构建器为每个草稿写入 `metadata.thread_id`，值由条目 ID 确定性派生并满足 Gateway 的 `^[A-Za-z0-9_-]{1,64}$`；同一轮如果拆成多条样本，它们共用同一个 `thread_id`，不同轮次使用不同值。runner 直接把这个值放进 run URL，同一 thread 在本次实验中只创建一次并串行执行其中的条目，因此一轮对话不会在 Langfuse 里被拆成多个 session。没有 `metadata.thread_id` 的旧数据集仍由 runner 为每条样本生成新的随机 thread。
 
 工具类样本里的工具名按 MCP 的 `call_name` 标注（`mcp__<server>__<tool>`），不是 `server.tool`；知识库 ID 示例是占位，实际值取 `knowledge_search` 返回的 `document_id` / `chunk_id`。Langfuse 保持 `user_id_mode=hashed` 时，`metadata.user_id` 与 Agent trace 的 `userId` 一致；把它也放进 `Evaluation.metadata`，score 就能按同一标签筛选。experiment trace 本身没有 user_id 字段，详见 6.2.1。
 
@@ -302,7 +302,7 @@ skill_rules 用于 K3 遵循度评判，可从 SKILL.md 中的关键步骤和输
 | 读 run | `GET /api/threads/{thread_id}/runs/{run_id}` | 取 `status`、`error`、`metadata`；本次 Langfuse trace id 在 `metadata["myflow-trace-id"]`。 |
 | 读父消息 | `GET /api/threads/{thread_id}/messages` | 只有 `category=message` 的父代理消息；工具调用/结果嵌在消息内容里。 |
 | 读证据 | `GET /api/threads/{thread_id}/runs/{run_id}/events` | **本方案新增，阶段 1 已实现**；这是取得 `subagent.*` 和 `retrieval.*` 的 API 途径。 |
-| 清理 | `DELETE /api/threads/{thread_id}` | 可选；至少保证每条样本使用独立 thread。 |
+| 清理 | `DELETE /api/threads/{thread_id}` | 可选；同一轮对话共享 thread，独立样本各自使用独立 thread。 |
 
 **5.2 请求**
 
@@ -338,7 +338,7 @@ actual_user = client.get("/v1/auth/me").json()  # 仅校验，不传给 Agent
 - session 有 TTL（默认 84600 秒）；长任务收到 401 时重新登录该账号，不要复用失效 cookie。
 - 本轮不构造跨用户权限样本；固定账号只使用自己可见的工具/Skill/知识库数据，账号之间不互相借数据。
 
-先建 thread。`thread_id` 必须匹配 `^[A-Za-z0-9_-]{1,64}$`，并且每条样本/每次实验唯一；重复使用同一 `thread_id` 会带上旧消息，破坏可复现性。
+先建 thread。`thread_id` 必须匹配 `^[A-Za-z0-9_-]{1,64}$`；构建器把同一轮对话的值写进 `metadata.thread_id`，不同轮次使用不同值。只有刻意共享的同一轮测试才复用同一个 thread。
 
 ```http
 POST /api/threads
@@ -389,7 +389,7 @@ Content-Type: application/json
 - `thread_id` 只能在 URL 里；`session_id`、`message`、`debug`、顶层 `user_id` 都不在 `RunCreateRequest` 中，会 422。
 - `user_role` 不是 run 参数；账号角色来自固定测试账号。本轮不评分权限/隔离，也不准备跨用户样本。
 - 服务端会在四个位置删除客户端身份键。因此 `metadata.user_id` 会被静默丢弃，顶层 `user_id` 会 422；两种都不是“切换用户”的入口。
-- 每条样本使用新 `thread`；评测结果**不评估长期记忆的影响**。评测环境应关闭长期记忆，或在每轮实验前统一清空固定账号记忆；否则记忆污染会让同一 query 的结果不可复现。该处理只用于保证可复现，不产生记忆相关指标。
+- 同一轮对话的样本共享 `metadata.thread_id`，独立样本各自使用新 `thread`；评测结果**不评估长期记忆的影响**。评测环境应关闭长期记忆，或在每轮实验前统一清空固定账号记忆；否则记忆污染会让同一 query 的结果不可复现。该处理只用于保证可复现，不产生记忆相关指标。
 
 **5.3 响应与证据取数**
 
@@ -509,7 +509,7 @@ GET /api/threads/{thread_id}/runs/{run_id}/events
 - [ ] 登录后 `/api/v1/auth/me` 返回的 `id` 经同一 salt 计算出的 hashed id 与样本 `metadata.user_id` 一致；真实身份由 Agent 解析，不由请求体下发。
 - [ ] 请求体带顶层 `user_id` 返回 422；样本 metadata 里的 `user_id` 不会被转发进 run 请求。
 - [ ] 同一 thread 用另一个测试账号读取返回 404（仅数据过滤校验，不评分）。
-- [ ] 每条样本使用新的 `thread_id`；run 结束后能按 `run_id` 读到 `subagent.start` / `subagent.step`。
+- [ ] 同一轮共享 `metadata.thread_id`，独立样本使用不同 `thread_id`；run 结束后能按 `run_id` 读到 `subagent.start` / `subagent.step`。
 - [ ] K0/R0 按 `task.subagent_type` / `subagent.start` 判路由：skill-finder 对应 K0，knowledge-researcher 对应 R0；不把内部 `knowledge_search` 调用当成 R0。
 - [ ] 评测环境 `subagent_enabled=true`、两个检索子代理可用、`skills.usage.prompt_top_k=0`；没有直连 `knowledge_search`、静态 `load_skill` 或 slash 样本。
 - [ ] `run.metadata["myflow-trace-id"]` 与 Langfuse trace 可关联。
@@ -648,7 +648,7 @@ uv run --project evals myflow-evals run \
 - **完整性检查**：runner 启动时保存本次 Dataset 的完整 item ID 集合；结束后与 `result.item_results` 的 item ID 对比，任何缺失、task 异常或未评分项都让整次实验失败，不能只看剩余样本的均值。
 - **黑盒调用**：runner 只走公开 API；gateway 必须是已部署的测试/预发实例，不要为了评测在生产实例上启动第二个服务。
 - **并发从 2 开始**：默认 `run_experiment(max_concurrency=50)` 对 Agent 太重；按 `subagent_runtime.max_running` 和网关容量设 2-4，单用户样本串行或小并发。
-- **每条样本独立 thread**，失败重试也换新 thread；不要用 `runs/wait` 的默认 `on_disconnect=cancel`，用 `on_disconnect=continue` 或 `POST /runs` + 轮询。
+- **同一轮共享 thread、独立样本各自 thread**；失败重试沿用该轮 thread；不要用 `runs/wait` 的默认 `on_disconnect=cancel`，用 `on_disconnect=continue` 或 `POST /runs` + 轮询。
 - **凭据只在 secret store**：`AGENT_USERS` 给构建和 runner 共用；密码、原始 user_id 不写 Dataset/日志；Dataset 只存 hashed `metadata.user_id`。
 - **实验 metadata 固定**：`git_sha`、model、dataset_version、`salt_version`、tool/skill/kb 版本、评测模式、并发数；否则分数无法解释。
 - **CI 两层**：PR 跑小回归集 + 规则指标 + 抽样 LLM 指标，10 分钟级；夜间跑全量 + DeepEval 全指标。评测失败用非零退出码阻断发布。
@@ -701,7 +701,7 @@ uv run --project evals myflow-evals run \
 **10. 风险与注意事项**
 
 - **合成数据偏差**：LLM 生成的问法过于规整，知识库问题容易照抄原文，需改写并结合线上真实问法。
-- **测试用户状态污染**：会话历史会让结果不可复现，每条样本独立 thread。
+- **测试用户状态污染**：会话历史会让结果不可复现，只有同一轮对话的样本共享 thread，独立样本各自使用新 thread。
 - **user_id 伪造风险**：服务端必须以 token/会话身份为准；评测中尝试在顶层请求体和 metadata 注入 user_id，确认前者 422、后者被删除，并用另一个账号读取同一 thread/run 得到 404。该检查只验证数据/身份边界，不纳入评分。
 - **Skill 变更导致样本失效**：Skill 改名、合并或拆分后，按 expected_skills 复查并更新样本。
 - **知识库变更导致样本失效**：文档更新后参考答案可能过期，必须按文 ID 复查并重新确认。

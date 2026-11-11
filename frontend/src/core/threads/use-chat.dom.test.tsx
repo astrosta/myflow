@@ -3,7 +3,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { captured, streamMock, fetchMessagePageMock } = vi.hoisted(() => {
+const { captured, streamMock, fetchMessagePageMock, stateMock } = vi.hoisted(() => {
   const streamMock = {
     messages: [] as unknown[],
     values: {},
@@ -23,6 +23,15 @@ const { captured, streamMock, fetchMessagePageMock } = vi.hoisted(() => {
         _options?: { beforeSeq?: number | null; limit?: number },
       ) => new Promise(() => {}),
     ),
+    stateMock: vi.fn(async (): Promise<{
+      values: Record<string, unknown>;
+      checkpoint_id: string | null;
+      checkpoint_ns: string | null;
+    }> => ({
+      values: {},
+      checkpoint_id: null,
+      checkpoint_ns: null,
+    })),
   };
 });
 
@@ -42,7 +51,7 @@ vi.mock("@/core/api/messages-feed", () => ({
   OLDER_PAGE_SIZE: 10,
   fetchMessagePage: fetchMessagePageMock,
 }));
-vi.mock("@/core/api/threads", () => ({ createThread: vi.fn(), getThreadState: vi.fn() }));
+vi.mock("@/core/api/threads", () => ({ createThread: vi.fn(), getThreadState: stateMock }));
 vi.mock("@/core/api/uploads", () => ({ uploadFiles: vi.fn() }));
 
 import { createThread } from "@/core/api/threads";
@@ -336,6 +345,50 @@ describe("useChat 的附件清单", () => {
 
     expect(createThreadMock).not.toHaveBeenCalled();
     expect(streamMock.submit).toHaveBeenCalled();
+  });
+});
+
+describe("useChat 的持久化状态", () => {
+  it("刷新后从 checkpoint state 恢复 artifacts", async () => {
+    stateMock.mockResolvedValue({
+      values: { artifacts: ["/mnt/user-data/outputs/report.txt"] },
+      checkpoint_id: "cp-1",
+      checkpoint_ns: "",
+    });
+
+    try {
+      const { result } = renderHook(() => useChat({ threadId: "t1" }), { wrapper });
+
+      await waitFor(() =>
+        expect(result.current.artifacts).toEqual([
+          "/mnt/user-data/outputs/report.txt",
+        ]),
+      );
+    } finally {
+      stateMock.mockResolvedValue({
+        values: {},
+        checkpoint_id: null,
+        checkpoint_ns: null,
+      });
+    }
+  });
+
+  it("run 结束后让持久化 state 重新扫描产物", () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+    });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    renderHook(() => useChat({ threadId: "t1" }), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+
+    act(() => {
+      (captured.at(-1) as { onFinish: () => void }).onFinish();
+    });
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["thread-state"] });
   });
 });
 

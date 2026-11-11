@@ -97,9 +97,12 @@ _EXPERIMENT_PREFIX = "agent-eval:"
 _UNCATEGORIZED = "unknown"
 _CATEGORY_KEY = "category"
 _EVAL_ITEM_METADATA_KEY = "eval_item_id"
+_THREAD_ID_METADATA_KEY = "thread_id"
 
 #: Langfuse hashed user id: HMAC-SHA256(salt, user_id)[:32], lowercase hex.
 _HASHED_USER_ID_RE = re.compile(r"[0-9a-f]{32}")
+#: Gateway thread-id contract: a metadata thread id must fit the run URL.
+_THREAD_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 __all__ = [
     "CI_SUBSET_SIZE",
@@ -491,10 +494,25 @@ class _ItemPlan:
     item_id: str
     query: str
     session: AccountSession
+    thread_id: str
+
+
+class _ThreadSlot:
+    """One Gateway thread shared by every item whose metadata names it.
+
+    The lock serializes items that share a thread (their runs cannot overlap),
+    and ``created`` makes sure the thread is created once per experiment rather
+    than once per item.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.created = False
+        self.message_count = 0
 
 
 class _ItemTask:
-    """The Langfuse task: one thread, one run, one evidence record per item."""
+    """The Langfuse task: one run and one evidence record per item."""
 
     def __init__(
         self,
@@ -509,6 +527,8 @@ class _ItemTask:
         self._store = store
         self._run_name = run_name
         self._lock = threading.Lock()
+        self._slots_lock = threading.Lock()
+        self._slots: dict[str, _ThreadSlot] = {}
         self.failures: list[FailedItem] = []
 
     async def __call__(self, *, item: Any, **kwargs: Any) -> dict[str, Any]:
@@ -531,19 +551,40 @@ class _ItemTask:
             raise
 
     def _run_item(self, plan: _ItemPlan) -> dict[str, Any]:
-        thread_id = uuid.uuid4().hex
-        self._api.create_thread(
-            plan.session,
-            thread_id,
-            {"eval": True, "eval_run": self._run_name, _EVAL_ITEM_METADATA_KEY: plan.item_id},
-        )
+        slot = self._slot_for(plan.thread_id)
+        # Items that name the same thread are turns of one conversation round:
+        # they must not overlap, and the first one creates the thread.
+        with slot.lock:
+            return self._run_item_on_thread(plan, slot)
+
+    def _run_item_on_thread(
+        self, plan: _ItemPlan, slot: _ThreadSlot
+    ) -> dict[str, Any]:
+        thread_id = plan.thread_id
+        # The slot records how many messages earlier runs on this thread left
+        # behind, so this item's evidence is not scored against the whole
+        # conversation. The first run starts at zero and needs no extra read.
+        prefix = slot.message_count
+        if not slot.created:
+            self._api.create_thread(
+                plan.session,
+                thread_id,
+                {
+                    "eval": True,
+                    "eval_run": self._run_name,
+                    _EVAL_ITEM_METADATA_KEY: plan.item_id,
+                },
+            )
+            slot.created = True
         run_id = self._api.start_run(
             plan.session, thread_id, plan.query, {_EVAL_ITEM_METADATA_KEY: plan.item_id}
         )
         snapshot = self._api.wait_run(plan.session, thread_id, run_id)
         events = self._api.list_events(plan.session, thread_id, snapshot.run_id)
         state = self._api.thread_state(plan.session, thread_id)
-        messages = _messages_from(state)
+        thread_messages = _messages_from(state)
+        slot.message_count = len(thread_messages)
+        messages = _messages_for_current_turn(thread_messages[prefix:], plan.query)
         evidence = collect_evidence(
             messages, events, run_id=snapshot.run_id, trace_id=snapshot.trace_id
         )
@@ -559,6 +600,14 @@ class _ItemTask:
             "status": snapshot.status,
             "evidence_id": evidence_id,
         }
+
+    def _slot_for(self, thread_id: str) -> _ThreadSlot:
+        with self._slots_lock:
+            slot = self._slots.get(thread_id)
+            if slot is None:
+                slot = _ThreadSlot()
+                self._slots[thread_id] = slot
+            return slot
 
     def _record(self, failure: FailedItem) -> None:
         with self._lock:
@@ -710,11 +759,13 @@ class ExperimentRunner:
         plans: list[_ItemPlan] = []
         for item in items:
             item_id = _item_id(item)
+            metadata = _metadata_of(item)
             plans.append(
                 _ItemPlan(
                     item_id=item_id,
                     query=_query_for(item_id, item),
-                    session=self._session_for(item_id, _metadata_of(item)),
+                    session=self._session_for(item_id, metadata),
+                    thread_id=self._thread_id_for(item_id, metadata),
                 )
             )
         return plans
@@ -741,6 +792,22 @@ class ExperimentRunner:
                 f"dataset item {item_id} names a user id with no logged-in test account"
             )
         return session
+
+    def _thread_id_for(self, item_id: str, metadata: Any) -> str:
+        """Return the item thread from metadata, or a fresh one for an old dataset."""
+        if not isinstance(metadata, Mapping):
+            return uuid.uuid4().hex
+        thread_id = metadata.get(_THREAD_ID_METADATA_KEY)
+        if thread_id is None:
+            # Datasets frozen before metadata.thread_id existed keep the old
+            # isolation rule: one fresh thread per execution.
+            return uuid.uuid4().hex
+        if not isinstance(thread_id, str) or not _THREAD_ID_RE.fullmatch(thread_id):
+            raise ExperimentConfigError(
+                f"dataset item {item_id} has a metadata.thread_id that is not a "
+                "valid Gateway thread id; rebuild the dataset instead"
+            )
+        return thread_id
 
 
 def ci_subset(items: Sequence[Any], size: int = CI_SUBSET_SIZE) -> list[Any]:
@@ -1171,6 +1238,50 @@ def _messages_from(state: Any) -> list[Mapping[str, Any]]:
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
         return []
     return [message for message in messages if isinstance(message, Mapping)]
+
+
+def _messages_for_current_turn(
+    messages: Sequence[Mapping[str, Any]], query: str
+) -> list[Mapping[str, Any]]:
+    """Drop history before this run's human message.
+
+    A dataset round can share a thread with the rest of its conversation, and a
+    rerun can find an older checkpoint in the same thread. In both cases the
+    final AI message alone would be the current answer, but the older tool calls
+    and retrieved chunks would leak into this sample's evidence. The run's own
+    human message is the boundary; when it is absent (a run that failed before
+    persisting input) the supplied messages are returned unchanged.
+    """
+    target = _message_text(query)
+    if not target:
+        return list(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("type") not in ("human", "user"):
+            continue
+        if _message_text(message.get("content")) == target:
+            return list(messages[index:])
+    return list(messages)
+
+
+def _message_text(content: Any) -> str:
+    """Normalize a checkpoint message's content for the turn-boundary lookup."""
+    if isinstance(content, str):
+        return " ".join(content.split())
+    if isinstance(content, Mapping):
+        text = content.get("text")
+        return " ".join(text.split()) if isinstance(text, str) else ""
+    if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, Mapping):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return " ".join(" ".join(parts).split())
+    return ""
 
 
 def _failure_reason(exc: BaseException) -> str:

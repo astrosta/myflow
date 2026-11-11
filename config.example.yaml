@@ -14,6 +14,8 @@ log_level: info
 agents:
   default_model: deepseek-reasoner
 
+title:
+  enabled: true
 # startup-only: 改了要重启（按 type 创建的单例不会随热重载重建）。
 # Gateway 的 lifespan 实际按 database.backend 创建 checkpointer；这一节供
 # AgentClient / CLI 使用。memory | sqlite | postgres；postgres 还要求

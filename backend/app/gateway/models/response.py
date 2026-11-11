@@ -120,6 +120,11 @@ class DeletedUploadResponse(BaseModel):
     deleted: str
 
 
+class ArtifactListResponse(BaseModel):
+    artifacts: list[str]
+    count: int
+
+
 _MODEL_WIRE_FIELDS = (
     "name",
     "model",

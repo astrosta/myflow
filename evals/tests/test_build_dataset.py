@@ -1499,6 +1499,23 @@ def test_build_account_items_emits_one_tool_draft_per_real_tool() -> None:
     ]
 
 
+def test_build_account_items_carries_a_deterministic_thread_id_per_item() -> None:
+    sources = _sources(
+        tools=[SEARCH_TOOL],
+        skills=[PRIVATE_SKILL],
+        knowledge=[POLICY_DOCUMENT],
+        traces=[FAILED_TRACE],
+    )
+
+    first = build_account_items(_offline_session(), sources)
+    second = build_account_items(_offline_session(), sources)
+
+    thread_ids = [draft.metadata["thread_id"] for draft in first]
+    assert thread_ids == [draft.id for draft in first]
+    assert thread_ids == [draft.metadata["thread_id"] for draft in second]
+    assert len(set(thread_ids)) == len(thread_ids)
+
+
 def test_tool_args_recurse_into_a_required_object_only_one_level() -> None:
     sources = _sources(tools=[NESTED_TOOL])
 
@@ -1574,6 +1591,7 @@ def test_trace_drafts_replay_the_query_and_carry_no_expectations() -> None:
         "source": "online_trace",
         "trace_id": "trace-error",
         "category": "kb_single_hop",
+        "thread_id": first.id,
     }
     assert second.metadata["category"] == "trace_replay"
 

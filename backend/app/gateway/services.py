@@ -101,8 +101,14 @@ _RESERVED_METADATA_KEYS = CLIENT_IDENTITY_KEYS | {TRACE_METADATA_KEY, "trace_par
 # user, session, trace name or tags used for audit and cost attribution.
 _RESERVED_METADATA_PREFIXES = ("langfuse_",)
 
-# 默认循环次数
-DEFAULT_RECURSION_LIMIT = 100
+#: Default LangGraph super-step budget for a run.
+#:
+#: This is NOT a model-turn count.  Every middleware hook is its own graph
+#: node, so the lead graph spends roughly nine super-steps per model/tool
+#: turn.  The old value (100) therefore expired after about nine turns even
+#: though it looked like a 100-turn budget.  Keep the default at the same
+#: ceiling as AppConfig.max_recursion_limit; operators can still lower it.
+DEFAULT_RECURSION_LIMIT = 1000
 _PASSTHROUGH_CONFIG_KEYS = frozenset({"tags", "run_name"})
 _HANDLED_CONFIG_KEYS = _PASSTHROUGH_CONFIG_KEYS | {"recursion_limit", "metadata", "configurable", "context"}
 
@@ -515,7 +521,7 @@ def build_run_config(thread_id: str, request_config: dict | None, run_metadata: 
 
 def _clamp_recursion_limit(value: Any, ceiling: int) -> int:
     if value is None:
-        return DEFAULT_RECURSION_LIMIT
+        return min(DEFAULT_RECURSION_LIMIT, ceiling)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise RunRequestInvalid("config.recursion_limit must be a positive integer")
     if value > ceiling:

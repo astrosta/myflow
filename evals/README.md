@@ -125,7 +125,7 @@ uv run --project evals myflow-evals run \
 | `--llm-sample FLOAT` | 适用条目中被 LLM 指标评分的比例。`ci` 默认 `0.2`，`full` 默认 `1.0`；选择是确定性的，同一 item/metric/seed/mode 每次都一样。 |
 | `--limit N` | 在模式选择之后限制所选条目。 |
 
-真正的 `run` 需要三个 Langfuse 变量以及 `AGENT_API` 和 `USER_ID_SALT`。它读取冻结的数据集，按模式选择条目，登录每个固定账户，并且只执行选中的条目——运行器将 `data=list(selected)` 传给 Langfuse，因此大型数据集绝不会被静默地全量运行。每个条目都有自己的 thread 和 run（`on_disconnect=continue`），然后运行器轮询运行的终态，读取运行事件账本和 thread checkpoint，将它们规范化为证据，用所有适用的规则评测器为该条目评分，并且只向 Langfuse 上传紧凑输出（答案、状态、追踪 ID、不透明证据 ID）。检索到的分块和引用载荷保留在运行器进程中。配置了评判模型时，运行器还会加上 LLM 指标适配器；任何一次评判失败都只记录为 `metric: ExceptionType`，不影响规则门禁，并在结果里以 `llm metric errors:` 行报告。
+真正的 `run` 需要三个 Langfuse 变量以及 `AGENT_API` 和 `USER_ID_SALT`。它读取冻结的数据集，按模式选择条目，登录每个固定账户，并且只执行选中的条目——运行器将 `data=list(selected)` 传给 Langfuse，因此大型数据集绝不会被静默地全量运行。每个条目都使用数据集 `metadata.thread_id` 指定的 thread，并在其中启动一个 run（`on_disconnect=continue`）；同一 thread 的条目串行执行且只创建一次 thread，因此同一轮对话的测试共享一个 Langfuse session。没有该字段的旧数据集仍为每个条目新建随机 thread。然后运行器轮询运行的终态，读取运行事件账本和 thread checkpoint，将它们规范化为证据，用所有适用的规则评测器为该条目评分，并且只向 Langfuse 上传紧凑输出（答案、状态、追踪 ID、不透明证据 ID）。检索到的分块和引用载荷保留在运行器进程中。配置了评判模型时，运行器还会加上 LLM 指标适配器；任何一次评判失败都只记录为 `metric: ExceptionType`，不影响规则门禁，并在结果里以 `llm metric errors:` 行报告。
 
 `--dry-run` 打印数据集、模式、运行名称以及将选择多少条目；它不启动任何 thread，不写入任何分数，也不登录任何账户——但它仍会通过 Langfuse 读取数据集，因此需要 Langfuse 变量，而 `AGENT_API` 和 `USER_ID_SALT` 不需要（没有任何登录）。
 
@@ -302,7 +302,7 @@ CLI 将该行打印到 stderr 并以 `1` 退出。调查其中列出的条目 ID
 
 transport 不影响采样，只要求服务器生效。每一次生效性跳过和每一个不可用的本地来源——未生效服务器、`/tools` 调用失败的服务器、未标记 `callable`/`enabled` 或没有可用 `input_schema` 的工具、未生效 Skill、没有可读分块的文档、不可用的 Langfuse——都会作为警告记录在 `BuildSources.warnings` 上，从而出现在构建报告中；一个损坏来源只损失它自己的条目，而不会使构建失败。因其他原因被丢弃的行按设计保持静默：public、builtin 类别或缺少 `skill_id`/`name` 的 Skill 从来不是该账户可用的样本，因此不会报告。导致账户数据不可用的 Gateway 故障仍会抛出异常。
 
-`build_account_items(session, sources, limit=...)` 是阶段 1 的纯函数：没有 I/O、没有时钟、没有随机性，为每个来源生成一个带确定性 ID 的草稿（`stable_item_id(kind, source_id, ordinal, hashed_user_id)`），因此重建是幂等的。`synthesize_account_items(session, sources, plan=..., writer=..., embedder=...)` 是阶段 2 的扩展路径：默认确定性扩展；传入 writer 时，按每个草稿的 source/evaluation_item 生成新 query，再统一去重、质检和计算 fingerprint。默认 `build` 用扩展路径；`--no-expand` 恢复阶段 1 路径。如果某个工具调用名是 Agent 无法回调的——带点的上游名称，或超出提供方长度限制——两条路径都会跳过并给出警告，不产生草稿，因为用它构建的样本永远无法通过。
+`build_account_items(session, sources, limit=...)` 是阶段 1 的纯函数：没有 I/O、没有时钟、没有随机性，为每个来源生成一个带确定性 ID 的草稿（`stable_item_id(kind, source_id, ordinal, hashed_user_id)`），并用该条目 ID 写入 `metadata.thread_id`，因此重建是幂等的、同一轮对话的测试总落在同一个 thread。`synthesize_account_items(session, sources, plan=..., writer=..., embedder=...)` 是阶段 2 的扩展路径：默认确定性扩展；传入 writer 时，按每个草稿的 source/evaluation_item 生成新 query，再统一去重、质检和计算 fingerprint。默认 `build` 用扩展路径；`--no-expand` 恢复阶段 1 路径。如果某个工具调用名是 Agent 无法回调的——带点的上游名称，或超出提供方长度限制——两条路径都会跳过并给出警告，不产生草稿，因为用它构建的样本永远无法通过。
 
 ### 草稿结构
 
@@ -368,6 +368,7 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
 - 工具的 `args` 来自真实 `inputSchema`：仅必填属性；存在 `enum` 时取第一个值，否则取类型占位符，并递归进入必填对象一层。`check_keys` 是已填充必填属性的排序列表。只有 `injection` 样本会填 `forbidden_tools`：被注入指令要求调用的破坏性工具列为禁止；`similar_tools` 只用 `similar_tools` 元数据标注干扰项，选错只会降低 `tool_hit`/`extra_calls_ratio`，不会触发整次运行失败。
 - 知识条目在元数据中携带 `document_id`/`chunk_id` 来源信息，但只输出 `expected_doc_ids`——chunk ID 是检索器实现细节。`kb_version` 为 `<base_id>:<chunk_count>`，因为知识 API 不暴露版本字符串；当文档重新分块时它仍会变化。
 - 追踪草稿完全没有期望，因此评测器会将其报告为不适用（`None`），而不是评分——这也意味着它对完整性门禁是 `unscored`，所以请将回放排除在回归运行之外。
+- `metadata.thread_id` 由条目 ID 确定性派生（满足 Gateway 的 `^[A-Za-z0-9_-]{1,64}$`），构建和重建得到同一个值；`run` 直接把它用作 Gateway thread ID，因此重复执行同一轮的测试不会各开一个 Langfuse session。当前一条草稿就是一轮；如果以后一轮拆成多条草稿，构建器给它们写入同一个 `thread_id`，runner 就会在该 thread 中串行执行这些轮次。
 - `metadata.user_id` 始终是 Langfuse 哈希用户 ID（`HMAC-SHA256(USER_ID_SALT, agent_user_id)[:32]`）。原始 `/me.id`、用户名和密码绝不会进入草稿、日志或报告。
 - 所有合成 query 的模板和固定问题使用简体中文；工具名、Skill 名、文档标题/文件名、ID 等专有标识保留原样。LLM 增强构建会把源描述和 `trace_replay` 也翻译成中文；纯确定性路径只保证模板中文，源描述/追踪原文可能保留原语言。语言变化会改变 query/fingerprint，已有数据集请用新名称重建。
 

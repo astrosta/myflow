@@ -29,6 +29,7 @@ from agentkit.runtime.runs.usage import UsageCollector
 from agentkit.runtime.stream_bridge.base import StreamBridge
 from agentkit.runtime.stream_modes import to_langgraph_stream_modes
 from agentkit.runtime.task import spawn_detached
+from agentkit.sandbox.artifacts import list_output_artifacts
 from agentkit.runtime.user_context import AUTO
 from agentkit.observability import RunTrace, start_run_trace
 from agentkit.agents.leader_agent import unwrap_agent_graph
@@ -319,6 +320,7 @@ async def _finalize(
     if record.ownership_lost:
         return
 
+    await _best_effort("artifact scan", _record_artifacts(ctx, record))
     await _best_effort("title fallback", _fallback_thread_title(run_manager, record, ctx))
 
     await ctx.run_store.update_run_completion(
@@ -343,6 +345,31 @@ async def _finalize(
             ctx.thread_store.update_status(thread_id, _thread_status(final), user_id=record.user_id),
         )
     #M6
+
+async def _record_artifacts(ctx: RunContext, record: RunRecord) -> None:
+    """Persist the files that actually exist in outputs after a run.
+
+    Scanning here (instead of only at write_file time) also covers bash and
+    run_code, and it runs on cancellation/error paths that never reach the
+    graph after_agent hook. The state endpoint re-scans on read, so a stale
+    checkpoint can never resurrect a deleted file.
+    """
+
+    head = await _checkpoint_head(ctx, record.thread_id)
+    if head is None or not getattr(head, "config", None):
+        return
+    artifacts = await asyncio.to_thread(
+        list_output_artifacts, record.thread_id, user_id=record.user_id
+    )
+    mutation = build_state_mutation_graph(
+        "artifact_scan",
+        checkpointer=ctx.checkpointer,
+        state_schema=get_thread_state_schema(),
+    )
+    await mutation.aupdate_state(
+        head.config, {"artifacts": Overwrite(artifacts)}, as_node="artifact_scan"
+    )
+
 
 async def _fallback_thread_title(run_manager: RunManager, record: RunRecord, ctx: RunContext | None) -> None:
     """Persist a local title when the first turn never reached after_model."""

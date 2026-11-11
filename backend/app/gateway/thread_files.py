@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 
 from agentkit.config.paths import get_paths
 from agentkit.persistence.base import iso_utc
+from agentkit.sandbox.artifacts import OUTPUTS_VIRTUAL, list_output_artifacts
 from agentkit.sandbox.security import PathMapping, _REJECT_HINT, find_path_mapping, resolve_sandbox_path
 from backend.app.gateway.errors import (
     ArtifactNotFound,
@@ -26,7 +27,7 @@ from backend.app.gateway.errors import (
 from backend.app.gateway.models.response import UploadedFileInfo
 
 _UPLOADS_VIRTUAL = "/mnt/user-data/uploads"
-_OUTPUTS_VIRTUAL = "/mnt/user-data/outputs"
+_OUTPUTS_VIRTUAL = OUTPUTS_VIRTUAL
 _USER_DATA = "/mnt/user-data"
 _ATTACHMENT_TYPES = {"text/html", "application/xhtml+xml", "image/svg+xml"}
 _MEDIA_TYPES = {
@@ -139,6 +140,14 @@ def _list_files(directory: Path) -> list[UploadedFileInfo]:
 async def list_upload_dir(thread_id: str, user_id: str | None) -> list[UploadedFileInfo]:
     directory = _uploads_dir(thread_id, user_id)
     return await asyncio.to_thread(_list_files, directory)
+
+
+async def list_artifacts(thread_id: str, user_id: str | None) -> list[str]:
+    """List deliverables under outputs without requiring the caller to know names."""
+
+    return await asyncio.to_thread(
+        list_output_artifacts, thread_id, user_id=user_id, paths=get_paths()
+    )
 
 
 def _write_upload(directory: Path, original: str, chunks: list[bytes], limits: UploadLimits, used: int) -> tuple[Path, int]:

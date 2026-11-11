@@ -666,6 +666,56 @@ def test_run_gives_every_item_its_own_thread_and_run() -> None:
     assert HASHED_USER_ID not in wire
 
 
+def test_run_reuses_the_metadata_thread_for_the_same_conversation_round() -> None:
+    first = _item("item-1")
+    second = _item("item-2")
+    first.metadata["thread_id"] = "eval-round-1"
+    second.metadata["thread_id"] = "eval-round-1"
+    gateway = FakeGateway()
+    dataset = FakeDataset([first, second])
+    runner = _runner(gateway, dataset)
+
+    runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    posts = [
+        json.loads(request.content)
+        for request in gateway.requests
+        if request.method == "POST"
+    ]
+    thread_posts = [body for body in posts if "thread_id" in body]
+    assert thread_posts == [
+        {
+            "thread_id": "eval-round-1",
+            "metadata": {
+                "eval": True,
+                "eval_run": RUN_NAME,
+                "eval_item_id": "item-1",
+            },
+        }
+    ]
+    run_paths = [
+        request.url.path
+        for request in gateway.requests
+        if request.method == "POST" and request.url.path.endswith("/runs")
+    ]
+    assert run_paths == [
+        "/api/threads/eval-round-1/runs",
+        "/api/threads/eval-round-1/runs",
+    ]
+
+
+def test_run_rejects_an_invalid_metadata_thread_id_before_any_request() -> None:
+    item = _item("item-1")
+    item.metadata["thread_id"] = "not/a/thread"
+    gateway = FakeGateway()
+    runner = _runner(gateway, FakeDataset([item]))
+
+    with pytest.raises(ExperimentConfigError, match="thread_id"):
+        runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    assert gateway.requests == []
+
+
 @pytest.mark.parametrize("status", ["error", "timeout", "interrupted"])
 def test_run_marks_a_failed_run_status_as_a_failed_item(status: str) -> None:
     gateway = FakeGateway(status_by_item={"item-2": status})

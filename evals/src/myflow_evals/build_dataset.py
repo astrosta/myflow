@@ -39,7 +39,7 @@ import os
 import random
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 import httpx
@@ -69,6 +69,8 @@ _TRACE_SOURCE = "online_trace"
 _TRACE_REPLAY_CATEGORY = "trace_replay"
 _TRACE_ERROR_LEVEL = "ERROR"
 _TRACE_LOW_SCORE = 0.5
+#: The Gateway thread-id contract; a dataset thread id must be usable verbatim.
+_THREAD_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _TRACE_PAGE_SIZE = 100
 _HUMAN_TURN_TYPES = frozenset({"human", "user"})
 #: Guard against a Langfuse deployment that reports an absurd page count.
@@ -228,6 +230,43 @@ def stable_item_id(kind: str, source_id: str, ordinal: int, user_hash: str) -> s
     material = f"{kind}\x1f{source_id}\x1f{ordinal}\x1f{user_hash}"
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
     return f"{kind}-{digest}"
+
+
+def thread_id_for_item(item_id: str) -> str:
+    """Return the stable Gateway thread id for one dataset item.
+
+    One dataset item is one conversation round, so its thread id comes from the
+    already deterministic item id: rebuilding a dataset reproduces the value and
+    every execution of the same round reuses the same Langfuse session. The
+    Gateway thread-id contract is used as-is; an id that cannot satisfy it (for
+    example a hand-written draft id with a slash) is hashed into the same space
+    instead of being sent to an endpoint that would reject it.
+    """
+    text = str(item_id or "")
+    if _THREAD_ID_RE.fullmatch(text):
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return f"eval-{digest[:32]}"
+
+
+def attach_thread_ids(
+    drafts: Sequence[DatasetItemDraft],
+) -> list[DatasetItemDraft]:
+    """Attach ``metadata.thread_id`` to every draft before it is written.
+
+    The value is derived from the draft id, never from the clock or a random
+    draw, so the test set carries the same thread id on every rebuild. A builder
+    that already chose a valid thread (for example by grouping several turns)
+    keeps it.
+    """
+    stamped: list[DatasetItemDraft] = []
+    for draft in drafts:
+        metadata = dict(draft.metadata)
+        existing = metadata.get("thread_id")
+        if not isinstance(existing, str) or not _THREAD_ID_RE.fullmatch(existing):
+            metadata["thread_id"] = thread_id_for_item(draft.id)
+        stamped.append(replace(draft, metadata=metadata))
+    return stamped
 
 
 def load_build_sources(
@@ -402,7 +441,7 @@ def build_account_items(
         drafts.append(_knowledge_draft(document, user_hash))
     for trace in _capped(sources.traces, limit):
         drafts.append(_trace_draft(trace, user_hash))
-    return drafts
+    return attach_thread_ids(drafts)
 
 
 def build_report(

@@ -369,3 +369,11 @@ def test_the_sync_subagent_path_refuses_too() -> None:
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert result.tool_call_id == "call-2"
+
+
+def test_the_prompt_tells_the_agent_where_deliverable_files_go() -> None:
+    prompt = apply_prompt_template(app_config=AppConfig())
+
+    assert "## 文件交付" in prompt
+    assert "/mnt/user-data/outputs/" in prompt
+    assert "workspace" in prompt

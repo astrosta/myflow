@@ -19,7 +19,7 @@ export const metadata: Metadata = {
     default: "MyFlow",
     template: "%s · MyFlow",
   },
-  description: "自托管的 Agent 工作区：长任务的过程可见、断点可续，知识库、技能、MCP、长期记忆与沙箱都在同一个会话里。",
+  description: "越用越懂你的自托管 Agent 工作区：记忆、技能、工具、知识与评测在同一个会话里彼此接续，每次协作都留下可复用的经验。",
 };
 
 export const viewport: Viewport = {

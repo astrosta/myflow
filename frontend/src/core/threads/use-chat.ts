@@ -38,7 +38,7 @@ import {
   updateFrameInterrupts,
   type ChatInterrupt,
 } from "./interrupts";
-import { foldUpdateFrame, isRelevantUpdateFrame } from "./stream-state";
+import { foldUpdateFrame, isRelevantUpdateFrame, mergeArtifacts } from "./stream-state";
 import { generateThreadId } from "./thread-id";
 import {
   createOptimisticHumanMessage,
@@ -60,6 +60,8 @@ const EMPTY_RUN_CONTEXT: RunContext = {};
 export const STOP_FOLLOW_UP_REFRESH_MS = 1_500;
 
 const messagesQueryKey = (threadId: string | null) => ["messages", threadId] as const;
+const threadStateQueryKey = (threadId: string | null) => ["thread-state", threadId] as const;
+const EMPTY_THREAD_VALUES: Record<string, unknown> = {};
 
 export interface UseChatOptions {
   /**
@@ -191,6 +193,23 @@ export function useChat({
     return acc;
   }, [newestPage.data, olderPages]);
 
+  /**
+   * Persisted non-message state. The SDK history endpoint's shape does not
+   * match the Gateway's {@code {values, checkpoint_id, checkpoint_ns}} response,
+   * so load it through the Gateway API ourselves. This is what restores
+   * artifacts (and todos) after a refresh instead of losing them with the
+   * in-memory stream.
+   */
+  const stateQuery = useQuery({
+    queryKey: threadStateQueryKey(effectiveThreadId),
+    queryFn: ({ signal }) => {
+      if (effectiveThreadId === null) throw new Error("no thread yet");
+      return getThreadState(effectiveThreadId, { signal });
+    },
+    enabled: hasThread,
+  });
+  const persistedValues = stateQuery.data?.values ?? EMPTY_THREAD_VALUES;
+
   const history = useMemo(() => loadedMessages(historyWindow), [historyWindow]);
   const floorSeq = useMemo(() => loadedFloorSeq(historyWindow), [historyWindow]);
   const moreBefore = useMemo(() => hasMoreBefore(historyWindow), [historyWindow]);
@@ -287,12 +306,23 @@ export function useChat({
        * `["messages"]` 是所有消息 query 的公共前缀，绕开这个过期闭包。
        */
       queryClient.invalidateQueries({ queryKey: ["messages"] });
+      // Artifacts are scanned when the run finalizes; pull the durable state
+      // again so a file written through bash/run_code appears in the panel.
+      queryClient.invalidateQueries({ queryKey: ["thread-state"] });
       /**
        * 标题也是这一轮收尾时才落库的：worker 在 finally 里把 checkpoint 的
        * `title` 投影到 `threads_meta.display_name`（M4 §4.1），然后才发 end 帧。
        * 侧栏读的是 ["threads"] 列表缓存，不失效的话它会继续显示"新对话"，
        * 直到用户刷新页面。
        */
+      queryClient.invalidateQueries({ queryKey: ["threads"] });
+    },
+    onError: () => {
+      // A failed run still finalizes server-side (artifact scan + title
+      // projection). Refresh the durable views so an error does not hide a
+      // file the agent already wrote.
+      queryClient.invalidateQueries({ queryKey: ["messages"] });
+      queryClient.invalidateQueries({ queryKey: ["thread-state"] });
       queryClient.invalidateQueries({ queryKey: ["threads"] });
     },
   });
@@ -330,7 +360,8 @@ export function useChat({
         // §5.2 第 3 条：用 `values` 重载持久化的线程状态（§3.1 那个例外）
         // 不用 SDK 的 getState：网关返回 { values, checkpoint_id, checkpoint_ns }，
         // 和 Platform 那套 { values, next, checkpoint, metadata, tasks } 对不上。
-        await getThreadState(resolvedThreadId);
+        const snapshot = await getThreadState(resolvedThreadId);
+        queryClient.setQueryData(threadStateQueryKey(resolvedThreadId), snapshot);
         await queryClient.refetchQueries({ queryKey: messagesQueryKey(resolvedThreadId) });
       },
       onRecovery: (event) => {
@@ -342,6 +373,7 @@ export function useChat({
         setSubagentEvents({});
         // 同样用前缀：恢复回调也可能被旧闭包调用
         queryClient.invalidateQueries({ queryKey: ["messages"] });
+        queryClient.invalidateQueries({ queryKey: ["thread-state"] });
       },
     });
   }, [effectiveThreadId, client, queryClient]);
@@ -376,13 +408,17 @@ export function useChat({
   );
 
   const state = useMemo(() => {
+    const persisted = persistedValues as ThreadState;
     const values = (stream.values ?? {}) as ThreadState;
     return {
+      ...persisted,
       ...values,
-      artifacts: values.artifacts ?? [],
-      todos: values.todos ?? null,
+      // The backend state is the durable list; live updates from this run are
+      // additive until the next state refresh reconciles them.
+      artifacts: mergeArtifacts(persisted.artifacts, values.artifacts),
+      todos: values.todos !== undefined ? values.todos : (persisted.todos ?? null),
     } satisfies ThreadState;
-  }, [stream.values]);
+  }, [persistedValues, stream.values]);
 
   const groups = useMemo(
     () =>
@@ -544,6 +580,7 @@ export function useChat({
     await stream.stop();
     // §5.1：立刻失效相关缓存，**并安排一次跟进刷新**
     queryClient.invalidateQueries({ queryKey: messagesQueryKey(effectiveThreadId) });
+    queryClient.invalidateQueries({ queryKey: ["thread-state"] });
     queryClient.invalidateQueries({ queryKey: ["threads"] });
     globalThis.setTimeout(() => {
       queryClient.invalidateQueries({ queryKey: ["threads"] });
@@ -560,7 +597,7 @@ export function useChat({
     artifacts: state.artifacts ?? [],
     todos: state.todos ?? [],
     streaming: Boolean(stream.isLoading),
-    threadLoading: Boolean(stream.isThreadLoading) || newestPage.isLoading,
+    threadLoading: Boolean(stream.isThreadLoading) || newestPage.isLoading || stateQuery.isLoading,
     loadingOlder,
     hasMoreBefore: moreBefore,
     error: stream.error ? String((stream.error as Error).message ?? stream.error) : null,

@@ -72,6 +72,9 @@ def write_file(
 ) -> str:
     """在沙箱中写入文本文件，父目录会自动创建。
 
+    需要交付给用户下载或打开的最终文件请写到
+    /mnt/user-data/outputs/；workspace 只用于临时文件。
+
     Args:
         path: 绝对虚拟路径。
         content: 要写入的文本。

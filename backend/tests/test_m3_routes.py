@@ -47,6 +47,7 @@ EXPECTED_ROUTES = {
     ("GET", "/api/threads/{thread_id}/uploads/list"),
     ("POST", "/api/threads/{thread_id}/uploads"),
     ("DELETE", "/api/threads/{thread_id}/uploads/{filename}"),
+    ("GET", "/api/threads/{thread_id}/artifacts"),
     ("GET", "/api/threads/{thread_id}/artifacts/{path:path}"),
     # rev.10：用户自己的 MCP server（/api/mcp-servers）。静态 /status、/reindex
     # 先于 /{server_id} 注册；server 是 user-private，路由只认调用者的 owner。

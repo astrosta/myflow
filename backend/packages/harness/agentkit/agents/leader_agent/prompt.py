@@ -217,5 +217,9 @@ def _discovery_entry(name: str, app_config: AppConfig, *, parallel: bool) -> str
 
 
 def _build_critical_reminders_section() -> str:
-    """Framework-owned reminders. M1 leaves the slot empty."""
-    return ""
+    """Static delivery rules shared by every model and provider."""
+    return """## 文件交付
+- 用户需要下载、打开或继续使用的最终文件，必须写到 `/mnt/user-data/outputs/`（可以放子目录）；`workspace` 只是临时工作区，不能作为交付位置。
+- 用 `write_file`、`bash` 或 `run_code` 生成交付文件后，在最终回复里说明文件名和用途；产物面板会列出 `outputs` 下的文件。
+- 只用于分析、调试或中间计算的临时文件可以留在 `workspace`，不要放进 `outputs`。
+"""
