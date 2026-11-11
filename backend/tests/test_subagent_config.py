@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from agentkit.config import (
     AppConfig,
     CustomSubagentConfig,
+    ResolvedSubagentTokenBudget,
     SubagentsConfig,
     SubagentTokenBudgetConfig,
     resolve_token_budget_max_tokens,
@@ -191,6 +192,34 @@ def test_explicit_token_budget_max_tokens_always_wins() -> None:
     assert cfg.resolve_subagent_token_budget_max_tokens() == 12_345
 
 
+def test_resolve_subagent_token_budget_uses_the_global_value() -> None:
+    cfg = _app(token_budget={"max_tokens": 1000, "warn_threshold": 0.5})
+    assert cfg.resolve_subagent_token_budget("general-purpose") == ResolvedSubagentTokenBudget(
+        max_tokens=1000,
+        warn_threshold=0.5,
+    )
+
+
+def test_resolve_subagent_token_budget_uses_a_type_override() -> None:
+    cfg = _app(
+        token_budget={"max_tokens": 1000},
+        agents={"general-purpose": {"token_budget": {"max_tokens": 250, "warn_threshold": 0.8}}},
+    )
+    assert cfg.resolve_subagent_token_budget("general-purpose") == ResolvedSubagentTokenBudget(
+        max_tokens=250,
+        warn_threshold=0.8,
+    )
+    assert cfg.resolve_subagent_token_budget("bash") == ResolvedSubagentTokenBudget(
+        max_tokens=1000,
+        warn_threshold=0.7,
+    )
+
+
+def test_resolve_subagent_token_budget_can_be_disabled_per_type() -> None:
+    cfg = _app(agents={"general-purpose": {"token_budget": {"enabled": False}}})
+    assert cfg.resolve_subagent_token_budget("general-purpose") is None
+
+
 @pytest.mark.parametrize("value", [0, 1.5, -0.2])
 def test_warn_threshold_stays_a_ratio(value: float) -> None:
     with pytest.raises(ValidationError):
@@ -266,6 +295,10 @@ def test_example_config_declares_the_subagent_sections() -> None:
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert data["subagents"]["max_total_per_run"] == 6
     assert data["subagents"]["token_budget"]["warn_threshold"] == 0.7
+    assert data["subagents"]["agents"]["general-purpose"]["max_turns"] == 80
+    assert data["subagents"]["agents"]["general-purpose"]["timeout_seconds"] == 900
+    assert data["subagents"]["agents"]["general-purpose"]["token_budget"]["max_tokens"] == 3_000_000
+    assert data["sandbox"]["bash_max_output_chars"] == 20_000
     assert data["subagent_runtime"]["max_running"] == 3
     assert data["subagent_runtime"]["admission_policy"] == "queue"
     AppConfig.model_validate(data)

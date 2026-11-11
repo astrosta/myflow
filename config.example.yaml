@@ -230,6 +230,8 @@ sandbox:
   # 所有 provider 共用：单条命令的墙钟超时（秒）。e2b 作为 SDK 命令超时，
   # opensandbox 用作 RunCommandOpts.timeout，local 用作子进程超时。
   bash_command_timeout: 600
+  # bash 返回给模型的字符上限：保留头尾，避免整页 HTML 进入上下文。
+  bash_max_output_chars: 20000
   # 额外挂载 {container_path, local_path, read_only}。
   # opensandbox 并进宿主挂载；local 直接加映射；e2b 不读宿主目录，忽略这一项。
   mounts: []
@@ -381,7 +383,17 @@ subagents:
     # max_tokens 留空即跟 summarization.enabled 耦合：开压缩 1_000_000，关 2_000_000；
     # 显式写了就永远以显式值为准。
     warn_threshold: 0.7
-  agents: {}                 # 按名字覆盖 builtin / custom：timeout_seconds / max_turns / model / token_budget
+  agents:
+    # 网页调研通常由 general-purpose 承担。150 轮 / 30 分钟的上限会让一个
+    # 抓网页循环跑出千万级 token；这里收紧到 80 轮 / 15 分钟，token_budget
+    # 仍是主限制，轮次与墙钟只是兜底。
+    general-purpose:
+      max_turns: 80
+      timeout_seconds: 900
+      # 2026-11-11 这次成功的新能源销量调研约 2.96M token；3M 是防跑飞的
+      # 硬上限，不是目标值。要更省可降到 1M，代价是更早返回部分结果。
+      token_budget:
+        max_tokens: 3000000
   # 内置检索子代理随功能开关出现：knowledge-researcher（knowledge_base.enabled）、
   # memory-researcher（memory.openviking.enabled）、skill-finder（skills.search.enabled）。
   # 它们使用 lead 不再直接持有的检索工具；子代理不可用时检索工具退回 lead 直连。

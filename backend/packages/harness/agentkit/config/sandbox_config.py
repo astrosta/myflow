@@ -268,6 +268,11 @@ class OpenSandboxConfig(BaseModel):
         return value
 
 
+#: bash 输出返回给模型前的字符上限。provider 的 1 MiB 只是防失控，
+#: 对上下文来说仍然太大；这里保留头尾，明确告诉模型有截断。
+DEFAULT_BASH_MAX_OUTPUT_CHARS = 20_000
+
+
 class SandboxConfig(BaseModel):
     """Local sandbox is path mapping, not isolation. Host bash stays off unless opted in."""
 
@@ -288,6 +293,14 @@ class SandboxConfig(BaseModel):
         default=600,
         gt=0,
         description="Wall-clock timeout in seconds for sandbox bash commands.",
+    )
+    bash_max_output_chars: int = Field(
+        default=DEFAULT_BASH_MAX_OUTPUT_CHARS,
+        ge=1000,
+        description=(
+            "Maximum bash output characters returned to the model. Longer output keeps "
+            "the head and tail and includes an explicit truncation marker."
+        ),
     )
     mounts: list[dict] = Field(
         default_factory=list,
@@ -317,6 +330,7 @@ class SandboxConfig(BaseModel):
 
 
 __all__ = [
+    "DEFAULT_BASH_MAX_OUTPUT_CHARS",
     "DEFAULT_OPENSANDBOX_IMAGE",
     "E2BSandboxConfig",
     "E2BSandboxNetworkConfig",

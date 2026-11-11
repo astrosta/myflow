@@ -138,6 +138,16 @@ class SubagentResult:
                 return
             self.token_usage_records = snapshot
 
+    def total_tokens(self) -> int:
+        """provider 已报的累计 token；未知用量不估算，读不到就按 0。"""
+        with self._state_lock:
+            total = 0
+            for record in self.token_usage_records:
+                value = record.get("total_tokens") if isinstance(record, Mapping) else None
+                if isinstance(value, int) and not isinstance(value, bool):
+                    total += max(0, value)
+            return total
+
     def claim_usage_report(self) -> bool:
         """先到先得：真正的上报者（``task`` 工具或隔离循环的兜底交付）拿到 True（§7.5）。"""
         with self._state_lock:

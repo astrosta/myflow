@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -235,3 +236,39 @@ def resolve_token_budget_max_tokens(
     if summarization_enabled:
         return DEFAULT_TOKEN_BUDGET_WITH_SUMMARIZATION
     return DEFAULT_TOKEN_BUDGET_WITHOUT_SUMMARIZATION
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSubagentTokenBudget:
+    """一个子代理类型的有效 token 预算（已合并全局值与类型覆盖）。"""
+
+    max_tokens: int
+    warn_threshold: float
+
+
+def resolve_subagent_token_budget(
+    config: SubagentsConfig,
+    name: str,
+    *,
+    summarization_enabled: bool,
+) -> ResolvedSubagentTokenBudget | None:
+    """解析某个子代理类型的有效 token 预算；enabled=false 返回 None。
+
+    覆盖顺序和超时/轮次一致：subagents.token_budget 是默认，
+    subagents.agents.<name>.token_budget 整块覆盖它。这里只负责解析，
+    真正计数与硬停在执行器的 TokenBudgetMiddleware。
+    """
+    override = config.agents.get(name)
+    token_budget = config.token_budget
+    if override is not None and override.token_budget is not None:
+        token_budget = override.token_budget
+    if not token_budget.enabled:
+        return None
+    max_tokens = resolve_token_budget_max_tokens(
+        token_budget,
+        summarization_enabled=summarization_enabled,
+    )
+    return ResolvedSubagentTokenBudget(
+        max_tokens=max_tokens,
+        warn_threshold=token_budget.warn_threshold,
+    )

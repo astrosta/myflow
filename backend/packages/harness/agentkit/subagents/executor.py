@@ -44,6 +44,10 @@ from langgraph.errors import GraphRecursionError
 
 from agentkit.agents.leader_agent.runtime_keys import CHECKPOINT_COORDINATE_KEYS
 from agentkit.agents.middlewares.assembly import build_subagent_runtime_middlewares
+from agentkit.agents.middlewares.token_budget_middleware import (
+    TOKEN_BUDGET_NO_RESULT_KEY,
+    TokenBudgetMiddleware,
+)
 from agentkit.agents.thread_state import ThreadState
 from agentkit.config import AppConfig
 from agentkit.knowledge.citations import collect_known_citations, resolve_citations
@@ -532,13 +536,25 @@ class SubagentExecutor:
         ``skip_memory_flush=True``、护栏 trio 与 SystemMessage 合并是 D9 的事；
         每份 task 都 new 一套实例，所以并行子代理的护栏状态不会串号（§12.5）。
         """
-        return list(
+        app_config = self._resolve_app_config()
+        middlewares = list(
             build_subagent_runtime_middlewares(
-                self._resolve_app_config(),
+                app_config,
                 model_name=dispatch.model_name,
                 lazy_init=self._lazy_init,
             )
         )
+        budget = app_config.resolve_subagent_token_budget(dispatch.config.name)
+        if budget is not None:
+            middlewares.append(
+                TokenBudgetMiddleware(
+                    max_tokens=budget.max_tokens,
+                    warn_threshold=budget.warn_threshold,
+                    usage_reader=dispatch.holder.total_tokens,
+                    subagent_name=dispatch.config.name,
+                )
+            )
+        return middlewares
 
     def _build_agent(self, dispatch: SubagentDispatch, middlewares: list[Any]) -> Any:
         """§7.4：``checkpointer=False`` + ``system_prompt=None``。
@@ -616,7 +632,7 @@ class SubagentExecutor:
         if status is SubagentStatus.COMPLETED and not result:
             status = SubagentStatus.FAILED
         if status is SubagentStatus.FAILED and error is None:
-            error = "子代理在轮次预算内没有产出结论"
+            error = "子代理在预算内没有产出结论"
         holder.try_set_terminal(
             status, result=result, error=error, stop_reason=reason, citations=citations
         )
@@ -676,6 +692,11 @@ def extract_final_result(state: Mapping[str, Any] | None) -> str | None:
     for message in reversed(messages):
         if getattr(message, "type", None) != "ai":
             continue
+        kwargs = getattr(message, "additional_kwargs", None)
+        if isinstance(kwargs, Mapping) and kwargs.get(TOKEN_BUDGET_NO_RESULT_KEY) is True:
+            # 预算截断发生在本轮只有 tool_calls、没有正文的时候：没有最终答复，
+            # 也不能把更早的一条中间思考当成结果。
+            return None
         text = message_content_to_text(getattr(message, "content", ""))
         if text.strip():
             return text

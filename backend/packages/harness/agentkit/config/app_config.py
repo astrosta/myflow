@@ -32,7 +32,12 @@ from agentkit.config.sandbox_config import SandboxConfig
 from agentkit.config.skills_config import SkillsConfig
 from agentkit.config.stream_config import StreamBridgeConfig
 from agentkit.config.subagent_runtime_config import SubagentRuntimeConfig
-from agentkit.config.subagents_config import SubagentsConfig, resolve_token_budget_max_tokens
+from agentkit.config.subagents_config import (
+    ResolvedSubagentTokenBudget,
+    SubagentsConfig,
+    resolve_subagent_token_budget,
+    resolve_token_budget_max_tokens,
+)
 from agentkit.config.summarization_config import SummarizationConfig
 from agentkit.config.title_config import TitleConfig
 from agentkit.config.tool_config import ToolConfig
@@ -314,6 +319,16 @@ class AppConfig(BaseModel):
         """子代理 token 预算上限（§4.1）：显式值永远优先，否则跟 summarization.enabled 耦合。"""
         return resolve_token_budget_max_tokens(
             self.subagents.token_budget,
+            summarization_enabled=self.summarization.enabled,
+        )
+
+    def resolve_subagent_token_budget(
+        self, name: str
+    ) -> ResolvedSubagentTokenBudget | None:
+        """某个子代理类型的有效 token 预算；类型级覆盖优先于全局段。"""
+        return resolve_subagent_token_budget(
+            self.subagents,
+            name,
             summarization_enabled=self.summarization.enabled,
         )
 

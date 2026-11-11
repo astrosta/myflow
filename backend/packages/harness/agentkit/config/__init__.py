@@ -11,6 +11,7 @@ from agentkit.config.observability_config import LangfuseConfig, ObservabilityCo
 from agentkit.config.pii_config import PIIConfig
 from agentkit.config.runs_config import RunsConfig
 from agentkit.config.sandbox_config import (
+    DEFAULT_BASH_MAX_OUTPUT_CHARS,
     DEFAULT_OPENSANDBOX_IMAGE,
     E2BSandboxConfig,
     E2BSandboxNetworkConfig,
@@ -28,11 +29,13 @@ from agentkit.config.subagent_runtime_config import SubagentRuntimeConfig
 from agentkit.config.subagents_config import (
     SUBAGENT_CONCURRENCY_CEILING,
     CustomSubagentConfig,
+    ResolvedSubagentTokenBudget,
     SubagentOverrideConfig,
     SubagentsConfig,
     SubagentTokenBudgetConfig,
     drop_null_config_entries,
     effective_subagent_concurrency,
+    resolve_subagent_token_budget,
     resolve_token_budget_max_tokens,
 )
 from agentkit.config.summarization_config import SummarizationConfig
@@ -54,6 +57,7 @@ __all__ = [
     "AuthConfig",
     "LocalLoginConfig",
     "CheckpointerConfig",
+    "DEFAULT_BASH_MAX_OUTPUT_CHARS",
     "E2BSandboxConfig",
     "E2BSandboxNetworkConfig",
     "E2BSandboxSyncConfig",
@@ -78,6 +82,7 @@ __all__ = [
     "SkillsConfig",
     "StreamBridgeConfig",
     "SUBAGENT_CONCURRENCY_CEILING",
+    "ResolvedSubagentTokenBudget",
     "SubagentOverrideConfig",
     "SubagentRuntimeConfig",
     "SubagentTokenBudgetConfig",
@@ -93,6 +98,7 @@ __all__ = [
     "drop_null_config_entries",
     "effective_subagent_concurrency",
     "get_app_config",
+    "resolve_subagent_token_budget",
     "resolve_token_budget_max_tokens",
     "set_app_config",
 ]
