@@ -63,6 +63,17 @@ describe("历史工具结果的身份与隐藏消息", () => {
     expect(message?.additional_kwargs).toEqual({ subagent_status: "completed" });
   });
 
+  it("中间件模型调用产生的旧账本行不会进入对话框", () => {
+    const titleRow: FeedMessage = {
+      ...row,
+      seq: 13,
+      content: { id: "title-1", type: "ai", content: "自动标题" },
+      metadata: { caller: "middleware:title" },
+    };
+
+    expect(feedMessageToChatMessage(titleRow)).toBeNull();
+  });
+
   it("hide_from_ui 的持久上下文不会被当成用户消息渲染", () => {
     const hiddenRow: FeedMessage = {
       ...row,

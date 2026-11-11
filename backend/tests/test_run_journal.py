@@ -112,6 +112,44 @@ def test_middleware_tagged_model_call_skips_the_human_input() -> None:
     asyncio.run(scenario())
 
 
+def test_middleware_llm_end_never_writes_a_chat_message() -> None:
+    async def scenario() -> None:
+        store, journal = _journal()
+        model_run = uuid4()
+
+        await journal.on_chat_model_start(
+            {"name": "model"}, [[]], run_id=model_run, tags=MIDDLEWARE_TAGS
+        )
+        await journal.on_llm_end(
+            _response(_answer("生成出来的标题", usage=_usage())),
+            run_id=model_run,
+            tags=MIDDLEWARE_TAGS,
+        )
+        await journal.on_llm_error(
+            RuntimeError("title failed"), run_id=uuid4(), tags=MIDDLEWARE_TAGS
+        )
+        await journal.flush()
+
+        assert await store.list_events("thread-1", "run-1") == []
+
+    asyncio.run(scenario())
+
+
+def test_middleware_chain_end_does_not_reconcile_internal_messages() -> None:
+    async def scenario() -> None:
+        store, journal = _journal()
+        await journal.on_chain_end(
+            {"messages": [AIMessage(content="内部标题", id="title-ai")]},
+            run_id=uuid4(),
+            tags=MIDDLEWARE_TAGS,
+        )
+        await journal.flush()
+
+        assert await store.list_events("thread-1", "run-1") == []
+
+    asyncio.run(scenario())
+
+
 def test_llm_end_writes_one_row_per_generation_and_dedups_by_run_id() -> None:
     async def scenario() -> None:
         store, journal = _journal()

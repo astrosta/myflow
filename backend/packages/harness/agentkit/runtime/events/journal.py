@@ -136,6 +136,8 @@ class RunJournal(AsyncCallbackHandler):
     ) -> None:
         if parent_run_id is not None:
             return
+        if _is_middleware(tags):
+            return  # 中间件链的 outputs 不是用户对话
         await self._reconcile_messages(outputs)  # 漏回调的最后一道保险
         await self._put(RUN_END_EVENT, content=outputs, metadata={"status": "success"})
         await self.flush()
@@ -149,6 +151,8 @@ class RunJournal(AsyncCallbackHandler):
         tags: Sequence[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        if _is_middleware(tags):
+            return  # 标题/摘要模型失败不能伪装成用户 run 的错误
         await self._put(
             RUN_ERROR_EVENT,
             content=_error_text(error),
@@ -170,9 +174,9 @@ class RunJournal(AsyncCallbackHandler):
         **kwargs: Any,
     ) -> None:
         """chat 模型的主路径。文本补全模型不走这里，走 on_llm_start。"""
-        index = self._begin_llm(run_id)
         if _is_middleware(tags):
             return  # 中间件自己的调用不产生用户消息
+        index = self._begin_llm(run_id)
         for message in _flatten_messages(messages):
             if not isinstance(message, HumanMessage):
                 continue
@@ -206,6 +210,8 @@ class RunJournal(AsyncCallbackHandler):
         tags: Sequence[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        if _is_middleware(tags):
+            return  # 标题/摘要模型不是聊天消息，绝不写进 llm.ai.response
         key = _key(run_id)
         if key in self._written_llm:
             return  # 流式回放：同一 run_id 只写一次，写两次就是两条 AI 消息
@@ -230,6 +236,8 @@ class RunJournal(AsyncCallbackHandler):
         tags: Sequence[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        if _is_middleware(tags):
+            return  # 中间件调用失败由它自己降级，不污染用户事件账本
         key = _key(run_id)
         self._written_llm.add(key)
         await self._put(

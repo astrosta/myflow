@@ -61,54 +61,22 @@ export default function LandingPage() {
       </header>
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-6">
-        <section className="grid gap-10 border-b border-neutral-200 pb-14 pt-12 lg:grid-cols-[minmax(0,1.55fr)_minmax(18rem,0.75fr)] lg:items-start lg:gap-16 lg:pb-20 lg:pt-16">
-          <h1 className="max-w-3xl text-4xl font-semibold leading-[1.15] tracking-[-0.035em] text-neutral-900 sm:text-5xl lg:text-6xl">
-            <span className="block text-balance">越用越懂你的智能体</span>
-            <span className="mt-4 block text-pretty text-lg font-normal leading-[1.7] tracking-normal text-neutral-500 sm:mt-5 sm:text-xl">
-              <span className="text-neutral-300">——</span>
-              它记得你们的每一次协作，并不断把经验转化为更贴合你的能力。
-            </span>
+        <section className="border-b border-neutral-200 pb-14 pt-10">
+          <h1 className="max-w-3xl text-balance text-3xl font-semibold leading-tight tracking-tight text-neutral-900 sm:text-4xl">
+            越用越懂你的智能体——它记得你们的每一次协作，并不断把经验转化为更贴合你的能力。
           </h1>
-
-          <div className="max-w-md lg:pt-2">
-            <p className="text-base leading-relaxed text-neutral-600">
-              MyFlow 是自托管 Agent 工作区：每次协作，都为下一次留下可用的能力。
-            </p>
-            <div className="mt-7 flex flex-wrap items-center gap-x-6 gap-y-3">
-              <Link
-                className="inline-flex h-10 items-center rounded-md bg-neutral-900 px-5 text-sm font-medium text-white transition-colors hover:bg-neutral-700"
-                href="/workspace"
-              >
-                进入工作区
-              </Link>
-              <a
-                className="text-sm font-medium text-neutral-500 underline-offset-4 transition-colors hover:text-neutral-900 hover:underline"
-                href="#capabilities"
-              >
-                查看五种能力
-              </a>
-            </div>
+          <div className="mt-8">
+            <Link
+              className="inline-flex h-10 items-center rounded-md bg-neutral-900 px-5 text-sm font-medium text-white transition-colors hover:bg-neutral-700"
+              href="/workspace"
+            >
+              进入工作区
+            </Link>
           </div>
         </section>
 
-        <section
-          aria-labelledby="capabilities-title"
-          className="py-14 sm:py-16"
-          id="capabilities"
-        >
-          <div className="max-w-2xl">
-            <h2
-              className="text-2xl font-semibold tracking-tight text-neutral-900 sm:text-3xl"
-              id="capabilities-title"
-            >
-              从记得你，到更懂你。
-            </h2>
-            <p className="mt-3 text-sm leading-relaxed text-neutral-500">
-              记忆、技能、工具、知识与评测在同一个工作区里彼此接续；每一次协作，都能留下下一次可复用的经验。
-            </p>
-          </div>
-
-          <div className="mt-9 grid gap-px border border-neutral-200 bg-neutral-200 sm:grid-cols-2 lg:grid-cols-6">
+        <section aria-label="工作区能力" className="py-14">
+          <div className="grid gap-px border border-neutral-200 bg-neutral-200 sm:grid-cols-2 lg:grid-cols-6">
             {FEATURES.map((feature, index) => (
               <article
                 className={[
@@ -119,21 +87,15 @@ export default function LandingPage() {
                 key={feature.title}
               >
                 <feature.Icon className="text-neutral-400" size={20} />
-                <h3 className="mt-5 text-base font-semibold tracking-tight text-neutral-900">
+                <h2 className="mt-5 text-base font-semibold tracking-tight text-neutral-900">
                   {feature.title}
-                </h3>
+                </h2>
                 <p className="mt-2.5 max-w-prose text-sm leading-7 text-neutral-600">
                   {feature.body}
                 </p>
               </article>
             ))}
           </div>
-        </section>
-
-        <section aria-label="产品原则" className="border-t border-neutral-200 py-10">
-          <p className="max-w-3xl text-balance text-base leading-relaxed text-neutral-700">
-            MyFlow 的底线很简单：要么给你一个结果，要么明确告诉你为什么没有——不留永远转圈的卡片，也不假装成功。
-          </p>
         </section>
       </main>
 

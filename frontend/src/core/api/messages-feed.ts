@@ -85,6 +85,13 @@ export function feedMessageToChatMessage(row: FeedMessage): ChatMessage | null {
   const type = MESSAGE_EVENT_TYPES[row.event_type];
   if (!type) return null; // 非消息事件（trace / outputs）不该出现在这个端点
 
+  // 旧账本里 TitleMiddleware / SummarizationMiddleware 的模型调用也会写成
+  // llm.ai.response；它们不是用户对话。新 run 已在 journal 层过滤，这里同时兜住
+  // 升级前已经落库的标题行。
+  if (typeof row.metadata?.caller === "string" && row.metadata.caller.startsWith("middleware:")) {
+    return null;
+  }
+
   /**
    * **身份优先用 content 里那个 LangChain 消息 id。**
    *
