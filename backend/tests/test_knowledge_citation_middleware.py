@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from agentkit.agents.middlewares.delegation_ledger import RUN_START_MESSAGE_IDS_KEY
 from agentkit.agents.middlewares.knowledge_citation_middleware import (
     KnowledgeCitationMiddleware,
 )
@@ -13,14 +14,19 @@ from agentkit.knowledge.citations import CITATION_KEY, citations_for_hits
 from agentkit.knowledge.models import SearchHit
 
 
-def _citation() -> dict:
+def _citation(
+    *,
+    chunk_id: str = "d1:0",
+    document_id: str = "d1",
+    content: str = "安装步骤",
+) -> dict:
     return citations_for_hits([
         SearchHit(
-            chunk_id="d1:0",
-            document_id="d1",
+            chunk_id=chunk_id,
+            document_id=document_id,
             filename="manual.md",
             section="安装",
-            content="安装步骤",
+            content=content,
             score=0.9,
             knowledge_base_id="b1",
             knowledge_base_name="产品文档",
@@ -86,3 +92,43 @@ def test_after_model_returns_none_when_the_answer_does_not_cite_anything() -> No
         _state("没有标记的答案", citations=[_citation()]),
         SimpleNamespace(context={}),
     ) is None
+
+
+def test_previous_turn_citations_are_not_reused_after_the_run_boundary() -> None:
+    old = _citation()
+    new = _citation(chunk_id="d2:0", document_id="d2", content="新来源")
+    middleware = KnowledgeCitationMiddleware()
+    state = {
+        "messages": [
+            HumanMessage(id="old-human", content="上一轮问题"),
+            ToolMessage(
+                id="old-tool",
+                content="上一轮结果",
+                tool_call_id="old-call",
+                name="task",
+                additional_kwargs={CITATION_KEY: [old]},
+            ),
+            HumanMessage(id="new-human", content="这一轮问题"),
+            ToolMessage(
+                id="new-tool",
+                content="这一轮结果",
+                tool_call_id="new-call",
+                name="task",
+                additional_kwargs={CITATION_KEY: [new]},
+            ),
+            AIMessage(
+                id="ai-1",
+                content=f"旧 [{old['citation_id']}] 新 [{new['citation_id']}]",
+            ),
+        ]
+    }
+
+    update = middleware.after_model(
+        state,
+        SimpleNamespace(
+            context={RUN_START_MESSAGE_IDS_KEY: ["old-human", "old-tool"]}
+        ),
+    )
+
+    [message] = update["messages"]
+    assert message.additional_kwargs[CITATION_KEY] == [new]

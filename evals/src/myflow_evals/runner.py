@@ -681,7 +681,14 @@ class ExperimentRunner:
                 f"dataset {dataset_name!r} has no items; build it before running it"
             )
         selected = select_items(items, mode=mode, max_items=max_items)
-        plans = {plan.item_id: plan for plan in self._plan(selected)}
+        # A per-run suffix keeps a reused dataset thread from inheriting turns
+        # started by an earlier experiment. Items that share a source thread
+        # still share one Gateway thread within this run.
+        thread_scope = uuid.uuid4().hex[:12]
+        plans = {
+            plan.item_id: plan
+            for plan in self._plan(selected, thread_scope=thread_scope)
+        }
 
         task = _ItemTask(
             api=self._api, plans=plans, store=self._store, run_name=run_name
@@ -754,8 +761,10 @@ class ExperimentRunner:
             return float(self._llm_sample_ratio)
         return _FULL_LLM_SAMPLE if mode == MODE_FULL else DEFAULT_CI_LLM_SAMPLE
 
-    def _plan(self, items: Sequence[Any]) -> list[_ItemPlan]:
-        """Resolve account and query for every item before the first thread exists."""
+    def _plan(
+        self, items: Sequence[Any], *, thread_scope: str
+    ) -> list[_ItemPlan]:
+        """Resolve account, query, and run-scoped thread for every item."""
         plans: list[_ItemPlan] = []
         for item in items:
             item_id = _item_id(item)
@@ -765,7 +774,9 @@ class ExperimentRunner:
                     item_id=item_id,
                     query=_query_for(item_id, item),
                     session=self._session_for(item_id, metadata),
-                    thread_id=self._thread_id_for(item_id, metadata),
+                    thread_id=self._thread_id_for(
+                        item_id, metadata, thread_scope=thread_scope
+                    ),
                 )
             )
         return plans
@@ -793,8 +804,10 @@ class ExperimentRunner:
             )
         return session
 
-    def _thread_id_for(self, item_id: str, metadata: Any) -> str:
-        """Return the item thread from metadata, or a fresh one for an old dataset."""
+    def _thread_id_for(
+        self, item_id: str, metadata: Any, *, thread_scope: str
+    ) -> str:
+        """Return a run-scoped Gateway thread, or a fresh one for an old dataset."""
         if not isinstance(metadata, Mapping):
             return uuid.uuid4().hex
         thread_id = metadata.get(_THREAD_ID_METADATA_KEY)
@@ -807,7 +820,22 @@ class ExperimentRunner:
                 f"dataset item {item_id} has a metadata.thread_id that is not a "
                 "valid Gateway thread id; rebuild the dataset instead"
             )
-        return thread_id
+        return _scoped_thread_id(thread_id, thread_scope)
+
+
+def _scoped_thread_id(source: str, scope: str) -> str:
+    """Append a run scope while staying inside the Gateway's 64-char limit.
+
+    The source part keeps items from the same dataset thread grouped in the
+    current experiment; the random scope prevents a second experiment from
+    reading the first experiment's conversation history.
+    """
+    suffix = f"-{scope}"
+    if len(source) + len(suffix) <= 64:
+        return source + suffix
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:8]
+    keep = max(1, 64 - len(suffix) - len(digest) - 2)
+    return f"{source[:keep]}-{digest}{suffix}"
 
 
 def ci_subset(items: Sequence[Any], size: int = CI_SUBSET_SIZE) -> list[Any]:

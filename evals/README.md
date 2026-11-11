@@ -125,7 +125,7 @@ uv run --project evals myflow-evals run \
 | `--llm-sample FLOAT` | 适用条目中被 LLM 指标评分的比例。`ci` 默认 `0.2`，`full` 默认 `1.0`；选择是确定性的，同一 item/metric/seed/mode 每次都一样。 |
 | `--limit N` | 在模式选择之后限制所选条目。 |
 
-真正的 `run` 需要三个 Langfuse 变量以及 `AGENT_API` 和 `USER_ID_SALT`。它读取冻结的数据集，按模式选择条目，登录每个固定账户，并且只执行选中的条目——运行器将 `data=list(selected)` 传给 Langfuse，因此大型数据集绝不会被静默地全量运行。每个条目都使用数据集 `metadata.thread_id` 指定的 thread，并在其中启动一个 run（`on_disconnect=continue`）；同一 thread 的条目串行执行且只创建一次 thread，因此同一轮对话的测试共享一个 Langfuse session。没有该字段的旧数据集仍为每个条目新建随机 thread。然后运行器轮询运行的终态，读取运行事件账本和 thread checkpoint，将它们规范化为证据，用所有适用的规则评测器为该条目评分，并且只向 Langfuse 上传紧凑输出（答案、状态、追踪 ID、不透明证据 ID）。检索到的分块和引用载荷保留在运行器进程中。配置了评判模型时，运行器还会加上 LLM 指标适配器；任何一次评判失败都只记录为 `metric: ExceptionType`，不影响规则门禁，并在结果里以 `llm metric errors:` 行报告。
+真正的 `run` 需要三个 Langfuse 变量以及 `AGENT_API` 和 `USER_ID_SALT`。它读取冻结的数据集，按模式选择条目，登录每个固定账户，并且只执行选中的条目——运行器将 `data=list(selected)` 传给 Langfuse，因此大型数据集绝不会被静默地全量运行。每个条目都使用数据集 `metadata.thread_id` 指定的来源 thread，并在其中启动一个 run（`on_disconnect=continue`）。运行器会在 Gateway thread id 后追加一次性 run scope：同一 run 内相同 `metadata.thread_id` 的条目仍共享一个 thread、串行执行且只创建一次，但重复跑同一冻结数据集时不会读到上一实验的历史。没有该字段的旧数据集仍为每个条目新建随机 thread。然后运行器轮询运行的终态，读取运行事件账本和 thread checkpoint，将它们规范化为证据，用所有适用的规则评测器为该条目评分，并且只向 Langfuse 上传紧凑输出（答案、状态、追踪 ID、不透明证据 ID）。检索到的分块和引用载荷保留在运行器进程中。配置了评判模型时，运行器还会加上 LLM 指标适配器；任何一次评判失败都只记录为 `metric: ExceptionType`，不影响规则门禁，并在结果里以 `llm metric errors:` 行报告。
 
 `--dry-run` 打印数据集、模式、运行名称以及将选择多少条目；它不启动任何 thread，不写入任何分数，也不登录任何账户——但它仍会通过 Langfuse 读取数据集，因此需要 Langfuse 变量，而 `AGENT_API` 和 `USER_ID_SALT` 不需要（没有任何登录）。
 

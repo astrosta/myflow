@@ -666,7 +666,7 @@ def test_run_gives_every_item_its_own_thread_and_run() -> None:
     assert HASHED_USER_ID not in wire
 
 
-def test_run_reuses_the_metadata_thread_for_the_same_conversation_round() -> None:
+def test_run_shares_one_run_scoped_thread_for_the_same_conversation_round() -> None:
     first = _item("item-1")
     second = _item("item-2")
     first.metadata["thread_id"] = "eval-round-1"
@@ -683,25 +683,65 @@ def test_run_reuses_the_metadata_thread_for_the_same_conversation_round() -> Non
         if request.method == "POST"
     ]
     thread_posts = [body for body in posts if "thread_id" in body]
-    assert thread_posts == [
-        {
-            "thread_id": "eval-round-1",
-            "metadata": {
-                "eval": True,
-                "eval_run": RUN_NAME,
-                "eval_item_id": "item-1",
-            },
-        }
-    ]
+    assert len(thread_posts) == 1
+    scoped_thread = thread_posts[0]["thread_id"]
+    assert scoped_thread.startswith("eval-round-1-")
+    assert len(scoped_thread) <= 64
+    assert thread_posts[0]["metadata"] == {
+        "eval": True,
+        "eval_run": RUN_NAME,
+        "eval_item_id": "item-1",
+    }
     run_paths = [
         request.url.path
         for request in gateway.requests
         if request.method == "POST" and request.url.path.endswith("/runs")
     ]
     assert run_paths == [
-        "/api/threads/eval-round-1/runs",
-        "/api/threads/eval-round-1/runs",
+        f"/api/threads/{scoped_thread}/runs",
+        f"/api/threads/{scoped_thread}/runs",
     ]
+
+
+def test_two_runs_scope_the_same_source_thread_separately() -> None:
+    first = _item("item-1")
+    second = _item("item-2")
+    first.metadata["thread_id"] = "eval-round-1"
+    second.metadata["thread_id"] = "eval-round-1"
+    gateway = FakeGateway()
+    runner = _runner(gateway, FakeDataset([first, second]))
+
+    runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+    runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    thread_posts = [
+        json.loads(request.content)
+        for request in gateway.requests
+        if request.method == "POST"
+        and b'"thread_id"' in request.content
+    ]
+    assert len(thread_posts) == 2
+    ids = [post["thread_id"] for post in thread_posts]
+    assert len(set(ids)) == 2
+    assert all(thread_id.startswith("eval-round-1-") for thread_id in ids)
+
+
+def test_run_scoped_thread_stays_within_the_gateway_limit() -> None:
+    item = _item("item-1")
+    item.metadata["thread_id"] = "x" * 64
+    gateway = FakeGateway()
+    runner = _runner(gateway, FakeDataset([item]))
+
+    runner.run("agent-eval/regression/v1", RUN_NAME, mode="ci")
+
+    thread_posts = [
+        json.loads(request.content)
+        for request in gateway.requests
+        if request.method == "POST" and b'"thread_id"' in request.content
+    ]
+    assert len(thread_posts) == 1
+    assert len(thread_posts[0]["thread_id"]) <= 64
+    assert thread_posts[0]["thread_id"] != "x" * 64
 
 
 def test_run_rejects_an_invalid_metadata_thread_id_before_any_request() -> None:
