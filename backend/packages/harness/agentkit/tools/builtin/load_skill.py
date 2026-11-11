@@ -1,8 +1,8 @@
 """load_skill —— 按技能名加载技能正文（系统内置工具）。
 
-`<available_skills>` 每行是 `name | description | id`。id 必填且必须来自该行；
-内置技能在代码里共用一个常量 id，因此仍用 name 定位具体技能。成功加载私有技能
-会累计使用次数；内置技能不计使用次数。
+`<available_skills>` 每行是 `name | description | id`。内置技能在代码里共用一个
+常量 id，因此仍用 name 定位具体技能。私有技能应先让 skill-finder 返回 name/id，
+再用这两个参数加载。成功加载私有技能会累计使用次数；内置技能不计使用次数。
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class LoadSkillInput(BaseModel):
     )
     id: str = Field(
         min_length=1,
-        description="<available_skills> 行里的 id；必填，必须原样使用该行的值。",
+        description="<available_skills> 行的 id，或 skill-finder 返回的 skill_id。",
     )
 
 
@@ -59,13 +59,13 @@ async def load_skill(
 ) -> str:
     """按技能名加载一个技能正文。
 
-    `<available_skills>` 的每行给出 name 和 id；id 必须原样传入。加载成功会把
-    技能记入 `<active_skills>`，并让技能声明的 allowed-tools 生效；内置技能不累计
-    使用次数。
+    `<available_skills>` 的每行给出 name 和 id；私有技能先调用 skill-finder 取得
+    name/id，内置技能可以直接从索引加载。加载成功会把技能记入 `<active_skills>`，
+    并让技能声明的 allowed-tools 生效；内置技能不累计使用次数。
 
     Args:
-        name: <available_skills> 行里的技能名。
-        id: <available_skills> 行里的 id，必填。
+        name: 技能名；来自 <available_skills> 或 skill-finder。
+        id: 对应的 id；来自 <available_skills> 或 skill-finder 的 skill_id。
     """
     config = safe_app_config()
     if config is None:

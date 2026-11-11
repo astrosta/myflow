@@ -211,15 +211,26 @@ def test_the_lead_section_says_what_to_do_with_results() -> None:
     assert "如实转述" in prompt
 
 
-def test_the_lead_section_points_at_the_skills_index_when_skill_finder_is_listed() -> None:
+def test_the_lead_section_routes_private_skills_through_finder_but_allows_builtin() -> None:
     prompt = _section(SubagentPolicy(allowed=None, max_concurrent=3))
-    assert "技能见下方索引" in prompt
+    assert "id=builtin" in prompt
+    assert "skill-finder" in prompt
     assert "load_skill" in prompt
+    assert "私有技能" in prompt
+    assert "索引对不上时" not in prompt
     assert "私有知识库" not in prompt
 
     bash_only = _section(SubagentPolicy(allowed=["bash"], max_concurrent=3))
-    assert "技能见下方索引" not in bash_only
+    assert "id=builtin" not in bash_only
+    assert "skill-finder" not in bash_only
     assert "load_skill" not in bash_only
+
+
+def test_skill_finder_description_distinguishes_private_skills_from_builtins() -> None:
+    description = BUILTIN_SUBAGENTS["skill-finder"].description
+    assert "私有技能" in description
+    assert "id=builtin" in description
+    assert "索引能对上" not in description
 
 
 def test_the_role_sets_the_reply_language() -> None:

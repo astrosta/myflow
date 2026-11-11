@@ -467,7 +467,7 @@ skills:
     enabled: true
     redis_url: $REDIS_URL           # 留空则退回 PostgreSQL load_count
     key_prefix: myflow:skills:usage # key = <prefix>:<user_id>
-    prompt_top_k: 10                # 私有技能超过 N 个时只列前 N 个；0 = 不列私有技能
+    prompt_top_k: 10                # 产品默认：私有技能只列最常用的 N 个；评测环境设为 0
     refresh_seconds: 30             # 多 worker 的 top-K 缓存刷新间隔；0 = 关闭
   # 可重建缓存的保留策略；数据库元数据与扫描历史永久保留。
   retention:

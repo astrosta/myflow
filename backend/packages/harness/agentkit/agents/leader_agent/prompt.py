@@ -49,7 +49,8 @@ def apply_prompt_template(
         soul=_build_soul_section(app_config),
         user_profile=user_profile or "",
         thinking_style=_build_thinking_style_section(),
-        # 委派开启时索引照样渲染：内置技能只能经索引发现，skill-finder 只做长尾检索
+        # 内置技能始终走索引；私有技能由 skill-finder 发现（评测环境 prompt_top_k=0，
+        # 私有条目不会进入静态索引）。
         skills_section=_build_skills_section(
             app_config, user_id=user_id, available_skills=available_skills
         ),
@@ -178,12 +179,16 @@ def _retrieval_hint(names: list[str]) -> list[str]:
     if KNOWLEDGE_SUBAGENT_NAME in listed or MEMORY_SUBAGENT_NAME in listed:
         parts.append("用户的私有知识库和长期记忆只能通过对应的检索子代理访问")
     if SKILL_SUBAGENT_NAME in listed:
-        parts.append("技能见下方索引")
+        parts.append(
+            "索引中 id=builtin 的内置技能可以直接 load_skill；"
+            "私有技能和内部流程必须先经 skill-finder 检索"
+        )
     lines = ["；".join(parts) + "。"] if parts else []
     if SKILL_SUBAGENT_NAME in listed:
         lines.append(
-            "索引对不上时委派 skill-finder，它只交回 name/id；"
-            "要按该技能执行时，用 name 和 id 调用 load_skill。"
+            "需要内部 SOP、私有技能，或不确定索引里是否有匹配项时，先委派 skill-finder；"
+            "它只交回 name/id，拿到后再用 name 和 id 调用 load_skill。"
+            "不要用 bash/ls 检查 /mnt/skills。"
         )
     return lines
 
