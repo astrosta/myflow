@@ -30,6 +30,9 @@ describe("首页", () => {
       "越用越懂你的智能体——它记得你们的每一次协作，并不断把经验转化为更贴合你的能力。",
     );
     expect(screen.getByRole("link", { name: "进入工作区" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "跳到主要内容" }).getAttribute("href")).toBe(
+      "#main-content",
+    );
   });
 
   it("五种能力各有一句话介绍", () => {

@@ -47,27 +47,44 @@ const FEATURES = [
 
 export default function LandingPage() {
   return (
-    <div className="flex min-h-dvh flex-col bg-white">
-      <header className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-6">
-        <Link className="text-sm font-semibold tracking-wide text-neutral-900" href="/">
+    <div className="flex min-h-dvh flex-col bg-white selection:bg-neutral-200 selection:text-neutral-900">
+      <a
+        className="sr-only focus:not-sr-only focus:fixed focus:left-6 focus:top-6 focus:z-50 focus:rounded-md focus:bg-neutral-900 focus:px-4 focus:py-3 focus:text-sm focus:font-medium focus:text-white"
+        href="#main-content"
+      >
+        跳到主要内容
+      </a>
+
+      <header className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-3">
+        <Link
+          className="inline-flex min-h-11 items-center text-base font-semibold tracking-tight text-neutral-900"
+          href="/"
+        >
           MyFlow
         </Link>
         <nav aria-label="主导航" className="flex items-center gap-6 text-sm text-neutral-500">
-          <Link className="transition-colors hover:text-neutral-900" href="/workspace">
+          <Link
+            className="inline-flex min-h-11 items-center transition-colors hover:text-neutral-900"
+            href="/workspace"
+          >
             工作区
           </Link>
           <HomeAuthLink />
         </nav>
       </header>
 
-      <main className="mx-auto w-full max-w-6xl flex-1 px-6">
-        <section className="border-b border-neutral-200 pb-14 pt-10">
+      <main
+        className="mx-auto w-full max-w-6xl flex-1 px-6 focus:outline-none"
+        id="main-content"
+        tabIndex={-1}
+      >
+        <section className="pb-10 pt-10">
           <h1 className="max-w-3xl text-balance text-3xl font-semibold leading-tight tracking-tight text-neutral-900 sm:text-4xl">
             越用越懂你的智能体——它记得你们的每一次协作，并不断把经验转化为更贴合你的能力。
           </h1>
           <div className="mt-8">
             <Link
-              className="inline-flex h-10 items-center rounded-md bg-neutral-900 px-5 text-sm font-medium text-white transition-colors hover:bg-neutral-700"
+              className="inline-flex h-11 items-center rounded-md bg-neutral-900 px-6 text-sm font-medium text-white transition-colors hover:bg-neutral-700 active:bg-neutral-800"
               href="/workspace"
             >
               进入工作区
@@ -75,7 +92,7 @@ export default function LandingPage() {
           </div>
         </section>
 
-        <section aria-label="工作区能力" className="py-14">
+        <section aria-label="工作区能力" className="pb-14 pt-10">
           <div className="grid gap-px border border-neutral-200 bg-neutral-200 sm:grid-cols-2 lg:grid-cols-6">
             {FEATURES.map((feature, index) => (
               <article
@@ -86,11 +103,11 @@ export default function LandingPage() {
                 ].join(" ")}
                 key={feature.title}
               >
-                <feature.Icon className="text-neutral-400" size={20} />
+                <feature.Icon className="text-neutral-500" size={20} />
                 <h2 className="mt-5 text-base font-semibold tracking-tight text-neutral-900">
                   {feature.title}
                 </h2>
-                <p className="mt-2.5 max-w-prose text-sm leading-7 text-neutral-600">
+                <p className="mt-2.5 max-w-prose text-pretty text-sm leading-7 text-neutral-600">
                   {feature.body}
                 </p>
               </article>
@@ -99,7 +116,7 @@ export default function LandingPage() {
         </section>
       </main>
 
-      <footer className="mx-auto w-full max-w-6xl px-6 py-8 text-xs text-neutral-500">
+      <footer className="mx-auto w-full max-w-6xl px-6 py-6 text-xs text-neutral-500">
         MyFlow · 自托管 Agent 工作区 · LangGraph Platform 兼容网关
       </footer>
     </div>

@@ -17,7 +17,7 @@ export function HomeAuthLink() {
   if (user) return null;
 
   return (
-    <Link className="transition-colors hover:text-neutral-900" href="/login">
+    <Link className="inline-flex min-h-11 items-center transition-colors hover:text-neutral-900" href="/login">
       登录
     </Link>
   );
