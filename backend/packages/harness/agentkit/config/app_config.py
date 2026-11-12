@@ -46,6 +46,13 @@ from agentkit.subagents.config import INHERIT_MODEL
 
 _BRACED_ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+#: Leaves whose empty value is a supported configuration state. An env
+#: reference there must not turn "not configured" into a startup failure:
+#: skills.usage.redis_url empty means the PostgreSQL load-count fallback.
+_ENV_OPTIONAL_PATHS: frozenset[tuple[str, ...]] = frozenset(
+    {("skills", "usage", "redis_url")}
+)
+
 _SHARED_SERVICE_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
     "embedding": (
         ("knowledge_base", "embedding"),
@@ -137,7 +144,9 @@ class AppConfig(BaseModel):
     _models_by_name: dict[str, ModelConfig] = PrivateAttr(default_factory=dict)
 
     @classmethod
-    def resolve_env_variables(cls, config: Any, *, _allow_unset: bool = False) -> Any:
+    def resolve_env_variables(
+        cls, config: Any, *, _allow_unset: bool = False, _path: tuple[str, ...] = ()
+    ) -> Any:
         """Expand `$VAR` / `${VAR}` references in configuration values.
 
         A section that the selected mode never reads must not make startup depend
@@ -145,33 +154,43 @@ class AppConfig(BaseModel):
         `source=filesystem` never touches the repository or its credentials, so
         an unset `SKILLS_GIT_REPOSITORY` has to resolve to the empty default
         instead of failing the whole config load.
+
+        Optional leaves listed in `_ENV_OPTIONAL_PATHS` follow the same rule:
+        an empty `skills.usage.redis_url` is the documented PostgreSQL fallback,
+        not a reason to reject the whole file.
         """
         if isinstance(config, str):
             return cls._expand_env(config, allow_unset=_allow_unset)
         if isinstance(config, list):
             return [
-                cls.resolve_env_variables(item, _allow_unset=_allow_unset)
+                cls.resolve_env_variables(item, _allow_unset=_allow_unset, _path=_path)
                 for item in config
             ]
         if isinstance(config, dict):
-            ignore_git_env = cls._git_config_is_inactive(config)
             return {
                 key: cls.resolve_env_variables(
-                    value, _allow_unset=_allow_unset or (ignore_git_env and key == "git")
+                    value,
+                    _allow_unset=_allow_unset
+                    or cls._unset_env_allowed(config, (*_path, key)),
+                    _path=(*_path, key),
                 )
                 for key, value in config.items()
             }
         return config
 
     @classmethod
-    def _git_config_is_inactive(cls, config: dict[str, Any]) -> bool:
-        """Whether this is a skills block whose selected source never reads Git."""
-        if "git" not in config:
-            return False
+    def _unset_env_allowed(cls, config: dict[str, Any], path: tuple[str, ...]) -> bool:
+        """Whether an unset env reference at this leaf has a supported meaning."""
+        if path[-1:] == ("git",):
+            return not cls._skills_source_is_git(config)
+        return path in _ENV_OPTIONAL_PATHS
+
+    @classmethod
+    def _skills_source_is_git(cls, config: dict[str, Any]) -> bool:
         source = config.get("source", "filesystem")
         if isinstance(source, str):
             source = cls.resolve_env_variables(source)
-        return source != "git"
+        return source == "git"
 
     @classmethod
     def _expand_env(cls, value: str, *, allow_unset: bool) -> str:

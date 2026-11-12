@@ -33,6 +33,7 @@ lead 图由 `build_middlewares` 组装，子代理图由 `build_subagent_runtime
 | 16 | `PIIOutputMiddleware` | 总是 |
 | 17 | `SubagentLimitMiddleware` | 本次 run 允许委派 |
 | 18 | 调用方传入的 `custom_middlewares` | 有传入时，接在最后 |
+| 19 | `SystemMessageCoalescingMiddleware` | 总是，最内层 |
 
 `after_model` 因此先跑 `SubagentLimitMiddleware`，再跑 `PIIOutputMiddleware`，然后才是记忆、标题和摘要。这样模型刚写出的文本和工具参数先脱敏，记忆中间件看到的是脱敏后的内容；委派超额也在工具节点执行前被剥掉。
 
@@ -52,6 +53,7 @@ lead 图由 `build_middlewares` 组装，子代理图由 `build_subagent_runtime
 | 6 | `ToolErrorHandlingMiddleware` |
 | 7 | `PIIMiddleware` |
 | 8 | `PIIOutputMiddleware` |
+| 9 | `SystemMessageCoalescingMiddleware` |
 
 子代理链上没有上传清单、标题、技能绑定、动态日期、摘要、长期记忆和委派限额。
 
@@ -120,6 +122,10 @@ lead 图由 `build_middlewares` 组装，子代理图由 `build_subagent_runtime
 ### PIIOutputMiddleware
 
 `after_model` 上对模型写出的正文和 `tool_calls` 参数做脱敏，换成 handle。工具返回的 `ToolMessage` 不归它处理。
+
+### SystemMessageCoalescingMiddleware
+
+最内层 `wrap_model_call`。把本次请求里的系统提示词和中间件注入的 SystemMessage 合并成一条前导系统消息，并从 `messages` 里移除其余 SystemMessage；跨午夜只保留最新的动态日期 reminder。只改 `ModelRequest`，不改 state 和 checkpoint。vLLM / Qwen 等严格模板只接受第一条消息是 system，没有这一层就会在第二轮或首次注入时返回 400。
 
 ### SubagentLimitMiddleware
 

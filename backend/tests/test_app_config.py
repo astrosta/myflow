@@ -78,6 +78,43 @@ def test_git_skills_still_require_git_credentials(monkeypatch):
         )
 
 
+def test_unset_redis_url_falls_back_to_empty(tmp_path, monkeypatch):
+    """skills.usage.redis_url 空值表示退回 PostgreSQL 计数，不能挡启动。"""
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+models:
+  - name: fake
+    use: langchain_core.language_models.fake_chat_models.FakeListChatModel
+    model: fake
+skills:
+  source: filesystem
+  usage:
+    redis_url: $REDIS_URL
+""",
+        encoding="utf-8",
+    )
+
+    config = AppConfig.from_file(path)
+
+    assert config.skills.usage.redis_url == ""
+
+
+def test_example_config_loads_without_the_optional_redis_url(monkeypatch):
+    """随仓库发布的示例配置不带 REDIS_URL 也必须能启动。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/myflow")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("SKILLS_GIT_REPOSITORY", raising=False)
+    path = Path(__file__).resolve().parents[2] / "config.example.yaml"
+
+    config = AppConfig.from_file(path)
+
+    assert config.skills.source == "filesystem"
+    assert config.skills.usage.redis_url == ""
+
+
 def test_resolve_config_path_finds_config_yaml_in_cwd(tmp_path, monkeypatch):
     """没有 MYFLOW_CONFIG_PATH 时回落到 cwd 的 config.yaml（曾因少了逗号只看首字母路径）。"""
     monkeypatch.delenv("MYFLOW_CONFIG_PATH", raising=False)

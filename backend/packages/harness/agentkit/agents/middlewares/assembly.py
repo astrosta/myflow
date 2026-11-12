@@ -32,6 +32,9 @@ from agentkit.agents.middlewares.skill_activation_middleware import SkillActivat
 from agentkit.agents.middlewares.skill_tool_policy_middleware import SkillToolPolicyMiddleware
 from agentkit.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
 from agentkit.agents.middlewares.summarization_middleware import create_summarization_middleware
+from agentkit.agents.middlewares.system_message_coalescing_middleware import (
+    SystemMessageCoalescingMiddleware,
+)
 from agentkit.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
 from agentkit.agents.middlewares.title_middleware import TitleMiddleware
 from agentkit.agents.middlewares.tool_error_handling_middleware import ToolErrorHandlingMiddleware
@@ -207,7 +210,7 @@ def build_middlewares(
     # 输出侧脱敏最后注册：after_model 反序，因此它在 Memory/Title 之前跑，模型
     # 写回的 AI 文本和 tool_calls 参数先变成 handle，Memory 再看到脱敏/去 handle 视图。
     chain.append(PIIOutputMiddleware(app_config=resolved))
-    # SLOT: ViewImage / SystemMessageCoalescing / LoopDetection（W3）
+    # SLOT: ViewImage / LoopDetection（W3）
     # M8 §10.3：槽位耗尽时剥调用（lead-only）。after_model 反序，所以它排在 DurableContext
     # **之前**跑——prior 数的正是"这次模型调用之前"已经派出去的那些委派。
     if subagent_enabled and subagent_policy is not None:
@@ -222,6 +225,10 @@ def build_middlewares(
     # SLOT: TerminalResponse / SafetyFinishReason / Clarification（W3，必须最后注册）
     if custom_middlewares:
         chain.extend(custom_middlewares)
+    # Must be the innermost wrap_model_call: every other middleware above may
+    # inject a SystemMessage, and strict chat templates accept only the first
+    # message as system. Keeping it last also covers caller-supplied middleware.
+    chain.append(SystemMessageCoalescingMiddleware())
     return chain
 
 
@@ -243,4 +250,7 @@ def build_subagent_runtime_middlewares(
     chain.append(SubagentRetrievalToolStripMiddleware())
     chain.append(DynamicContextMiddleware(app_config=app_config))
     chain.append(PIIOutputMiddleware(app_config=app_config))
+    # The subagent prompt lives in the initial state's SystemMessage; the date
+    # reminder adds another one. Merge them before the model call.
+    chain.append(SystemMessageCoalescingMiddleware())
     return chain

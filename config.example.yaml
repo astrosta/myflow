@@ -476,7 +476,7 @@ skills:
 
   # 每个用户的技能使用次数：Redis ZSET 只做 top-K 排序，PostgreSQL load_count 持久化。
   usage:
-    enabled: true
+    enabled: false
     redis_url: $REDIS_URL           # 留空则退回 PostgreSQL load_count
     key_prefix: myflow:skills:usage # key = <prefix>:<user_id>
     prompt_top_k: 10                # 产品默认：私有技能只列最常用的 N 个；评测环境设为 0
