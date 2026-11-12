@@ -862,6 +862,10 @@ class _RecordingWriter:
         self.generations.append(
             (kind, dict(source), dict(evaluation), variant, fallback)
         )
+        if kind.startswith("skill_"):
+            skills = source.get("skills") if isinstance(source, dict) else None
+            if isinstance(skills, list) and skills and isinstance(skills[0], dict):
+                return f"生成的问题 {index}：请使用 {skills[0].get('name', '')} 技能"
         return f"生成的问题 {index}"
 
     def skill_rules(
@@ -905,6 +909,19 @@ class _ShortWriter:
         self, *, name: str, description: str, body: str
     ) -> list[str]:
         return ["only one rule"]
+
+
+class _UngroundedSkillWriter(_RecordingWriter):
+    def generate(
+        self,
+        *,
+        kind: str,
+        source: Any,
+        evaluation: Any,
+        variant: int,
+        fallback: str,
+    ) -> str:
+        return "帮我扫描 PDF 转成可编辑 Word"
 
 
 class _FakeJudge:
@@ -978,7 +995,7 @@ def test_writer_material_includes_knowledge_content() -> None:
     assert source["kind"] == "knowledge"
     assert source["content"] == POLICY.chunk_content
     assert evaluation["category"] == "kb_single_hop"
-    assert fallback.startswith("根据《policy.md》")
+    assert fallback.startswith("《policy.md》中关于「refunds」")
 
     unanswerable = next(
         generation
@@ -1008,6 +1025,19 @@ def test_writer_returning_an_empty_query_falls_back() -> None:
     assert [draft.input["query"] for draft in result.drafts] == [
         draft.input["query"] for draft in baseline.drafts
     ]
+    assert any("question writer failed" in warning for warning in result.warnings)
+
+
+def test_writer_query_not_grounded_in_skill_falls_back() -> None:
+    sources = _sources(skills=[SKILL_WITH_TOOL])
+    baseline = synthesize_account_items(_session(), sources)
+    result = synthesize_account_items(
+        _session(), sources, writer=_UngroundedSkillWriter()
+    )
+
+    baseline_skill = _by_category(baseline.drafts, "skill_single")[0]
+    skill = _by_category(result.drafts, "skill_single")[0]
+    assert skill.input["query"] == baseline_skill.input["query"]
     assert any("question writer failed" in warning for warning in result.warnings)
 
 

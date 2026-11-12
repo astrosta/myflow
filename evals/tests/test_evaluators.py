@@ -21,6 +21,8 @@ from myflow_evals.evaluators import (
     clarification_ok,
     extra_calls_ratio,
     forbidden_violation,
+    kb_chunk_mrr,
+    kb_chunk_recall_at_5,
     kb_mrr,
     kb_recall_at_5,
     kb_routing,
@@ -680,6 +682,77 @@ def test_kb_recall_ignores_chunks_beyond_rank_five() -> None:
     )
 
 
+def test_kb_chunk_recall_and_mrr_score_chunk_ids() -> None:
+    evidence = _evidence(
+        subagent_calls=[_subagent("knowledge-researcher")],
+        retrieved_chunks=[
+            _chunk("doc-1", 0),
+            _chunk("doc-1", 2),
+            _chunk("doc-2", 0),
+        ],
+    )
+    metadata = {"chunk_id": "doc-1:2"}
+
+    recall = kb_chunk_recall_at_5(
+        expected_output={}, evidence=evidence, metadata=metadata
+    )
+    assert recall is not None
+    assert recall.name == "kb_chunk_recall@5"
+    assert recall.value == 1.0
+
+    mrr = kb_chunk_mrr(expected_output={}, evidence=evidence, metadata=metadata)
+    assert mrr is not None
+    assert mrr.name == "kb_chunk_mrr"
+    assert mrr.value == 0.5
+
+
+def test_kb_chunk_recall_reads_primary_and_related_chunks() -> None:
+    evidence = _evidence(
+        subagent_calls=[_subagent("knowledge-researcher")],
+        retrieved_chunks=[_chunk("doc-1", 2), _chunk("doc-1", 3)],
+    )
+    metadata = {
+        "chunk_id": "doc-1:2",
+        "related_chunk_ids": ["doc-1:3", "doc-1:4"],
+    }
+
+    recall = kb_chunk_recall_at_5(
+        expected_output={}, evidence=evidence, metadata=metadata
+    )
+    assert recall is not None
+    assert recall.value == pytest.approx(2 / 3)
+
+
+def test_kb_chunk_metrics_ignore_chunks_beyond_rank_five() -> None:
+    chunks = [_chunk(f"doc-{index}", 0) for index in range(5)] + [
+        _chunk("doc-expected", 0)
+    ]
+    evidence = _evidence(
+        subagent_calls=[_subagent("knowledge-researcher")],
+        retrieved_chunks=chunks,
+    )
+    metadata = {"chunk_id": "doc-expected:0"}
+
+    recall = kb_chunk_recall_at_5(
+        expected_output={}, evidence=evidence, metadata=metadata
+    )
+    assert recall is not None
+    assert recall.value == 0.0
+    mrr = kb_chunk_mrr(expected_output={}, evidence=evidence, metadata=metadata)
+    assert mrr is not None
+    assert mrr.value == pytest.approx(1 / 6)
+
+
+def test_kb_chunk_metrics_are_none_without_expected_chunks() -> None:
+    evidence = _evidence(
+        subagent_calls=[_subagent("knowledge-researcher")],
+        retrieved_chunks=[_chunk("doc-1", 0)],
+    )
+
+    assert kb_chunk_recall_at_5(expected_output={}, evidence=evidence) is None
+    assert kb_chunk_mrr(expected_output={}, evidence=evidence) is None
+
+
 def test_kb_recall_is_none_when_knowledge_researcher_was_never_routed() -> None:
     evidence = _evidence(retrieved_chunks=[_chunk("doc-1")], kb_called=True)
     expected = {"expected_doc_ids": ["doc-1"]}
@@ -805,6 +878,7 @@ RICH_EXPECTED = {
     ],
     "expected_skills": ["deploy"],
     "expected_doc_ids": ["doc-1"],
+    "expected_chunk_ids": ["doc-1:0"],
     "forbidden_tools": ["mcp__db__drop"],
     "expect_kb": True,
     "expect_skill": True,
@@ -863,6 +937,8 @@ def test_rule_evaluators_map_the_design_metric_names() -> None:
         "kb_routing",
         "kb_recall@5",
         "kb_mrr",
+        "kb_chunk_recall@5",
+        "kb_chunk_mrr",
         "citation_valid",
         "forbidden_violation",
         "clarification_ok",
@@ -939,6 +1015,7 @@ def test_clarification_ok_requires_a_question_and_no_tool_call() -> None:
         ("skill_hit", 0.90, "min"),
         ("kb_routing", 0.95, "min"),
         ("kb_recall@5", 0.85, "min"),
+        ("kb_chunk_recall@5", 0.85, "min"),
         ("citation_valid", 0.95, "min"),
     ],
 )
@@ -954,12 +1031,13 @@ def test_thresholds_carry_the_design_gates(
 
 
 def test_thresholds_gate_only_rule_metrics() -> None:
-    assert len(THRESHOLDS) == 11
+    assert len(THRESHOLDS) == 12
     assert set(THRESHOLDS) <= set(RULE_EVALUATORS)
     for name in (
         "retrieval_mrr",
         "skill_mrr",
         "kb_mrr",
+        "kb_chunk_mrr",
         "skill_extra",
         "no_tool_ok",
         "clarification_ok",

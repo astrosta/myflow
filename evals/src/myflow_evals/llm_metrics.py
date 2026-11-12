@@ -87,7 +87,9 @@ LLM_THRESHOLDS: dict[str, dict[str, Any]] = {
     "faithfulness": {"value": 0.90, "comparison": "min", "kind": "llm"},
     "contextual_recall": {"value": 0.80, "comparison": "min", "kind": "llm"},
     "contextual_precision": {"value": 0.70, "comparison": "min", "kind": "llm"},
-    "contextual_relevancy": {"value": 0.70, "comparison": "min", "kind": "llm"},
+    # contextual_relevancy is recorded for diagnostics, not gated. With top_k=5
+    # and one gold chunk in kb_single_hop its ceiling is structurally low; R2 is
+    # gated by contextual_precision and contextual_recall instead.
     "answer_quality": {"value": 0.85, "comparison": "min", "kind": "llm"},
     "answer_correctness": {"value": 0.80, "comparison": "min", "kind": "llm"},
     "answer_relevancy": {"value": 0.85, "comparison": "min", "kind": "llm"},
@@ -244,7 +246,7 @@ def _prompt_contextual_recall(judge: ChatModel, case: JudgeCase) -> JudgeScore:
 
 def _prompt_contextual_precision(judge: ChatModel, case: JudgeCase) -> JudgeScore:
     expected = case.expected_output or {}
-    chunks = _chunk_rows(case.evidence)
+    chunks = _context_chunks(case.evidence)
     prompt = _join_sections(
         f"Question:\n{case.query}",
         f"Reference answer:\n{_clip(_text(expected.get('reference_answer')) or '', _REFERENCE_LIMIT)}",
@@ -268,7 +270,7 @@ def _prompt_contextual_precision(judge: ChatModel, case: JudgeCase) -> JudgeScor
 
 
 def _prompt_contextual_relevancy(judge: ChatModel, case: JudgeCase) -> JudgeScore:
-    chunks = _chunk_rows(case.evidence)
+    chunks = _context_chunks(case.evidence)
     prompt = _join_sections(
         f"Question:\n{case.query}",
         f"Retrieved chunks:\n{_context_text(case)}",
@@ -412,19 +414,32 @@ def _parse_json_object(text: str) -> Mapping[str, Any] | None:
 
 
 def _context_text(case: JudgeCase) -> str:
+    chunks = _context_chunks(case.evidence)
+    if not chunks:
+        return "(no retrieved context)"
+    # Include every chunk that will be judged. The old implementation stopped
+    # at _CONTEXT_LIMIT and still asked for one verdict per all chunks, so the
+    # judge's list length could never match the visible list.
+    per_chunk = max(200, min(_CHUNK_LIMIT, _CONTEXT_LIMIT // len(chunks)))
     lines: list[str] = []
-    used = 0
-    for rank, chunk in enumerate(_chunk_rows(case.evidence), start=1):
-        content = _clip(_text(chunk.get("content")) or "", _CHUNK_LIMIT)
-        if not content:
-            continue
+    for rank, chunk in enumerate(chunks, start=1):
+        content = _clip(_text(chunk.get("content")), per_chunk)
         header = f"[{rank}] chunk={_text(chunk.get('chunk_id')) or '?'}"
-        block = f"{header}\n{content}"
-        if used + len(block) > _CONTEXT_LIMIT:
-            break
-        lines.append(block)
-        used += len(block)
-    return "\n\n".join(lines) if lines else "(no retrieved context)"
+        lines.append(f"{header}\n{content}")
+    return "\n\n".join(lines)
+
+
+def _context_chunks(evidence: RunEvidence) -> list[Mapping[str, Any]]:
+    """Chunks that are actually rendered for the judge.
+
+    Both the prompt and the requested verdict count must come from this list;
+    otherwise a clipped context asks the judge for verdicts it cannot see.
+    """
+    return [
+        chunk
+        for chunk in _chunk_rows(evidence)
+        if _text(chunk.get("content"))
+    ]
 
 
 def _chunk_rows(evidence: RunEvidence) -> list[Mapping[str, Any]]:

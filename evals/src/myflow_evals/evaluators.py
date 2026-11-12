@@ -341,6 +341,51 @@ def kb_mrr(
     )
 
 
+def kb_chunk_recall_at_5(
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
+) -> Evaluation | None:
+    """R1: share of expected chunk ids inside the first five retrieved chunks."""
+    expected = _expected_chunk_ids(expected_output, metadata)
+    if not expected:
+        return None
+    if not _subagent_routing(evidence, _KB_SUBAGENT)[0]:
+        return None
+    top = _chunk_ids(evidence.retrieved_chunks)[:_TOP_K]
+    hits = sum(1 for chunk_id in expected if chunk_id in top)
+    return Evaluation(
+        name="kb_chunk_recall@5",
+        value=hits / len(expected),
+        comment=f"{hits}/{len(expected)} expected chunks in the top 5 chunks",
+    )
+
+
+def kb_chunk_mrr(
+    *,
+    expected_output: Mapping[str, Any] | None,
+    evidence: RunEvidence,
+    metadata: Mapping[str, Any] | None = None,
+) -> Evaluation | None:
+    """R1: reciprocal rank of the first retrieved expected chunk."""
+    expected = _expected_chunk_ids(expected_output, metadata)
+    if not expected:
+        return None
+    if not _subagent_routing(evidence, _KB_SUBAGENT)[0]:
+        return None
+    rank = _first_rank(_chunk_ids(evidence.retrieved_chunks), expected)
+    if rank is None:
+        return Evaluation(
+            name="kb_chunk_mrr", value=0.0, comment="no expected chunk was retrieved"
+        )
+    return Evaluation(
+        name="kb_chunk_mrr",
+        value=1.0 / rank,
+        comment=f"first expected chunk at rank {rank}",
+    )
+
+
 def citation_valid(
     *,
     expected_output: Mapping[str, Any] | None,
@@ -497,6 +542,8 @@ RULE_EVALUATORS: dict[str, Callable[..., Evaluation | None]] = {
     "kb_routing": kb_routing,
     "kb_recall@5": kb_recall_at_5,
     "kb_mrr": kb_mrr,
+    "kb_chunk_recall@5": kb_chunk_recall_at_5,
+    "kb_chunk_mrr": kb_chunk_mrr,
     "citation_valid": citation_valid,
     "forbidden_violation": forbidden_violation,
     "clarification_ok": clarification_ok,
@@ -517,6 +564,7 @@ THRESHOLDS: dict[str, dict[str, Any]] = {
     "skill_hit": {"value": 0.90, "comparison": "min", "kind": "rule"},
     "kb_routing": {"value": 0.95, "comparison": "min", "kind": "rule"},
     "kb_recall@5": {"value": 0.85, "comparison": "min", "kind": "rule"},
+    "kb_chunk_recall@5": {"value": 0.85, "comparison": "min", "kind": "rule"},
     "citation_valid": {"value": 0.95, "comparison": "min", "kind": "rule"},
     "forbidden_violation": {"value": 0.0, "comparison": "max", "kind": "rule"},
 }
@@ -628,6 +676,42 @@ def _chunk_document_ids(chunks: Sequence[Any]) -> list[str | None]:
             document_id if isinstance(document_id, str) and document_id else None
         )
     return document_ids
+
+
+def _chunk_ids(chunks: Sequence[Any]) -> list[str | None]:
+    """One chunk id per row, preserving rank for MRR."""
+    chunk_ids: list[str | None] = []
+    for chunk in chunks:
+        chunk_id = chunk.get("chunk_id") if isinstance(chunk, Mapping) else None
+        chunk_ids.append(chunk_id if isinstance(chunk_id, str) and chunk_id else None)
+    return chunk_ids
+
+
+def _expected_chunk_ids(
+    expected_output: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+) -> list[str]:
+    """Expected chunk ids from the item declaration or build metadata.
+
+    Old datasets carry the primary chunk in metadata.chunk_id; multi-hop items
+    also carry related_chunk_ids. A future dataset may declare expected_chunk_ids
+    directly, which takes precedence.
+    """
+    declared = _string_list(expected_output, "expected_chunk_ids")
+    if declared:
+        return declared
+    if not isinstance(metadata, Mapping):
+        return []
+    chunk_ids: list[str] = []
+    primary = metadata.get("chunk_id")
+    if isinstance(primary, str) and primary:
+        chunk_ids.append(primary)
+    related = metadata.get("related_chunk_ids")
+    if isinstance(related, list):
+        chunk_ids.extend(
+            item for item in related if isinstance(item, str) and item
+        )
+    return list(dict.fromkeys(chunk_ids))
 
 
 _QUESTION_MARKERS = (

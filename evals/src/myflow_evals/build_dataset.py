@@ -54,6 +54,13 @@ _KIND_TRACE = "trace"
 #: Fixed kind order: reports and drafts never depend on dict iteration quirks.
 _KIND_ORDER = (_KIND_TOOL, _KIND_SKILL, _KIND_KNOWLEDGE, _KIND_TRACE)
 
+#: Predicate markers used only to keep a chunk's subject as the question topic.
+_KNOWLEDGE_PREDICATE_RE = re.compile(
+    r"(?:包括|包含|应当|应该|必须|不得|可以|是|为|由|对|在|有|规定|要求|指|"
+    r"take|takes|is|are|must|should|will|can|may|has|have)\b",
+    re.IGNORECASE,
+)
+
 #: Sample this many chunks and keep the longest readable one, not chunk index 0.
 _CHUNK_SAMPLE_SIZE = 3
 #: Other readable chunks carried beside the primary one for multi-hop questions.
@@ -1173,9 +1180,39 @@ def _template_query(kind: str, name: str, description: str) -> str:
     return f"请使用 {name} {label}。"
 
 
-def _knowledge_query(document: KnowledgeSource) -> str:
+def knowledge_question(document: KnowledgeSource) -> str:
+    """Build a concrete question from the sampled chunk, not just its filename.
+
+    Section metadata is the best deterministic topic when present. Otherwise the
+    first line of the chunk usually names the clause, entity, or procedure; it is
+    enough to make the question specific without relying on an LLM writer.
+    """
     title = document.filename.strip() or "该文档"
-    return f"根据《{title}》，要点是什么？"
+    topic = _knowledge_topic(document)
+    if topic:
+        return f"《{title}》中关于「{topic}」的具体规定是什么？请给出条件、数字和结论。"
+    return f"《{title}》中具体规定了哪些条件、数字和做法？"
+
+
+def _knowledge_topic(document: KnowledgeSource) -> str:
+    section = " ".join(document.section.split()).strip(" #:-")
+    if section:
+        return section[:80]
+    first_line = next(
+        (line.strip() for line in document.chunk_content.splitlines() if line.strip()),
+        "",
+    )
+    topic = re.sub(r"^[#>*\-\d.、\s]+", "", first_line)
+    topic = re.split(r"[。！？!?；;]", topic, maxsplit=1)[0].strip()
+    # Keep the subject before the predicate when the chunk has no section. This
+    # turns "Refunds take five days" into the topic "Refunds" instead of putting
+    # the answer itself into the question.
+    subject = _KNOWLEDGE_PREDICATE_RE.split(topic, maxsplit=1)[0].strip(" ，,、:：")
+    return (subject or topic)[:60]
+
+
+def _knowledge_query(document: KnowledgeSource) -> str:
+    return knowledge_question(document)
 
 
 def _schema_hash(schema: Mapping[str, Any]) -> str:

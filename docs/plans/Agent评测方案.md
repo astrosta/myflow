@@ -79,14 +79,14 @@ Skills 检索与工具检索结构类似（Milvus 混合检索 + 按 user_id 过
 | 层级 | 评测内容 | 指标 | 实现方式 | 初始阈值 |
 | --- | --- | --- | --- | --- |
 | R0 路由 | 该查知识库时是否委派 knowledge-researcher 子代理，不查时是否没有委派 | kb_routing | 规则 | ≥ 0.95 |
-| R1 检索召回 | 期望的资料是否被检索到 | kb_recall@k（按切片或文档 ID）、kb_mrr | 规则 | kb_recall@5 ≥ 0.85 |
+| R1 检索召回 | 期望的资料是否被检索到 | kb_recall@k（文档 ID）、kb_chunk_recall@k（切片 ID）、kb_mrr | 规则 | kb_recall@5 ≥ 0.85；kb_chunk_recall@5 ≥ 0.85 |
 | R1 检索召回（无 ID 标注时） | 检索内容是否覆盖参考答案所需信息 | ContextualRecall | DeepEval (LLM) | ≥ 0.80 |
-| R2 检索精度 | 相关切片是否排在前面、噪声多不多 | ContextualPrecision、ContextualRelevancy | DeepEval (LLM) | ≥ 0.70 |
+| R2 检索精度 | 相关切片是否排在前面、噪声多不多 | ContextualPrecision、ContextualRecall；ContextualRelevancy 仅记录 | DeepEval (LLM) | precision ≥ 0.70；relevancy 不硬门禁 |
 | R3 生成忠实度 | 回答是否忠于检索内容，有无编造 | Faithfulness | DeepEval (LLM) | ≥ 0.90 |
 | R3 引用 | 回答引用的来源是否真实存在于检索结果中 | citation_valid | 规则 | ≥ 0.95 |
 | R4 拒答 | 知识库没有答案时是否明确说明，而不是编造 | refusal_ok | 规则 + LLM 判定 | ≥ 0.90 |
 
-说明：R0 只看是否委派了 knowledge-researcher，不看子代理内部是否调用 `knowledge_search`；后者属于 R1 的检索证据。所有 `expect_skill` / `expect_kb` 样本都必须走对应子代理；评测环境要保证 `subagent_enabled=true`、两个检索子代理可用、`skills.usage.prompt_top_k=0`，样本不走 slash。若出现静态 `load_skill`、直连 `knowledge_search` 或未委派，属于配置/样本无效，应失败而不是 N/A。R1 只用文档 ID 比对：评测集标注 `expected_doc_ids`。切片 ID 会随切片策略变化，建议优先标注文档 ID 加页码或段落位置，切片策略调整后仍然可用。
+说明：R0 只看是否委派了 knowledge-researcher，不看子代理内部是否调用 `knowledge_search`；后者属于 R1 的检索证据。所有 `expect_skill` / `expect_kb` 样本都必须走对应子代理；评测环境要保证 `subagent_enabled=true`、两个检索子代理可用、`skills.usage.prompt_top_k=0`，样本不走 slash。若出现静态 `load_skill`、直连 `knowledge_search` 或未委派，属于配置/样本无效，应失败而不是 N/A。R1 同时看文档 ID 与切片 ID：评测集标注 `expected_doc_ids`，构建器还会把主切片 `chunk_id`（多跳再加 `related_chunk_ids`）放进 metadata；`kb_chunk_recall@5` / `kb_chunk_mrr` 用它检查“命中文档但没命中目标切片”。切片 ID 会随切片策略变化，跨版本比较时仍需结合页面/段落位置。
 
 **3.4 端到端与安全**
 
@@ -536,9 +536,11 @@ GET /api/threads/{thread_id}/runs/{run_id}/events
 | kb_routing | R0 | 规则 | 否 | 是否调用 knowledge-researcher 子代理与 expect_kb 一致记 1 |
 | kb_recall@5 | R1 | 规则 | 否 | expected_doc_ids 出现在前 5 个切片中的比例 |
 | kb_mrr | R1 | 规则 | 否 | 首个期望文档排名的倒数 |
+| kb_chunk_recall@5 | R1 | 规则 | 否 | metadata 中的 chunk_id / related_chunk_ids 出现在前 5 个切片中的比例 |
+| kb_chunk_mrr | R1 | 规则 | 否 | 首个期望切片排名的倒数；仅记录 |
 | contextual_recall | R1 | DeepEval | 是 | 参考答案中的信息被检索内容覆盖的比例 |
 | contextual_precision | R2 | DeepEval | 是 | 相关切片是否排在不相关切片之前 |
-| contextual_relevancy | R2 | DeepEval | 是 | 检索内容中与问题相关的比例 |
+| contextual_relevancy | R2 | DeepEval | 是 | 检索内容中与问题相关的比例；单跳 top-5 仅记录，不作硬门禁 |
 | faithfulness | R3 | DeepEval | 是 | 回答中的陈述被检索内容支持的比例 |
 | citation_valid | R3 | 规则 | 否 | 最终消息的 `knowledge_citations` 必须全部出现在本次检索来源中 |
 | refusal_ok | R4 | 规则 + LLM | 是 | 无答案样本是否明确说明没有相关信息 |
@@ -981,7 +983,8 @@ THRESHOLDS = {"retrieval_recall@5": 0.95, "tool_hit": 0.90, "args_accuracy": 0.8
         "extra_calls_ratio": 1.5,
         "skill_routing": 0.95, "skill_recall@5": 0.95, "skill_hit": 0.90,
         "skill_adherence": 0.85,
-        "kb_routing": 0.95, "kb_recall@5": 0.85, "faithfulness": 0.90,
+        "kb_routing": 0.95, "kb_recall@5": 0.85, "kb_chunk_recall@5": 0.85,
+        "faithfulness": 0.90,
         "citation_valid": 0.95, "refusal_ok": 0.90, "answer_quality": 0.85,
         "answer_correctness": 0.80}
 MUST_BE_ZERO = ["forbidden_violation"]

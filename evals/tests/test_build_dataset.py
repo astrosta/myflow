@@ -1558,7 +1558,9 @@ def test_knowledge_drafts_keep_provenance_but_emit_expected_doc_ids_only() -> No
 
     draft = drafts[0]
     assert draft.id == stable_item_id("knowledge", "doc-1", 0, HASHED_USER_ID)
-    assert draft.input["query"] == "根据《policy.md》，要点是什么？"
+    assert draft.input["query"] == (
+        "《policy.md》中关于「Refunds」的具体规定是什么？请给出条件、数字和结论。"
+    )
     assert draft.expected_output["expect_kb"] is True
     assert draft.expected_output["expected_doc_ids"] == ["doc-1"]
     assert draft.expected_output["reference_answer"] == "Refunds take five business days."

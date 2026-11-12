@@ -107,6 +107,13 @@ def test_the_metric_catalog_matches_the_design() -> None:
         assert spec["comparison"] in {"min", "max"}
 
 
+def test_contextual_relevancy_is_record_only_for_single_hop_top_k() -> None:
+    assert "contextual_relevancy" in LLM_METRICS
+    assert "contextual_relevancy" not in LLM_THRESHOLDS
+    assert "contextual_precision" in LLM_THRESHOLDS
+    assert "contextual_recall" in LLM_THRESHOLDS
+
+
 def test_applicability_honors_the_sample_shape() -> None:
     assert metric_applicable("faithfulness", _case({"expect_kb": True})) is True
     assert metric_applicable("faithfulness", _case({"expect_kb": True, "expect_refusal": True})) is False
@@ -205,6 +212,30 @@ def test_contextual_precision_uses_the_ranked_relevance_verdicts() -> None:
     prompt = judge.calls[0][1]
     assert "relevant one" in prompt
     assert "more noise" in prompt
+
+
+def test_contextual_metrics_judge_every_chunk_they_ask_about() -> None:
+    chunks = [
+        {"chunk_id": f"c{index}", "content": f"chunk-{index} " + "x" * 5000}
+        for index in range(1, 6)
+    ]
+    evidence = _evidence(retrieved_chunks=chunks)
+
+    for metric, expected in (
+        ("contextual_precision", {"reference_answer": "42"}),
+        ("contextual_relevancy", {"expect_kb": True}),
+    ):
+        judge = FakeJudge(json.dumps({"relevant": [True] * 5, "reason": "all visible"}))
+        score = PromptJudgeEngine(judge).score(
+            metric, _case(expected, evidence=evidence)
+        )
+
+        assert score is not None
+        assert score.value == 1.0
+        prompt = judge.calls[0][1]
+        assert "chunk-1" in prompt
+        assert "chunk-5" in prompt, "the verdict count must match the rendered chunks"
+        assert "(5 values)" in prompt
 
 
 def test_tool_correctness_is_computed_without_calling_the_judge() -> None:
