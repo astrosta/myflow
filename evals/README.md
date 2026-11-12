@@ -335,7 +335,7 @@ transport 不影响采样，只要求服务器生效。每一次生效性跳过�
    "category": "skill_single", "source": "synthetic_from_skill", "skill_commit": "<sha or null>"}}
 
 // 知识库：kb_single_hop / kb_multi_hop / kb_unanswerable
-{"input": {"query": "根据《<filename>》，要点是什么？"},
+{"input": {"query": "关于「<chunk condition / subject>」，具体有哪些条件、数字和要求？"},
  "expected_output": {"expect_kb": true, "expected_doc_ids": ["<document_id>"],
    "reference_answer": "<主分块正文>", "key_points": ["<主分块正文>"],
    "expect_refusal": false, "expected_tools": []},

@@ -57,7 +57,15 @@ _KIND_ORDER = (_KIND_TOOL, _KIND_SKILL, _KIND_KNOWLEDGE, _KIND_TRACE)
 #: Predicate markers used only to keep a chunk's subject as the question topic.
 _KNOWLEDGE_PREDICATE_RE = re.compile(
     r"(?:包括|包含|应当|应该|必须|不得|可以|是|为|由|对|在|有|规定|要求|指|"
-    r"take|takes|is|are|must|should|will|can|may|has|have)\b",
+    r"(?:take|takes|is|are|must|should|will|can|may|has|have)\b)",
+    re.IGNORECASE,
+)
+
+#: Leading clause/section identifiers are not semantic question material. They
+#: are stripped before deriving a topic from a section or the chunk's first line.
+_CLAUSE_PREFIX_RE = re.compile(
+    r"^(?:第[一二三四五六七八九十百千万零〇两\d]+[条章节款项编]|"
+    r"(?:section|article|chapter)\s*[\d.]+)[\s:：、.\-—]*",
     re.IGNORECASE,
 )
 
@@ -1187,15 +1195,22 @@ def knowledge_question(document: KnowledgeSource) -> str:
     first line of the chunk usually names the clause, entity, or procedure; it is
     enough to make the question specific without relying on an LLM writer.
     """
-    title = document.filename.strip() or "该文档"
     topic = _knowledge_topic(document)
     if topic:
-        return f"《{title}》中关于「{topic}」的具体规定是什么？请给出条件、数字和结论。"
-    return f"《{title}》中具体规定了哪些条件、数字和做法？"
+        return f"关于「{topic}」，具体有哪些条件、数字和要求？"
+    return "这份资料具体有哪些条件、数字和要求？"
 
 
 def _knowledge_topic(document: KnowledgeSource) -> str:
-    section = " ".join(document.section.split()).strip(" #:-")
+    section = " ".join(document.section.split()).strip(
+        " #:-/-—–·:：,，《》〈〉“”\"‘’"
+    )
+    section = _strip_source_name(section, document.filename).strip(
+        " /-—–·:：,，《》〈〉“”\"‘’"
+    )
+    section = _strip_clause_prefix(section).strip(
+        " /-—–·:：,，《》〈〉“”\"‘’"
+    )
     if section:
         return section[:80]
     first_line = next(
@@ -1204,11 +1219,34 @@ def _knowledge_topic(document: KnowledgeSource) -> str:
     )
     topic = re.sub(r"^[#>*\-\d.、\s]+", "", first_line)
     topic = re.split(r"[。！？!?；;]", topic, maxsplit=1)[0].strip()
-    # Keep the subject before the predicate when the chunk has no section. This
-    # turns "Refunds take five days" into the topic "Refunds" instead of putting
-    # the answer itself into the question.
-    subject = _KNOWLEDGE_PREDICATE_RE.split(topic, maxsplit=1)[0].strip(" ，,、:：")
+    topic = _strip_source_name(topic, document.filename)
+    topic = _strip_clause_prefix(topic)
+    # Keep the subject before the predicate when the chunk has no semantic
+    # section. This turns "Refunds take five days" into "Refunds" and
+    # "第六条 掌握…必须申报" into the actor/condition, never the article number.
+    subject = _KNOWLEDGE_PREDICATE_RE.split(topic, maxsplit=1)[0].strip(
+        " ，,、:：《》〈〉“”\"‘’"
+    )
     return (subject or topic)[:60]
+
+
+def _strip_clause_prefix(text: str) -> str:
+    return _CLAUSE_PREFIX_RE.sub("", text, count=1).strip()
+
+
+def _strip_source_name(text: str, filename: str) -> str:
+    """Remove a document filename/stem so questions do not just name the source."""
+    cleaned = text
+    source = filename.strip()
+    if not source:
+        return cleaned
+    names = [source]
+    stem = source.rsplit(".", 1)[0].strip() if "." in source else ""
+    if stem and stem != source:
+        names.append(stem)
+    for name in sorted(names, key=len, reverse=True):
+        cleaned = re.sub(re.escape(name), "", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _knowledge_query(document: KnowledgeSource) -> str:

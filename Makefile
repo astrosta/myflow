@@ -91,7 +91,6 @@ up: check-deploy ## 构建并启动全部容器（依赖 + 网关 + 前端）
 	@printf 'Status: make ps    Health: make health    Logs: make logs-backend\n'
 
 up-backend: check-deploy ## 构建并启动后端容器（先起依赖，再起网关）
-	$(DEPS_COMPOSE) up -d
 	$(BACKEND_COMPOSE) up -d --build
 	@printf '\nStarted: gateway http://0.0.0.0:$(BACKEND_PORT)/docs\n'
 	@printf 'Status: make ps    Health: make health    Logs: make logs-backend\n'

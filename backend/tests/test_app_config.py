@@ -36,6 +36,48 @@ def test_whole_value_env_reference_still_replaces_the_string(monkeypatch):
     assert AppConfig.resolve_env_variables("$DATABASE_URL") == "postgresql://db/myflow"
 
 
+def test_filesystem_skills_do_not_require_git_credentials(tmp_path, monkeypatch):
+    """filesystem 来源不读 Git 仓库：没配 SKILLS_GIT_* 也不能挡住进程启动。"""
+    monkeypatch.delenv("SKILLS_GIT_REPOSITORY", raising=False)
+    monkeypatch.delenv("SKILLS_GIT_SSH_KEY", raising=False)
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+models:
+  - name: fake
+    use: langchain_core.language_models.fake_chat_models.FakeListChatModel
+    model: fake
+skills:
+  source: filesystem
+  git:
+    repository: $SKILLS_GIT_REPOSITORY
+    ssh_key: $SKILLS_GIT_SSH_KEY
+""",
+        encoding="utf-8",
+    )
+
+    config = AppConfig.from_file(path)
+
+    assert config.skills.source == "filesystem"
+    assert config.skills.git.repository == ""
+    assert config.skills.git.ssh_key == ""
+
+
+def test_git_skills_still_require_git_credentials(monkeypatch):
+    """只有 filesystem 来源能跳过 Git 环境变量；git 来源仍要当场报错。"""
+    monkeypatch.delenv("SKILLS_GIT_REPOSITORY", raising=False)
+
+    with pytest.raises(ValueError, match=r"\$SKILLS_GIT_REPOSITORY"):
+        AppConfig.resolve_env_variables(
+            {
+                "skills": {
+                    "source": "git",
+                    "git": {"repository": "$SKILLS_GIT_REPOSITORY"},
+                }
+            }
+        )
+
+
 def test_resolve_config_path_finds_config_yaml_in_cwd(tmp_path, monkeypatch):
     """没有 MYFLOW_CONFIG_PATH 时回落到 cwd 的 config.yaml（曾因少了逗号只看首字母路径）。"""
     monkeypatch.delenv("MYFLOW_CONFIG_PATH", raising=False)

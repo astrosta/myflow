@@ -27,6 +27,7 @@ from myflow_evals.build_dataset import (
     build_account_items,
     build_report,
     fetch_account_traces,
+    knowledge_question,
     load_build_sources,
     stable_item_id,
     write_drafts,
@@ -1559,7 +1560,7 @@ def test_knowledge_drafts_keep_provenance_but_emit_expected_doc_ids_only() -> No
     draft = drafts[0]
     assert draft.id == stable_item_id("knowledge", "doc-1", 0, HASHED_USER_ID)
     assert draft.input["query"] == (
-        "《policy.md》中关于「Refunds」的具体规定是什么？请给出条件、数字和结论。"
+        "关于「Refunds」，具体有哪些条件、数字和要求？"
     )
     assert draft.expected_output["expect_kb"] is True
     assert draft.expected_output["expected_doc_ids"] == ["doc-1"]
@@ -1575,6 +1576,27 @@ def test_knowledge_drafts_keep_provenance_but_emit_expected_doc_ids_only() -> No
     assert draft.metadata["source_kind"] == "knowledge"
     assert draft.metadata["category"] == "kb_single_hop"
     assert draft.metadata["source"] == "synthetic_from_docs"
+
+
+def test_knowledge_question_removes_filename_and_document_title() -> None:
+    document = KnowledgeSource(
+        knowledge_base_id="kb-1",
+        document_id="doc-security",
+        filename="网络安全审查办法.pdf",
+        chunk_id="doc-security:6",
+        chunk_content="第六条 掌握超过100万用户个人信息的运营者赴国外上市，必须申报网络安全审查。",
+        chunk_count=1,
+        section="网络安全审查办法 / 第六条",
+    )
+
+    query = knowledge_question(document)
+
+    assert "网络安全审查办法" not in query
+    assert ".pdf" not in query
+    assert "第六条" not in query
+    assert "必须申报网络安全审查" not in query
+    assert "掌握超过100万用户个人信息的运营者赴国外上市" in query
+    assert query.startswith("关于「掌握超过100万用户个人信息的运营者赴国外上市」")
 
 
 def test_trace_drafts_replay_the_query_and_carry_no_expectations() -> None:

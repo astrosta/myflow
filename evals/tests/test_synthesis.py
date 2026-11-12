@@ -25,6 +25,7 @@ from myflow_evals.build_dataset import (
     SkillSource,
     TraceSource,
 )
+from myflow_evals.llm import JudgeError
 from myflow_evals.synthesis import (
     BOUNDARY_QUESTIONS,
     MAX_UNANSWERABLE_PER_ACCOUNT,
@@ -924,6 +925,32 @@ class _UngroundedSkillWriter(_RecordingWriter):
         return "帮我扫描 PDF 转成可编辑 Word"
 
 
+class _FilenameWriter(_RecordingWriter):
+    def generate(
+        self,
+        *,
+        kind: str,
+        source: Any,
+        evaluation: Any,
+        variant: int,
+        fallback: str,
+    ) -> str:
+        return "根据《policy.md》，要点是什么？"
+
+
+class _ClauseWriter(_RecordingWriter):
+    def generate(
+        self,
+        *,
+        kind: str,
+        source: Any,
+        evaluation: Any,
+        variant: int,
+        fallback: str,
+    ) -> str:
+        return "关于「第六条」，具体有哪些条件和要求？"
+
+
 class _FakeJudge:
     def __init__(self, reply: Any) -> None:
         self.reply = reply
@@ -995,7 +1022,7 @@ def test_writer_material_includes_knowledge_content() -> None:
     assert source["kind"] == "knowledge"
     assert source["content"] == POLICY.chunk_content
     assert evaluation["category"] == "kb_single_hop"
-    assert fallback.startswith("《policy.md》中关于「refunds」")
+    assert fallback.startswith("关于「refunds」")
 
     unanswerable = next(
         generation
@@ -1025,6 +1052,35 @@ def test_writer_returning_an_empty_query_falls_back() -> None:
     assert [draft.input["query"] for draft in result.drafts] == [
         draft.input["query"] for draft in baseline.drafts
     ]
+    assert any("question writer failed" in warning for warning in result.warnings)
+
+
+def test_writer_query_naming_the_kb_filename_falls_back() -> None:
+    sources = _sources(knowledge=[POLICY])
+    baseline = synthesize_account_items(_session(), sources)
+    result = synthesize_account_items(
+        _session(), sources, writer=_FilenameWriter()
+    )
+
+    for category in ("kb_single_hop", "kb_multi_hop"):
+        baseline_draft = _by_category(baseline.drafts, category)[0]
+        draft = _by_category(result.drafts, category)[0]
+        assert draft.input["query"] == baseline_draft.input["query"]
+        assert "policy.md" not in draft.input["query"]
+    assert any("question writer failed" in warning for warning in result.warnings)
+
+
+def test_writer_query_with_an_article_label_falls_back() -> None:
+    sources = _sources(knowledge=[POLICY])
+    baseline = synthesize_account_items(_session(), sources)
+    result = synthesize_account_items(
+        _session(), sources, writer=_ClauseWriter()
+    )
+
+    baseline_draft = _by_category(baseline.drafts, "kb_single_hop")[0]
+    draft = _by_category(result.drafts, "kb_single_hop")[0]
+    assert draft.input["query"] == baseline_draft.input["query"]
+    assert "第六条" not in draft.input["query"]
     assert any("question writer failed" in warning for warning in result.warnings)
 
 
@@ -1236,6 +1292,23 @@ def test_openai_writer_skill_rules_prompt_is_grounded_and_never_empty() -> None:
     assert '"rules"' in system.lower()
     assert payload["body_available"] is False
     assert payload["output_format"]["rules"]
+
+
+def test_writer_warning_includes_a_safe_judge_error_detail() -> None:
+    writer = OpenAIQuestionWriter(
+        _FakeJudge(JudgeError("judge request failed with HTTP 401"))
+    )
+
+    query = writer.generate(
+        kind="single_tool",
+        source={"kind": "tool", "tools": []},
+        evaluation={"category": "single_tool"},
+        variant=0,
+        fallback="规则问题",
+    )
+
+    assert query == "规则问题"
+    assert "HTTP 401" in writer.warnings[-1]
 
 
 def test_writer_translates_trace_replay_to_chinese() -> None:

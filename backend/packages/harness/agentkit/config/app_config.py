@@ -137,35 +137,70 @@ class AppConfig(BaseModel):
     _models_by_name: dict[str, ModelConfig] = PrivateAttr(default_factory=dict)
 
     @classmethod
-    def resolve_env_variables(cls, config: Any) -> Any:
+    def resolve_env_variables(cls, config: Any, *, _allow_unset: bool = False) -> Any:
+        """Expand `$VAR` / `${VAR}` references in configuration values.
+
+        A section that the selected mode never reads must not make startup depend
+        on its environment variables.  `skills.git` is the concrete case:
+        `source=filesystem` never touches the repository or its credentials, so
+        an unset `SKILLS_GIT_REPOSITORY` has to resolve to the empty default
+        instead of failing the whole config load.
+        """
         if isinstance(config, str):
-            if "${" in config:
-                missing: list[str] = []
-
-                def replace(match: re.Match[str]) -> str:
-                    name = match.group(1)
-                    value = os.getenv(name)
-                    if value is None:
-                        missing.append(name)
-                        return match.group(0)
-                    return value
-
-                expanded = _BRACED_ENV.sub(replace, config)
-                if missing:
-                    names = ", ".join(f"${{{name}}}" for name in missing)
-                    raise ValueError(f"Environment variable {names} is not set")
-                return expanded
-            if config.startswith("$"):
-                value = os.getenv(config[1:])
-                if value is None:
-                    raise ValueError(f"Environment variable {config} is not set")
-                return value
-            return config
+            return cls._expand_env(config, allow_unset=_allow_unset)
         if isinstance(config, list):
-            return [cls.resolve_env_variables(item) for item in config]
+            return [
+                cls.resolve_env_variables(item, _allow_unset=_allow_unset)
+                for item in config
+            ]
         if isinstance(config, dict):
-            return {key: cls.resolve_env_variables(value) for key, value in config.items()}
+            ignore_git_env = cls._git_config_is_inactive(config)
+            return {
+                key: cls.resolve_env_variables(
+                    value, _allow_unset=_allow_unset or (ignore_git_env and key == "git")
+                )
+                for key, value in config.items()
+            }
         return config
+
+    @classmethod
+    def _git_config_is_inactive(cls, config: dict[str, Any]) -> bool:
+        """Whether this is a skills block whose selected source never reads Git."""
+        if "git" not in config:
+            return False
+        source = config.get("source", "filesystem")
+        if isinstance(source, str):
+            source = cls.resolve_env_variables(source)
+        return source != "git"
+
+    @classmethod
+    def _expand_env(cls, value: str, *, allow_unset: bool) -> str:
+        if "${" in value:
+            missing: list[str] = []
+
+            def replace(match: re.Match[str]) -> str:
+                name = match.group(1)
+                env_value = os.getenv(name)
+                if env_value is None:
+                    if allow_unset:
+                        return ""
+                    missing.append(name)
+                    return match.group(0)
+                return env_value
+
+            expanded = _BRACED_ENV.sub(replace, value)
+            if missing:
+                names = ", ".join(f"${{{name}}}" for name in missing)
+                raise ValueError(f"Environment variable {names} is not set")
+            return expanded
+        if value.startswith("$"):
+            env_value = os.getenv(value[1:])
+            if env_value is None:
+                if allow_unset:
+                    return ""
+                raise ValueError(f"Environment variable {value} is not set")
+            return env_value
+        return value
 
     @model_validator(mode="before")
     @classmethod
