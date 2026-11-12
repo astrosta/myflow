@@ -90,7 +90,9 @@ up: check-deploy ## 构建并启动全部容器（依赖 + 网关 + 前端）
 	@printf '\nStarted: frontend http://0.0.0.0:2026/workspace , gateway http://0.0.0.0:8001/docs\n'
 	@printf 'Status: make ps    Health: make health    Logs: make logs-backend\n'
 
-up-backend: check-deploy ## 构建并启动后端容器（先起依赖，再起网关）
+up-backend: check-deploy ## 构建并启动后端容器（缺 myflow-deps_default 网络时先创建）
+	@docker network inspect myflow-deps_default >/dev/null 2>&1 \
+		|| { printf 'Creating docker network myflow-deps_default\n'; docker network create myflow-deps_default; }
 	$(BACKEND_COMPOSE) up -d --build
 	@printf '\nStarted: gateway http://0.0.0.0:$(BACKEND_PORT)/docs\n'
 	@printf 'Status: make ps    Health: make health    Logs: make logs-backend\n'
