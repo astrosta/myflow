@@ -199,17 +199,24 @@ def test_a_resolution_failure_drops_a_cached_result(tmp_path: Path, monkeypatch)
     assert builtin_loader._cache == {}
 
 
-def test_builtin_loader_warns_once_for_a_missing_root(tmp_path: Path, caplog):
-    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "missing")})
+def test_filesystem_source_creates_a_missing_builtin_root(tmp_path: Path, caplog):
+    root = tmp_path / "skills" / "builtin"
+    config = skills_config(tmp_path, builtin={"path": str(root)})
+
     with caplog.at_level("WARNING", logger="agentkit.skills.builtin"):
         assert load_builtin_skills(config) == ()
-        assert load_builtin_skills(config) == ()
-    assert len(builtin_warnings(caplog)) == 1
+
+    assert root.is_dir()
+    assert builtin_warnings(caplog) == []
 
 
 def test_clear_builtin_cache_resets_the_warned_missing_root(tmp_path: Path, caplog):
     """告警去重靠 warned-roots 集合；clear_builtin_cache() 必须把它一起清掉，否则重载后永远静默。"""
-    config = skills_config(tmp_path, builtin={"path": str(tmp_path / "missing")})
+    config = skills_config(
+        tmp_path,
+        source="git",
+        builtin={"path": str(tmp_path / "missing")},
+    )
     with caplog.at_level("WARNING", logger="agentkit.skills.builtin"):
         assert load_builtin_skills(config) == ()
         assert load_builtin_skills(config) == ()
@@ -219,6 +226,17 @@ def test_clear_builtin_cache_resets_the_warned_missing_root(tmp_path: Path, capl
 
         assert load_builtin_skills(config) == ()
         assert len(builtin_warnings(caplog)) == 2
+
+
+def test_git_source_never_creates_a_missing_builtin_root(tmp_path: Path, caplog):
+    root = tmp_path / "skills" / "builtin"
+    config = skills_config(tmp_path, source="git", builtin={"path": str(root)})
+
+    with caplog.at_level("WARNING", logger="agentkit.skills.builtin"):
+        assert load_builtin_skills(config) == ()
+
+    assert not root.exists()
+    assert len(builtin_warnings(caplog)) == 1
 
 
 def test_missing_root_recovers_after_the_directory_appears(tmp_path: Path):

@@ -7,6 +7,9 @@
 * 用目录指纹缓存扫描结果，SKILL.md 一改就重新扫；
 * 根目录缺失或读不了时只告警一次，避免每次列技能都刷日志；目录恢复后必须能重新发现技能。
 
+filesystem 来源是本地调试路径，内置技能目录不存在时由加载器创建，运维不需要
+先手工建空目录。git 来源不写工作树：目录缺失仍然只告警一次。
+
 根目录缺失或读不了（PermissionError、is_dir() 之后被并发删除、resolve() 失败等）
 一律退化成空元组，绝不把异常抛进启动、列表或提示词构建——内置技能是可选资源，
 它坏了不能拖垮整个进程。失败结果不进缓存。
@@ -41,6 +44,7 @@ _lock = threading.Lock()
 __all__ = [
     "builtin_names",
     "clear_builtin_cache",
+    "ensure_builtin_root",
     "load_builtin_skills",
     "resolve_builtin_root",
 ]
@@ -63,6 +67,21 @@ def resolve_builtin_root(config: SkillsConfig) -> Path:
     return resolved
 
 
+def ensure_builtin_root(config: SkillsConfig) -> Path | None:
+    """Create the built-in root for a filesystem deployment and return it.
+
+    Git checkouts are never written here: a missing built-in tree there is a
+    deployment mistake and stays a warning. Filesystem mode is the local
+    debugging path, so an empty built-in tree is created on demand.
+    """
+    if not config.builtin.enabled or config.source != "filesystem":
+        return None
+    root = resolve_builtin_root(config)
+    if not root.is_dir():
+        root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def _is_junction(path: Path) -> bool:
     """Python 3.12 在 Windows 上提供 Path.is_junction；其它平台没有这个 API。"""
     is_junction = getattr(path, "is_junction", None)
@@ -80,6 +99,9 @@ def load_builtin_skills(config: SkillsConfig) -> tuple[Skill, ...]:
         try:
             root = resolve_builtin_root(config)
             warn_key = root
+            if config.source == "filesystem" and not root.is_dir():
+                # Local debugging: an empty built-in tree is normal, not an error.
+                root.mkdir(parents=True, exist_ok=True)
             if not root.is_dir():
                 # 不缓存空结果：目录晚一点出现时，下一次调用必须能发现它。
                 _cache.pop(root, None)

@@ -130,9 +130,10 @@ def build_host_mounts(
     """Build the complete host-mount list for one OpenSandbox user/thread.
 
     Thread data is created before the list is returned. The git private-skill
-    tree is created empty if the catalog has not materialized it yet; the builtin
-    tree is never created here (a missing builtin directory is a skipped mount,
-    not a reason to write into the project).
+    tree is created empty if the catalog has not materialized it yet. For the
+    filesystem source the builtin tree is created too: it is a local-debug tree
+    shipped inside the project, so an empty directory is the normal start state.
+    Git never writes the builtin tree here; a missing one stays a skipped mount.
     """
 
     roots = resolve_host_roots(host_mount, field_prefix=field_prefix)
@@ -183,6 +184,15 @@ def build_host_mounts(
 
     builtin_root = _builtin_root(skills)
     if builtin_root is not None:
+        if skills.source == "filesystem" and not builtin_root.is_dir():
+            try:
+                builtin_root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "could not create the built-in skills directory %s: %s",
+                    builtin_root,
+                    exc,
+                )
         if not builtin_root.is_dir():
             logger.warning(
                 "built-in skills directory is missing; skipping builtin mount: %s",

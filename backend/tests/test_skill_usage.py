@@ -219,7 +219,7 @@ def test_the_example_config_publishes_the_usage_block() -> None:
     path = Path(__file__).resolve().parents[2] / "config.example.yaml"
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert data["skills"]["usage"] == {
-        "enabled": True,
+        "enabled": False,
         "redis_url": "$REDIS_URL",
         "key_prefix": "myflow:skills:usage",
         "prompt_top_k": 10,

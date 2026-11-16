@@ -720,7 +720,7 @@ def assert_virtual_path(path: str, mounts: list[VirtualMount], *, write: bool = 
 - `skills_catalog` 启动时会物化私有 active 树；provider 的 `acquire` 发生在首次工具调用，通常晚于启动。
 - 如果 `private_root` 不存在，provider `mkdir -p` 空目录，保证 host-mount 源存在；后续物化写入同一目录，挂载立即可见。
 - 如果 catalog 启动失败，`skills_catalog` 会 fail-closed；provider 仍可创建空目录，但提示词不会有私有技能。
-- 内置技能目录缺失时跳过挂载并 warning；不要为了挂载创建项目目录，避免掩盖打包错误。
+- 内置技能目录缺失时：`skills.source=filesystem` 会创建空目录再挂载（本地调试路径，空目录是正常起点）；`skills.source=git` 仍跳过挂载并 warning，不为挂载写 Git 工作树，避免掩盖打包错误。
 
 ## 12. 上传与产物
 

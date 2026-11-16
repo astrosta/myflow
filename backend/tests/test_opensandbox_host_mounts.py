@@ -70,6 +70,27 @@ def test_planning_does_not_need_an_e2b_section(tmp_path: Path) -> None:
     assert by_container["/mnt/skills/private"].read_only is True
 
 
+def test_filesystem_source_creates_a_missing_builtin_tree(tmp_path: Path) -> None:
+    config = AppConfig(
+        models=[{"name": "m", "use": "langchain_deepseek:ChatDeepSeek"}],
+        sandbox=SandboxConfig(),
+        skills=_skills(tmp_path, source="filesystem"),
+    )
+    builtin = tmp_path / "skills" / "builtin"
+    builtin.rmdir()
+
+    build_host_mounts(
+        app_config=config,
+        host_mount=_host_mount(tmp_path),
+        user_id="u1",
+        thread_id="t1",
+        paths=Paths(tmp_path / ".myflow"),
+        field_prefix="sandbox.opensandbox.host_mount",
+    )
+
+    assert builtin.is_dir()
+
+
 def test_host_root_defaults_to_local_root() -> None:
     roots = resolve_host_roots(
         SimpleNamespace(local_root="/opt/myflow", host_root=None),

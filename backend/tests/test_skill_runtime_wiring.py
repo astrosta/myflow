@@ -305,6 +305,18 @@ def test_lifespan_builds_starts_and_stops_the_runtime(
     asyncio.run(scenario())
 
 
+def test_filesystem_startup_creates_a_missing_builtin_dir(tmp_path: Path) -> None:
+    builtin = tmp_path / "skills" / "builtin"
+    config = _config(source="filesystem", builtin={"path": str(builtin)})
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    runtime = asyncio.run(gateway_app.start_skill_runtime(app, config))
+
+    assert runtime is None
+    assert builtin.is_dir()
+    assert app.state.skill_runtime is None
+
+
 def test_filesystem_source_never_builds_the_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         app = SimpleNamespace(state=SimpleNamespace(skill_runtime=object()))

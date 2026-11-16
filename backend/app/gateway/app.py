@@ -35,6 +35,7 @@ from agentkit.persistence.thread_meta import make_thread_meta_store
 from agentkit.runtime import cancel_detached
 from agentkit.runtime.checkpointer import make_checkpointer
 from agentkit.sandbox.runtime import shutdown_sandbox_provider, start_sandbox_provider
+from agentkit.skills.builtin import ensure_builtin_root
 from agentkit.subagents.runtime import get_subagent_runtime
 from agentkit.persistence.events import make_run_event_store
 from agentkit.runtime.run_services import build_run_services
@@ -74,13 +75,21 @@ logger = logging.getLogger(__name__)
 async def start_skill_runtime(app: FastAPI, app_config: AppConfig) -> SkillRuntime | None:
     """Build and start the Git-backed catalog runtime (lifespan-owned).
 
-    filesystem 来源只保留 M7 的扫描器：不建 runtime、不读 Git、不挂 active 树。
+    filesystem 来源只保留 M7 的扫描器：不建 runtime、不读 Git、不挂 active 树；
+    启动时补建缺失的内置技能目录，避免本地调试必须手工建空目录。
     Git 来源在数据库就绪后构建运行时，先刷新快照再启动 outbox worker；任何一步
     失败都让启动失败——半启动的技能目录比不启动更难排查。所以 start() 抛错时
     先把已经装上的运行时停掉并清空注册表，再让异常继续向上冒（否则 outbox 任务
     会活到事件循环关闭，对着已经释放的 engine 轮询）。
     """
     if app_config.skills.source != "git":
+        # filesystem is the local-debug source: create the optional built-in
+        # tree before the sandbox provider freezes its read-only mount list.
+        # A failure here stays a warning, just like an unreadable tree.
+        try:
+            ensure_builtin_root(app_config.skills)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Could not create the built-in skills directory: %s", exc)
         app.state.skill_runtime = None
         return None
     runtime = build_skill_runtime(app_config)
