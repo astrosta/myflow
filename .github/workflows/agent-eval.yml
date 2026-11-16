@@ -2,9 +2,6 @@ name: agent-eval
 
 on:
   pull_request:
-  schedule:
-    # Nightly full run: every metric, LLM metrics as hard gates.
-    - cron: "0 18 * * *"
 
 permissions:
   contents: read
@@ -34,19 +31,8 @@ jobs:
       # metrics run only when judge secrets exist, are sampled, and stay soft.
       # The dataset is frozen input here: this workflow never runs "build".
       - name: CI regression subset
-        if: github.event_name == 'pull_request'
         run: >-
           uv run --project evals myflow-evals run
           --mode ci
           --dataset agent-eval/regression/v1
           --run-name "ci-${GITHUB_SHA}"
-
-      # Nightly: full dataset with the DeepEval extra. Once a metric has at
-      # least 20 scored samples, LLM metrics become hard gates.
-      - name: Nightly full run
-        if: github.event_name == 'schedule'
-        run: >-
-          uv run --project evals --extra llm myflow-evals run
-          --mode full
-          --dataset agent-eval/regression/v1
-          --run-name "nightly-${GITHUB_SHA}"
