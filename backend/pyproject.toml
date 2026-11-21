@@ -52,6 +52,11 @@ openviking = [
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    # 以下测试模块在导入期直接使用 knowledge extra 的解析/索引依赖；
+    # 它们不是应用默认依赖，但缺了会让整个 pytest 在 collection 阶段失败。
+    "pymilvus>=2.5",
+    "pypdf>=7.0.0",
+    "cisco-ai-skill-scanner>=2.2,<3",
     # Redis 版桥的协议测试跑在 fakeredis 上：不需要真的 Redis 服务，也不进生产依赖。
     # [lua] 提供 EVALSHA 支持；缺了它，Redis 版桥的脚本测试会全部报 unknown command。
     "fakeredis[lua]>=2.30",
@@ -59,6 +64,12 @@ dev = [
 
 [tool.uv.sources]
 agentkit = { workspace = true }
+
+
+[tool.pytest.ini_options]
+# `backend` 是仓库根下的顶层包，而 Jenkins / Makefile 都从 backend/
+# 目录启动 pytest；补上仓库根，否则 `backend.app...` 会报 ModuleNotFoundError。
+pythonpath = [".."]
 
 
 [build-system]

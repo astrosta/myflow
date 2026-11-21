@@ -435,7 +435,10 @@ tool-search = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "cisco-ai-skill-scanner" },
     { name = "fakeredis", extra = ["lua"] },
+    { name = "pymilvus" },
+    { name = "pypdf" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -461,7 +464,10 @@ provides-extras = ["postgres", "knowledge", "tool-search", "observability", "ski
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cisco-ai-skill-scanner", specifier = ">=2.2,<3" },
     { name = "fakeredis", extras = ["lua"], specifier = ">=2.30" },
+    { name = "pymilvus", specifier = ">=2.5" },
+    { name = "pypdf", specifier = ">=7.0.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
 ]

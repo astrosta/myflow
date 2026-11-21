@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from agentkit.agents.memory.openviking.profile_tools import configure_profile_updater
 from agentkit.sandbox.lease import reset_sandbox_lease_manager
 from agentkit.sandbox.sandbox_provider import reset_sandbox_provider
+
+# 应用把仓库根当作 project_root，但 Jenkins / Makefile 为了跑 backend 的
+# pyproject 会先 cd backend。测试从哪个目录启动都不该改变 contracts/ 等
+# 仓库级路径；外部显式设置的 MYFLOW_PROJECT_ROOT 仍然优先。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+os.environ.setdefault("MYFLOW_PROJECT_ROOT", str(_REPO_ROOT))
 
 
 @pytest.fixture(autouse=True)

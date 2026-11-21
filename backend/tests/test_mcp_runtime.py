@@ -28,7 +28,7 @@ import pytest_asyncio
 from mcp import types as mcp_types
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from agentkit.config.mcp_servers_config import McpServersConfig
+from agentkit.config.mcp_servers_config import MCP_SERVER_KEY_ENV, McpServersConfig
 from agentkit.config.tool_search_config import ToolSearchConfig
 from agentkit.mcp import net
 from agentkit.mcp.client import McpServerConnection
@@ -1072,7 +1072,12 @@ def test_building_a_disabled_runtime_publishes_nothing() -> None:
     assert get_tool_search_runtime() is None
 
 
-def test_an_enabled_build_without_a_key_fails_before_anything_is_published() -> None:
+def test_an_enabled_build_without_a_key_fails_before_anything_is_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pymilvus loads the checkout's .env at import time; this case is about
+    # the absence of a key, so it must not inherit the developer's key.
+    monkeypatch.delenv(MCP_SERVER_KEY_ENV, raising=False)
     with pytest.raises(ValueError, match="encryption_key"):
         build_mcp_runtime(McpServersConfig(enabled=True))
 
