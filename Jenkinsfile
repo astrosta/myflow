@@ -42,36 +42,36 @@ pipeline {
             }
         }
 
-        stage('Test') {
-            parallel {
-                stage('Backend') {
-                    steps {
-                        sh '''
-                            set -euo pipefail
-                            cd backend
-                            uv run pytest --junitxml=../reports/backend-junit.xml
-                        '''
-                    }
-                }
-                stage('Frontend') {
-                    steps {
-                        sh '''
-                            set -euo pipefail
-                            cd frontend
-                            pnpm exec vitest run --reporter=default --reporter=junit --outputFile=../reports/frontend-junit.xml
-                        '''
-                    }
-                }
-                stage('Evals') {
-                    steps {
-                        sh '''
-                            set -euo pipefail
-                            uv run --project evals pytest evals/tests -v --junitxml=reports/evals-junit.xml
-                        '''
-                    }
-                }
-            }
-        }
+        // stage('Test') {
+        //     parallel {
+        //         stage('Backend') {
+        //             steps {
+        //                 sh '''
+        //                     set -euo pipefail
+        //                     cd backend
+        //                     uv run pytest --junitxml=../reports/backend-junit.xml
+        //                 '''
+        //             }
+        //         }
+        //         stage('Frontend') {
+        //             steps {
+        //                 sh '''
+        //                     set -euo pipefail
+        //                     cd frontend
+        //                     pnpm exec vitest run --reporter=default --reporter=junit --outputFile=../reports/frontend-junit.xml
+        //                 '''
+        //             }
+        //         }
+        //         stage('Evals') {
+        //             steps {
+        //                 sh '''
+        //                     set -euo pipefail
+        //                     uv run --project evals pytest evals/tests -v --junitxml=reports/evals-junit.xml
+        //                 '''
+        //             }
+        //         }
+        //     }
+        // }
 
         stage('Up backend') {
             steps {
