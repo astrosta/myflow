@@ -34,9 +34,7 @@ pipeline {
                     set -euo pipefail
                     command -v uv >/dev/null
                     command -v node >/dev/null
-                    corepack enable
-                    corepack prepare "pnpm@${PNPM_VERSION}" --activate
-                    uv python install 3.12
+                    command -v pnpm >/dev/null
                     uv sync --frozen --all-packages
                     (cd frontend && pnpm install --frozen-lockfile)
                     mkdir -p reports
