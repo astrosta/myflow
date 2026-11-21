@@ -5,7 +5,7 @@
 #                REDIS_URL：stream_bridge、skills.usage、openviking capture、sandbox lease
 #   milvus       127.0.0.1:19530        无鉴权（VECTOR_STORE_URI）
 #                etcd、minio 只给 Milvus standalone，不对外
-#   openviking   127.0.0.1:1933         配置只来自挂载的 ov.conf
+#   openviking   127.0.0.1:1933         配置来自挂载的 ov.conf；API key 由仓库根 .env 注入
 #   gitea web    0.0.0.0:3001           Web UI（容器内 3000）
 #   gitea ssh    127.0.0.1:2222         SKILLS_GIT_REPOSITORY
 #   opensandbox  127.0.0.1:8080         sandbox.opensandbox.domain，无 API key
@@ -150,6 +150,11 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:1933:1933"
+    environment:
+      # ov.conf 里只写 ${VAR} 引用，真实 key 全部来自仓库根 .env。
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?set EMBEDDING_API_KEY in the repo root .env}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY in the repo root .env}
+      OPENVIKING_ROOT_API_KEY: ${OPENVIKING_ROOT_API_KEY:?set OPENVIKING_ROOT_API_KEY in the repo root .env}
     volumes:
       # 只挂配置文件。数据目录由 ov.conf 的 storage.workspace 决定。
       - ./ov.conf:/app/.openviking/ov.conf:ro
