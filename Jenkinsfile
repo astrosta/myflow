@@ -1,7 +1,8 @@
 // 云服务器上的 Jenkins：检出代码、跑单测，通过后再构建并启动网关和前端。
 // 单测对应 make test-backend / test-frontend / test-evals。
 // 不重启 Postgres / Redis 等依赖；这些需要事先在服务器上通过 make up 准备好。
-// .env 与 config.yaml 不在仓库里，必须已经放在本次构建的工作区中。
+// .env 与 config.yaml 不在仓库里：服务器上的真值放在 MYFLOW_CONFIG_DIR，
+// 每次 Checkout 后由 Config 阶段复制进工作区（不依赖上一次构建的残留文件）。
 // Agent 需要 bash、make、Python 3.12、uv、Node 22、Corepack（pnpm 11.22.0）、Docker。
 
 pipeline {
@@ -19,12 +20,30 @@ pipeline {
         UV_DEFAULT_INDEX = 'https://pypi.tuna.tsinghua.edu.cn/simple'
         NEXT_TELEMETRY_DISABLED = '1'
         PNPM_VERSION = '11.22.0'
+        MYFLOW_CONFIG_DIR = '/var/jenkins_home/myflow-config'
     }
 
     stages {
         stage('Checkout') {
             steps {
                 checkout scm
+            }
+        }
+
+        stage('Config') {
+            steps {
+                sh '''
+                    set -euo pipefail
+                    for file in .env config.yaml; do
+                        src="${MYFLOW_CONFIG_DIR}/${file}"
+                        if [ ! -f "$src" ]; then
+                            printf 'Missing %s. Put the server-side .env and config.yaml in %s before building.\n' "$src" "$MYFLOW_CONFIG_DIR" >&2
+                            exit 1
+                        fi
+                        cp "$src" "$file"
+                        chmod 600 "$file"
+                    done
+                '''
             }
         }
 
