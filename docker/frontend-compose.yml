@@ -26,6 +26,18 @@ services:
       - ../.env
     ports:
       - "0.0.0.0:2026:2026"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - "http://127.0.0.1:2026/workspace"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
     volumes:
       - ../config.yaml:/app/config.yaml:ro
       - ../.env:/app/.env:ro

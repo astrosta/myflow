@@ -21,7 +21,7 @@ uv run --env-file .env --with uvicorn \
   （这里的 attr 必须是零参可调用对象 / loop 类，不是 `(use_subprocess)->class`）。
   只改 `asyncio.set_event_loop_policy` **无效**（uvicorn 会绕过 policy）。
 
-起来之后：`http://127.0.0.1:8001/docs`。
+起来之后：`http://127.0.0.1:8001/docs`。探活用 `http://127.0.0.1:8001/health`（进程）与 `/health/ready`（数据库就绪）；两者都不需要登录，也不依赖 docs 开关。
 
 开发热重载：
 

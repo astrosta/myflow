@@ -21,6 +21,7 @@ FRONTEND_COMPOSE := $(COMPOSE) -f docker/frontend-compose.yml --env-file $(ENV_F
 
 BACKEND_PORT ?= 8001
 FRONTEND_PORT ?= 2026
+HEALTH_HOST ?= 127.0.0.1
 BACKEND_ARGS ?=
 
 EVAL_ENV_FILE ?= evals/.env
@@ -36,7 +37,7 @@ EVAL_ARGS ?=
 
 .PHONY: help init install install-all check-config check-deploy check-eval-env \
 	dev-backend dev-frontend up up-backend up-frontend deploy down restart build ps \
-	logs-backend logs-frontend logs-deps health \
+	logs-backend logs-frontend logs-deps health health-containers \
 	test test-backend test-frontend test-evals \
 	eval-install eval-install-llm \
 	eval-build-dry eval-build eval-run-dry eval-run
@@ -135,13 +136,22 @@ logs-frontend: check-deploy ## 跟踪前端日志
 logs-deps: check-deploy ## 跟踪依赖服务日志
 	$(DEPS_COMPOSE) logs -f --tail=100
 
-health: ## 探测网关与前端 HTTP 状态
+health: ## 探测网关 readiness 与前端 HTTP 状态
 	@status=0; \
-	for entry in "gateway http://0.0.0.0:$(BACKEND_PORT)/docs" "frontend http://0.0.0.0:$(FRONTEND_PORT)/workspace"; do \
+	for entry in "gateway http://$(HEALTH_HOST):$(BACKEND_PORT)/health/ready" "frontend http://$(HEALTH_HOST):$(FRONTEND_PORT)/workspace"; do \
 		set -- $$entry; \
-		code=$$(curl -sS -o /dev/null -w '%{http_code}' "$$2" 2>/dev/null || true); \
+		code=$$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' "$$2" 2>/dev/null || true); \
 		printf '%-8s %s  %s\n' "$$1" "$$code" "$$2"; \
 		if [ "$$code" != "200" ]; then status=1; fi; \
+	done; \
+	exit $$status
+
+health-containers: check-deploy ## 读取网关/前端容器的 Docker healthcheck 结果
+	@status=0; \
+	for name in myflow-backend myflow-frontend; do \
+		health=$$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$$name" 2>/dev/null || true); \
+		printf '%-18s %s\n' "$$name" "$${health:-missing}"; \
+		[ "$$health" = "healthy" ] || status=1; \
 	done; \
 	exit $$status
 

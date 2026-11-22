@@ -85,10 +85,13 @@ make dev-backend BACKEND_ARGS="--loop backend.app.gateway.selector_loop:selector
 
 ```bash
 make health FRONTEND_PORT=3000
-# 或单独 curl
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/docs
+# 或单独 curl：ready 会检查应用数据库；liveness 不碰依赖
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/health
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/health/ready
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/workspace
 ```
+
+`/health` 只证明进程能响应；`/health/ready` 还要求 lifespan 已完成且应用数据库 `SELECT 1` 成功。
 
 不用 `make` 时，等价命令是：
 
@@ -119,14 +122,16 @@ make init           # 仅补齐缺失文件
 make up             # 依赖 + 网关 + 前端（也可用 make deploy）
 make up-backend     # 只构建并启动网关（会先起依赖）
 make up-frontend    # 只构建并启动前端
-make ps             # 查看状态
-make health         # 探活
-make logs-backend   # 跟踪网关日志
+make ps                # 查看容器状态（healthcheck 结果也在这一列）
+make health            # 从宿主机探 HTTP（默认 127.0.0.1）
+make health-containers # 读取网关/前端容器的 Docker health 状态
+make logs-backend      # 跟踪网关日志
 make down           # 停止；数据卷保留
 ```
 
 `make up` 先后台启动依赖，再构建并启动网关与前端；`make up-backend` / `make up-frontend` 可单独重建一侧。
-首次启动时依赖的健康检查可能需要几十秒，用 `make ps` 观察，就绪后再 `make health`。
+首次启动时依赖与网关的健康检查可能需要几十秒，用 `make ps` 观察；就绪后 `make health`（宿主机）或 `make health-containers`（也可在 Jenkins 容器里执行）应返回成功。
+`/health/ready` 不依赖 Swagger docs，所以生产设置 `GATEWAY_ENABLE_DOCS=false` 不会影响探活。
 `make restart` 等价于 `make down` + `make up`。
 
 网关容器加入依赖项目的 Docker 网络 `myflow-deps_default`，用服务名访问 Postgres / Redis 等
@@ -179,8 +184,9 @@ docker build -f docker/frontend.Dockerfile -t myflow-frontend:local .
 探活：
 
 ```bash
-make health
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/docs
+make health            # 从宿主机探网关 readiness 与前端
+make health-containers # 直接在 Docker 侧读 healthcheck 状态（Jenkins 容器内也可用）
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/health/ready
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:2026/workspace
 ```
 

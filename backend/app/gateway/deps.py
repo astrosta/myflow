@@ -42,6 +42,7 @@ __all__ = [
     "get_run_store",
     "get_session_auth",
     "get_thread_store",
+    "is_app_ready",
     "require_all_scopes",
     "require_authenticated",
     "require_scope",
@@ -60,6 +61,12 @@ def caller_from_request(request: Request) -> RunCaller:
         return RunCaller(kind=CallerKind.HTTP, user_id=None)
     kind = CallerKind.INTERNAL if auth.kind is AuthKind.internal else CallerKind.HTTP
     return RunCaller(kind=kind, user_id=auth.user_id, scopes=auth.scopes, user_role=auth.role)
+
+
+def is_app_ready(request: Request) -> bool:
+    """Lifespan completed: the health router must not read `request.app` itself."""
+
+    return bool(getattr(request.app.state, "ready", False))
 
 
 def get_auth_service(request: Request) -> AuthService:

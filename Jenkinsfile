@@ -108,8 +108,10 @@ pipeline {
             steps {
                 sh '''
                     set -euo pipefail
-                    for _ in 1 2 3 4 5 6; do
-                        if make health; then
+                    # Docker healthchecks probe inside each container, so this works
+                    # even when Jenkins itself runs in a container without host access.
+                    for _ in $(seq 1 24); do
+                        if make health-containers; then
                             exit 0
                         fi
                         sleep 5

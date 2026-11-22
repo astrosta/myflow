@@ -50,6 +50,7 @@ from backend.app.gateway.errors import install_error_handlers
 from backend.app.gateway.middleware.trace import TraceMiddleware
 from backend.app.gateway.routers import (
     artifacts,
+    health,
     knowledge,
     mcp_servers,
     memory_items,
@@ -359,6 +360,7 @@ async def stop_openviking_memory(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Open the database before the checkpointer, and close it after."""
+    app.state.ready = False
     app_config = get_app_config()
     # 固定单 worker 的理由在这里都成立：认证桶不能共享，进程级工具运行时
     # （启动同步 + 午夜任务 + 同步锁）也不能被复制到多个 worker。
@@ -424,9 +426,11 @@ async def lifespan(app: FastAPI):
                     )
                     if recovered:
                         logger.warning("recovered %s inflight runs as error after restart", recovered)
+                    app.state.ready = True
                     try:
                         yield
                     finally:
+                        app.state.ready = False
                         if openviking_runtime is not None:
                             await stop_openviking_memory(
                                 app, openviking_runtime, openviking_redis
@@ -511,6 +515,8 @@ def create_app(*, use_openviking_memory: bool | None = None) -> FastAPI:
     )
     install_middleware(application)
     install_error_handlers(application)
+    # 探针挂在根路径；认证中间件已把 /health 与 /health/ready 设为永远放行。
+    application.include_router(health.router)
     # 统一约定：router 只声明资源段（/threads、/models、/uploads…），/api 在这里加。
     # 少加一个就是 404 —— 浏览器请求的是 /api/models、/api/threads/{id}/uploads。
     application.include_router(threads.router, prefix="/api")

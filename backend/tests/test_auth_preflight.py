@@ -27,12 +27,14 @@ def test_a_broken_config_says_503_not_unauthenticated(monkeypatch) -> None:
 
     from backend.app.gateway.app import install_error_handlers, install_middleware
     from backend.app.gateway.auth import settings as settings_mod
+    from backend.app.gateway.routers import health
 
     def _boom():
         raise ValueError("Environment variable $DEEPSEEK_API_KEY is not set")
 
     monkeypatch.setattr(settings_mod, "get_app_config", _boom)
     application = FastAPI(redirect_slashes=False)
+    application.include_router(health.router)
     install_middleware(application)  # 不钉 settings：走"按请求解析配置"那条路径
     install_error_handlers(application)
     client = TestClient(application, raise_server_exceptions=False)
@@ -46,8 +48,11 @@ def test_a_broken_config_says_503_not_unauthenticated(monkeypatch) -> None:
     assert login.json()["code"] == "auth_unavailable"
     assert "$DEEPSEEK_API_KEY" not in login.text, "配置细节不回显给客户端"
 
-    # 健康检查是编排系统的探针：认证配置坏了也不能让它变红（这里是 404，说明放行了）
-    assert client.get("/health/ready").status_code == 404
+    # 健康检查是编排系统的探针：认证配置坏了也不能变成 401/`auth_unavailable`。
+    assert client.get("/health").status_code == 200
+    ready = client.get("/health/ready")
+    assert ready.status_code == 503
+    assert ready.json() == {"status": "not_ready"}
 
 
 def test_auth_is_enabled_by_default_and_demands_a_long_secret(monkeypatch) -> None:
