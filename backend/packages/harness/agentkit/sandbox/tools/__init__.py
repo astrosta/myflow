@@ -1,6 +1,7 @@
 """Tool objects referenced by config use: paths."""
 
 from agentkit.sandbox.tools.bash_tool import bash_tool
+from agentkit.sandbox.tools.curl_tool import curl_tool
 from agentkit.sandbox.tools.file_tools import (
     glob,
     grep,
@@ -13,6 +14,7 @@ from agentkit.sandbox.tools.run_code import run_code
 
 __all__ = [
     "bash_tool",
+    "curl_tool",
     "glob",
     "grep",
     "ls",

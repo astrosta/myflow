@@ -12,6 +12,7 @@ from agentkit.reflection import resolve_variable
 from agentkit.sandbox import is_host_bash_allowed
 from agentkit.sandbox.tools import (
     bash_tool,
+    curl_tool,
     glob,
     grep,
     ls,
@@ -34,9 +35,11 @@ logger = logging.getLogger(__name__)
 #: advertising the two tools would cost the model a round trip to be told so.
 _MCP_BUILTIN_TOOL_NAMES = frozenset({"tool_search", "tool_execute"})
 
-_BASH_TOOL_NAMES = frozenset({"bash"})
-_HOST_BASH_DISABLED = (
-    "Host bash is disabled, so bash tools are omitted. "
+#: Tools that need a working sandbox shell.  curl is included: it is one
+#: command in the same shell and must follow the same host-bash trust switch.
+_SHELL_TOOL_NAMES = frozenset({"bash", "curl"})
+_HOST_SHELL_DISABLED = (
+    "Host shell is disabled, so bash and curl tools are omitted. "
     "Switch to a Docker provider, or set sandbox.allow_host_bash: true in a trusted local environment."
 )
 
@@ -52,6 +55,7 @@ _BUILTIN_TOOLS: tuple[tuple[str, BaseTool], ...] = (
     ("sandbox", glob),
     ("sandbox", grep),
     ("sandbox", bash_tool),
+    ("sandbox", curl_tool),
     ("sandbox", run_code),
     ("tools", tool_search),
     ("tools", tool_execute),
@@ -153,7 +157,7 @@ def _apply_capability_filters(
     selected: list[BaseTool] = []
     hid_bash = False
     for tool in tools:
-        if _is_bash_tool(tool.name) and not bash_allowed:
+        if _is_shell_tool(tool.name) and not bash_allowed:
             hid_bash = True
             continue
         if tool.name == "run_code" and not run_code_enabled:
@@ -170,7 +174,7 @@ def _apply_capability_filters(
             continue
         selected.append(tool)
     if hid_bash:
-        logger.warning(_HOST_BASH_DISABLED)
+        logger.warning(_HOST_SHELL_DISABLED)
     return selected
 
 
@@ -184,8 +188,8 @@ def _mcp_servers_enabled(app_config: Any) -> bool:
     return bool(getattr(getattr(app_config, "mcp_servers", None), "enabled", False))
 
 
-def _is_bash_tool(name: str) -> bool:
-    return name in _BASH_TOOL_NAMES or name.startswith("bash_")
+def _is_shell_tool(name: str) -> bool:
+    return name in _SHELL_TOOL_NAMES or name.startswith("bash_")
 
 
 def _model_supports_vision(app_config: AppConfig, model_name: str | None) -> bool:

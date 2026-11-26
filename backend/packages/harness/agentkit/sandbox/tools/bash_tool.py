@@ -57,8 +57,8 @@ def _run_command(runtime: ToolRuntime[Any, Any], command: str, timeout: float | 
     return mask_host_paths(output, sandbox) or "(no output)"
 
 
-def truncate_bash_output(text: str, max_chars: int) -> str:
-    """把模型可见的 bash 输出限制在 max_chars 内，保留头尾并给出截断标记。
+def truncate_bash_output(text: str, max_chars: int, *, label: str = "bash") -> str:
+    """把模型可见的命令输出限制在 max_chars 内，保留头尾并给出截断标记。
 
     工具层截断而不是只依赖 provider 的 1 MiB：一份 14 万字符的原始 HTML 仍在
     1 MiB 以内，却足以把子代理上下文从几千 token 抬到几万 token。
@@ -67,7 +67,8 @@ def truncate_bash_output(text: str, max_chars: int) -> str:
     if len(text) <= budget:
         return text
     marker = (
-        f"\n\n...[bash output truncated: {len(text):,} chars total; "
+        "\n\n...["
+        f"{label} output truncated: {len(text):,} chars total; "
         "showing head and tail]...\n\n"
     )
     if budget <= len(marker):

@@ -224,13 +224,13 @@ sandbox:
   #   agentkit.sandbox.e2b:E2BSandboxProvider            需要 e2b 段 + E2B 兼容控制面（无宿主挂载）
   #   agentkit.sandbox.opensandbox:OpenSandboxProvider   需要 opensandbox 段 + opensandbox-server
   use: agentkit.sandbox.local:LocalSandboxProvider
-  # 只对 local 生效：local 下默认不暴露 bash 工具。换成 e2b/opensandbox 时这个开关被忽略
-  # （隔离来自沙箱/容器，bash 工具始终可用），不要在隔离环境里指望它关掉 bash。
+  # 只对 local 生效：local 下默认不暴露 bash / curl 工具。换成 e2b/opensandbox 时这个开关被忽略
+  # （隔离来自沙箱/容器，bash / curl 工具始终可用），不要在隔离环境里指望它关掉 shell。
   allow_host_bash: false
   # 所有 provider 共用：单条命令的墙钟超时（秒）。e2b 作为 SDK 命令超时，
   # opensandbox 用作 RunCommandOpts.timeout，local 用作子进程超时。
   bash_command_timeout: 600
-  # bash 返回给模型的字符上限：保留头尾，避免整页 HTML 进入上下文。
+  # bash / curl 返回给模型的字符上限：保留头尾，避免整页 HTML 进入上下文。
   bash_max_output_chars: 20000
   # 额外挂载 {container_path, local_path, read_only}。
   # opensandbox 并进宿主挂载；local 直接加映射；e2b 不读宿主目录，忽略这一项。

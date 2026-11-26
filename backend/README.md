@@ -203,6 +203,15 @@ Gateway 在宿主机上解析不到它，表现为请求发不出去（`pre_send
 shell 通道会把片段写到 `/mnt/user-data/workspace/.myflow-run/`、跑完即删；typescript/java/go
 在 shell 通道下会明确报"需要 code interpreter"，不会猜着跑。
 
+**curl（HTTP 请求）**：内置 `curl` 工具在沙箱里发一次 HTTP 请求，支持
+`url` / `method` / `headers` / `body` / `timeout` / `follow_redirects` /
+`include_headers`。它和 `bash` 共用同一个 shell 信任边界：local provider 没开
+`allow_host_bash` 时两个工具都不出现在工具表里，隔离 provider 下始终可用。
+工具只接受 `http://` / `https://` URL，参数经过 shell quoting；响应文本超过
+`bash_max_output_chars` 时按 bash 同样的规则保留头尾并标注截断。镜像里需要自带
+`curl`（默认 `python:3.12` 自带；自定义 E2B / OpenSandbox 镜像要先确认）；需要把
+响应落盘时用 bash 的 `curl -o` 写到 workspace。
+
 **回滚**：`sandbox.use` 改回 local 或 E2B 并重启即可；旧的 `osb:` sandbox_id 在
 `get()` 里是内存 miss，runtime 会重新 acquire；残留沙箱交给服务端的 TTL 或 `osb` CLI。
 
